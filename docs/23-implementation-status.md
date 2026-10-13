@@ -86,7 +86,22 @@ once any `tool_calls` delta has been emitted — is the reason this is not a sma
   10 UNCERTAIN, and each was written from documentation rather than a live call.
 * That the panel works. It has never been rendered — there is no browser on this machine. `panel/README.md` carries a seven-step manual checklist and names six response shapes that were inferred because the conductor API does not exist to check them against.
 
-## 6. Why this file is in the repository
+## 6. Preserved partial attempts
+
+Three pieces of real work exist only as gitignored drafts, because each was left in a state that does
+not compile and reverting the tracked files was the only way to keep the tree green. They are
+resumable and they are worth reading before starting over:
+
+| Path | What it is |
+|---|---|
+| `.research/incomplete-cli-attempt/` | `mr-cli`: 805-line `main.rs`, 544-line `output.rs`, its `Cargo.toml`. Declares eleven modules and writes two of them, so it fails to build. The *layout* is the useful part. |
+| `.research/store-incomplete-attempt.rs` | `mr-core/src/store.rs`: 867 lines, truncated mid-`impl`. References `struct Store` and `struct UsageWriter`, neither of which was ever written. |
+| `.research/incomplete-mock-faults-attempt.rs` | `tools/mock-upstream`: 1360 lines attempting the `faults.rs` contract. Superseded — the committed `lib.rs` compiles and its 13 tests pass, so start from that, not this. |
+
+These are gitignored deliberately. Shipping a file that does not compile, to record that someone once
+tried, trades a working tree for a note — and the note can live outside the build.
+
+## 7. Why this file is in the repository
 
 A reader deciding whether to use this project needs to know which of its sentences are backed by
 running code. Putting that question in one place, with a command beside each answer, is cheaper for
