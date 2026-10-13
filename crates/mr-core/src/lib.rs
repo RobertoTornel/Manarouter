@@ -3,9 +3,11 @@
 //! Shared foundation for Manarouter: the configuration model, the compiled routing snapshot that
 //! the data plane reads, the on-disk store, and the secret vault.
 //!
-//! Nothing in this crate talks to the network. It is pure data, so both the control plane (which
-//! authors and compiles) and the data plane (which reads a compiled snapshot) depend on it without
-//! pulling in an HTTP stack.
+//! With the single exception of the [`oauth`] login flows (which must reach each provider's
+//! token endpoint to exchange and refresh credentials), nothing in this crate talks to the
+//! network. Everything else is pure data, so both the control plane (which authors and compiles)
+//! and the data plane (which reads a compiled snapshot) depend on it without pulling in an HTTP
+//! stack of their own.
 //!
 //! ## The two representations
 //!
@@ -26,6 +28,7 @@ pub mod dialect;
 pub mod error;
 pub mod ids;
 pub mod model;
+pub mod oauth;
 pub mod published;
 pub mod secret;
 pub mod snapshot;
