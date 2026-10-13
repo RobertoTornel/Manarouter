@@ -1,0 +1,22 @@
+[package]
+name = "mr-dialects"
+description = "Dialect translation between OpenAI, Anthropic, Responses and provider-native shapes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+mr-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+memchr = { workspace = true }
+http = { workspace = true }
+futures-util = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }

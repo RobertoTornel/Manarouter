@@ -1,0 +1,634 @@
+# Manarouter provider catalogue — SEED DATA, not runtime configuration.
+# This file is compiled into `mr-core` with include_str! and read through
+# `mr_core::catalog::catalog()`. It is the list of upstream providers this build knows how to talk
+# to, and it exists so that `mr providers add <id>` (and the panel's "add provider" screen) can
+# create a correctly-configured provider in one step. Nothing here is read on the request path, and
+# nothing here is ever written by the panel. The operator-owned file is
+# `~/.config/manarouter/config.json`; once a template is instantiated it becomes an ordinary
+# `Provider` there and this file is not consulted again.
+# Every entry was sourced from `.research/omniroute.md`, `.research/9router.md`,
+# `.research/oauth.md`, `.research/omniroute-protocol-layer.md` and
+# `.research/commandcode-bridge.md`. Where the research marks an endpoint or a protocol as
+# uncertain, the entry is still shipped and says so in `note`.
+# Conventions:
+#   * `dialect` is the kebab-case serde spelling: open-ai, anthropic, google, codex, copilot,
+#     antigravity, command-code.
+#   * `auth` is AuthKind's internally-tagged serde shape, so it is always an inline table:
+#     { type = "bearer" }, { type = "api-key-header", header = "x-api-key" },
+#     { type = "query-param", param = "key" } or { type = "oauth", platform = "openai-codex" }.
+# produces; use the same spelling here and in config.json.
+#   * `base_url` is the prefix the dialect appends its route path to. Where a provider deviates
+#     from the dialect default, the deviation is named in `route_overrides`, keyed by the
+#     kebab-case RouteKind (chat-completions, responses, embeddings, messages, ...).
+#   * A header value written as `${name}` is a template the OAuth layer fills from the credential
+#     at request time; it is recorded because a missing header is a hard upstream 400.
+#   * Unrecognised keys on an entry are preserved verbatim in the entry's `extra` map: that is
+#     where OAuth constants, alternate hosts and path quirks live.
+#   * `api_key_url` and `docs_url` are omitted unless the research recorded one. Inventing a URL
+#     would be worse than leaving the panel to say "consult the provider".
+# Binding project decision: no provider that authenticates by browser cookie or by scraping a web
+# session is listed here, however many connections the migration source has for it. Cookie/web-
+# session entries in the research (claude-web, deepseek-web, gemini-web, zai-web, duckduckgo-web,
+# lmarena, veoaifree-web) and the excluded no-auth proxies (aihorde, pollinations) are deliberately
+# absent. `ProviderTemplate::validate()` enforces this for anything added later.
+# `version` is the data-file format version, so a future migration can tell revisions apart.
+
+version = 1
+
+# ---------------------------------------------------------------------------------------------
+# OAuth platforms this project implements itself (verified header fingerprints, `.research/oauth.md`)
+# ---------------------------------------------------------------------------------------------
+
+[[providers]]
+id = "openai-codex"
+label = "OpenAI Codex (ChatGPT subscription)"
+dialect = "codex"
+base_url = "https://chatgpt.com/backend-api/codex"
+auth = { type = "oauth", platform = "openai-codex" }
+oauth_platform = "openai-codex"
+capabilities = ["responses", "tool-calling", "reasoning", "vision"]
+key_strategy = "round-robin"
+note = "OAuth only. The relay injects chatgpt-account-id from the JWT claim at https://api.openai.com/auth -> chatgpt_account_id; sending a literal value there is a hard failure. originator must be codex_cli_rs for the official endpoint. UNCERTAIN: OpenAI-Beta responses=experimental is only needed by older servers, so it is sent for compatibility."
+docs_url = "https://github.com/openai/codex"
+oauth_authorize_url = "https://auth.openai.com/oauth/authorize"
+oauth_token_url = "https://auth.openai.com/oauth/token"
+oauth_client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+oauth_scopes = "openid profile email offline_access"
+oauth_redirect_port = 1455
+oauth_redirect_path = "/auth/callback"
+oauth_pkce = "S256"
+user_agent_template = "codex_cli_rs/<version> (<OsType> <os version>; <arch>) <terminal-ua>"
+
+[providers.headers]
+"originator" = "codex_cli_rs"
+"chatgpt-account-id" = "${chatgpt_account_id}"
+"OpenAI-Beta" = "responses=experimental"
+
+[[providers]]
+id = "github-copilot"
+label = "GitHub Copilot"
+dialect = "copilot"
+base_url = "https://api.githubcopilot.com"
+auth = { type = "oauth", platform = "github-copilot" }
+oauth_platform = "github-copilot"
+capabilities = ["chat", "responses", "messages", "embeddings", "models", "tool-calling", "reasoning", "vision"]
+note = "Editor-Version is mandatory: omitting it is a hard 400 (missing Editor-Version header for IDE auth). Copilot-Integration-Id selects the integrator allowlist that decides model availability. The bearer sent upstream is the Copilot token minted from the GitHub token, never the raw GitHub token."
+docs_url = "https://github.com/ericc-ch/copilot-api"
+oauth_device_code_url = "https://github.com/login/device/code"
+oauth_token_url = "https://github.com/login/oauth/access_token"
+copilot_token_url = "https://api.github.com/copilot_internal/v2/token"
+copilot_integration_id = "vscode-chat"
+
+[providers.headers]
+"Editor-Version" = "vscode/${vs_code_version}"
+"Copilot-Integration-Id" = "vscode-chat"
+"editor-plugin-version" = "copilot-chat/0.26.7"
+"user-agent" = "GitHubCopilotChat/0.26.7"
+"openai-intent" = "conversation-panel"
+"x-github-api-version" = "2025-04-01"
+"x-vscode-user-agent-library-version" = "electron-fetch"
+
+[[providers]]
+id = "antigravity"
+label = "Google Antigravity / Gemini Code Assist"
+dialect = "antigravity"
+base_url = "https://cloudcode-pa.googleapis.com"
+auth = { type = "oauth", platform = "antigravity" }
+oauth_platform = "antigravity"
+capabilities = ["chat", "models", "tool-calling", "reasoning", "vision"]
+note = "UNCERTAIN (T2): the Antigravity client identity and the exact x-goog-api-client and User-Agent values are reverse-engineered, not primary-confirmed. Client-Metadata is a JSON object and must be sent verbatim. Every project-scoped call needs the project id obtained from the onboardUser envelope."
+oauth_generate_path = "/v1internal:generateContent"
+oauth_stream_path = "/v1internal:streamGenerateContent?alt=sse"
+oauth_onboard_path = "/v1internal:onboardUser"
+oauth_project_required = true
+
+[providers.headers]
+"X-Goog-Api-Client" = "google-cloud-sdk vscode_cloudshelleditor/0.1"
+"Client-Metadata" = '{"ideType":"ANTIGRAVITY","platform":"WINDOWS","pluginType":"GEMINI"}'
+"User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/${antigravity_version} Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36"
+
+[[providers.quota]]
+name = "weekly"
+kind = "provider-declared"
+seconds = 604800
+reset_only = true
+
+[[providers]]
+id = "cline"
+label = "Cline"
+dialect = "open-ai"
+base_url = "https://api.cline.bot/api/v1"
+auth = { type = "oauth", platform = "cline" }
+oauth_platform = "cline"
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+key_strategy = "round-robin"
+note = "OAuth-only upstream (authModes=[oauth]). This build does not implement the cline OAuth platform, so the entry records the migration target rather than offering a working login."
+
+# ---------------------------------------------------------------------------------------------
+# Command Code — its own CLI envelope, not OpenAI (`.research/commandcode-bridge.md`)
+# ---------------------------------------------------------------------------------------------
+
+[[providers]]
+id = "command-code"
+label = "Command Code"
+dialect = "command-code"
+base_url = "https://api.commandcode.ai"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+note = "The alpha/generate envelope is always SSE, even for a non-streaming client request; the relay translates the CLI event stream back. x-command-code-version must track a CLI version the upstream still accepts (1.79.2 at the time of research)."
+docs_url = "https://github.com/dev2k6/command-code-proxy-server"
+upstream_path = "/alpha/generate"
+bridge_default_port = 3050
+
+[providers.headers]
+"x-command-code-version" = "1.79.2"
+"x-cli-environment" = "production"
+"accept" = "text/event-stream"
+
+# ---------------------------------------------------------------------------------------------
+# Major key-based providers a user is most likely to want
+# ---------------------------------------------------------------------------------------------
+
+[[providers]]
+id = "openai"
+label = "OpenAI"
+dialect = "open-ai"
+base_url = "https://api.openai.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "responses", "embeddings", "audio-transcription", "audio-speech", "images-generations", "models", "tool-calling", "reasoning", "vision"]
+note = "The reference OpenAI surface: /chat/completions, /responses, /embeddings, /audio/*, /images/generations, /models. Key-based access only; the ChatGPT-subscription surface is the separate openai-codex entry."
+
+[[providers]]
+id = "anthropic"
+label = "Anthropic"
+dialect = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+auth = { type = "api-key-header", header = "x-api-key" }
+capabilities = ["messages", "models", "tool-calling", "reasoning", "vision"]
+note = "Anthropic Messages dialect. anthropic-version is required; 2023-06-01 is the value the research records."
+
+[providers.headers]
+"anthropic-version" = "2023-06-01"
+
+[[providers.quota]]
+name = "5h"
+kind = "provider-declared"
+seconds = 18000
+reset_only = true
+
+[[providers]]
+id = "gemini"
+label = "Google Gemini (AI Studio)"
+dialect = "google"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+auth = { type = "query-param", param = "key" }
+capabilities = ["chat", "embeddings", "models", "tool-calling", "reasoning", "vision"]
+note = "API-key access to the generativelanguage surface (models/{model}:generateContent). Vertex and service-account access is a different endpoint and is not shipped here. The key may also be sent as x-goog-api-key instead of ?key=."
+
+[[providers]]
+id = "openrouter"
+label = "OpenRouter"
+dialect = "open-ai"
+base_url = "https://openrouter.ai/api/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "responses", "embeddings", "models", "tool-calling", "reasoning", "vision"]
+note = "One key reaches many upstreams. The OpenAI dialect entry is the general one; OpenRouter also exposes an Anthropic-compatible surface."
+
+[[providers]]
+id = "groq"
+label = "Groq"
+dialect = "open-ai"
+base_url = "https://api.groq.com/openai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "audio-transcription", "audio-speech", "tool-calling", "reasoning"]
+
+[[providers]]
+id = "mistral"
+label = "Mistral"
+dialect = "open-ai"
+base_url = "https://api.mistral.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "embeddings", "models", "tool-calling", "reasoning", "vision"]
+
+[[providers]]
+id = "deepseek"
+label = "DeepSeek"
+dialect = "open-ai"
+base_url = "https://api.deepseek.com"
+auth = { type = "bearer" }
+capabilities = ["chat", "responses", "models", "tool-calling", "reasoning"]
+note = "Chat lives at the origin root (/chat/completions), not under /v1. The same key also reaches /responses and an Anthropic-compatible /anthropic/v1/messages surface."
+
+[[providers]]
+id = "xai"
+label = "xAI (Grok)"
+dialect = "open-ai"
+base_url = "https://api.x.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "responses", "models", "tool-calling", "reasoning", "vision"]
+note = "Key access is Bearer. xAI also supports an OAuth flow that this build does not implement."
+
+[[providers]]
+id = "together"
+label = "Together AI"
+dialect = "open-ai"
+base_url = "https://api.together.xyz/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "embeddings", "models", "tool-calling", "reasoning", "vision"]
+
+[[providers]]
+id = "fireworks"
+label = "Fireworks AI"
+dialect = "open-ai"
+base_url = "https://api.fireworks.ai/inference/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "embeddings", "models", "tool-calling", "reasoning", "vision"]
+
+[[providers]]
+id = "cerebras"
+label = "Cerebras"
+dialect = "open-ai"
+base_url = "https://api.cerebras.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+
+[[providers]]
+id = "perplexity"
+label = "Perplexity"
+dialect = "open-ai"
+base_url = "https://api.perplexity.ai"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+
+[[providers]]
+id = "cohere"
+label = "Cohere"
+dialect = "open-ai"
+base_url = "https://api.cohere.com/compatibility/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "embeddings", "models", "tool-calling", "reasoning", "vision"]
+note = "The OpenAI-compatible surface is under /compatibility/v1; the native Cohere v2 surface is not modelled."
+
+[[providers]]
+id = "voyage"
+label = "Voyage AI"
+dialect = "open-ai"
+base_url = "https://api.voyageai.com/v1"
+auth = { type = "bearer" }
+capabilities = ["embeddings"]
+note = "Embeddings only, so the chat route is deliberately absent."
+
+[[providers]]
+id = "jina"
+label = "Jina AI"
+dialect = "open-ai"
+base_url = "https://api.jina.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["embeddings"]
+note = "Embeddings only (the Foundation API). Reader and rerank endpoints are not modelled."
+
+# ---------------------------------------------------------------------------------------------
+# Local / self-hosted runtimes — loopback defaults, no credential required
+# ---------------------------------------------------------------------------------------------
+
+[[providers]]
+id = "ollama"
+label = "Ollama (local)"
+dialect = "open-ai"
+base_url = "http://127.0.0.1:11434/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning", "vision"]
+note = "Loopback default for the OpenAI-compatible surface. Ollama needs no credential; auth stays bearer so an account can be attached when a fronting proxy asks for one."
+
+[[providers]]
+id = "llama-cpp"
+label = "llama.cpp (local)"
+dialect = "open-ai"
+base_url = "http://127.0.0.1:8080/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+note = "Loopback default for a llama-server process. Needs no credential unless the server was started with one."
+
+[[providers]]
+id = "vllm"
+label = "vLLM (local)"
+dialect = "open-ai"
+base_url = "http://127.0.0.1:8000/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "responses", "embeddings", "models", "tool-calling", "reasoning", "vision"]
+note = "Loopback default for vLLM's OpenAI-compatible server. Which routes exist depends on the served model and on --task flags."
+
+# ---------------------------------------------------------------------------------------------
+# Providers OmniRoute's database actually holds credentials for (migration targets)
+# ---------------------------------------------------------------------------------------------
+
+[[providers]]
+id = "openadapter"
+label = "OpenAdapter"
+dialect = "open-ai"
+base_url = "https://api.openadapter.in/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+key_strategy = "round-robin"
+
+[[providers]]
+id = "aion"
+label = "Aion Labs"
+dialect = "open-ai"
+base_url = "https://api.aionlabs.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+key_strategy = "round-robin"
+
+[[providers]]
+id = "api-airforce"
+label = "API.airforce"
+dialect = "open-ai"
+base_url = "https://api.airforce/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+note = "Free-tier aggregator that passes the client's model id through unchanged (passthroughModels)."
+
+[[providers]]
+id = "agnes"
+label = "Agnes AI"
+dialect = "open-ai"
+base_url = "https://apihub.agnes-ai.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "reasoning"]
+
+[[providers]]
+id = "bytez"
+label = "Bytez"
+dialect = "open-ai"
+base_url = "https://api.bytez.com/models/v2/openai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models"]
+note = "UNCERTAIN: the registry base URL is model-scoped (/models/v2/openai/v1), so the chat path depends on how Bytez resolves the model id."
+
+[[providers]]
+id = "cheaperinference"
+label = "Cheaper Inference"
+dialect = "open-ai"
+base_url = "https://api.cheaperinference.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "responses", "models", "reasoning"]
+note = "UNCERTAIN: the OmniRoute executor selects the chat or responses URL per model."
+
+[[providers]]
+id = "cloudflare-ai"
+label = "Cloudflare Workers AI"
+dialect = "open-ai"
+base_url = "https://api.cloudflare.com/client/v4/accounts"
+auth = { type = "bearer" }
+capabilities = ["chat", "embeddings", "models"]
+note = "UNCERTAIN: the registry base stops at /client/v4/accounts; the account id is a path segment, recorded in route_overrides. The Workers AI binding also exposes embeddings and images."
+
+[providers.route_overrides]
+chat-completions = "{account_id}/ai/v1/chat/completions"
+
+[[providers]]
+id = "deepinfra"
+label = "DeepInfra"
+dialect = "open-ai"
+base_url = "https://api.deepinfra.com/v1/openai"
+auth = { type = "bearer" }
+capabilities = ["chat", "embeddings", "models", "tool-calling", "reasoning", "vision"]
+note = "The OpenAI surface is under /v1/openai."
+
+[[providers]]
+id = "free-ai"
+label = "Free.ai"
+dialect = "open-ai"
+base_url = "https://api.free.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models"]
+note = "UNCERTAIN: the registry lists the chat URL as https://api.free.ai/v1/chat/ with zero models, so the prefix used here is inferred."
+
+[[providers]]
+id = "freeaiapikey"
+label = "FreeAIAPIKey"
+dialect = "open-ai"
+base_url = "https://api.freeaiapikey.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+
+[[providers]]
+id = "freemodel-dev"
+label = "FreeModel.dev"
+dialect = "open-ai"
+base_url = "https://api.freemodel.dev/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+
+[[providers]]
+id = "inception"
+label = "Inception"
+dialect = "open-ai"
+base_url = "https://api.inceptionlabs.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "reasoning"]
+
+[[providers]]
+id = "llm-kiwi"
+label = "LLM.Kiwi"
+dialect = "open-ai"
+base_url = "https://api.llm.kiwi/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models"]
+
+[[providers]]
+id = "nvidia"
+label = "NVIDIA NIM"
+dialect = "open-ai"
+base_url = "https://integrate.api.nvidia.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "embeddings", "models", "tool-calling", "reasoning", "vision"]
+note = "The model id is the NIM path name (for example meta/llama-3.1-8b-instruct)."
+
+[[providers]]
+id = "ollama-cloud"
+label = "Ollama Cloud"
+dialect = "open-ai"
+base_url = "https://ollama.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning", "vision"]
+note = "Ollama's hosted service, distinct from the loopback Ollama runtime entry."
+
+[[providers]]
+id = "opencode"
+label = "OpenCode Free"
+dialect = "open-ai"
+base_url = "https://opencode.ai/zen/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "reasoning"]
+note = "Free tier needs no credential; auth stays bearer so a key can be attached. The key-based tiers are the separate opencode-zen and opencode-go entries."
+
+[[providers]]
+id = "requesty"
+label = "Requesty"
+dialect = "open-ai"
+base_url = "https://router.requesty.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+
+[[providers]]
+id = "routeway"
+label = "Routeway"
+dialect = "open-ai"
+base_url = "https://api.routeway.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+
+[[providers]]
+id = "sealion"
+label = "SEA-LION"
+dialect = "open-ai"
+base_url = "https://api.sea-lion.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "embeddings", "models", "reasoning"]
+note = "SEA-LION, the Southeast Asian language models from AI Singapore."
+
+[[providers]]
+id = "uncloseai"
+label = "UncloseAI"
+dialect = "open-ai"
+base_url = "https://hermes.ai.unturf.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models"]
+note = "UNCERTAIN: a free public endpoint that needs no credential; availability and rate limits are not guaranteed."
+
+[[providers]]
+id = "vercel-ai-gateway"
+label = "Vercel AI Gateway"
+dialect = "open-ai"
+base_url = "https://ai-gateway.vercel.sh/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "responses", "embeddings", "models", "tool-calling", "reasoning", "vision"]
+note = "One key routes to many upstreams."
+
+# ---------------------------------------------------------------------------------------------
+# Additional sourced, key-based providers from the same registries
+# ---------------------------------------------------------------------------------------------
+
+[[providers]]
+id = "glm"
+label = "Z.ai GLM Coding"
+dialect = "open-ai"
+base_url = "https://api.z.ai/api/coding/paas/v4"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+note = "The coding-plan OpenAI surface. An Anthropic-compatible surface exists at /api/anthropic/v1/messages and 9Router prefers it; the OpenAI transport is shipped here."
+glm_url_suffix = "?beta=true"
+
+[[providers.quota]]
+name = "daily"
+kind = "provider-declared"
+seconds = 86400
+reset_only = true
+
+[[providers]]
+id = "kimi"
+label = "Kimi (Moonshot)"
+dialect = "open-ai"
+base_url = "https://api.moonshot.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "responses", "models", "tool-calling", "reasoning"]
+note = "UNCERTAIN which host a given key reaches: OmniRoute's kimi entry points at the legacy Moonshot host api.moonshot.ai/v1, while 9Router's newer kimi entry uses api.kimi.com/coding/v1 with OpenAI, Anthropic and Responses transports."
+
+[[providers]]
+id = "minimax"
+label = "MiniMax Coding"
+dialect = "open-ai"
+base_url = "https://api.minimax.io/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+note = "An Anthropic-compatible surface exists at /anthropic/v1/messages, and the image and TTS endpoints live on the same host."
+
+[[providers.quota]]
+name = "5h"
+kind = "provider-declared"
+seconds = 18000
+reset_only = true
+
+[[providers]]
+id = "huggingface"
+label = "HuggingFace Router"
+dialect = "open-ai"
+base_url = "https://router.huggingface.co/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models"]
+note = "UNCERTAIN: OmniRoute lists chat at router.huggingface.co/v1, while 9Router classifies HuggingFace as an image and STT provider."
+
+[[providers]]
+id = "nebius"
+label = "Nebius AI"
+dialect = "open-ai"
+base_url = "https://api.studio.nebius.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "embeddings", "models", "tool-calling", "reasoning"]
+note = "UNCERTAIN: 9Router puts chat on api.studio.nebius.ai/v1 and embeddings on api.tokenfactory.nebius.com/v1; OmniRoute lists chat on the tokenfactory host."
+
+[[providers]]
+id = "novita"
+label = "Novita AI"
+dialect = "open-ai"
+base_url = "https://api.novita.ai/openai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "embeddings", "models", "tool-calling", "reasoning", "vision"]
+note = "The OpenAI surface is under /openai/v1."
+
+[[providers]]
+id = "sambanova"
+label = "SambaNova"
+dialect = "open-ai"
+base_url = "https://api.sambanova.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+
+[[providers]]
+id = "hyperbolic"
+label = "Hyperbolic"
+dialect = "open-ai"
+base_url = "https://api.hyperbolic.xyz/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+
+[[providers]]
+id = "xiaomi-mimo"
+label = "Xiaomi MiMo"
+dialect = "open-ai"
+base_url = "https://api.xiaomimimo.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "reasoning"]
+note = "Region-mapped host with sgp as the default; an Anthropic-compatible surface exists at /anthropic/v1/messages and a token-plan host at token-plan-sgp.xiaomimimo.com/v1."
+
+[[providers]]
+id = "opencode-zen"
+label = "OpenCode Zen"
+dialect = "open-ai"
+base_url = "https://opencode.ai/zen/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "responses", "models", "tool-calling", "reasoning"]
+note = "Key-based tier at the same host as the free opencode entry; the host also serves /messages and /responses, which a single-dialect provider cannot express."
+
+[[providers]]
+id = "opencode-go"
+label = "OpenCode Go"
+dialect = "open-ai"
+base_url = "https://opencode.ai/zen/go/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "responses", "models", "tool-calling", "reasoning"]
+note = "Go-plan tier; the host also serves /messages and /responses, which a single-dialect provider cannot express."
+
+# ---------------------------------------------------------------------------------------------
+# Not shipped, deliberately
+# ---------------------------------------------------------------------------------------------
+# kiro               — AWS CodeWhisperer event-stream protocol; no Dialect can express it.
+# fishaudio          — bespoke TTS surface; the research records no HTTP chat base.
+# auggie, zcode      — non-HTTP (CLI/stdio) transports.
+# cloudflare-playground — cf_agent RPC over WebSocket, no key.
+# codex-app-server, devin-cli-agentic — local app servers, not upstream providers.
+# aihorde, pollinations — excluded by the project's no-web-session decision.
+# claude-web, deepseek-web, gemini-web, zai-web, duckduckgo-web, lmarena, veoaifree-web — cookie /
+#                        browser-session auth, excluded by the same decision.

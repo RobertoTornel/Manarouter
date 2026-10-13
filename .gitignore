@@ -1,0 +1,31 @@
+# --- Rust ---
+/target/
+**/*.rs.bk
+*.pdb
+
+# --- local runtime state (never commit) ---
+/.manarouter/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# --- secrets: must never be committed ---
+secrets/
+*.key
+*.pem
+.env
+.env.*
+
+# --- research scratch (kept locally, not published) ---
+/.research/
+
+# --- editor / OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# --- local backups ---
+*.bak
+plan.md.bak

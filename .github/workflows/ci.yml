@@ -1,0 +1,95 @@
+name: CI
+
+# Manarouter routes requests to paid upstream accounts, so the build has to prove two things that
+# a normal Rust test suite does not: that no credential is committed, and that the entire routing
+# path works against a mock upstream with no network access at all. A test suite that needs real
+# credentials is a test suite that is skipped on every machine but one.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail fast on warnings: this codebase is small enough that a warning is always fixable, and a
+  # warning that is allowed to accumulate is a warning nobody reads.
+  RUSTFLAGS: "-D warnings"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux is the primary target; macOS is included because the panel is expected to be used
+        # from a desktop and because it catches Unix-permission assumptions that differ.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The secret scan inspects tracked files, so a shallow clone is sufficient and faster.
+          fetch-depth: 1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: No committed credentials
+        run: scripts/check-secrets.sh
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        # Every test must pass with no network and no credentials. Anything needing a real upstream
+        # belongs behind an ignored test that a human runs deliberately (see docs/18-testing.md).
+        run: cargo test --workspace --all-targets
+
+      - name: Test release profile
+        # The release profile enables LTO, `panic = "abort"` and `strip`. Those settings change
+        # codegen enough that a debug-only test pass is not evidence the shipped binary works.
+        run: cargo test --workspace --release
+
+  docs:
+    name: docs build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Internal documentation links
+        run: |
+          # Every relative markdown link in docs/ and README.md must resolve, or the
+          # LLM-facing index quietly rots into a list of dead ends.
+          status=0
+          for f in README.md docs/*.md; do
+            [ -f "$f" ] || continue
+            dir=$(dirname "$f")
+            while IFS= read -r target; do
+              case "$target" in
+                http*|'#'*|mailto:*) continue ;;
+              esac
+              path="${target%%#*}"
+              [ -z "$path" ] && continue
+              if [ ! -e "$dir/$path" ] && [ ! -e "$path" ]; then
+                echo "$f: broken link -> $target"
+                status=1
+              fi
+            done < <(grep -oE '\]\([^)]+\)' "$f" | sed -E 's/^\]\(//; s/\)$//')
+          done
+          exit $status

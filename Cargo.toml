@@ -1,0 +1,105 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/mr-core",
+  "crates/mr-dialects",
+  "crates/manarouter-relay",
+  "crates/manarouter-conductor",
+  "crates/mr-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/RobertoTornel/Manarouter"
+homepage = "https://github.com/RobertoTornel/Manarouter"
+authors = ["Roberto Tornel Candel"]
+description = "Latency-obsessed AI router: a Rust data plane that only sends and receives, and a control plane that decides everything else."
+
+[workspace.dependencies]
+# --- workspace crates ---
+mr-core = { path = "crates/mr-core" }
+mr-dialects = { path = "crates/mr-dialects" }
+
+# --- async runtime / http ---
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "client", "client-legacy", "tokio", "http1", "http2"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+axum = { version = "0.8", features = ["json", "query", "macros"] }
+tower = "0.5"
+futures-util = "0.3"
+async-trait = "0.1"
+pin-project-lite = "0.2"
+
+# --- tls ---
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "logging", "native-tokio"] }
+webpki-roots = "0.26"
+rustls-pemfile = "2"
+
+# --- data ---
+bytes = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+toml = "0.8"
+memchr = "2"
+smallvec = { version = "1", features = ["union", "const_generics"] }
+arc-swap = "1"
+indexmap = { version = "2", features = ["serde"] }
+
+# --- storage ---
+rusqlite = { version = "0.37", features = ["bundled", "serde_json", "time"] }
+
+# --- crypto / ids ---
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+sha2 = "0.10"
+hmac = "0.12"
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
+subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
+argon2 = "0.5"
+password-hash = { version = "0.5", features = ["rand_core"] }
+
+# --- observability / errors / cli ---
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+clap = { version = "4", features = ["derive", "env"] }
+notify = "6"
+humantime = "2"
+httpdate = "1"
+time = { version = "0.3", features = ["formatting", "parsing", "serde", "macros"] }
+
+# --- allocator ---
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+incremental = false
+debug = false
+
+[profile.dev]
+opt-level = 0
+debug = 1
+# Dependencies are slow and rarely change; optimize them even in dev builds.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.bench]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
