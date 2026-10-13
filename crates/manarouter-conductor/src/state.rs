@@ -37,6 +37,65 @@ use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::auth::PanelAuth;
 
+/// Where the two directory-backed assets of the panel live.
+///
+/// The compiler cannot embed them: the spec preferred a compile-time embed (`include_dir`), but
+/// the manifest for this crate is owned elsewhere, so the panel is served from disk instead. Both
+/// directories are resolved **once, at startup** — a later `cd` or chdir cannot silently change
+/// which `panel/` the process serves — and are `None` when nothing was found, which is what makes
+/// "panel directory missing" a graceful placeholder page rather than a crash.
+#[derive(Debug, Clone, Default)]
+pub struct ServeDirs {
+    /// Directory holding the panel's static shell (`index.html` and friends).
+    pub panel: Option<PathBuf>,
+    /// Directory holding the markdown documentation browsed at `GET /api/docs`.
+    pub docs: Option<PathBuf>,
+}
+
+impl ServeDirs {
+    /// Look for `panel/` and `docs/` next to the usual places an operator runs from: the working
+    /// directory, its parents (for `cargo run` from a crate directory), and the executable's
+    /// location (for a release binary under `target/release/`, and for `cargo test`, whose cwd is
+    /// the crate root while the executable sits three levels up in the workspace).
+    pub fn discover() -> Self {
+        let mut bases: Vec<PathBuf> = Vec::new();
+        if let Ok(cwd) = std::env::current_dir() {
+            bases.push(cwd.clone());
+            let mut up = cwd;
+            for _ in 0..2 {
+                match up.parent() {
+                    Some(p) => {
+                        up = p.to_path_buf();
+                        bases.push(up.clone());
+                    }
+                    None => break,
+                }
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            let mut up = exe.parent().map(Path::to_path_buf);
+            for _ in 0..5 {
+                match up {
+                    Some(p) => {
+                        up = p.parent().map(Path::to_path_buf);
+                        bases.push(p);
+                    }
+                    None => break,
+                }
+            }
+        }
+        let panel = bases
+            .iter()
+            .map(|b| b.join("panel"))
+            .find(|p| p.join("index.html").is_file());
+        let docs = bases
+            .iter()
+            .map(|b| b.join("docs"))
+            .find(|p| p.is_dir());
+        Self { panel, docs }
+    }
+}
+
 /// Everything the request handlers share.
 ///
 /// Cheap to clone: every field is an `Arc` (or a handle that wraps one), so handlers clone the
@@ -66,6 +125,8 @@ pub struct AppState {
     /// separate process, so the conductor cannot observe its socket — it can only report the value
     /// the relay was last started from. The panel needs both to render "configured vs running".
     pub running_ports: Arc<RunningPorts>,
+    /// Where `panel/` and `docs/` were found at startup.
+    pub dirs: ServeDirs,
     /// For uptime in `GET /api/health`.
     pub started_at: Instant,
 }
@@ -120,6 +181,16 @@ impl CommitError {
     }
 }
 
+/// Backup journal for the vault writes performed while assembling an edit that may still fail.
+///
+/// See [`AppState::tx_put`]. Zero fields besides the writes themselves; `Default` is all a
+/// handler needs.
+#[derive(Debug, Default)]
+pub struct VaultTx {
+    /// `(vault id, value that was stored before this edit)`.
+    writes: Vec<(String, Option<String>)>,
+}
+
 /// A one-shot "please restart" signal from the API to `main`.
 ///
 /// `Notify::notify_one` rather than `notify_waiters`: a permit is stored even when nobody is
@@ -160,6 +231,7 @@ impl AppState {
         auth: PanelAuth,
         running_relay_port: u16,
         running_control_port: u16,
+        dirs: ServeDirs,
     ) -> Result<Self, String> {
         let dir = config_path
             .parent()
@@ -183,6 +255,7 @@ impl AppState {
                 relay: AtomicU16::new(running_relay_port),
                 control: AtomicU16::new(running_control_port),
             }),
+            dirs,
             started_at: Instant::now(),
         })
     }
@@ -243,14 +316,52 @@ impl AppState {
         Ok(())
     }
 
-    /// Write one secret into the vault and flush it to disk immediately.
+    /// Write one secret into the vault **on behalf of a pending edit**, remembering what was
+    /// there before so the edit can be undone.
     ///
-    /// Flush-per-write rather than batched: a crash right after a save must not leave the config
-    /// referencing a secret that was never durably written.
-    pub async fn put_secret(&self, id: &str, value: &str) -> Result<(), String> {
+    /// Why the bookkeeping: a handler writes secrets while assembling the next configuration, but
+    /// that configuration may still fail validation. Without a backup, a rejected edit would leave
+    /// the new secret in the vault — and if the secret replaced an existing one, the *old* secret
+    /// would be lost while `config.json` still points at its id. [`Self::tx_rollback`] restores
+    /// exactly the previous state in that case.
+    ///
+    /// Each write is flushed to disk immediately: a crash right after a successful save must not
+    /// leave the config referencing a secret that was never durably written.
+    pub async fn tx_put(&self, tx: &mut VaultTx, id: &str, value: &str) -> Result<(), String> {
         let mut vault = self.vault.lock().await;
+        let previous = vault.get(id).map_err(|e| e.to_string())?;
         vault.put(id, value).map_err(|e| e.to_string())?;
-        vault.flush().map_err(|e| e.to_string())
+        vault.flush().map_err(|e| e.to_string())?;
+        tx.writes.push((id.to_owned(), previous));
+        Ok(())
+    }
+
+    /// Undo every secret write recorded in `tx`, newest first, and flush.
+    ///
+    /// Failures here are logged rather than propagated: the caller is already reporting a more
+    /// important error, and the worst case is an orphaned vault entry (never a lost one — a
+    /// restore that fails leaves the newer value, which is what the rollback could not fix
+    /// anyway).
+    pub async fn tx_rollback(&self, tx: VaultTx) {
+        if tx.writes.is_empty() {
+            return;
+        }
+        let mut vault = self.vault.lock().await;
+        for (id, previous) in tx.writes.iter().rev() {
+            let outcome = match previous {
+                Some(value) => vault.put(id, value),
+                None => {
+                    vault.delete(id);
+                    Ok(())
+                }
+            };
+            if let Err(e) = outcome {
+                tracing::warn!(secret_id = %id, error = %e, "could not roll back a vault write");
+            }
+        }
+        if let Err(e) = vault.flush() {
+            tracing::warn!(error = %e, "could not flush the vault after a rollback");
+        }
     }
 
     /// Remove one secret from the vault (absent ids are fine).
@@ -259,6 +370,28 @@ impl AppState {
         if vault.delete(id) {
             let _ = vault.flush();
         }
+    }
+
+    /// Remove every secret whose id starts with `prefix`, returning how many went.
+    ///
+    /// Used when an entity is deleted: `provider/{pid}/…` covers the account secrets, the
+    /// provider-wide secret, and any OAuth material stored under the same prefix, without this
+    /// crate having to know the OAuth module's id scheme.
+    pub async fn delete_secrets_with_prefix(&self, prefix: &str) -> usize {
+        let mut vault = self.vault.lock().await;
+        let ids: Vec<String> = vault.ids().into_iter().filter(|id| id.starts_with(prefix)).collect();
+        let mut removed = 0;
+        for id in &ids {
+            if vault.delete(id) {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            if let Err(e) = vault.flush() {
+                tracing::warn!(error = %e, "could not flush the vault after a cascade delete");
+            }
+        }
+        removed
     }
 
     /// Swap in a new panel-password hash.

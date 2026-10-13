@@ -69,7 +69,12 @@ impl OAuthPlatform for Copilot {
         )))
     }
 
-    async fn exchange_code(&self, _code: &str, _pkce: Option<&super::Pkce>, _port: u16) -> Result<TokenSet> {
+    async fn exchange_code(
+        &self,
+        _code: &str,
+        _pkce: Option<&super::Pkce>,
+        _port: u16,
+    ) -> Result<TokenSet> {
         Err(oauth_error(format!(
             "{}: there is no authorization code; the device flow is used instead",
             Self::ID
@@ -77,10 +82,7 @@ impl OAuthPlatform for Copilot {
     }
 
     async fn refresh(&self, _refresh_token: &str) -> Result<TokenSet> {
-        Err(oauth_error(format!(
-            "{}: refresh not yet wired",
-            Self::ID
-        )))
+        Err(oauth_error(format!("{}: refresh not yet wired", Self::ID)))
     }
 
     async fn account_identity(&self, _tokens: &TokenSet) -> Result<AccountIdentity> {

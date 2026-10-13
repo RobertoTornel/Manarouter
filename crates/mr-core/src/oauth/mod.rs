@@ -226,7 +226,10 @@ impl Pkce {
         OsRng.fill_bytes(&mut bytes);
         let verifier = URL_SAFE_NO_PAD.encode(bytes);
         let challenge = Self::s256(&verifier);
-        Self { verifier, challenge }
+        Self {
+            verifier,
+            challenge,
+        }
     }
 
     /// Wrap an existing verifier, validating it against RFC 7636 §4.1: 43–128 characters from
@@ -245,7 +248,10 @@ impl Pkce {
             )));
         }
         let challenge = Self::s256(&verifier);
-        Ok(Self { verifier, challenge })
+        Ok(Self {
+            verifier,
+            challenge,
+        })
     }
 
     /// The base64url (no padding) SHA-256 of `verifier` — the `code_challenge`.
@@ -619,10 +625,19 @@ mod tests {
 
     #[test]
     fn refresh_leads_match_the_documented_windows() {
-        assert_eq!(platform("openai-codex").unwrap().refresh_lead(), Duration::from_secs(300));
-        assert_eq!(platform("github-copilot").unwrap().refresh_lead(), Duration::from_secs(300));
+        assert_eq!(
+            platform("openai-codex").unwrap().refresh_lead(),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            platform("github-copilot").unwrap().refresh_lead(),
+            Duration::from_secs(300)
+        );
         // Antigravity's client refreshes when expiry is within 60 s of now.
-        assert_eq!(platform("antigravity").unwrap().refresh_lead(), Duration::from_secs(60));
+        assert_eq!(
+            platform("antigravity").unwrap().refresh_lead(),
+            Duration::from_secs(60)
+        );
     }
 
     #[test]
@@ -634,9 +649,8 @@ mod tests {
                 .all()
                 .iter()
                 .find(|provider| provider.oauth_platform.as_deref() == Some(p.id()));
-            let template = template.unwrap_or_else(|| {
-                panic!("platform {} has no catalogue entry", p.id())
-            });
+            let template =
+                template.unwrap_or_else(|| panic!("platform {} has no catalogue entry", p.id()));
             for (name, value) in pairs {
                 assert!(
                     HeaderName::from_bytes(name.as_bytes()).is_ok(),
@@ -649,9 +663,10 @@ mod tests {
                     p.id()
                 );
                 // The golden-header invariant: what the code will send is what the data says.
-                let in_catalogue = template.headers.iter().any(|(k, v)| {
-                    k.eq_ignore_ascii_case(name) && v == value
-                });
+                let in_catalogue = template
+                    .headers
+                    .iter()
+                    .any(|(k, v)| k.eq_ignore_ascii_case(name) && v == value);
                 assert!(
                     in_catalogue,
                     "{}: fingerprint header {name:?} = {value:?} does not match the catalogue",
@@ -690,10 +705,19 @@ mod tests {
     #[test]
     fn redirect_uri_is_built_from_the_bound_port() {
         let ports = platform("openai-codex").unwrap().redirect_ports();
-        assert_eq!(ports.redirect_uri(1455), "http://127.0.0.1:1455/auth/callback");
-        assert_eq!(ports.redirect_uri(1457), "http://127.0.0.1:1457/auth/callback");
+        assert_eq!(
+            ports.redirect_uri(1455),
+            "http://127.0.0.1:1455/auth/callback"
+        );
+        assert_eq!(
+            ports.redirect_uri(1457),
+            "http://127.0.0.1:1457/auth/callback"
+        );
         let ag = platform("antigravity").unwrap().redirect_ports();
-        assert_eq!(ag.redirect_uri(51121), "http://localhost:51121/oauth-callback");
+        assert_eq!(
+            ag.redirect_uri(51121),
+            "http://localhost:51121/oauth-callback"
+        );
     }
 
     #[tokio::test]
@@ -765,7 +789,10 @@ mod tests {
     #[test]
     fn token_set_round_trips_and_preserves_unknown_keys() {
         let mut extra = Map::new();
-        extra.insert("id_token".to_string(), Value::String("header.payload.sig".into()));
+        extra.insert(
+            "id_token".to_string(),
+            Value::String("header.payload.sig".into()),
+        );
         extra.insert("weird_new_key".to_string(), json!({"nested": [1, 2]}));
         extra.insert("expires_in".to_string(), json!(3600));
         let tokens = TokenSet {
@@ -784,7 +811,10 @@ mod tests {
             Some("header.payload.sig"),
             "unknown keys must survive the round trip"
         );
-        assert_eq!(decoded.extra.get("weird_new_key"), Some(&json!({"nested": [1, 2]})));
+        assert_eq!(
+            decoded.extra.get("weird_new_key"),
+            Some(&json!({"nested": [1, 2]}))
+        );
         assert_eq!(decoded.expires_at, Millis(1_700_000_000_000));
         // …and the JSON itself still carries them as plain keys, not as a nested blob.
         let value: serde_json::Value = serde_json::from_str(&encoded).expect("reparse");
@@ -809,7 +839,10 @@ mod tests {
     #[test]
     fn token_set_debug_hides_every_token_value() {
         let mut extra = Map::new();
-        extra.insert("id_token".to_string(), Value::String("super-secret-jwt".into()));
+        extra.insert(
+            "id_token".to_string(),
+            Value::String("super-secret-jwt".into()),
+        );
         let tokens = TokenSet {
             access_token: "ACCESS-SECRET-VALUE".into(),
             refresh_token: Some("REFRESH-SECRET-VALUE".into()),
@@ -819,8 +852,14 @@ mod tests {
             extra,
         };
         let printed = format!("{tokens:?}");
-        assert!(!printed.contains("ACCESS-SECRET-VALUE"), "Debug leaked access token: {printed}");
-        assert!(!printed.contains("REFRESH-SECRET-VALUE"), "Debug leaked refresh token: {printed}");
+        assert!(
+            !printed.contains("ACCESS-SECRET-VALUE"),
+            "Debug leaked access token: {printed}"
+        );
+        assert!(
+            !printed.contains("REFRESH-SECRET-VALUE"),
+            "Debug leaked refresh token: {printed}"
+        );
         assert!(
             !printed.contains("super-secret-jwt"),
             "Debug leaked an extra value: {printed}"
@@ -842,7 +881,10 @@ mod tests {
             interval: Duration::from_secs(5),
         };
         let printed = format!("{auth:?}");
-        assert!(!printed.contains("DEVICE-CODE-SECRET"), "Debug leaked device code: {printed}");
+        assert!(
+            !printed.contains("DEVICE-CODE-SECRET"),
+            "Debug leaked device code: {printed}"
+        );
         // The human needs the user code and the URI, so those stay visible.
         assert!(printed.contains("ABCD-1234"));
         assert!(printed.contains("https://github.com/login/device"));
@@ -854,7 +896,10 @@ mod tests {
         let slow = DevicePoll::SlowDown;
         assert!(pending.is_continue());
         assert!(slow.is_continue());
-        assert_ne!(pending, slow, "slow_down is not pending: the interval must change");
+        assert_ne!(
+            pending, slow,
+            "slow_down is not pending: the interval must change"
+        );
 
         let refused = DevicePoll::AccessDenied;
         assert!(refused.is_refusal());
@@ -862,7 +907,10 @@ mod tests {
 
         // Only AccessDenied is a refusal: the others are progress, a deadline, or a fault.
         assert!(!DevicePoll::ExpiredToken.is_refusal());
-        assert!(!DevicePoll::Failed { message: "boom".into() }.is_refusal());
+        assert!(!DevicePoll::Failed {
+            message: "boom".into()
+        }
+        .is_refusal());
         assert!(!DevicePoll::Success(TokenSet::new("at")).is_refusal());
         assert!(!DevicePoll::Success(TokenSet::new("at")).is_continue());
     }

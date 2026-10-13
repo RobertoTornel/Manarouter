@@ -127,7 +127,12 @@ impl OAuthPlatform for Antigravity {
         )))
     }
 
-    async fn exchange_code(&self, _code: &str, _pkce: Option<&Pkce>, _port: u16) -> Result<TokenSet> {
+    async fn exchange_code(
+        &self,
+        _code: &str,
+        _pkce: Option<&Pkce>,
+        _port: u16,
+    ) -> Result<TokenSet> {
         Err(oauth_error(format!(
             "{}: token exchange not yet wired",
             Self::ID
@@ -135,10 +140,7 @@ impl OAuthPlatform for Antigravity {
     }
 
     async fn refresh(&self, _refresh_token: &str) -> Result<TokenSet> {
-        Err(oauth_error(format!(
-            "{}: refresh not yet wired",
-            Self::ID
-        )))
+        Err(oauth_error(format!("{}: refresh not yet wired", Self::ID)))
     }
 
     async fn account_identity(&self, _tokens: &TokenSet) -> Result<AccountIdentity> {
@@ -164,7 +166,10 @@ impl OAuthPlatform for Antigravity {
         // request may land in the wrong client's quota pool — a silent wrong-bucket, not an
         // error, which is why the catalogue note pins it.
         &[
-            ("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1"),
+            (
+                "X-Goog-Api-Client",
+                "google-cloud-sdk vscode_cloudshelleditor/0.1",
+            ),
             (
                 "Client-Metadata",
                 r#"{"ideType":"ANTIGRAVITY","platform":"WINDOWS","pluginType":"GEMINI"}"#,
@@ -189,8 +194,14 @@ mod tests {
         assert_eq!(ide.client_id(), crate::published::ANTIGRAVITY_CLIENT_ID);
         assert_eq!(cli.client_id(), crate::published::GEMINI_CLI_CLIENT_ID);
         assert_ne!(ide.client_id(), cli.client_id());
-        assert_eq!(ide.client_secret(), crate::published::ANTIGRAVITY_CLIENT_SECRET);
-        assert_eq!(cli.client_secret(), crate::published::GEMINI_CLI_CLIENT_SECRET);
+        assert_eq!(
+            ide.client_secret(),
+            crate::published::ANTIGRAVITY_CLIENT_SECRET
+        );
+        assert_eq!(
+            cli.client_secret(),
+            crate::published::GEMINI_CLI_CLIENT_SECRET
+        );
         assert_ne!(ide.client_secret(), cli.client_secret());
     }
 
@@ -212,7 +223,10 @@ mod tests {
             "a Google client secret was written as a literal in antigravity.rs"
         );
         // …and the identities really are reached through `published`.
-        assert_eq!(Antigravity::ide().client_id(), crate::published::ANTIGRAVITY_CLIENT_ID);
+        assert_eq!(
+            Antigravity::ide().client_id(),
+            crate::published::ANTIGRAVITY_CLIENT_ID
+        );
         assert_eq!(
             Antigravity::gemini_cli().client_id(),
             crate::published::GEMINI_CLI_CLIENT_ID
@@ -228,7 +242,10 @@ mod tests {
         // identical vtables, and codegen units are allowed to duplicate those.
         let registered_data = registered as *const dyn OAuthPlatform as *const ();
         let ide_data = &IDE as *const dyn OAuthPlatform as *const ();
-        assert_eq!(registered_data, ide_data, "registry must serve antigravity::IDE");
+        assert_eq!(
+            registered_data, ide_data,
+            "registry must serve antigravity::IDE"
+        );
         assert_eq!(IDE.tier(), "ide");
         assert_eq!(Antigravity::gemini_cli().tier(), "gemini-cli");
         assert_ne!(IDE.client_id(), Antigravity::gemini_cli().client_id());

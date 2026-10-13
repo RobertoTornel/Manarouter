@@ -63,7 +63,12 @@ impl OAuthPlatform for Codex {
         )))
     }
 
-    async fn exchange_code(&self, _code: &str, _pkce: Option<&Pkce>, _port: u16) -> Result<TokenSet> {
+    async fn exchange_code(
+        &self,
+        _code: &str,
+        _pkce: Option<&Pkce>,
+        _port: u16,
+    ) -> Result<TokenSet> {
         Err(oauth_error(format!(
             "{}: token exchange not yet wired",
             Self::ID
@@ -71,10 +76,7 @@ impl OAuthPlatform for Codex {
     }
 
     async fn refresh(&self, _refresh_token: &str) -> Result<TokenSet> {
-        Err(oauth_error(format!(
-            "{}: refresh not yet wired",
-            Self::ID
-        )))
+        Err(oauth_error(format!("{}: refresh not yet wired", Self::ID)))
     }
 
     async fn account_identity(&self, _tokens: &TokenSet) -> Result<AccountIdentity> {

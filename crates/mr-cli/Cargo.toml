@@ -20,9 +20,32 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rusqlite = { workspace = true }
 time = { workspace = true }
 humantime = { workspace = true }
+# Added by the CLI task: an HTTP client for `provider test` / `models sync` (no reqwest in this
+# workspace; the same hyper + rustls stack manarouter-relay already builds with), plus the crypto
+# and encoding helpers `key` and the migration hash-verification need.
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+hyper-rustls = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+# `std::os::unix::process::CommandExt::process_group` is std, but signalling the whole group with
+# `libc::killpg` needs the libc symbol directly (used by `serve` to tear children down). Declared
+# directly because the workspace [workspace.dependencies] table does not export libc; the version
+# matches the one already pinned in Cargo.lock.
+libc = "0.2"
+
+[dev-dependencies]
+# None: tests use hand-rolled temp directories (std::env::temp_dir + pid) so the binary keeps the
+# same dependency floor as the rest of the workspace.
