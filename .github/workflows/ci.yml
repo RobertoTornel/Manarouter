@@ -65,6 +65,47 @@ jobs:
         # codegen enough that a debug-only test pass is not evidence the shipped binary works.
         run: cargo test --workspace --release
 
+  # The tools carry their own `[workspace]` tables so they cannot break `cargo check --workspace` —
+  # which is exactly why they need their own job. A crate excluded from the workspace check is a crate
+  # that rots silently: `tools/mock-upstream` sat in `main` in a state that did not compile, and the
+  # main job reported success the whole time because it never looked at it.
+  tools:
+    name: tools
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Named explicitly rather than globbed: a glob that silently matches nothing is the same
+        # failure mode as the one this job exists to fix. `bench` is deliberately absent — it is an
+        # empty directory today, and a matrix entry for a crate with no manifest is a red job that
+        # says nothing. Add it here in the commit that creates it.
+        tool: [mock-upstream]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/${{ matrix.tool }}
+
+      - name: Format
+        working-directory: tools/${{ matrix.tool }}
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        working-directory: tools/${{ matrix.tool }}
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: tools/${{ matrix.tool }}
+        run: cargo test
+
   docs:
     name: docs build
     runs-on: ubuntu-latest
