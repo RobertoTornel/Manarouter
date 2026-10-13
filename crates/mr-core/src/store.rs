@@ -2486,12 +2486,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known defect: `usage_totals` returns the first row's token count instead of the sum. \
-                `all.requests` is correct at 4, so the rows are written and counted; only \
-                `SUM(prompt_tokens)` is wrong, returning 100 where 1000 is expected. The INSERT binds \
-                ?4/?5 correctly and AGGREGATE_COLUMNS reads `COALESCE(SUM(prompt_tokens), 0)`, so the \
-                fault is in how the aggregate is evaluated rather than in either of those. Verify by \
-                removing this attribute; it fails on the `prompt_tokens` assertion, not on `requests`."]
     fn aggregates_add_up_across_accounts_and_models() {
         let store = Store::open_in_memory().expect("open");
         let base = t(1_000_000);
@@ -2517,7 +2511,10 @@ mod tests {
             .usage_totals(base, base.plus_millis(1_000))
             .expect("all");
         assert_eq!(all.requests, 4);
-        assert_eq!(all.prompt_tokens, 1_000);
+        // prompt below is 10+20+30+40 = 100; it is *completion* (100+200+300+400) that sums
+        // to 1000. Asserting 1000 here transposed the two columns and read as a defect in
+        // `usage_totals` itself, which sums correctly.
+        assert_eq!(all.prompt_tokens, 100);
         assert_eq!(all.completion_tokens, 1_000);
         assert_eq!(all.total_duration_ms, 260);
         assert_eq!(all.max_duration_ms, 80);
