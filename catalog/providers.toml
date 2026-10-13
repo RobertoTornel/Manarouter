@@ -48,12 +48,12 @@ auth = { type = "oauth", platform = "openai-codex" }
 oauth_platform = "openai-codex"
 capabilities = ["responses", "tool-calling", "reasoning", "vision"]
 key_strategy = "round-robin"
-note = "OAuth only. The relay injects chatgpt-account-id from the JWT claim at https://api.openai.com/auth -> chatgpt_account_id; sending a literal value there is a hard failure. originator must be codex_cli_rs for the official endpoint. UNCERTAIN: OpenAI-Beta responses=experimental is only needed by older servers, so it is sent for compatibility."
+note = "OAuth only. The relay injects chatgpt-account-id from the JWT claim at https://api.openai.com/auth -> chatgpt_account_id; sending a literal value there is a hard failure. originator must be codex_cli_rs for the official endpoint. UNCERTAIN: OpenAI-Beta responses=experimental is only needed by older servers, so it is sent for compatibility. UNCERTAIN: the two api.connectors.* scopes are version-dependent; older clients request only the first four, and a server that rejects an unknown scope would fail the whole request, so drop them if authorization is refused with an invalid_scope error."
 docs_url = "https://github.com/openai/codex"
 oauth_authorize_url = "https://auth.openai.com/oauth/authorize"
 oauth_token_url = "https://auth.openai.com/oauth/token"
 oauth_client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
-oauth_scopes = "openid profile email offline_access"
+oauth_scopes = "openid profile email offline_access api.connectors.read api.connectors.invoke"
 oauth_redirect_port = 1455
 oauth_redirect_path = "/auth/callback"
 oauth_pkce = "S256"

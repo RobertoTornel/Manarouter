@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Manarouter — panel</title>
+<!-- data: URI favicon avoids a stray /favicon.ico request on an offline install -->
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="./app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<div id="app-root">
+  <div id="shell" hidden>
+    <aside class="sidebar">
+      <div class="brand">Manarouter</div>
+      <nav aria-label="Primary">
+        <ul id="nav-list">
+          <li><a href="#/overview"  data-route="overview">Overview</a></li>
+          <li><a href="#/providers" data-route="providers">Providers</a></li>
+          <li><a href="#/combos"    data-route="combos">Combos</a></li>
+          <li><a href="#/keys"      data-route="keys">Keys</a></li>
+          <li><a href="#/aliases"   data-route="aliases">Aliases</a></li>
+          <li><a href="#/models"    data-route="models">Models</a></li>
+          <li><a href="#/quota"     data-route="quota">Quota</a></li>
+          <li><a href="#/settings"  data-route="settings">Settings</a></li>
+          <li><a href="#/docs"      data-route="docs">Documentation</a></li>
+        </ul>
+      </nav>
+      <div class="sidebar-foot">
+        <div id="sidebar-meta" class="sidebar-meta"></div>
+        <button id="logout-btn" class="btn btn-ghost btn-sm" type="button">Log out</button>
+      </div>
+    </aside>
+
+    <div class="main-col">
+      <header class="topbar">
+        <h1 id="topbar-title" class="topbar-title">Overview</h1>
+        <!-- button, not span: it navigates to the overview, so it must be keyboard reachable -->
+        <button id="topbar-health" class="health-pill" type="button" aria-label="Control plane status">
+          <span class="dot dot-idle" aria-hidden="true"></span>
+          <span class="health-text">checking…</span>
+        </button>
+      </header>
+
+      <!-- Restart-pending banner lives here, above <main>, so it persists across every view -->
+      <div id="banner-slot"></div>
+
+      <main id="main" tabindex="-1"></main>
+    </div>
+  </div>
+
+  <div id="login-root" hidden></div>
+</div>
+
+<div id="drawer-root"></div>
+<div id="dialog-root"></div>
+<div id="toasts" class="toasts" role="region" aria-label="Notifications" aria-live="polite"></div>
+
+<noscript><p class="noscript">This panel requires JavaScript.</p></noscript>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
