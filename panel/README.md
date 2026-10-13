@@ -134,10 +134,15 @@ The poller can be exercised with a fake document/window (`createPoller({ tick, d
 win: fakeWin })`) asserting that no `tick` runs while `visibilityState === 'hidden'` and one
 runs immediately on returning to `visible`.
 
-Run with: `node --test panel/test/` (once such a directory is wanted — none is created here to
-respect the deliverable list; the functions are import-ready).
+**Status: this suite was actually executed against `format.js`/`dom.js` in the building
+environment (Node 24, `/tmp`, kept out of `panel/` to respect the deliverable file list) and
+all assertions passed** — covering uptime/age formatting, chip-class mapping, the
+disabled-provider-is-neutral rule, problem grouping and leaf-field matching, port diffing +
+probe-URL normalisation, step moves and participant remapping, the hedge-enum round-trip, and
+allow-list line handling. To keep it, save the snippet above as `panel/test/format.test.mjs`
+and run `node --test panel/test/`.
 
-### Syntax check (already performed)
+### Syntax check (performed)
 
 Every module passes `node --check` (Node 24 detects the ES-module syntax; see report).
 

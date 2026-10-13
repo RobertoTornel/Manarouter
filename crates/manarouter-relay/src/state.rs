@@ -189,6 +189,14 @@ impl RelayState {
         let path = mr_core::config::snapshot_path();
         let want = config.routing_digest();
 
+        // The snapshot is a **derived cache**: every byte of it comes from the configuration, so any
+        // problem reading it is answered by compiling a fresh one. That is deliberate and it is why
+        // this does not have an error arm for a corrupt or truncated file.
+        //
+        // An earlier version returned the error for anything that was not `NotFound`, which meant a
+        // relay could not start on a fresh install at all: `load_from` wrapped every read failure in
+        // one variant, so the "compile me a fresh one" arm was unreachable and the process exited
+        // instead. A cache that can be rebuilt must never be able to stop the program.
         let snapshot = match RoutingSnapshot::load_from(&path) {
             Ok(s) if s.digest() == want => s,
             Ok(stale) => {
@@ -197,24 +205,16 @@ impl RelayState {
                     config = want,
                     "compiled snapshot is stale; recompiling from the configuration"
                 );
-                let fresh = RoutingSnapshot::compile(&config)?;
-                // A failure to persist is not fatal: the relay can serve correctly from memory, and
-                // refusing to start because a cache file could not be written would be the tail
-                // wagging the dog.
-                if let Err(e) = fresh.write_to(&path) {
-                    tracing::warn!(error = %e, "could not persist the recompiled snapshot");
-                }
-                fresh
+                Self::recompile(&config, &path)?
             }
-            Err(mr_core::error::Error::NotFound(_)) => {
-                tracing::info!("no compiled snapshot; compiling from the configuration");
-                let fresh = RoutingSnapshot::compile(&config)?;
-                if let Err(e) = fresh.write_to(&path) {
-                    tracing::warn!(error = %e, "could not persist the compiled snapshot");
-                }
-                fresh
+            Err(e) => {
+                tracing::info!(
+                    error = %e,
+                    path = %path.display(),
+                    "no usable compiled snapshot; compiling from the configuration"
+                );
+                Self::recompile(&config, &path)?
             }
-            Err(e) => return Err(e),
         };
 
         let upstream = Upstream::default_pool().map_err(|e| {
@@ -224,6 +224,22 @@ impl RelayState {
             mr_core::error::Error::InvalidState(format!("could not build the upstream client: {e}"))
         })?;
         Ok(Self::new(&config, snapshot, upstream))
+    }
+
+    /// Compile the configuration into a snapshot and cache it, without making the cache load-bearing.
+    ///
+    /// A failure to write is logged and ignored. The relay can serve correctly from the value it holds
+    /// in memory, and refusing to start because a cache file could not be written would be the tail
+    /// wagging the dog — particularly since the next start would simply recompile again.
+    fn recompile(
+        config: &Config,
+        path: &std::path::Path,
+    ) -> mr_core::error::Result<RoutingSnapshot> {
+        let fresh = RoutingSnapshot::compile(config)?;
+        if let Err(e) = fresh.write_to(path) {
+            tracing::warn!(error = %e, "could not persist the compiled snapshot");
+        }
+        Ok(fresh)
     }
 
     /// The current routing table.

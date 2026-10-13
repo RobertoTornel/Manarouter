@@ -830,7 +830,16 @@ impl RoutingSnapshot {
     /// Load and decode a snapshot from a file.
     pub fn load_from(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path).map_err(|e| {
-            Error::Snapshot(format!("cannot read snapshot {}: {e}", path.display()))
+            // An absent file is a distinct case from an unreadable one, and callers act on the
+            // difference: the first run of a process that has never compiled a snapshot is not an
+            // error, while a file that exists and cannot be read is something an operator should
+            // know about. Collapsing both into one variant made "compile me a fresh one" impossible
+            // to express, which is how a relay ends up unable to start on a fresh install.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::NotFound(format!("no snapshot at {}", path.display()))
+            } else {
+                Error::Snapshot(format!("cannot read snapshot {}: {e}", path.display()))
+            }
         })?;
         Self::decode(&bytes)
     }
