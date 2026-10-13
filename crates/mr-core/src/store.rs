@@ -2168,9 +2168,16 @@ mod tests {
             .record_account_success(&account("a"), now.plus_millis(1))
             .expect("success");
         assert_eq!(health.state, AccountState::Ready);
-        assert_eq!(health.reset_at, None);
+        assert_eq!(health.reset_at, None, "a success arms no cooldown");
         assert_eq!(health.consecutive_failures, 0);
-        assert!(health.retry_due(now.plus_millis(1)) || health.reset_at.is_none());
+        assert_eq!(
+            health.last_failure_kind, None,
+            "the permanent classification is cleared"
+        );
+        assert!(
+            !health.retry_due(now.plus_millis(1)),
+            "ready is not 'due', it is usable"
+        );
     }
 
     #[test]
