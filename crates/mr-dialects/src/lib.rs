@@ -173,9 +173,15 @@ pub fn translate_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Option<T
         // Identical dialects: nothing to do.
         (a, b) if a.is_passthrough_to(b) => Ok(None),
 
-        // GitHub Copilot and Antigravity both expose an OpenAI-shaped chat surface once the
-        // credential is attached, so an OpenAI client needs no body translation for them.
-        (Dialect::OpenAi, Dialect::Copilot) | (Dialect::OpenAi, Dialect::Antigravity) => Ok(None),
+        // GitHub Copilot exposes an OpenAI-shaped chat surface once the bearer is attached, so an
+        // OpenAI client needs no body translation for it. Antigravity sat on this line too and
+        // was wrong there: its credential does not change the wire shape. `cloudcode-pa.googleapis.com`
+        // speaks Gemini `generateContent` wrapped in `{model, request, userAgent, requestId}`, its
+        // answers come back wrapped in `{"response": ...}`, and mr-core marks it neither
+        // passthrough-able nor body-flag streaming (it always streams). It routes through the
+        // google translator below instead — see `docs/providers/antigravity.md` and the request
+        // body in `docs/12-oauth-antigravity.md` §5.
+        (Dialect::OpenAi, Dialect::Copilot) => Ok(None),
 
         (Dialect::OpenAi, Dialect::Anthropic) => {
             anthropic::from_openai_request(ctx, body).map(Some)
@@ -184,9 +190,13 @@ pub fn translate_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Option<T
             openai::from_anthropic_request(ctx, body).map(Some)
         }
 
-        (Dialect::OpenAi, Dialect::Google) | (Dialect::Anthropic, Dialect::Google) => {
-            google::from_pivot_request(ctx, body).map(Some)
-        }
+        // Plain Gemini and Cloud Code are the same inference shape. `google::from_pivot_request`
+        // picks `models/{model}:generateContent` or the `v1internal:` envelope off the upstream
+        // dialect, so both pairings land on the same translator.
+        (Dialect::OpenAi, Dialect::Google)
+        | (Dialect::Anthropic, Dialect::Google)
+        | (Dialect::OpenAi, Dialect::Antigravity)
+        | (Dialect::Anthropic, Dialect::Antigravity) => google::from_pivot_request(ctx, body).map(Some),
 
         (Dialect::OpenAi, Dialect::CommandCode) | (Dialect::Anthropic, Dialect::CommandCode) => {
             commandcode::from_pivot_request(ctx, body).map(Some)
@@ -212,9 +222,12 @@ pub fn translate_response_body(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<By
     match (ctx.client_dialect, ctx.upstream_dialect) {
         (Dialect::OpenAi, Dialect::Anthropic) => anthropic::to_openai_response(ctx, body),
         (Dialect::Anthropic, Dialect::OpenAi) => openai::to_anthropic_response(ctx, body),
-        (Dialect::OpenAi, Dialect::Google) | (Dialect::Anthropic, Dialect::Google) => {
-            google::to_pivot_response(ctx, body)
-        }
+        // `google::to_pivot_response` unwraps the Cloud Code `{response: {...}, traceId}`
+        // envelope when the upstream is Antigravity, so both Gemini pairings answer here.
+        (Dialect::OpenAi, Dialect::Google)
+        | (Dialect::Anthropic, Dialect::Google)
+        | (Dialect::OpenAi, Dialect::Antigravity)
+        | (Dialect::Anthropic, Dialect::Antigravity) => google::to_pivot_response(ctx, body),
         (Dialect::OpenAi, Dialect::CommandCode) | (Dialect::Anthropic, Dialect::CommandCode) => {
             commandcode::to_pivot_response(ctx, body)
         }
@@ -245,9 +258,12 @@ pub fn translate_sse_data(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<Stri
         (Dialect::OpenAi, Dialect::CommandCode) | (Dialect::Anthropic, Dialect::CommandCode) => {
             commandcode::sse_to_pivot(ctx, data)
         }
-        (Dialect::OpenAi, Dialect::Google) | (Dialect::Anthropic, Dialect::Google) => {
-            google::sse_to_pivot(ctx, data)
-        }
+        // Cloud Code's stream frames carry the same `{"response": ...}` wrapper, unwrapped per
+        // frame inside `google::sse_to_pivot`.
+        (Dialect::OpenAi, Dialect::Google)
+        | (Dialect::Anthropic, Dialect::Google)
+        | (Dialect::OpenAi, Dialect::Antigravity)
+        | (Dialect::Anthropic, Dialect::Antigravity) => google::sse_to_pivot(ctx, data),
         (Dialect::OpenAi, Dialect::Codex) | (Dialect::Anthropic, Dialect::Codex) => {
             responses::sse_to_pivot(ctx, data)
         }
@@ -331,5 +347,48 @@ mod tests {
     #[test]
     fn retry_event_is_namespaced_so_it_cannot_collide_with_a_provider_event() {
         assert!(RETRY_EVENT.starts_with("manarouter."));
+    }
+
+    #[test]
+    fn antigravity_upstreams_reach_the_gemini_translator_on_every_half() {
+        // Reachability, not correctness. google.rs's own tests all passed while this pairing
+        // still forwarded an OpenAI body verbatim to `cloudcode-pa/v1internal:generateContent`
+        // and failed the response half with Unsupported — a dead module with perfect unit
+        // coverage. This asserts the dispatcher arms instead.
+        let ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Antigravity, "gemini-2.5-pro");
+
+        let req = translate_request(&ctx, br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+            .expect("an OpenAI client must reach the translator for an Antigravity upstream")
+            .expect("byte-forwarding would hand v1internal an OpenAI body");
+        let doc: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(doc["request"]["contents"][0]["parts"][0]["text"], "hi");
+        assert!(
+            req.path_override
+                .as_deref()
+                .is_some_and(|p| p.starts_with("v1internal:")),
+            "the Cloud Code endpoint names its methods, not its models"
+        );
+
+        let resp = translate_response_body(
+            &ctx,
+            br#"{"response":{"candidates":[{"content":{"parts":[{"text":"hey"}]},"finishReason":"STOP"}]},"traceId":"t"}"#,
+        )
+        .expect("the Cloud Code response wrapper must unwrap, not report Unsupported");
+        let resp: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(resp["choices"][0]["message"]["content"], "hey");
+
+        let frames = translate_sse_data(
+            &ctx,
+            r#"{"response":{"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"STOP"}]}}"#,
+        )
+        .expect("the SSE half must route to the Gemini translator as well");
+        assert!(frames.iter().any(|f| f.contains("[DONE]")));
+
+        // The Anthropic-client pairing had no arm at all before: Unsupported outright.
+        let anthropic_ctx = TranslateCtx::new(RouteKind::Messages, Dialect::Antigravity, "gemini-2.5-pro");
+        assert!(
+            translate_request(&anthropic_ctx, br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+                .is_ok()
+        );
     }
 }
