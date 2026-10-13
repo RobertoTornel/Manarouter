@@ -15,7 +15,7 @@ Build a small, public, open-source AI router that:
 - Has **custom combos**: user-named models that route to an ordered list of steps with per-combo strategy (priority, round-robin, reset-aware priority) and a **hedged race mode**.
 - Tracks **provider quota** and schedules **reset-aware**.
 - Ships a **small web panel** to add/remove/modify providers, keys, combos, and change the **listen port for next restart**.
-- Ports the provider set from a local **OmniRoute** install (v16.3.5) and integrates the **commandcode-bridge** protocol as a first-class provider.
+- Ports the provider set from a local **OmniRoute** install (v3.8.51) and integrates the **commandcode-bridge** protocol as a first-class provider.
 - Is **obsessively optimized for latency**: the data plane does nothing but send and receive bytes.
 
 ### Hard constraints from the brief
@@ -37,7 +37,12 @@ Build a small, public, open-source AI router that:
 
 This is not guesswork — the local OmniRoute install was inspected directly.
 
-### 2.1 OmniRoute (local install, v16.3.5)
+### 2.1 OmniRoute (local install, v3.8.51)
+
+> **Corrected.** Earlier revisions of this plan said v16.3.5. That is the **Next.js** version, which a
+> process-title rewrite makes look like OmniRoute's. `package.json` reports **3.8.51**, verified in
+> `.research/omniroute-protocol-layer.md` §1. Every conclusion drawn from the OmniRoute source is
+> unaffected — only the label above the install was wrong.
 
 - Install root: `~/.local/lib/node_modules/omniroute` (~2.5 GB, Node/TypeScript).
 - Live instance: `http://127.0.0.1:20129`, 9500 models across **45 `owned_by` provider ids**.

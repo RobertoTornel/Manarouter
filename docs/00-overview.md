@@ -101,7 +101,7 @@ The full request path, step by step, is in [architecture](01-architecture.md).
 | Authored config load/save/validate, unknown-key preservation | implemented | [configuration](03-configuration.md) |
 | Compiled routing snapshot: compile, encode, decode, verify, atomic write | implemented | [routing snapshot](04-routing-snapshot.md) |
 | Hot swap through `ArcSwap` | implemented | [routing snapshot](04-routing-snapshot.md) §8 |
-| Per-account health states and provider rollup | implemented (types and rollup) | [key selection](05-key-selection.md) §5 |
+| Per-account health states and provider rollup | implemented (types and rollup) | [key selection](05-key-selection.md) §6 |
 | Key strategies: `priority`, `round-robin`, `random`, `least-used` | implemented (enum and plans); relay selection in progress | [key selection](05-key-selection.md) |
 | Combos and the three combo strategies | implemented (schema, compile) | [combos](06-combos.md) |
 | Hedged race with four winner-fail modes | implemented (plan); execution in progress | [the hedged race](07-hedged-race.md) |

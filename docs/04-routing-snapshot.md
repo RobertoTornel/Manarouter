@@ -170,7 +170,7 @@ model being requested — which the compiler does not know. `Account::candidate_
 function that applies them, and its doc comment claims the set "is computed at compile time and
 stored in the snapshot"; the code does not do that, and cannot, because the list is per-request. What
 the snapshot stores is the allow/deny lists themselves, and the relay evaluates them when it selects
-an account. [Key selection](05-key-selection.md) §4 works through what that means in practice.
+an account. [Key selection](05-key-selection.md) §5 works through what that means in practice.
 
 Hedge handling has one subtlety worth naming: `hedge.enabled` in the plan is
 `combo.hedge.enabled && participants.len() >= 2`. A "race" of one participant is not a race, so the

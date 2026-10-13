@@ -125,9 +125,9 @@ rotation are tracked per account, and an account-less provider is invisible to s
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Provider shows `Unconfigured` | no accounts added, or every account `enabled = false` | add an account, or re-enable one — see [key selection](05-key-selection.md) §5 |
+| Provider shows `Unconfigured` | no accounts added, or every account `enabled = false` | add an account, or re-enable one — see [key selection](05-key-selection.md) §6 |
 | Requests return a routing error naming the provider | `provider.enabled` is `false` in `config.json` | set it true; disabled providers are removed from the compiled snapshot entirely |
-| Requests return a key error naming the model | the account's `models_allow` does not cover this model | widen `models_allow`, or clear it — see [key selection](05-key-selection.md) §4 |
+| Requests return a key error naming the model | the account's `models_allow` does not cover this model | widen `models_allow`, or clear it — see [key selection](05-key-selection.md) §5 |
 
 ---
 
@@ -389,7 +389,7 @@ Open <http://127.0.0.1:20901> and look at two things:
 1. **Provider health.** Each provider shows a rollup over its accounts. `Unconfigured` means zero
    enabled accounts; `Dead` means accounts exist but none is usable — and *all accounts deliberately
    disabled* reports `Unconfigured`, because that is an instruction, not an outage. The distinction
-   and its consequences are in [key selection](05-key-selection.md) §5.
+   and its consequences are in [key selection](05-key-selection.md) §6.
 2. **The snapshot digest.** The panel shows the digest of the compiled table and when it was built.
    If you edit `config.json` and the digest does not change, the edit was not routing-relevant — or
    the conductor did not see it. `routing_digest` hashes provider order and enabled state, account

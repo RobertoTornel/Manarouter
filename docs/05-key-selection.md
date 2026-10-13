@@ -107,7 +107,77 @@ placement question as the round-robin cursor, and it has the same answer.
 
 ---
 
-## 3. What "unusable" means
+## 3. Worked examples
+
+Take three accounts of one provider, all enabled, in compiled order A, B, C with `priority` 0, 1, 2 —
+so the list the relay sees is `[A, B, C]`. All three allow the requested model, so health is the only
+filter. Six consecutive requests, no failures:
+
+| Request | `priority` | `round-robin` | `random` (one possible draw) | `least-used` |
+|---|---|---|---|---|
+| 1 | A | A | C | A |
+| 2 | A | B | B | B |
+| 3 | A | C | C | C |
+| 4 | A | A | A | A |
+| 5 | A | B | C | B |
+| 6 | A | C | B | C |
+| **Totals** | A×6 | A×2 B×2 C×2 | A×1 B×2 C×3 | A×2 B×2 C×2 |
+
+- `priority` is deterministic and sticky: A serves every request until it becomes unusable.
+- `round-robin` is a strict cycle; its cursor moves through the eligible set.
+- `random` has no guarantee, and this draw is deliberately uneven — three of six to C — because
+  unevenness is the honest expectation over a short run. A uniform draw is only fair in aggregate.
+- `least-used` produces the same totals as round-robin here and differs in mechanism: it reads the
+  counter rather than a cursor, so an unequal starting position stays unequal until the counts level.
+  Starting with A at 10 requests and B and C at 0 selects B then C then A, whereas round-robin would
+  start wherever its cursor happened to be.
+
+### One account is rate-limited mid-sequence
+
+The interesting case, and the one all four strategies must handle identically: request 3 returns 429
+from A, so A becomes `RateLimited` with an `available_after`. Requests 4–6 see `[B, C]`.
+
+| Request | `priority` | `round-robin` | `random` | `least-used` |
+|---|---|---|---|---|
+| 1 | A | A | C | A |
+| 2 | A | B | B | B |
+| 3 | **A → 429** | **C** | **C** | **C** |
+| 4 | B | B | B | B |
+| 5 | B | C | C | C |
+| 6 | B | B | B | B |
+
+Four behaviours are worth separating out.
+
+**`priority` moves down and stays down.** From request 4 it selects B and keeps selecting B until B
+fails or A's `available_after` passes. A is skipped, not removed: when its cooldown expires it is
+eligible again, and because it is first in the compiled order it resumes serving. That is the desired
+shape for a sticky strategy — the account that was preferred before the outage is preferred after it.
+
+**`round-robin` advances past the ineligible account without giving it a turn.** The cursor is over
+the eligible set, so with A out the cycle over `[B, C]` is B, C, B, C. Had the cursor indexed the
+unfiltered list and skipped A while advancing, A's skipped turns would still consume rotation slots
+and the pattern would be distorted. When A returns it rejoins the eligible set at the cursor's
+position rather than at the front.
+
+**`random` and `least-used` need the same filter as the other two.** A is excluded from the draw, not
+merely deprioritised — "pick at random, then fall back if it is unusable" and "pick at random among
+usable accounts" are different algorithms, and only the second is correct. The same applies to
+`least-used`: the minimum is taken over eligible accounts, or an account that is out for an hour would
+keep winning a comparison it cannot serve.
+
+**A failed request is still a request.** `least-used` counts the 429 against A, because the request
+was issued; the count reflects load, not successes. An account in a long backoff therefore accumulates
+no new counts and looks *less* used when it returns. That is one more reason it is a load spreader and
+not a health signal, and it is why the strategy must never be used as a proxy for "which account is
+best right now" — that question belongs to `AccountState`, not to a counter.
+
+The four strategies differ in which usable account they pick. They do not differ in whether an
+unusable account can be picked, and there is no strategy — including `random` — for which that is a
+probabilistic question.
+
+---
+
+## 4. What "unusable" means
 
 An account is a candidate for selection if and only if it is in `AccountState::Ready`. Every other
 state is skipped, by every strategy, without exception.
@@ -137,7 +207,7 @@ Two consequences worth naming:
 
 ---
 
-## 4. `models_allow` / `models_deny`, and where they apply
+## 5. `models_allow` / `models_deny`, and where they apply
 
 An account may be usable and still not be allowed to serve the model being requested. The filtering is
 per model id, and it happens **after** health and **before** the strategy:
@@ -172,7 +242,7 @@ allow = []                         deny = []
 
 The ordering matters when an account is the only one that allows a model. If the model-permitted
 account is also rate-limited, the eligible set is empty and the request fails with the no-account
-error in §6 — it does **not** fall through to an account that is healthy but forbidden to serve that
+error in §7 — it does **not** fall through to an account that is healthy but forbidden to serve that
 model. Routing a request to an account that must not serve it is worse than failing it.
 
 `models_allow` and `models_deny` are copied into every `AccountPlan`, so the relay evaluates them
@@ -181,7 +251,7 @@ decision.
 
 ---
 
-## 5. Health is per account, never per provider
+## 6. Health is per account, never per provider
 
 This is the single most important operational rule in this document, and the one both reference
 projects got wrong. A provider is **not** healthy or dead. Its accounts are. The provider-level value
@@ -230,7 +300,7 @@ by selecting a different account.
 
 ---
 
-## 6. When no account is usable
+## 7. When no account is usable
 
 The eligible set can be empty for four distinct reasons, and they need four distinct messages:
 
@@ -260,7 +330,7 @@ the HTTP mapping is the part still to be built.*
 
 ---
 
-## 7. Reset-aware priority
+## 8. Reset-aware priority
 
 `ComboStrategy::ResetAwarePriority` is the one combo strategy that changes traversal order at runtime,
 and it exists because the alternative — removing an exhausted step from the chain — loses information
@@ -301,7 +371,7 @@ The strategy vocabulary is `priority`, `round-robin`, `reset-aware-priority` (al
 
 ---
 
-## 8. Where the state lives, and how to observe it
+## 9. Where the state lives, and how to observe it
 
 Account state is **observed, not authored**, and it is stored accordingly:
 
