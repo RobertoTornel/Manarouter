@@ -330,6 +330,15 @@ impl Upstream {
         })
     }
 
+    /// The client the relay uses by default.
+    ///
+    /// The pool sizes are the ones `docs/16-latency-engineering.md` §3.2 justifies: four idle
+    /// connections per host, because a hedge may need three at once and a fourth concurrent request
+    /// should not have to wait for a handshake.
+    pub fn default_pool() -> Result<Self> {
+        Self::new(Duration::from_secs(90), 4)
+    }
+
     /// The pool settings this client was built with.
     pub fn pool_settings(&self) -> (Duration, usize) {
         self.inner.pool_settings()

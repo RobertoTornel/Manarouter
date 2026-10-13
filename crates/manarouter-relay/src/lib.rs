@@ -24,9 +24,14 @@
 //!   every request.
 //! * [`upstream`] — the HTTP client: pooling, the separate first-byte timeout, and streaming
 //!   passthrough.
+//! * [`state`] — the hot-swappable routing table, the client keys, and the one piece of mutable
+//!   routing state in the process.
+//! * [`select`] — step and account selection and the hedged-race policy. Pure functions, so the
+//!   decisions that are most likely to be wrong can be tested without a network.
+//! * [`server`] — the route table and the accept loop.
 //!
-//! Further modules are added as the data plane is built; see `docs/01-architecture.md` for the
-//! intended shape and `docs/16-latency-engineering.md` for what each one is allowed to cost.
+//! See `docs/01-architecture.md` for the intended shape and `docs/16-latency-engineering.md` for
+//! what each module is allowed to cost.
 
 use mimalloc::MiMalloc;
 
@@ -37,4 +42,7 @@ use mimalloc::MiMalloc;
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
 pub mod model_scan;
+pub mod select;
+pub mod server;
+pub mod state;
 pub mod upstream;

@@ -19,6 +19,7 @@ authors = ["Roberto Tornel Candel"]
 description = "Latency-obsessed AI router: a Rust data plane that only sends and receives, and a control plane that decides everything else."
 
 [workspace.dependencies]
+socket2 = { version = "0.6", features = ["all"] }
 # --- workspace crates ---
 mr-core = { path = "crates/mr-core" }
 mr-dialects = { path = "crates/mr-dialects" }

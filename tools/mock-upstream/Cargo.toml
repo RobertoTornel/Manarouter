@@ -1,0 +1,26 @@
+[workspace]
+
+[package]
+name = "mock-upstream"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+publish = false
+description = "Deterministic, fault-injecting fake model provider for testing Manarouter without network, credentials or cost."
+
+# Every dependency is pinned to an exact version instead of inheriting the root
+# workspace's `[workspace.dependencies]`, because this crate is deliberately detached (see the
+# `[workspace]` table above and the module docs in `src/lib.rs`). The versions are the same ones
+# the root workspace resolves to, so a change there can be mirrored here by hand rather than
+# silently inherited.
+[dependencies]
+axum = { version = "=0.8.9", default-features = false, features = ["json", "multipart", "tokio", "http1", "tower-log"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.154", features = ["preserve_order"] }
+tokio = { version = "=1.53.2", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+
+[profile.test]
+# The fault tests sleep on purpose; a faster profile keeps the suite honest about wall time.
+opt-level = 1
