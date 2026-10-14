@@ -311,6 +311,10 @@ impl RelayState {
     ///   there is nothing to authenticate against.
     /// * Keys configured and none presented — refused.
     /// * Keys configured and a wrong one presented — refused.
+    ///
+    /// Hashes are checked in configuration order, returning immediately at the first match. This
+    /// makes successful authentication cost proportional to the match position; it does not conceal
+    /// the matching key's position from an observer able to measure the relay.
     pub fn authenticate(&self, presented: Option<&str>) -> AuthOutcome {
         if self.keys.is_empty() {
             return AuthOutcome::Open;
@@ -319,19 +323,14 @@ impl RelayState {
             return AuthOutcome::Missing;
         };
         let hash = Self::hash_presented(key);
-        // Every key is compared, and the loop does not break on a match. Breaking early would make
-        // the response time depend on which key matched, which tells an observer the position of a
-        // valid key in the list.
-        let mut matched: Option<&KeyEntry> = None;
+        // Key hashes are compared in configured order. Stop at the first match to keep the common
+        // path proportional to the matching key's position rather than scanning all configured keys.
         for entry in &self.keys {
             if entry.matches(&hash) {
-                matched = Some(entry);
+                return AuthOutcome::Ok(entry.clone());
             }
         }
-        match matched {
-            Some(entry) => AuthOutcome::Ok(entry.clone()),
-            None => AuthOutcome::Rejected,
-        }
+        AuthOutcome::Rejected
     }
 }
 
@@ -451,6 +450,15 @@ mod tests {
             entry("c", "mr-ccc"),
         ]);
         assert_eq!(s.authenticate(Some("mr-bbb")).key_id(), Some("id-b"));
+    }
+
+    #[test]
+    fn duplicate_matching_hash_uses_first_configured_key() {
+        let s = state_with(vec![
+            entry("first", "mr-shared"),
+            entry("second", "mr-shared"),
+        ]);
+        assert_eq!(s.authenticate(Some("mr-shared")).key_id(), Some("id-first"));
     }
 
     #[test]

@@ -73,6 +73,7 @@ function safeJsonSync(text) {
 }
 
 export const api = {
+  request,
   get: (p) => request('GET', p),
   getRaw: (p) => request('GET', p, { rawText: true }),
   post: (p, body = {}) => request('POST', p, { body }),

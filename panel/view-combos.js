@@ -28,7 +28,7 @@ const STRATEGIES = [
 ];
 
 const WINNER_METRICS = [
-  ['first-response-byte', 'first response byte (TTFB)', 'Race is decided at the first byte of the winning response. Losing requests are cancelled, so a loser costs essentially nothing. Note: for a non-streaming upstream the first body byte IS the whole completion, so hedging those can cost a full completion per loser.'],
+  ['first-response-byte', 'first response byte (TTFB)', 'Race is decided at the first byte of the winning response. The relay cancels local loser work, but providers may continue generating or billing after disconnect. For non-streaming upstreams the first body byte is the complete response, so hedging can cost a full completion per loser.'],
   ['first-complete-token', 'first complete token', 'Race is decided at the first fully decoded token. Fairer to providers that stream immediately and then think, but every loser pays one token.'],
 ];
 

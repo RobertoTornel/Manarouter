@@ -607,8 +607,9 @@ pub struct HedgeSpec {
     pub on_winner_fail: WinnerFailMode,
     /// Whether the losers are cancelled as soon as the winner is committed.
     ///
-    /// On by default and almost always correct: a loser cancelled before its first byte has
-    /// produced nothing billable. Turning it off is only useful for debugging the race.
+    /// On by default and almost always correct: dropping a loser limits local resource use, but does
+    /// not guarantee that the provider stops generating or billing. Turning it off is only useful
+    /// for debugging the race.
     #[serde(default = "default_true")]
     pub cancel_losers: bool,
     /// Extra grace given to a lower-priority participant before it is abandoned once the winner is

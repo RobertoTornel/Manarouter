@@ -76,6 +76,18 @@ Matched problems are *also* kept in the list — completeness beats cleverness.
 
 ## Testing
 
+### Browser end-to-end smoke test
+
+`test/browser.e2e.mjs` exercises the guarded login and client-key create/rotate dialogs in a headless browser against a local mock API. It never contacts the configured conductor or reads user configuration. Run it where Playwright and a matching browser are installed:
+
+```bash
+npm install --no-save playwright
+npx playwright install chromium
+node panel/test/browser.e2e.mjs
+```
+
+For Firefox, use `npx playwright install firefox` then `BROWSER=firefox node panel/test/browser.e2e.mjs`. Playwright is intentionally not a project dependency. Set `PLAYWRIGHT_MODULE` to an installed module path only if it is not resolvable from the checkout; set `CHROMIUM_EXECUTABLE` or `FIREFOX_EXECUTABLE` only if using a browser binary not matched to the installed Playwright version. The test exits with code 2 and setup guidance if Playwright is unavailable. The checkout panel files are served by this test’s own local ephemeral HTTP server.
+
 ### Pure functions (`node`, no browser needed)
 
 `format.js` touches no DOM, `poll.js` takes injected `doc`/`win`, `dom.js`'s pure helpers

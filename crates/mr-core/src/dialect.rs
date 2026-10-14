@@ -489,7 +489,8 @@ impl ComboStrategy {
 pub enum WinnerMetric {
     /// The first non-error upstream response **body** byte.
     ///
-    /// A loser cancelled here has generated nothing billable, so a lost hedge is almost free.
+    /// Local cancellation happens after a body frame arrives for the winner; upstream providers may
+    /// continue generation or bill for losing requests after the relay drops their connections.
     #[default]
     FirstResponseByte = 0,
     /// The first fully-parsed content delta, or the complete document when the client asked for a

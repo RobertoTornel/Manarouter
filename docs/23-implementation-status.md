@@ -4,7 +4,7 @@ This file exists because a specification that reads as finished while the code i
 no specification. Everything below is checked against the tree, and the command that checks it is
 given so you can re-run it.
 
-> **Last audited:** working tree at `main` (`8b32c3d` plus uncommitted local edits); source and docs reviewed during the current session. Run the verification commands below again after changes.
+> **Last audited:** working tree based on `main`, with current uncommitted implementation and test changes. The verification list below reflects the current session; rerun before release.
 
 ## 1. What runs
 
@@ -12,30 +12,26 @@ given so you can re-run it.
 |---|---|---|
 | `mr-core` — config, snapshot compiler, vault, usage store, OAuth | **Substantial, not complete** | Codex, Copilot, and Antigravity OAuth authorization/token exchange/refresh/Google userinfo identity code is wired; Antigravity IDE client details remain reverse-engineered and unverified. |
 | `mr-dialects` — OpenAI, Anthropic, Responses, Google, Command Code translation | **Reachable, test coverage uneven** | Relay dispatches request and response translation per selected step. Responses implementation needs focused regression tests. |
-| `manarouter-relay` — HTTP API, auth, snapshot, account selection, translation | **Runs; hedging not wired** | Sequential step loop remains the request executor; `hedge_decide` is not called by the relay. |
+| `manarouter-relay` — HTTP API, auth, snapshot, account selection, translation | **Runs; hedging not wired** | Sequential step loop remains the request executor; `hedge_decide` is not called by the relay. Client-key scan now exits at first match (a deliberate latency tradeoff that reveals configured match position to a local timing observer). |
 | `manarouter-conductor` — auth, API, state, serving, quota query | **Implemented** | API routes and Store-backed `/api/quota` exist. Verify live separately; no conductor was running during this audit. |
-| `mr-cli` | **Partial** | Account/provider/combo/key/model families dispatch; client keys can now be rotated in place via `mr key rotate`; `serve`, `doctor`, `migrate`, `config`, and `vault` still return not-implemented errors. |
-| `panel/` | **Implemented, browser behavior unverified** | JS syntax checks pass and bootstrap now displays failures; no browser-driven route/login verification completed. |
+| `mr-cli` | **Partial** | Account/provider/combo/key/model families dispatch; `mr key rotate` is supported; `mr doctor` performs read-only config, vault metadata, snapshot freshness, and listener exposure checks; it fails if no enabled client key is present while relay bind is not confirmed loopback-only. `serve`, `migrate`, `config`, and `vault` remain unimplemented. |
+| `panel/` | **Implemented; critical browser workflow verified** | Firefox E2E covers panel login, client-key creation, and rotation against an isolated mock API; other routes remain unverified. |
 | OAuth | **Partial; flows wired** | Conductor OAuth routes cover Codex, Copilot, and Antigravity authorization code flows; tokens are vault-backed, metadata lives in SQLite, and relay resolves/refreshes credentials. Antigravity's interactive loopback OAuth exchange/refresh, v2 userinfo identity, free-tier Cloud Code onboarding with bounded LRO polling, encrypted token context persistence, and account-bound relay project injection are implemented. Paid-tier onboarding remains fail-closed without explicit project input. T2 client metadata and PKCE are reverse-engineered/unverified; no live Google login or Cloud Code request was exercised. Cline remains unavailable. |
 | `tools/mock-upstream` | **Fault control API wired; behaviors partial** | Detached crate tests pass; `POST /__control` and request-local `x-mock-fault` merge patches are reachable. Not every field in `Fault` is yet applied to response generation. |
 | `tools/bench` | **Absent** | No harness currently enforces the latency budget. |
 
-Verification run during this session:
+Verification run during this session (all local tests used mock/isolated data):
 
 ```sh
-cargo test --workspace
-cargo fmt --manifest-path tools/mock-upstream/Cargo.toml
-cargo test --manifest-path tools/mock-upstream/Cargo.toml  # 22 passed
-node --check panel/app.js
-```
-Workspace tests exited successfully. Re-run the full quality gates before release:
-
-```sh
-cargo fmt --all --check
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo test --workspace --all-targets
 bash scripts/check-secrets.sh
+bash scripts/test-installer-systemd.sh
+PATH="$HOME/.cargo/bin:$PATH" python3 tests/smoke_e2e.py
+BROWSER=firefox PLAYWRIGHT_MODULE=/path/to/playwright FIREFOX_EXECUTABLE=/path/to/firefox node panel/test/browser.e2e.mjs
 ```
+Workspace tests, lint, secret scan, installer simulation, mock-upstream E2E smoke, and Firefox panel workflow all passed locally. The smoke and installer tests are wired into CI; the browser test remains a local opt-in because Playwright/browser binaries are not project dependencies.
 
 ## 2. What running it found
 
@@ -69,9 +65,11 @@ So: hedging is a design with a tested decision function and no concurrent runner
 "try each step in order", which is genuinely useful and is *not* the feature as described. Do not
 take a latency measurement from this tree and attribute it to hedging.
 
-The remaining work is a runner that spawns the participants, feeds `Participant` states to
-`hedge_decide`, and cancels losers under the `MidstreamPolicy` guard. That guard — refusing to splice
-once any `tool_calls` delta has been emitted — is the reason this is not a small change.
+A safe executor remains a separate implementation task: request preparation currently sits inside
+sequential dispatch, responses may stream immediately after commitment, and upstream cancellation
+cannot promise that a provider stops generation or billing. Any runner must define those semantics,
+limit fan-out, preserve current sequential behavior when disabled, and test cancellation/fallback with
+a mock upstream before enabling it for users.
 
 ## 4. Verified implementation properties and limits
 
@@ -97,8 +95,7 @@ once any `tool_calls` delta has been emitted — is the reason this is not a sma
   Codex and Copilot also still need real-provider opt-in smoke verification.
 * That the provider catalogue was executed against every entry. `docs/providers/catalog.md` marks
   uncertain entries and the catalogue is not a live reachability guarantee.
-* That the panel works in a real browser. Syntax and asset/API checks are not a substitute for browser
-  interaction; login and all nine routes remain unverified. The boot failure path is now visible.
+* That every panel route works in a real browser. Firefox E2E verifies login and client-key create/rotate against a mock API; the remaining routes are still unverified. The boot failure path is visible.
 * That all mock fault fields are effective: control and request-local patch endpoints are wired, but
   a subset of fault knobs still needs implementation/coverage.
 * That the latency budget is enforced. `tools/bench/` has no harness.

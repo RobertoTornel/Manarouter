@@ -11,6 +11,10 @@ The latency window is an **eligibility gate**, not a stopwatch race. Reading it 
 produces a system that is slower *and* more expensive, so this document works through the
 consequences carefully.
 
+> **Implementation status:** this page describes the intended hedge policy. The relay currently runs
+> combo steps sequentially; hedged execution, winner recovery, mid-stream switching, and session
+> affinity described below are not wired. `hedge.enabled` does not yet start concurrent requests.
+
 ---
 
 ## 1. What a combo is
@@ -178,13 +182,14 @@ is exactly the situation where waiting is the point.
 
 | Value | Definition | Cost of a losing hedge |
 |---|---|---|
-| `first_response_byte` | The first non-error byte of the upstream response **body** — time to first byte. | Approximately nothing. The loser has generated no billable output. |
+| `first_response_byte` | The first non-error byte of the upstream response **body** — time to first byte. | Provider-dependent: dropping the relay connection does not guarantee upstream cancellation or stop billing. |
 | `first_complete_token` | The first fully-parsed content delta, or the complete response body when the client asked for a non-streaming reply. | One token of output on every participant that loses. |
 
-`first_response_byte` is the default because it is nearly free: a losing participant is cancelled
-after its headers, before it has produced any output tokens, so the only cost is a wasted request
-slot. `first_complete_token` is available for providers that open a stream immediately and then
-think for seconds — with those, TTFB says nothing about who will actually answer first.
+`first_response_byte` is the default because the relay can discard a loser as soon as a candidate is
+chosen. That only cancels local work: providers may continue generation and bill for a request after
+the relay closes the connection. `first_complete_token` is available for providers that open a stream
+immediately and then think for seconds — with those, TTFB says nothing about who will actually answer
+first.
 
 Non-streaming requests are a special case worth noting: there is no "first byte of content" to key
 on until the whole response arrives, because a non-streaming body is delivered as one document. The
@@ -322,25 +327,18 @@ configuration parsing, no new per-request allocation, no new lookup.
 
 ---
 
-## 8. Session affinity
+## 8. Session affinity (planned; not wired)
 
-A hedged race is worth doing once per conversation, not once per turn. Affinity makes that happen.
+Session affinity is a proposed optimization for a future executor, not current relay behavior. The
+current relay does not run hedged races or pin conversations to a selected step.
 
-The session key is either the client-supplied `x-manarouter-session` header, or a hash of the
-conversation's first system message plus its first user message. The relay keeps a small sharded LRU
-map from session key to the chosen step, and once a conversation has a winner it stays with that
-winner for the session.
+The intended session key would be the client-supplied `x-manarouter-session` header, or a hash of the
+conversation's first system message plus its first user message. A future relay could keep a small
+sharded LRU map from session key to the chosen step so a conversation remains on that step.
 
-Two benefits, and the second is easy to miss:
-
-1. **Latency.** Only the first turn pays for a race. Later turns go straight to the known-good model.
-2. **Cost and quality.** Upstream prompt caching keys on the conversation prefix. Staying on the
-   same model keeps that cache warm — both reference routers observed a meaningful cost reduction
-   from exactly this — and keeps the conversation's voice consistent, which matters for multi-turn
-   agentic work.
-
-The map is lock-free and sharded, so it costs no lock on the hot path. Affinity is per-combo and can
-be turned off for a combo whose steps are meant to rotate.
+Potential benefits if implemented would include racing only the first turn, preserving upstream
+prompt-cache locality, and keeping a multi-turn conversation on one model. These are design goals, not
+verified Manarouter behavior.
 
 ---
 
