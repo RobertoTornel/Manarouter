@@ -30,9 +30,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::Router;
 use bytes::Bytes;
-use mr_core::dialect::{AuthKind, Dialect};
+use futures_util::StreamExt;
+use http_body_util::{BodyExt, BodyStream, StreamBody};
+use mr_core::dialect::{AuthKind, Dialect, RouteKind};
 use mr_core::secret::Vault;
 use mr_core::snapshot::{Resolution, StepPlan};
+
+use mr_dialects::{translate_request, TranslateCtx};
 
 use crate::model_scan::{scan_request_head, RequestHead};
 use crate::select::{self, Health};
@@ -234,6 +238,11 @@ async fn dispatch(
     let head = scan_request_head(&bytes);
     let scan_done = started.elapsed();
 
+    // The client's route decides the pivot the body is read in, and therefore which translation
+    // applies. Derived from the path rather than passed in by each handler so that a new route
+    // cannot be registered and silently fall through to Chat Completions.
+    let route = route_kind_for(uri.path());
+
     let Some(model_name) = requested_model(&head, &bytes) else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -339,18 +348,72 @@ async fn dispatch(
             None => None,
         };
 
-        let Some(url) = build_url(step, provider.route_overrides.get(route_key(&uri))) else {
+        // --- Dialect translation, per step, because the upstream dialect belongs to the provider
+        // and a combo may mix dialects across its steps. ---
+        //
+        // `translate_request` returns `None` when the client and the upstream speak the same shape,
+        // and that is the fast path: the original bytes go upstream with no parse and no re-encode,
+        // which preserves provider-specific fields this router does not understand — a re-encode
+        // would silently delete them. A body is built only when the dialects actually differ.
+        let ctx = TranslateCtx {
+            route,
+            client_dialect,
+            upstream_dialect: provider.dialect,
+            upstream_model: step.model.as_str(),
+            client_streaming: head.wants_stream(),
+            session_id: None,
+        };
+        let translated = match translate_request(&ctx, &bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    client_dialect,
+                    "invalid_request_error",
+                    &e.to_string(),
+                );
+            }
+        };
+        // Destructured in one move rather than read field-by-field: taking `path_override` by
+        // reference and then moving `body` out of the same value is a borrow conflict, and cloning
+        // the body to sidestep it would copy the whole request for every translated call.
+        let (outgoing, force_stream, dialect_content_type, dialect_path, translated_body) =
+            match translated {
+                Some(t) => (
+                    t.body,
+                    t.force_stream,
+                    Some(t.content_type),
+                    t.path_override,
+                    true,
+                ),
+                None => (bytes.clone(), false, None, None, false),
+            };
+
+        // A path the translator named wins over the provider's route override. The translator knows
+        // which dialect it just wrote the body for; a route override is keyed by the *client's*
+        // route, and says nothing about an upstream that does not follow OpenAI's path convention.
+        let Some(url) = build_url(
+            step,
+            dialect_path
+                .as_ref()
+                .or_else(|| provider.route_overrides.get(route_key(&uri))),
+        ) else {
             continue;
         };
 
         let request = UpstreamRequest {
             method: method.clone(),
             url,
-            headers: upstream_headers(provider, step, credential.as_deref(), &headers, &head),
-            // The original bytes go upstream unchanged. No parse and no re-encode, which is not only
-            // the fastest path but the one that preserves provider-specific fields this router does
-            // not understand — a re-encode would silently delete them.
-            body: bytes.clone(),
+            headers: upstream_headers(
+                provider,
+                step,
+                credential.as_deref(),
+                &headers,
+                &head,
+                force_stream,
+                dialect_content_type,
+            ),
+            body: outgoing,
             http2: provider.http2,
             connect_timeout: Duration::from_millis(step.connect_timeout_ms),
             ttfb_timeout: Duration::from_millis(step.ttfb_timeout_ms),
@@ -369,7 +432,7 @@ async fn dispatch(
                     total_us = started.elapsed().as_micros() as u64,
                     "served"
                 );
-                return build_response(response);
+                return build_client_response(ctx, translated_body, response).await;
             }
             Ok(response) => {
                 let reason = classify_status(response.status);
@@ -549,7 +612,15 @@ fn build_url(step: &StepPlan, override_path: Option<&String>) -> Option<String> 
     let path = override_path
         .map(String::as_str)
         .unwrap_or_else(|| default_path(step.dialect));
-    Some(format!("{base}{path}"))
+
+    // A declared override may be relative. Command Code's own constant is `alpha/generate`, with no
+    // leading slash, because it reads as a path fragment rather than a route; the base has just had
+    // its trailing slash trimmed, so concatenating the two produced `…commandcode.aialpha/generate`.
+    // The separator is supplied here so that no constant has to remember to include it.
+    if path.starts_with('/') {
+        return Some(format!("{base}{path}"));
+    }
+    Some(format!("{base}/{path}"))
 }
 
 /// The default upstream path for a dialect with no declared override.
@@ -572,6 +643,8 @@ fn upstream_headers(
     credential: Option<&str>,
     client_headers: &HeaderMap,
     head: &RequestHead,
+    force_stream: bool,
+    translated_content_type: Option<&'static str>,
 ) -> HeaderMap {
     let mut map = HeaderMap::with_capacity(provider.headers.len() + 3);
 
@@ -590,16 +663,58 @@ fn upstream_headers(
 
     apply_auth(&mut map, &step.auth, credential);
 
-    // The client's content type is forwarded so that multipart uploads stay multipart.
-    if let Some(ct) = client_headers.get("content-type") {
-        map.insert("content-type", ct.clone());
+    // A translated body is JSON by construction, so the client's content type is dropped for it —
+    // forwarding `multipart/form-data` alongside a JSON body would be a lie the upstream acts on.
+    // Untranslated bodies keep the client's content type, so multipart uploads stay multipart.
+    match translated_content_type {
+        Some(ct) => {
+            map.insert("content-type", HeaderValue::from_static(ct));
+        }
+        None => {
+            if let Some(ct) = client_headers.get("content-type") {
+                map.insert("content-type", ct.clone());
+            }
+        }
     }
 
-    if head.wants_stream() {
+    // Command Code and Codex answer only in `text/event-stream`, whatever the client asked for. A
+    // non-streaming client still gets an event stream from upstream; the relay folds it back into
+    // one JSON document on the way out. Asking for JSON here would get a JSON *error* instead.
+    if head.wants_stream() || force_stream {
         map.insert("accept", HeaderValue::from_static("text/event-stream"));
     }
 
+    // Command Code will not answer without these two: they are how its CLI identifies itself, and
+    // the constants live next to the translator that writes the body so the two cannot drift apart.
+    if step.dialect == Dialect::CommandCode {
+        map.insert(
+            "x-command-code-version",
+            HeaderValue::from_static(mr_dialects::commandcode::COMMAND_CODE_VERSION),
+        );
+        map.insert(
+            "x-cli-environment",
+            HeaderValue::from_static(mr_dialects::commandcode::CLI_ENVIRONMENT),
+        );
+    }
+
     map
+}
+
+/// The client route a request arrived on, from its path.
+///
+/// The fallback is Chat Completions because that is the route an unknown path cannot have reached:
+/// `router()` registers an explicit list, and a path outside it is a 404 before this is called.
+fn route_kind_for(path: &str) -> RouteKind {
+    match path {
+        "/v1/responses" => RouteKind::Responses,
+        "/v1/embeddings" => RouteKind::Embeddings,
+        "/v1/audio/transcriptions" => RouteKind::AudioTranscription,
+        "/v1/audio/speech" => RouteKind::AudioSpeech,
+        "/v1/images/generations" => RouteKind::ImagesGenerations,
+        "/v1/messages" => RouteKind::Messages,
+        "/v1/messages/count_tokens" => RouteKind::CountTokens,
+        _ => RouteKind::ChatCompletions,
+    }
 }
 
 /// Apply a provider's auth to the outgoing headers.
@@ -654,6 +769,161 @@ fn apply_auth(headers: &mut HeaderMap, auth: &AuthKind, credential: Option<&str>
 ///
 /// The body is streamed through as it arrives. Buffering would defeat streaming entirely, and
 /// re-encoding would risk altering bytes the provider chose deliberately.
+/// Build the client-facing response, translating the body back when the request was translated.
+///
+/// `translated` is whether `translate_request` produced a body. It is the response half's only
+/// signal, and it is deliberately the same flag: a pairing that needed no request translation needs
+/// no response translation either, and deriving the two from one decision is what stops them
+/// disagreeing. `translate_request` already knows the answer — `is_passthrough` is documented as a
+/// necessary but not sufficient condition, so re-deriving it here could only introduce a second,
+/// subtler opinion.
+async fn build_client_response(
+    ctx: TranslateCtx<'_>,
+    translated: bool,
+    upstream: crate::upstream::UpstreamResponse,
+) -> Response {
+    if !translated {
+        return build_response(upstream);
+    }
+
+    let status = upstream.status;
+    let headers = upstream.headers.clone();
+
+    // A streaming client gets a streaming answer, frame by frame. A non-streaming client gets a
+    // single document, which means an upstream that always streams has to be folded — that is the
+    // ordinary case for Command Code, whose every answer is an event stream.
+    let body = if ctx.client_streaming {
+        // `axum::body::Body` requires `'static`, so nothing that borrows this function's `ctx` can
+        // be captured. The scalars are lifted out and the model id is owned here, and a fresh
+        // context is built per frame from the owned id — which is why only the id needs copying.
+        let route = ctx.route;
+        let client_dialect = ctx.client_dialect;
+        let upstream_dialect = ctx.upstream_dialect;
+        let client_streaming = ctx.client_streaming;
+        let model = ctx.upstream_model.to_owned();
+
+        let frames = BodyStream::new(upstream.body);
+        // The buffer is carried across frames because a `data:` line has no obligation to arrive in
+        // one piece; translating a half-line would corrupt the stream in a way that looks like an
+        // upstream fault. `scan` is what makes the carry-over expressible without a mutex.
+        let stream = frames.scan(String::new(), move |pending, frame| {
+            let ctx = TranslateCtx {
+                route,
+                client_dialect,
+                upstream_dialect,
+                upstream_model: &model,
+                client_streaming,
+                session_id: None,
+            };
+            let out = match frame {
+                Ok(frame) => frame
+                    .into_data()
+                    .ok()
+                    .map(|chunk| translate_stream_chunk(&ctx, pending, &chunk)),
+                Err(e) => Some(vec![Err(e)]),
+            };
+            async move { Some(out) }
+        });
+        let stream = stream.filter_map(|item| async move { item });
+        let stream = stream.flat_map(|chunks| {
+            futures_util::stream::iter(chunks.into_iter().map(|c| c.map(http_body::Frame::data)))
+        });
+        AxumBody::new(StreamBody::new(stream))
+    } else {
+        let collected = upstream.body.collect().await;
+        match collected {
+            Ok(collected) => {
+                let raw = collected.to_bytes();
+                match mr_dialects::translate_response_body(&ctx, &raw) {
+                    Ok(out) => AxumBody::from(out),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not translate the upstream response");
+                        AxumBody::from(raw)
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the upstream body did not finish");
+                AxumBody::empty()
+            }
+        }
+    };
+
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    for (name, value) in headers.iter() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if HOP_BY_HOP.contains(&lower.as_str()) {
+            continue;
+        }
+        response.headers_mut().append(name.clone(), value.clone());
+    }
+    response
+}
+
+/// Translate one upstream chunk, carrying any partial trailing line into the next call.
+///
+/// Returns one result per output frame. A chunk that contains no complete line yields nothing, and
+/// its bytes stay in `pending` — an event stream is line-oriented, so a chunk boundary in the middle
+/// of a `data:` line is normal rather than exceptional.
+fn translate_stream_chunk(
+    ctx: &TranslateCtx<'_>,
+    pending: &mut String,
+    chunk: &Bytes,
+) -> Vec<Result<Bytes, hyper::Error>> {
+    // A chunk that is not valid UTF-8 at its end is kept whole and retried once the rest arrives;
+    // `from_utf8` failing on a truncated multi-byte character is the same situation as a truncated
+    // line, and treating it as an error would drop a legitimate frame.
+    let Ok(text) = std::str::from_utf8(chunk) else {
+        pending.push_str(&String::from_utf8_lossy(chunk));
+        return Vec::new();
+    };
+    pending.push_str(text);
+
+    let mut out = Vec::new();
+    while let Some(idx) = pending.find('\n') {
+        let line: String = pending.drain(..=idx).collect();
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            out.push(Ok(Bytes::from_static(b"\n")));
+            continue;
+        }
+        match trimmed.strip_prefix("data: ") {
+            Some(data) => match mr_dialects::translate_sse_data(ctx, data) {
+                Ok(lines) => {
+                    for line in lines {
+                        if line.is_empty() {
+                            continue;
+                        }
+                        out.push(Ok(Bytes::from(format!("{line}\n\n"))));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not translate an event-stream frame");
+                }
+            },
+            // Comments (`: ping`), `event:` and `id:` lines carry no payload to translate and are
+            // forwarded as they are. Dropping them would break upstreams that use them as keepalives.
+            None => out.push(Ok(Bytes::from(format!("{trimmed}\n")))),
+        }
+    }
+    out
+}
+
+/// Headers that describe the connection between the relay and the provider, hoisted so the direct
+/// and translated response paths drop exactly the same set.
+const HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+];
+
 fn build_response(upstream: crate::upstream::UpstreamResponse) -> Response {
     let status = upstream.status;
     let mut response = Response::new(AxumBody::new(upstream.body));
@@ -662,18 +932,6 @@ fn build_response(upstream: crate::upstream::UpstreamResponse) -> Response {
     // Hop-by-hop headers describe the connection between the relay and the provider. Forwarding them
     // would tell the client something false about its own connection. `content-length` is dropped
     // because the body is streamed from a source whose length is not known here.
-    const HOP_BY_HOP: &[&str] = &[
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-        "content-length",
-    ];
-
     for (name, value) in upstream.headers.iter() {
         let lower = name.as_str().to_ascii_lowercase();
         if HOP_BY_HOP.contains(&lower.as_str()) {
@@ -816,6 +1074,29 @@ mod tests {
         }
     }
 
+    /// A minimal provider plan: no headers, no accounts, no route overrides.
+    fn provider_plan() -> mr_core::snapshot::ProviderPlan {
+        mr_core::snapshot::ProviderPlan {
+            id: mr_core::ids::ProviderId::from_raw("p"),
+            label: None,
+            dialect: Dialect::OpenAi,
+            base_url: "https://example.com".into(),
+            auth: AuthKind::Bearer,
+            key_strategy: Default::default(),
+            accounts: Vec::new(),
+            capabilities: Vec::new(),
+            connect_timeout_ms: 1,
+            ttfb_timeout_ms: 1,
+            idle_timeout_ms: 1,
+            total_timeout_ms: 1,
+            headers: Default::default(),
+            route_overrides: Default::default(),
+            http2: Default::default(),
+            prewarm: false,
+            steps: Vec::new(),
+        }
+    }
+
     #[test]
     fn a_bearer_header_yields_the_key() {
         let h = headers(&[("authorization", "Bearer mr-abc")]);
@@ -912,12 +1193,190 @@ mod tests {
 
     #[test]
     fn a_provider_route_override_wins_over_the_dialect_default() {
-        // Command Code's `/alpha/generate` cannot be derived from a base URL.
+        // Uses the dialect's own constant rather than a hand-written copy of it. The earlier version
+        // of this test wrote `"/alpha/generate"` with a leading slash while the constant is
+        // `"alpha/generate"` without one, so the test asserted a URL the code never built and the
+        // real one — `https://api.commandcode.aialpha/generate` — went unnoticed.
         let s = step(Dialect::CommandCode, "https://api.commandcode.ai");
-        let over = "/alpha/generate".to_string();
+        let over = mr_dialects::commandcode::GENERATE_PATH.to_string();
         assert_eq!(
             build_url(&s, Some(&over)).as_deref(),
             Some("https://api.commandcode.ai/alpha/generate")
+        );
+    }
+
+    #[test]
+    fn a_relative_route_override_gains_its_separator() {
+        let s = step(Dialect::OpenAi, "https://example.com");
+        let over = "v1/other".to_string();
+        assert_eq!(
+            build_url(&s, Some(&over)).as_deref(),
+            Some("https://example.com/v1/other")
+        );
+    }
+
+    #[test]
+    fn a_base_url_with_a_trailing_slash_does_not_double_it() {
+        let s = step(Dialect::OpenAi, "https://example.com/");
+        let over = "/v1/other".to_string();
+        assert_eq!(
+            build_url(&s, Some(&over)).as_deref(),
+            Some("https://example.com/v1/other")
+        );
+    }
+
+    #[test]
+    fn the_commandcode_translation_reaches_the_right_url() {
+        // The whole chain in one assertion: an OpenAI client, a Command Code provider, the
+        // translator's own path, and the URL the relay would actually fetch. Every other test here
+        // checks one link; this is the one that would have caught the missing separator, because it
+        // is the only one that takes the path from the translator rather than inventing it.
+        let ctx = TranslateCtx {
+            route: RouteKind::ChatCompletions,
+            client_dialect: Dialect::OpenAi,
+            upstream_dialect: Dialect::CommandCode,
+            upstream_model: "claude-sonnet-4-5",
+            client_streaming: false,
+            session_id: None,
+        };
+        let translated = translate_request(&ctx, br#"{"model":"m","messages":[]}"#)
+            .expect("an OpenAI body translates to Command Code")
+            .expect("the dialects differ, so a body must be produced");
+        assert!(translated.force_stream, "Command Code always streams");
+        let path = translated.path_override.expect("a path is declared");
+        let s = step(Dialect::CommandCode, "https://api.commandcode.ai");
+        assert_eq!(
+            build_url(&s, Some(&path)).as_deref(),
+            Some("https://api.commandcode.ai/alpha/generate")
+        );
+    }
+
+    #[test]
+    fn a_forced_stream_asks_the_upstream_for_an_event_stream() {
+        // A non-streaming client calling an upstream that only speaks SSE still has to be sent
+        // `accept: text/event-stream`; asking for JSON gets a JSON *error* back instead.
+        let p = provider_plan();
+        let head = scan_request_head(br#"{"model":"m"}"#);
+        assert!(!head.wants_stream());
+        let out = upstream_headers(
+            &p,
+            &step(Dialect::CommandCode, "https://example.com"),
+            None,
+            &HeaderMap::new(),
+            &head,
+            true,
+            None,
+        );
+        assert_eq!(out.get("accept").unwrap(), "text/event-stream");
+    }
+
+    #[test]
+    fn commandcode_is_told_which_client_is_calling() {
+        let p = provider_plan();
+        let head = scan_request_head(br#"{"model":"m"}"#);
+        let out = upstream_headers(
+            &p,
+            &step(Dialect::CommandCode, "https://example.com"),
+            None,
+            &HeaderMap::new(),
+            &head,
+            false,
+            None,
+        );
+        assert_eq!(
+            out.get("x-command-code-version").unwrap(),
+            mr_dialects::commandcode::COMMAND_CODE_VERSION
+        );
+        assert_eq!(
+            out.get("x-cli-environment").unwrap(),
+            mr_dialects::commandcode::CLI_ENVIRONMENT
+        );
+    }
+
+    #[test]
+    fn another_dialect_is_not_told_it_is_commandcode() {
+        let p = provider_plan();
+        let head = scan_request_head(br#"{"model":"m"}"#);
+        let out = upstream_headers(
+            &p,
+            &step(Dialect::OpenAi, "https://example.com"),
+            None,
+            &HeaderMap::new(),
+            &head,
+            false,
+            None,
+        );
+        assert!(!out.contains_key("x-command-code-version"));
+    }
+
+    #[test]
+    fn a_translated_body_replaces_the_clients_content_type() {
+        // Forwarding `multipart/form-data` next to a JSON body is a lie the upstream acts on.
+        let p = provider_plan();
+        let head = scan_request_head(br#"{"model":"m"}"#);
+        let mut client = HeaderMap::new();
+        client.insert(
+            "content-type",
+            "multipart/form-data; boundary=x".parse().unwrap(),
+        );
+        let out = upstream_headers(
+            &p,
+            &step(Dialect::CommandCode, "https://example.com"),
+            None,
+            &client,
+            &head,
+            false,
+            Some("application/json"),
+        );
+        assert_eq!(out.get("content-type").unwrap(), "application/json");
+    }
+
+    #[test]
+    fn an_untranslated_body_keeps_the_clients_content_type() {
+        let p = provider_plan();
+        let head = scan_request_head(br#"{"model":"m"}"#);
+        let mut client = HeaderMap::new();
+        client.insert(
+            "content-type",
+            "multipart/form-data; boundary=x".parse().unwrap(),
+        );
+        let out = upstream_headers(
+            &p,
+            &step(Dialect::OpenAi, "https://example.com"),
+            None,
+            &client,
+            &head,
+            false,
+            None,
+        );
+        assert_eq!(
+            out.get("content-type").unwrap(),
+            "multipart/form-data; boundary=x"
+        );
+    }
+
+    #[test]
+    fn every_registered_route_maps_to_its_own_kind() {
+        // A new route that fell through to the fallback would be translated as Chat Completions.
+        assert_eq!(
+            route_kind_for("/v1/chat/completions"),
+            RouteKind::ChatCompletions
+        );
+        assert_eq!(route_kind_for("/v1/responses"), RouteKind::Responses);
+        assert_eq!(route_kind_for("/v1/embeddings"), RouteKind::Embeddings);
+        assert_eq!(
+            route_kind_for("/v1/audio/transcriptions"),
+            RouteKind::AudioTranscription
+        );
+        assert_eq!(route_kind_for("/v1/audio/speech"), RouteKind::AudioSpeech);
+        assert_eq!(
+            route_kind_for("/v1/images/generations"),
+            RouteKind::ImagesGenerations
+        );
+        assert_eq!(route_kind_for("/v1/messages"), RouteKind::Messages);
+        assert_eq!(
+            route_kind_for("/v1/messages/count_tokens"),
+            RouteKind::CountTokens
         );
     }
 
@@ -993,30 +1452,12 @@ mod tests {
     #[test]
     fn an_invalid_provider_header_is_skipped_rather_than_failing_the_request() {
         // A typo in a provider's configuration should log, not take the provider down.
-        let mut p = mr_core::snapshot::ProviderPlan {
-            id: mr_core::ids::ProviderId::from_raw("p"),
-            label: None,
-            dialect: Dialect::OpenAi,
-            base_url: "https://example.com".into(),
-            auth: AuthKind::Bearer,
-            key_strategy: Default::default(),
-            accounts: Vec::new(),
-            capabilities: Vec::new(),
-            connect_timeout_ms: 1,
-            ttfb_timeout_ms: 1,
-            idle_timeout_ms: 1,
-            total_timeout_ms: 1,
-            headers: Default::default(),
-            route_overrides: Default::default(),
-            http2: Default::default(),
-            prewarm: false,
-            steps: Vec::new(),
-        };
+        let mut p = provider_plan();
         p.headers.insert("good".into(), "fine".into());
         p.headers.insert("bad header".into(), "value".into());
         let s = step(Dialect::OpenAi, "https://example.com");
         let head = scan_request_head(br#"{"model":"m"}"#);
-        let out = upstream_headers(&p, &s, None, &HeaderMap::new(), &head);
+        let out = upstream_headers(&p, &s, None, &HeaderMap::new(), &head, false, None);
         assert!(out.contains_key("good"));
         assert_eq!(out.len(), 1, "the malformed header must not be forwarded");
     }
