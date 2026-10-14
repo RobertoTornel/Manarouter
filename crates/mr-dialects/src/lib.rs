@@ -205,7 +205,9 @@ pub fn translate_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Option<T
         (Dialect::OpenAi, Dialect::Google)
         | (Dialect::Anthropic, Dialect::Google)
         | (Dialect::OpenAi, Dialect::Antigravity)
-        | (Dialect::Anthropic, Dialect::Antigravity) => google::from_pivot_request(ctx, body).map(Some),
+        | (Dialect::Anthropic, Dialect::Antigravity) => {
+            google::from_pivot_request(ctx, body).map(Some)
+        }
 
         (Dialect::OpenAi, Dialect::CommandCode) | (Dialect::Anthropic, Dialect::CommandCode) => {
             commandcode::from_pivot_request(ctx, body).map(Some)
@@ -376,11 +378,18 @@ mod tests {
         // still forwarded an OpenAI body verbatim to `cloudcode-pa/v1internal:generateContent`
         // and failed the response half with Unsupported — a dead module with perfect unit
         // coverage. This asserts the dispatcher arms instead.
-        let ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Antigravity, "gemini-2.5-pro");
+        let ctx = TranslateCtx::new(
+            RouteKind::ChatCompletions,
+            Dialect::Antigravity,
+            "gemini-2.5-pro",
+        );
 
-        let req = translate_request(&ctx, br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
-            .expect("an OpenAI client must reach the translator for an Antigravity upstream")
-            .expect("byte-forwarding would hand v1internal an OpenAI body");
+        let req = translate_request(
+            &ctx,
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .expect("an OpenAI client must reach the translator for an Antigravity upstream")
+        .expect("byte-forwarding would hand v1internal an OpenAI body");
         let doc: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
         assert_eq!(doc["request"]["contents"][0]["parts"][0]["text"], "hi");
         assert!(
@@ -406,11 +415,13 @@ mod tests {
         assert!(frames.iter().any(|f| f.contains("[DONE]")));
 
         // The Anthropic-client pairing had no arm at all before: Unsupported outright.
-        let anthropic_ctx = TranslateCtx::new(RouteKind::Messages, Dialect::Antigravity, "gemini-2.5-pro");
-        assert!(
-            translate_request(&anthropic_ctx, br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
-                .is_ok()
-        );
+        let anthropic_ctx =
+            TranslateCtx::new(RouteKind::Messages, Dialect::Antigravity, "gemini-2.5-pro");
+        assert!(translate_request(
+            &anthropic_ctx,
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#
+        )
+        .is_ok());
     }
 
     #[test]
@@ -475,8 +486,11 @@ mod tests {
         assert_eq!(frames[0], payload, "and untouched");
 
         openai::reset_stream_state();
-        let start = translate_sse_data(&anthropic_ctx, r#"{"choices":[{"delta":{"role":"assistant"}}]}"#)
-            .expect("an Anthropic client's Copilot stream must reach the adapter");
+        let start = translate_sse_data(
+            &anthropic_ctx,
+            r#"{"choices":[{"delta":{"role":"assistant"}}]}"#,
+        )
+        .expect("an Anthropic client's Copilot stream must reach the adapter");
         assert!(start.join("").contains("message_start"));
         let end = translate_sse_data(&anthropic_ctx, "[DONE]")
             .expect("the stream must be allowed to close");

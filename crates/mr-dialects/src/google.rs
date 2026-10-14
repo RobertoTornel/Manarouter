@@ -1041,7 +1041,11 @@ mod tests {
     use serde_json::{json, Value};
 
     fn ctx() -> TranslateCtx<'static> {
-        TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Google, "gemini-2.0-flash")
+        TranslateCtx::new(
+            RouteKind::ChatCompletions,
+            Dialect::Google,
+            "gemini-2.0-flash",
+        )
     }
 
     fn anthropic_ctx() -> TranslateCtx<'static> {
@@ -1148,7 +1152,10 @@ mod tests {
         assert_eq!(parts[1]["inlineData"]["data"], "QUJD");
         assert_eq!(parts[2]["inlineData"]["mimeType"], "image/jpeg");
         assert_eq!(parts[3]["fileData"]["mimeType"], "image/webp");
-        assert_eq!(parts[3]["fileData"]["fileUri"], "https://example.com/cat.webp");
+        assert_eq!(
+            parts[3]["fileData"]["fileUri"],
+            "https://example.com/cat.webp"
+        );
     }
 
     #[test]
@@ -1188,10 +1195,12 @@ mod tests {
     fn tool_choice_maps_to_modes_and_allow_lists() {
         let tool = json!({"type": "function", "function": {"name": "f", "description": "d"}});
 
-        let none = build(json!({"model": "x", "messages": [], "tools": [tool], "tool_choice": "none"}));
+        let none =
+            build(json!({"model": "x", "messages": [], "tools": [tool], "tool_choice": "none"}));
         assert_eq!(none["toolConfig"]["functionCallingConfig"]["mode"], "NONE");
 
-        let auto = build(json!({"model": "x", "messages": [], "tools": [tool], "tool_choice": "auto"}));
+        let auto =
+            build(json!({"model": "x", "messages": [], "tools": [tool], "tool_choice": "auto"}));
         assert_eq!(auto["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
 
         let pinned = build(json!({
@@ -1223,7 +1232,7 @@ mod tests {
             Some(0.0),
             "temperature 0 is a real answer, not an absent field"
         );
-        assert_eq!( cfg["topP"].as_f64(), Some(0.9));
+        assert_eq!(cfg["topP"].as_f64(), Some(0.9));
         assert_eq!(cfg["maxOutputTokens"], 256);
         assert_eq!(cfg["stopSequences"], json!(["END", "DONE"]));
         assert!(
@@ -1246,9 +1255,13 @@ mod tests {
         assert!(!r.force_stream);
         assert_eq!(r.content_type, "application/json");
         let doc: Value = serde_json::from_slice(&r.body).unwrap();
-        assert!(doc.get("model").is_none(), "the URL names the model, not the body");
+        assert!(
+            doc.get("model").is_none(),
+            "the URL names the model, not the body"
+        );
 
-        let body = serde_json::to_vec(&json!({"model": "x", "messages": [], "stream": true})).unwrap();
+        let body =
+            serde_json::to_vec(&json!({"model": "x", "messages": [], "stream": true})).unwrap();
         let r = from_pivot_request(&ctx(), &body).unwrap();
         assert_eq!(
             r.path_override.as_deref(),
@@ -1272,10 +1285,20 @@ mod tests {
 
     #[test]
     fn antigravity_upstream_wraps_the_body_and_names_v1internal() {
-        let c = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Antigravity, "gemini-2.5-pro");
-        let body = serde_json::to_vec(&json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]})).unwrap();
+        let c = TranslateCtx::new(
+            RouteKind::ChatCompletions,
+            Dialect::Antigravity,
+            "gemini-2.5-pro",
+        );
+        let body = serde_json::to_vec(
+            &json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .unwrap();
         let r = from_pivot_request(&c, &body).unwrap();
-        assert_eq!(r.path_override.as_deref(), Some("v1internal:generateContent"));
+        assert_eq!(
+            r.path_override.as_deref(),
+            Some("v1internal:generateContent")
+        );
         let doc: Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(doc["model"], "gemini-2.5-pro");
         assert_eq!(doc["request"]["contents"][0]["parts"][0]["text"], "hi");
@@ -1286,11 +1309,17 @@ mod tests {
     fn malformed_request_bodies_are_rejected() {
         match from_pivot_request(&ctx(), b"{oops") {
             Err(TranslateError::MalformedRequest { .. }) => {}
-            other => panic!("expected MalformedRequest, got {:?}", other.map(|r| r.path_override)),
+            other => panic!(
+                "expected MalformedRequest, got {:?}",
+                other.map(|r| r.path_override)
+            ),
         }
         match from_pivot_request(&ctx(), b"[1,2,3]") {
             Err(TranslateError::MalformedRequest { .. }) => {}
-            other => panic!("expected MalformedRequest, got {:?}", other.map(|r| r.path_override)),
+            other => panic!(
+                "expected MalformedRequest, got {:?}",
+                other.map(|r| r.path_override)
+            ),
         }
     }
 
@@ -1564,15 +1593,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(frames.len(), 3, "role, reasoning, content");
-        assert_eq!(chunk(&frames[1])["choices"][0]["delta"]["reasoning_content"], "pondering");
-        assert_eq!(chunk(&frames[2])["choices"][0]["delta"]["content"], "answer");
+        assert_eq!(
+            chunk(&frames[1])["choices"][0]["delta"]["reasoning_content"],
+            "pondering"
+        );
+        assert_eq!(
+            chunk(&frames[2])["choices"][0]["delta"]["content"],
+            "answer"
+        );
     }
 
     #[test]
     fn stream_noise_is_skipped_and_no_finish_means_no_done() {
         reset_stream_state();
         let c = ctx();
-        assert!(sse_to_pivot(&c, "keep-alive commentary").unwrap().is_empty());
+        assert!(sse_to_pivot(&c, "keep-alive commentary")
+            .unwrap()
+            .is_empty());
         assert!(sse_to_pivot(&c, "{}").unwrap().is_empty());
 
         let partial = sse_to_pivot(
@@ -1650,7 +1687,10 @@ mod tests {
             joined.contains("content_block_stop"),
             "the open block must close before the stream ends"
         );
-        assert!(joined.contains("max_tokens"), "the real stop reason must survive");
+        assert!(
+            joined.contains("max_tokens"),
+            "the real stop reason must survive"
+        );
         assert!(joined.contains("message_stop"));
         assert!(!joined.contains("[DONE]"));
     }
@@ -1659,11 +1699,22 @@ mod tests {
     fn reset_stream_state_starts_the_next_stream_clean() {
         reset_stream_state();
         let c = ctx();
-        let a = sse_to_pivot(&c, r#"{"candidates":[{"content":{"parts":[{"text":"x"}]}}]}"#).unwrap();
-        assert!(a[0].contains("assistant"), "first stream opens with a role chunk");
+        let a = sse_to_pivot(
+            &c,
+            r#"{"candidates":[{"content":{"parts":[{"text":"x"}]}}]}"#,
+        )
+        .unwrap();
+        assert!(
+            a[0].contains("assistant"),
+            "first stream opens with a role chunk"
+        );
 
         reset_stream_state();
-        let b = sse_to_pivot(&c, r#"{"candidates":[{"content":{"parts":[{"text":"y"}]}}]}"#).unwrap();
+        let b = sse_to_pivot(
+            &c,
+            r#"{"candidates":[{"content":{"parts":[{"text":"y"}]}}]}"#,
+        )
+        .unwrap();
         assert!(
             b[0].contains("assistant"),
             "a reset stream must open with a role chunk again"

@@ -88,10 +88,7 @@ impl ServeDirs {
             .iter()
             .map(|b| b.join("panel"))
             .find(|p| p.join("index.html").is_file());
-        let docs = bases
-            .iter()
-            .map(|b| b.join("docs"))
-            .find(|p| p.is_dir());
+        let docs = bases.iter().map(|b| b.join("docs")).find(|p| p.is_dir());
         Self { panel, docs }
     }
 }
@@ -156,9 +153,11 @@ impl CommitError {
     /// The problems, for the error envelope's `details` list.
     pub fn details(&self) -> Vec<serde_json::Value> {
         match self {
-            Self::Validation(problems) => {
-                problems.iter().map(serde_json::Value::from).collect()
-            }
+            Self::Validation(problems) => problems
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
             other => vec![serde_json::Value::from(other.message())],
         }
     }
@@ -241,7 +240,8 @@ impl AppState {
         // Creating the vault is allowed to fail here (an unreadable directory must stop startup)
         // but never inside a handler: the API should not discover at first save that the vault
         // could not be opened.
-        let vault = Vault::open(&dir).map_err(|e| format!("cannot open the vault in {}: {e}", dir.display()))?;
+        let vault = Vault::open(&dir)
+            .map_err(|e| format!("cannot open the vault in {}: {e}", dir.display()))?;
         let snapshot = compile_initial(&config, &snapshot_path)?;
         Ok(Self {
             config: Arc::new(RwLock::new(config)),
@@ -288,9 +288,23 @@ impl AppState {
     /// On `Ok`, the file, the in-memory configuration, the snapshot on disk and the installed
     /// snapshot all describe the same configuration.
     pub async fn commit(&self, next: Config) -> Result<(), CommitError> {
+        self.commit_with(next, |cfg| cfg.validate()).await
+    }
+
+    /// [`Self::commit`] with a caller-supplied validator.
+    ///
+    /// Exactly one caller uses this (the provider-create endpoint in `api.rs`, which permits a
+    /// provider that is *born* without accounts because the panel adds them afterwards — see the
+    /// comment there). Every other mutation calls plain [`Self::commit`]. The compile-before-save
+    /// ordering is identical either way: a custom validator is not a way to write a broken
+    /// configuration, only to permit one shape of a valid one.
+    pub async fn commit_with<F>(&self, next: Config, validate: F) -> Result<(), CommitError>
+    where
+        F: FnOnce(&Config) -> Vec<String>,
+    {
         // (1) Validate. `validate` returns every problem, so the operator sees the whole list
         // in one round trip instead of fixing them one at a time.
-        let problems = next.validate();
+        let problems = validate(&next);
         if !problems.is_empty() {
             return Err(CommitError::Validation(problems));
         }
@@ -306,9 +320,9 @@ impl AppState {
             .map_err(|e| CommitError::Save(format!("{}: {e}", self.config_path.display())))?;
 
         // (4) Write the snapshot only now that the configuration it describes is on disk.
-        snapshot
-            .write_to(&self.snapshot_path)
-            .map_err(|e| CommitError::SnapshotWrite(format!("{}: {e}", self.snapshot_path.display())))?;
+        snapshot.write_to(&self.snapshot_path).map_err(|e| {
+            CommitError::SnapshotWrite(format!("{}: {e}", self.snapshot_path.display()))
+        })?;
 
         // (5) Publish.
         self.snapshot.install(snapshot);
@@ -379,7 +393,11 @@ impl AppState {
     /// crate having to know the OAuth module's id scheme.
     pub async fn delete_secrets_with_prefix(&self, prefix: &str) -> usize {
         let mut vault = self.vault.lock().await;
-        let ids: Vec<String> = vault.ids().into_iter().filter(|id| id.starts_with(prefix)).collect();
+        let ids: Vec<String> = vault
+            .ids()
+            .into_iter()
+            .filter(|id| id.starts_with(prefix))
+            .collect();
         let mut removed = 0;
         for id in &ids {
             if vault.delete(id) {

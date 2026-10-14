@@ -86,6 +86,44 @@ pub(crate) fn header(name: &'static str, value: &str) -> Option<(HeaderName, Hea
     }
 }
 
+/// Clamp for a token endpoint's `expires_in` (seconds): a provider reporting a negative or
+/// absurd lifetime must not wrap `Millis` arithmetic. Zero reads as "already expired"
+/// (refresh — the honest reading of an unknown expiry), ten years as the longest plausible
+/// refresh interval.
+pub(crate) const MAX_EXPIRES_IN_SECS: i64 = 10 * 365 * 24 * 3600;
+
+/// Absolute expiry for a token whose endpoint reported `expires_in` **seconds** — clamped,
+/// and computed in one place so no platform can mistake seconds for milliseconds (a mix-up
+/// puts expiry 50 000 years out and the token gets used long after it died).
+pub(crate) fn expires_at_from_secs(expires_in: i64) -> Millis {
+    Millis::now().plus_secs(expires_in.clamp(0, MAX_EXPIRES_IN_SECS))
+}
+
+/// Decode a JWT payload for its *claims only* — signature verification is deliberately not
+/// done here.
+///
+/// Why that is safe in these flows: each token arrives over TLS from the provider's own
+/// token endpoint in the very request/response being parsed, and the claims are used only as
+/// metadata (the account-id header, the panel's identity line) — never to authorise
+/// anything. Verifying would require fetching the provider's JWKS, pinning algorithms and
+/// checking clocks; a failure there would lock users out of a login that actually succeeded.
+/// If such a token is ever accepted from any other source, this function must gain real
+/// verification before it is reused.
+pub(crate) fn jwt_payload(token: &str) -> Result<serde_json::Map<String, serde_json::Value>> {
+    use base64::Engine as _;
+
+    let payload = token
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| oauth_error("expected a JWT (header.payload.signature)"))?;
+    // JWT segments are base64url without padding; some stacks add padding anyway, so accept
+    // both spellings before giving up.
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .map_err(|_| oauth_error("JWT payload is not base64url"))?;
+    serde_json::from_slice(&decoded).map_err(|_| oauth_error("JWT payload is not JSON"))
+}
+
 /// A set of OAuth tokens as stored and as returned by a token endpoint.
 ///
 /// Unknown response keys are preserved in [`extra`](TokenSet::extra) (flattened, so they survive
@@ -766,7 +804,7 @@ mod tests {
     #[test]
     fn pkce_rejects_verifiers_outside_the_rfc() {
         assert!(Pkce::from_verifier("too-short").is_err());
-        assert!(Pkce::from_verifier(&"a".repeat(129)).is_err());
+        assert!(Pkce::from_verifier("a".repeat(129)).is_err());
         assert!(
             Pkce::from_verifier("a".repeat(43).replace('a', "=").as_str()).is_err(),
             "padding is not in the allowed alphabet"

@@ -20,7 +20,16 @@
 //!
 //! * [`auth`] — panel authentication: Argon2id passwords, sessions, origin checks, and the refusal
 //!   to start a remotely-reachable panel with no password.
-//!
-//! Further modules are added as the control plane is built.
+//! * [`state`] — the shared application state: the configuration behind a lock, the vault, the
+//!   compiled snapshot handle, the restart signal, and the commit sequence every mutation goes
+//!   through (validate → compile → save → install).
+//! * [`api`] — the REST surface the panel calls, plus the guard middleware (origin check, then
+//!   session) and the redaction/healing rules that keep credentials out of responses without
+//!   making round trips lossy.
+//! * [`serve`] — binding the control listener and serving `panel/` static assets; the place
+//!   where a bind failure becomes an actionable error instead of a panic.
 
+pub mod api;
 pub mod auth;
+pub mod serve;
+pub mod state;

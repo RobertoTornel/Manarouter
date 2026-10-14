@@ -774,7 +774,7 @@ thread_local! {
     /// live somewhere. A thread-local keeps concurrent conversations from sharing it; the state
     /// also resets itself once a terminal frame has gone out, so a pooled worker that never calls
     /// [`reset_stream_state`] still cannot splice two answers together.
-    static COMMAND_CODE_STREAM_STATE: RefCell<Option<StreamState>> = RefCell::new(None);
+    static COMMAND_CODE_STREAM_STATE: RefCell<Option<StreamState>> = const { RefCell::new(None) };
 }
 
 /// Forget the in-flight stream state.

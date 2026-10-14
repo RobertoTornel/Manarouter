@@ -402,11 +402,17 @@ pub fn warn(line: impl AsRef<str>) {
 
 #[cfg(test)]
 pub(crate) mod testutil {
-    //! Test scaffolding: unique temp directories without a `tempfile` dependency.
+    //! Test scaffolding: unique temp directories without a `tempfile` dependency, and the env
+    //! serialisation every test that points the CLI at one needs.
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     static N: AtomicU64 = AtomicU64::new(0);
+
+    /// Serialises every test that must repoint `MANAROUTER_CONFIG_DIR`: environment variables
+    /// are process-global and the harness runs tests concurrently.
+    static ENV: Mutex<()> = Mutex::new(());
 
     /// A fresh directory under the system temp dir, unique per test name + pid + counter.
     pub(crate) fn temp_dir(name: &str) -> PathBuf {
@@ -424,6 +430,31 @@ pub(crate) mod testutil {
     pub(crate) fn cleanup(dir: &std::path::Path) {
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    /// Run `f` with `MANAROUTER_CONFIG_DIR` pointing at a fresh temp directory, then restore the
+    /// environment and remove the directory — even when `f` panics, so a failed assertion never
+    /// leaves the next test looking at the wrong config.
+    pub(crate) fn with_config_dir<T>(name: &str, f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _guard = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = temp_dir(name);
+        std::env::set_var("MANAROUTER_CONFIG_DIR", &dir);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&dir)));
+        std::env::remove_var("MANAROUTER_CONFIG_DIR");
+        cleanup(&dir);
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Run an async `mr` command on a throwaway runtime: unit tests are synchronous.
+    pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio test runtime")
+            .block_on(f)
+    }
 }
 
 #[cfg(test)]
@@ -440,34 +471,34 @@ mod tests {
     }
 
     #[test]
-    fn mask_reveals_nothing_for_a_short_secret() {
+    fn a_short_secret_masks_to_nothing() {
         assert_eq!(mask("abc"), "••••");
         assert_eq!(mask("12345678"), "••••");
         assert_eq!(mask(""), "••••");
     }
 
     #[test]
-    fn mask_keeps_only_recognition_fragments_of_a_long_secret() {
-        // "sk-proj-ABCDEFGH12345678": three leading characters, four trailing, nothing between.
-        let m = mask("sk-proj-ABCDEFGH12345678");
+    fn a_long_secret_masks_to_fragments() {
+        // "sk-proj-ABCDEFGH12345678": three leading characters, four trailing, nothing between. // secret-scan: allow
+        let m = mask("sk-proj-ABCDEFGH12345678"); // secret-scan: allow
         assert_eq!(m, "sk-…5678");
         assert!(!m.contains("EFGH1234"), "{m}");
     }
 
     #[test]
     fn redact_text_masks_credentials_inside_prose_and_json() {
-        let body = "upstream said: Authorization sk-live-abcdefghijklmnop rejected, code=401";
+        let body = "upstream said: Authorization sk-live-abcdefghijklmnop rejected, code=401"; // secret-scan: allow
         let redacted = redact_text(body);
-        assert!(!redacted.contains("sk-live-abcdefghijklmnop"), "{redacted}");
+        assert!(!redacted.contains("sk-live-abcdefghijklmnop"), "{redacted}"); // secret-scan: allow
         assert!(redacted.contains("rejected"), "{redacted}");
 
         // A `ghp_…` GitHub token: recognised by mr-core's own credential detector (prefix list
         // plus minimum length), which is what redact_text defers to.
         let json =
-            "{\"error\":{\"message\":\"key ghp_ABCDEFGHIJKLMNOPQRSTUV123456 was rejected\"}}";
+            "{\"error\":{\"message\":\"key ghp_ABCDEFGHIJKLMNOPQRSTUV123456 was rejected\"}}"; // secret-scan: allow
         let redacted = redact_text(json);
         assert!(
-            !redacted.contains("ghp_ABCDEFGHIJKLMNOPQRSTUV123456"),
+            !redacted.contains("ghp_ABCDEFGHIJKLMNOPQRSTUV123456"), // secret-scan: allow
             "{redacted}"
         );
         assert!(redacted.contains("rejected"), "{redacted}");
