@@ -68,55 +68,105 @@ This surprises people, so it is documented in full, with worked timelines:
 
 ---
 
-## Quick start
+## Install and use it
+
+Manarouter is open-source software distributed as source code. The installer below downloads the
+repository and builds the Rust programs on your computer; it does not download a prebuilt binary.
+This copy-paste installer is for Linux and macOS. You need Git, `curl`, and Rust (`rustup`). First
+install Rust from <https://rustup.rs> if `cargo` is not already installed.
+
+Copy and paste this into a terminal:
 
 ```bash
-git clone https://github.com/RobertoTornel/Manarouter
-cd Manarouter
-cargo build --release
+curl -fsSL https://raw.githubusercontent.com/RobertoTornel/Manarouter/main/installer.sh | bash
 ```
 
-Add a provider and a key:
+The installer puts the source in `~/.local/share/manarouter/source` and command links in
+`~/.local/bin`. If the installer says `~/.local/bin` is not on your `PATH`, follow its printed
+instruction, open a new terminal, and check the install:
 
 ```bash
-./target/release/mr provider add openai --dialect open-ai --base-url https://api.openai.com/v1
-./target/release/mr account add openai --label personal --secret sk-...
-./target/release/mr models sync openai
+mr --help
 ```
 
-Make a combo that is a model name:
+### Add a provider and your upstream key
+
+For example, to connect an OpenAI-compatible provider:
 
 ```bash
-./target/release/mr combo add Brains \
-  --step openai/gpt-4o \
-  --step anthropic/claude-sonnet-4-5 \
-  --strategy priority
+mr provider add openai --dialect open-ai --base-url https://api.openai.com/v1
+mr account add openai --label personal --secret-stdin
 ```
 
-Run it:
+After the second command, paste your provider API key into the terminal and press **Ctrl-D** (on
+macOS, Ctrl-D works too). The key is saved in Manarouter's encrypted vault, not printed back or put
+in `config.json`. Manarouter encrypts the vault at rest, but the local `vault.key` file is needed to
+unlock it—keep your user account and backups protected. Treat provider keys as spend-capable secrets;
+do not paste them into chat or commit them to a file.
+
+List providers and sync their model lists:
 
 ```bash
-./target/release/mr serve          # relay on 20900, conductor + panel on 20901
+mr provider list
+mr models sync openai
+mr models list openai
 ```
 
-Point anything at it:
+### Make a client key and start the services
+
+A *provider key* pays for upstream model access. A separate *client key* lets your apps access your
+local Manarouter. Create one and keep it somewhere private:
 
 ```bash
-export OPENAI_BASE_URL=http://127.0.0.1:20900/v1
-export OPENAI_API_KEY=$(./target/release/mr key create --label my-client --print)
-
-curl $OPENAI_BASE_URL/chat/completions \
-  -H "authorization: Bearer $OPENAI_API_KEY" \
-  -d '{"model":"Brains","messages":[{"role":"user","content":"hello"}]}'
+mr key create --label my-computer --print
 ```
 
-Full walkthrough: [`docs/02-quickstart.md`](docs/02-quickstart.md).
+The one-time key is printed to your terminal. Copy it; Manarouter stores only its hash. Start the
+control panel/conductor and relay in **two terminals**:
+
+```bash
+manarouter-conductor
+```
+
+```bash
+manarouter-relay
+```
+
+The panel is at <http://127.0.0.1:20901>; the OpenAI-compatible API is at
+<http://127.0.0.1:20900/v1>. Keep the panel bound to loopback unless you have configured strong
+panel authentication and understand the network exposure. Do not expose it directly to the internet.
+
+Check that the relay can list the configured models:
+
+```bash
+curl http://127.0.0.1:20900/v1/models \
+  -H 'Authorization: Bearer PASTE_YOUR_CLIENT_KEY_HERE'
+```
+
+Then send a request (replace the example model with one from the model list):
+
+```bash
+curl http://127.0.0.1:20900/v1/chat/completions \
+  -H 'Authorization: Bearer PASTE_YOUR_CLIENT_KEY_HERE' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"openai/gpt-4o","messages":[{"role":"user","content":"Say hello."}]}'
+```
+
+The client key above is a placeholder: use the one-time value printed by `mr key create`. Each
+request may incur charges from your configured provider. To stop Manarouter, press **Ctrl-C** in
+each terminal. Configuration and encrypted credentials are kept under `~/.config/manarouter`; see
+[`docs/02-quickstart.md`](docs/02-quickstart.md) for configuration, model aliases, combos, API
+clients and troubleshooting.
+
+**Current implementation note:** `mr serve` and `mr doctor` are not implemented yet, so start the
+conductor and relay as separate processes as shown. The product is under active development; see
+[`docs/23-implementation-status.md`](docs/23-implementation-status.md) for current limitations.
 
 ---
 
 ## Documentation
 
-**If you are a language model working on this repository, read
+**If you are a language model helping a user operate Manarouter, read [`AGENTS.md`](AGENTS.md). If you are working on this repository, also read
 [`docs/LLM_INDEX.md`](docs/LLM_INDEX.md).** It is the single file that maps every task to the files
 that describe it, and it ends with a machine-readable manifest.
 
