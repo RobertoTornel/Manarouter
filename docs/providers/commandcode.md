@@ -20,7 +20,7 @@ with these headers, all of which are required:
 | `authorization` | `Bearer <key>` | Standard. |
 | `content-type` | `application/json` | Standard. |
 | `accept` | `text/event-stream` | The endpoint is always SSE. |
-| `x-command-code-version` | `1.79.2` | Sent by the first-party CLI. A mismatch is treated as an old client. |
+| `x-command-code-version` | `1.82.1` | CLI compatibility fingerprint used by the working bridge. |
 | `x-cli-environment` | `production` | Same. |
 
 The version and environment headers are **fingerprints**, not authentication. They identify the

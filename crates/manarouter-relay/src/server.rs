@@ -854,10 +854,22 @@ async fn build_client_response(
     *response.status_mut() = status;
     for (name, value) in headers.iter() {
         let lower = name.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lower.as_str()) {
+        if HOP_BY_HOP.contains(&lower.as_str())
+            || (ctx.upstream_dialect == Dialect::CommandCode && lower == "content-type")
+        {
             continue;
         }
         response.headers_mut().append(name.clone(), value.clone());
+    }
+    if ctx.upstream_dialect == Dialect::CommandCode {
+        let content_type = if ctx.client_streaming {
+            "text/event-stream; charset=utf-8"
+        } else {
+            "application/json; charset=utf-8"
+        };
+        if let Ok(value) = HeaderValue::from_str(content_type) {
+            response.headers_mut().insert("content-type", value);
+        }
     }
     response
 }
@@ -889,7 +901,14 @@ fn translate_stream_chunk(
             out.push(Ok(Bytes::from_static(b"\n")));
             continue;
         }
-        match trimmed.strip_prefix("data: ") {
+        let data = trimmed.strip_prefix("data: ").or_else(|| {
+            // The live Command Code endpoint emits newline-delimited JSON event objects rather than
+            // standard SSE `data:` records. Treat each JSON line as one event; metadata events are
+            // ignored by the dialect translator, while text/tool/finish events become OpenAI SSE.
+            (ctx.upstream_dialect == Dialect::CommandCode && trimmed.starts_with('{'))
+                .then_some(trimmed)
+        });
+        match data {
             Some(data) => match mr_dialects::translate_sse_data(ctx, data) {
                 Ok(lines) => {
                     for line in lines {
@@ -904,7 +923,8 @@ fn translate_stream_chunk(
                 }
             },
             // Comments (`: ping`), `event:` and `id:` lines carry no payload to translate and are
-            // forwarded as they are. Dropping them would break upstreams that use them as keepalives.
+            // forwarded as they are. Command Code metadata JSON is intentionally suppressed.
+            None if ctx.upstream_dialect == Dialect::CommandCode => {}
             None => out.push(Ok(Bytes::from(format!("{trimmed}\n")))),
         }
     }
@@ -1174,6 +1194,42 @@ mod tests {
             assert!(p.starts_with('/'), "{d:?} must have an absolute path");
             assert!(p.len() > 1, "{d:?} must not be the root");
         }
+    }
+
+    #[test]
+    fn commandcode_ndjson_metadata_is_suppressed_and_content_is_translated() {
+        let ctx = TranslateCtx {
+            route: RouteKind::ChatCompletions,
+            client_dialect: Dialect::OpenAi,
+            upstream_dialect: Dialect::CommandCode,
+            upstream_model: "deepseek/deepseek-v4-flash",
+            client_streaming: true,
+            session_id: None,
+        };
+        mr_dialects::commandcode::reset_stream_state();
+        let mut pending = String::new();
+        let metadata = Bytes::from_static(b"{\"type\":\"start\"}\n");
+        assert!(translate_stream_chunk(&ctx, &mut pending, &metadata).is_empty());
+        let token = Bytes::from_static(b"{\"type\":\"text-delta\",\"text\":\"OK\"}\n");
+        let output = translate_stream_chunk(&ctx, &mut pending, &token);
+        let output = output.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+        assert_eq!(output.len(), 1);
+        let text = std::str::from_utf8(&output[0]).unwrap();
+        assert!(text.starts_with("data: {"), "{text:?}");
+        assert!(text.contains("chat.completion.chunk"), "{text:?}");
+        assert!(text.contains("\"content\":\"OK\""), "{text:?}");
+        let finish = Bytes::from_static(
+            b"{\"type\":\"finish\",\"finishReason\":\"stop\",\"totalUsage\":{\"inputTokens\":2,\"outputTokens\":1}}\n",
+        );
+        let output = translate_stream_chunk(&ctx, &mut pending, &finish);
+        let text = output
+            .into_iter()
+            .map(Result::unwrap)
+            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(text.contains("finish_reason"), "{text:?}");
+        assert!(text.contains("[DONE]"), "{text:?}");
+        mr_dialects::commandcode::reset_stream_state();
     }
 
     #[test]

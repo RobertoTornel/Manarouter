@@ -35,11 +35,10 @@ use crate::openai::{pivot_response_to_anthropic, sse_to_anthropic, AnthropicStre
 use crate::sse;
 use crate::{Result, TranslateCtx, TranslateError, TranslatedRequest, SSE_DONE};
 
-/// The CLI version the upstream expects in `x-command-code-version`.
+/// CLI compatibility version sent in `x-command-code-version`.
 ///
-/// The reference bridge treats this as a live npm CLI version; `1.79.2` is the version its README
-/// pins, and a bump belongs with a change to this constant rather than a scattered literal.
-pub const COMMAND_CODE_VERSION: &str = "1.79.2";
+/// The working CLI-envelope bridge supplied for this adapter uses version 1.82.1.
+pub const COMMAND_CODE_VERSION: &str = "1.82.1";
 
 /// The `x-cli-environment` value. Hard-coded upstream, not configurable.
 pub const CLI_ENVIRONMENT: &str = "production";
@@ -681,6 +680,15 @@ pub fn to_pivot_response(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Bytes> {
             error = Some(err);
             break;
         }
+        // The live endpoint also emits bare JSON metadata events (`start`, `start-step`, etc.).
+        // They are not completion payloads and must not disturb the folded result.
+        if v.get("type").and_then(Value::as_str).is_some() {
+            if let Step::Error(err) = classify(&mut state, &v) {
+                error = Some(err);
+                break;
+            }
+            continue;
+        }
         // A body that is already a Chat Completions object is passed on rather than re-derived.
         if existing.is_none() && v.get("choices").is_some() {
             existing = Some(v);
@@ -1021,10 +1029,37 @@ mod tests {
     }
 
     #[test]
+    fn supplied_bridge_defaults_match_the_live_cli_envelope() {
+        let out = build_envelope(
+            &TranslateCtx::new(
+                RouteKind::ChatCompletions,
+                Dialect::CommandCode,
+                "deepseek/deepseek-v4-flash",
+            ),
+            json!({"model": "deepseek/deepseek-v4-flash", "messages": []})
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(COMMAND_CODE_VERSION, "1.82.1");
+        assert_eq!(out["config"]["workingDir"], ".");
+        assert_eq!(out["config"]["environment"], "cli");
+        assert_eq!(out["config"]["mainBranch"], "main");
+        assert_eq!(out["config"]["structure"], json!([]));
+        assert_eq!(out["config"]["recentCommits"], json!([]));
+        assert_eq!(out["params"]["system"], "");
+        assert_eq!(out["params"]["tools"], json!([]));
+        assert_eq!(out["params"]["model"], "deepseek/deepseek-v4-flash");
+    }
+
+    #[test]
     fn max_tokens_and_temperature_defaults_match_the_upstream_builder() {
         let out = build(json!({"model": "x", "messages": []}));
         assert_eq!(out["params"]["max_tokens"], 64_000);
         assert_eq!(out["params"]["temperature"], 0.3);
+        assert_eq!(out["config"]["workingDir"], ".");
+        assert_eq!(out["config"]["environment"], "cli");
+        assert_eq!(out["config"]["mainBranch"], "main");
+        assert_eq!(out["params"]["system"], "");
 
         // `??` semantics: an explicit zero is respected, not treated as absent.
         let out = build(json!({"model": "x", "messages": [], "max_tokens": 0, "temperature": 0}));
@@ -1344,6 +1379,10 @@ mod tests {
     #[test]
     fn a_buffered_stream_folds_into_one_completion() {
         let body = concat!(
+            r#"{"type":"start"}"#,
+            "\n",
+            r#"{"type":"start-step","request":{"body":{"model":"internal"}}}"#,
+            "\n",
             r#"{"type":"text-delta","text":"Hel"}"#,
             "\n",
             r#"{"type":"text-delta","text":"lo"}"#,
