@@ -178,6 +178,7 @@ impl Vault {
     ///
     /// The id doubles as AES-GCM associated data, which binds the ciphertext to its slot.
     pub fn put(&mut self, id: &str, value: &str) -> Result<()> {
+        self.reload_from_disk()?;
         let mut nonce_bytes = [0u8; NONCE_LEN];
         rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -251,11 +252,32 @@ impl Vault {
 
     /// Remove a secret. Returns whether anything was removed.
     pub fn delete(&mut self, id: &str) -> bool {
+        if !self.dirty && self.reload_from_disk().is_err() {
+            return false;
+        }
         let removed = self.file.entries.remove(id).is_some();
         if removed {
             self.dirty = true;
         }
         removed
+    }
+
+    /// Reload the current encrypted file, preserving this handle's cipher/key.
+    pub fn reload_from_disk(&mut self) -> Result<()> {
+        if self.dirty {
+            return Err(Error::Secret(
+                "refusing to reload a vault with unflushed changes".into(),
+            ));
+        }
+        self.file = if self.path.exists() {
+            let text = std::fs::read_to_string(&self.path)
+                .map_err(|e| Error::Secret(format!("cannot read {}: {e}", self.path.display())))?;
+            serde_json::from_str(&text)
+                .map_err(|e| Error::Secret(format!("cannot parse {}: {e}", self.path.display())))?
+        } else {
+            VaultFile::default()
+        };
+        Ok(())
     }
 
     /// Whether an id is present.

@@ -13,6 +13,12 @@ of adding a fourth platform is `docs/14-oauth-adding-a-platform.md`.
 
 ---
 
+## Current implementation scope
+
+The management API and panel currently offer interactive OAuth connection for **OpenAI Codex (browser loopback/PKCE)** and **GitHub Copilot (device code)**. Token sets are stored in the encrypted vault; non-secret credential metadata is in the conductor's SQLite store. The relay opens the same configured SQLite store and vault, resolves the metadata reference to its vault key, and uses the platform refresher before inference. Antigravity, Cline, xAI OAuth, and import-only or cookie/session credentials are not exposed as working login flows. No live login was exercised as part of implementation; run the automated tests before relying on the behavior.
+
+These OAuth operations live in the **conductor control plane**; they do not add endpoints to the inference relay. The relay only consumes the resulting account credential while serving inference.
+
 ## 1. Why OAuth instead of an API key
 
 An API key is a metered credential. Every token the router forwards is billed to a payment method,

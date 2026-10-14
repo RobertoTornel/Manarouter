@@ -96,7 +96,7 @@ base_url = "https://cloudcode-pa.googleapis.com"
 auth = { type = "oauth", platform = "antigravity" }
 oauth_platform = "antigravity"
 capabilities = ["chat", "models", "tool-calling", "reasoning", "vision"]
-note = "UNCERTAIN (T2): the Antigravity client identity and the exact x-goog-api-client and User-Agent values are reverse-engineered, not primary-confirmed. Client-Metadata is a JSON object and must be sent verbatim. Every project-scoped call needs the project id obtained from the onboardUser envelope."
+note = "This catalog entry records the migration target only: OAuth login, refresh, identity extraction and project onboarding are not implemented, so the OAuth platform is unavailable in this build. Do not use until those flows are implemented and verified."
 oauth_generate_path = "/v1internal:generateContent"
 oauth_stream_path = "/v1internal:streamGenerateContent?alt=sse"
 oauth_onboard_path = "/v1internal:onboardUser"

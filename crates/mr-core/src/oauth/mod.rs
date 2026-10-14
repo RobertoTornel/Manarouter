@@ -7,7 +7,8 @@
 //! |--------------------|----------------------|-----------------------------------|
 //! | `openai-codex`     | [`codex::Codex`]     | loopback authorization code + PKCE (S256) |
 //! | `github-copilot`   | [`copilot::Copilot`] | GitHub device code                |
-//! | `antigravity`      | [`antigravity::Antigravity`] | loopback authorization code (Google) |
+//! | `antigravity`      | not registered       | protocol implementation incomplete (Google) |
+//! | `cline`            | not registered       | no verified interactive flow      |
 //!
 //! ## Rules this module exists to enforce
 //!
@@ -40,6 +41,7 @@ pub mod codex;
 pub mod copilot;
 pub mod flow;
 pub mod refresh;
+pub mod session;
 
 use std::fmt;
 use std::time::Duration;
@@ -329,9 +331,8 @@ impl fmt::Debug for Pkce {
 /// The loopback ports and redirect path a browser-based login accepts, plus the host the
 /// redirect URI is spelled with.
 ///
-/// The host field exists because it genuinely differs: Codex spells its redirect `127.0.0.1`
-/// while Antigravity's registered URI spells `localhost` — the two are not interchangeable once
-/// the URI is compared against a pre-registered value.
+/// The host field exists because providers can register `127.0.0.1` or `localhost`; those are
+/// not interchangeable once the URI is compared against a pre-registered value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RedirectPorts {
     /// Host component of the redirect URI (`127.0.0.1` or `localhost`).
@@ -469,8 +470,7 @@ pub trait OAuthPlatform: Send + Sync {
     /// before reading it.
     fn redirect_ports(&self) -> RedirectPorts;
 
-    /// Whether the flow uses PKCE (S256). Codex and Antigravity do; the Copilot device flow
-    /// has no redirect at all, hence no code to bind.
+    /// Whether the flow uses PKCE (S256). The Copilot device flow has no redirect at all, hence no code to bind.
     fn requires_pkce(&self) -> bool;
 
     /// Whether the bound port must be checked against [`redirect_ports`](Self::redirect_ports)
@@ -516,7 +516,7 @@ pub trait OAuthPlatform: Send + Sync {
     ///
     /// Codex refreshes at 5 minutes to its clock (`L = 8`-style window in codex's manager);
     /// Copilot's session lasts ~30 minutes and its own client refreshes 300 s early;
-    /// Antigravity refreshes 60 s early per the reverse-engineered client. Claude Code is
+    /// Claude Code is
     /// documented at **4 hours** in `docs/10-oauth-overview.md §5` —
     /// `// UNCERTAIN:` that number appears in no primary source; if it is wrong, either a
     /// long-lived token expires in flight (one failed request, repaired by a forced refresh) or
@@ -551,9 +551,8 @@ use copilot::Copilot;
 static CODEX: Codex = Codex;
 static COPILOT: Copilot = Copilot;
 
-/// Registration order, matching `catalog/providers.toml`. The Antigravity entry is the
-/// catalogue's T2 identity — see [`antigravity::IDE`].
-static PLATFORMS: [&'static dyn OAuthPlatform; 3] = [&CODEX, &COPILOT, &antigravity::IDE];
+/// Registration order for complete and supported implementations, matching `catalog/providers.toml`.
+static PLATFORMS: [&'static dyn OAuthPlatform; 2] = [&CODEX, &COPILOT];
 
 /// Every registered platform. Required to resolve every `AuthKind::OAuth` catalogue id — see
 /// the tests at the bottom of this file, which check both directions.
@@ -576,7 +575,8 @@ mod tests {
     /// Providers whose catalogue note admits the platform is not implemented in this build.
     /// Each such entry must say so in its own note — an undocumented gap would silently route
     /// an operator into a login that cannot exist.
-    const NOT_IMPLEMENTED: &[&str] = &["cline"];
+    const NOT_IMPLEMENTED: &[&str] = &["antigravity", "cline"];
+    const NON_INTERACTIVE: &[&str] = &["xai"];
 
     fn oauth_platform_ids() -> Vec<String> {
         catalog()
@@ -593,6 +593,9 @@ mod tests {
     fn every_catalogue_oauth_platform_resolves() {
         let mut seen_unimplemented = Vec::new();
         for id in oauth_platform_ids() {
+            if NON_INTERACTIVE.contains(&id.as_str()) {
+                continue;
+            }
             if NOT_IMPLEMENTED.contains(&id.as_str()) {
                 // The exception is only legal while the catalogue admits it.
                 let note = catalog()
@@ -600,7 +603,7 @@ mod tests {
                     .and_then(|p| p.note.as_deref())
                     .unwrap_or("");
                 assert!(
-                    note.contains("does not implement"),
+                    note.contains("does not implement") || note.contains("not implemented"),
                     "provider {id} is exempt from the OAuth registry but its note does not \
                      say the platform is unimplemented"
                 );
@@ -613,10 +616,12 @@ mod tests {
                  OAuthPlatform is registered under that id"
             );
         }
+        // OAuth extras on otherwise API-key templates are not treated as OAuth registry entries.
         // The exception list must track the catalogue, not rot: a documented gap that got
         // implemented (or removed) has to be noticed.
         let catalogue_gaps: Vec<String> = oauth_platform_ids()
             .into_iter()
+            .filter(|id| !NON_INTERACTIVE.contains(&id.as_str()))
             .filter(|id| platform(id).is_none())
             .collect();
         assert_eq!(
@@ -671,11 +676,8 @@ mod tests {
             platform("github-copilot").unwrap().refresh_lead(),
             Duration::from_secs(300)
         );
-        // Antigravity's client refreshes when expiry is within 60 s of now.
-        assert_eq!(
-            platform("antigravity").unwrap().refresh_lead(),
-            Duration::from_secs(60)
-        );
+        // The incomplete Antigravity implementation is intentionally not registered.
+        assert!(platform("antigravity").is_none());
     }
 
     #[test]
@@ -725,12 +727,7 @@ mod tests {
         assert_eq!(ports.candidates(), vec![1455, 1457]);
         assert_eq!(ports.path, "/auth/callback");
 
-        let antigravity = platform("antigravity").unwrap();
-        assert!(antigravity.begins_with_loopback());
-        // Registered on the fixed port; the redirect URI spells `localhost`.
-        assert_eq!(antigravity.redirect_ports().candidates(), vec![51121]);
-        assert_eq!(antigravity.redirect_ports().host, "localhost");
-        assert_eq!(antigravity.redirect_ports().path, "/oauth-callback");
+        assert!(platform("antigravity").is_none());
 
         let copilot = platform("github-copilot").unwrap();
         assert!(!copilot.begins_with_loopback());
@@ -751,17 +748,13 @@ mod tests {
             ports.redirect_uri(1457),
             "http://127.0.0.1:1457/auth/callback"
         );
-        let ag = platform("antigravity").unwrap().redirect_ports();
-        assert_eq!(
-            ag.redirect_uri(51121),
-            "http://localhost:51121/oauth-callback"
-        );
+        assert!(platform("antigravity").is_none());
     }
 
     #[tokio::test]
     async fn flow_directions_reject_the_wrong_entry_point() {
         // Loopback platforms have no device flow …
-        for id in ["openai-codex", "antigravity"] {
+        for id in ["openai-codex"] {
             let p = platform(id).unwrap();
             assert!(p.device_start().await.is_err(), "{id}");
             assert!(p.device_poll("anything").await.is_err(), "{id}");

@@ -297,9 +297,9 @@ pub struct ProviderPlan {
 
 /// A compiled account: scheduling metadata plus a reference to the credential, never its value.
 ///
-/// `secret_ref` and `oauth_ref` are vault ids. The compiler resolves the conventional
-/// [`account_secret_id`] fallback at compile time so the relay never builds a string to find a key,
-/// and the secret itself is only ever read from the vault at request time.
+/// `secret_ref` names vault material; `oauth_ref` names an OAuth metadata record in the Store.
+/// The compiler resolves the conventional [`account_secret_id`] fallback for static credentials;
+/// the relay resolves OAuth metadata to its vault reference at request time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountPlan {
     /// Stable identifier.
@@ -1126,8 +1126,8 @@ fn temp_sibling(path: &Path) -> PathBuf {
 ///
 /// The credential reference is resolved here, once: an explicit `secret_ref` is kept, an account
 /// with no OAuth reference falls back to the conventional [`account_secret_id`] vault path, and an
-/// OAuth account keeps only its OAuth reference. The value of the secret is never touched — the
-/// vault is opened by the relay, and this module only ever handles ids.
+/// OAuth account keeps only its metadata reference. The relay opens the vault after resolving its
+/// metadata record; this module only handles ids.
 fn account_plan(provider_id: &str, account: &Account) -> AccountPlan {
     let secret_ref = match &account.secret_ref {
         Some(explicit) => Some(explicit.clone()),

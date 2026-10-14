@@ -394,6 +394,7 @@ export async function renderProviders(mount, ctx) {
   // ------------------------------------------------------------------ forms
 
   function buildAccountForm(p) {
+    if (p.auth?.type === 'oauth') return buildOAuthAccountForm(p);
     const label = h('input', { class: 'input', type: 'text', 'data-field': 'label' });
     const identity = h('input', { class: 'input mono', type: 'text', 'data-field': 'identity', placeholder: 'e.g. work@account' });
     const secret = h('input', { class: 'input mono', type: 'password', 'data-field': 'secret', autocomplete: 'off' });
@@ -420,6 +421,45 @@ export async function renderProviders(mount, ctx) {
         if (!err.details?.length) ctx.toast.error('Could not add the account', err);
         add.disabled = false;
       }
+    });
+    return form;
+  }
+
+  function buildOAuthAccountForm(p) {
+    const status = h('p', { class: 'muted' }, 'OAuth credentials are stored only in the encrypted local vault.');
+    const connect = h('button', { class: 'btn primary', type: 'button' }, 'Connect account');
+    const form = h('div', {}, status, connect);
+    connect.addEventListener('click', async () => {
+      connect.disabled = true;
+      try {
+        const platform = p.auth.platform;
+        const { platforms = [] } = await api.get('/api/oauth');
+        const details = platforms.find((x) => x.id === platform);
+        if (!details) throw new Error(`OAuth platform “${platform}” is unavailable in this build.`);
+        if (details.flow === 'browser') {
+          const start = await api.post(`/api/oauth/${encodeURIComponent(platform)}/authorize`, { provider_id: p.id });
+          window.open(start.authorization_url, '_blank', 'noopener,noreferrer');
+          status.textContent = 'Complete sign-in in the browser. This router must be running on the same machine as the browser callback.';
+          const done = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/complete`, { provider_id: p.id });
+          ctx.toast.success(`Connected ${done.account.label || 'OAuth account'}.`);
+        } else {
+          const start = await api.post(`/api/oauth/${encodeURIComponent(platform)}/device-code`, { provider_id: p.id });
+          status.replaceChildren(h('span', {}, `Enter code ${start.user_code} at `), h('a', { href: start.verification_uri, target: '_blank', rel: 'noopener noreferrer' }, start.verification_uri));
+          const deadline = Date.now() + start.expires_in_seconds * 1000;
+          while (Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, Math.max(1000, start.interval_seconds * 1000)));
+            const result = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/poll`, { provider_id: p.id });
+            if (result.status === 'complete') { ctx.toast.success(`Connected ${result.account.label || 'OAuth account'}.`); await reload(true); return; }
+            if (result.status === 'failed') throw new Error(result.message);
+            if (result.interval_seconds) start.interval_seconds = result.interval_seconds;
+            if (result.retry_after_seconds) start.interval_seconds = Math.max(start.interval_seconds, result.retry_after_seconds);
+          }
+          if (Date.now() >= deadline) throw new Error('OAuth device code expired. Start again.');
+        }
+        await reload(true);
+      } catch (err) {
+        ctx.toast.error('OAuth sign-in failed', err);
+      } finally { connect.disabled = false; }
     });
     return form;
   }

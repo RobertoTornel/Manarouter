@@ -108,6 +108,15 @@ pub struct AppState {
     pub snapshot_path: PathBuf,
     /// The encrypted secret store. `tokio::sync::Mutex` because every mutation awaits on it.
     pub vault: Arc<Mutex<Vault>>,
+    /// Ephemeral provider authorization sessions. They never contain a completed token response.
+    pub oauth_sessions: mr_core::oauth::session::OAuthSessions,
+    /// Serialize concurrent configuration mutations so overlapping OAuth logins can't lose accounts.
+    pub mutation_lock: Arc<Mutex<()>>,
+    /// The usage database: what the relay recorded about traffic that has already happened.
+    ///
+    /// Read-only from here. The relay is the only writer — it owns the request path, and the
+    /// conductor must never contend with it for a write lock on the hot path.
+    pub store: Arc<mr_core::store::Store>,
     /// Panel authentication policy. Behind a lock because changing the panel password rebuilds
     /// it (and thereby revokes every live session — see [`AppState::replace_password_hash`]).
     pub auth: Arc<RwLock<PanelAuth>>,
@@ -218,20 +227,33 @@ impl RestartSignal {
     }
 }
 
+/// File-backed inputs required to construct the shared application state.
+#[derive(Debug, Clone)]
+pub struct StateFiles {
+    pub config_path: PathBuf,
+    pub snapshot_path: PathBuf,
+    pub database_path: PathBuf,
+    pub dirs: ServeDirs,
+}
+
 impl AppState {
-    /// Build state from an already-loaded configuration.
+    /// Build state from an already-loaded configuration and its file locations.
     ///
     /// `running_relay_port` should be the relay port this process started with;
     /// `running_control_port` the port actually bound (0 before the listener exists).
     pub fn new(
         config: Config,
-        config_path: PathBuf,
-        snapshot_path: PathBuf,
+        files: StateFiles,
         auth: PanelAuth,
         running_relay_port: u16,
         running_control_port: u16,
-        dirs: ServeDirs,
     ) -> Result<Self, String> {
+        let StateFiles {
+            config_path,
+            snapshot_path,
+            database_path,
+            dirs,
+        } = files;
         let dir = config_path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -243,11 +265,19 @@ impl AppState {
         let vault = Vault::open(&dir)
             .map_err(|e| format!("cannot open the vault in {}: {e}", dir.display()))?;
         let snapshot = compile_initial(&config, &snapshot_path)?;
+        // Opened here for the same reason the vault is: a handler must not discover at its first
+        // read that the database could not be opened. `Store::open` creates the schema when the
+        // file is new, so a fresh install gets an empty usage history rather than an error.
+        let store = mr_core::store::Store::open(&database_path)
+            .map_err(|e| format!("cannot open {}: {e}", database_path.display()))?;
         Ok(Self {
             config: Arc::new(RwLock::new(config)),
             config_path,
             snapshot_path,
             vault: Arc::new(Mutex::new(vault)),
+            oauth_sessions: mr_core::oauth::session::OAuthSessions::new(),
+            mutation_lock: Arc::new(Mutex::new(())),
+            store: Arc::new(store),
             auth: Arc::new(RwLock::new(auth)),
             snapshot: SnapshotHandle::new(snapshot),
             restart: RestartSignal::default(),

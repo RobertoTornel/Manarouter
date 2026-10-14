@@ -4,30 +4,36 @@ This file exists because a specification that reads as finished while the code i
 no specification. Everything below is checked against the tree, and the command that checks it is
 given so you can re-run it.
 
-> **Last verified:** commit `fa78ae7`.
+> **Last audited:** working tree at `main` (`8b32c3d` plus uncommitted local edits); source and docs reviewed during the current session. Run the verification commands below again after changes.
 
 ## 1. What runs
 
-| Component | State | Evidence |
+| Component | State | Evidence / limitation |
 |---|---|---|
-| `mr-core` — config, snapshot compiler, vault, published constants, ids, dialects | **Complete** | `cargo test -p mr-core` → 150 pass |
-| `mr-dialects` — OpenAI↔Anthropic translation, SSE | **Partial** | 73 pass; `responses`, `google`, `commandcode` are stubs returning `Unsupported` |
-| `manarouter-relay` — upstream client, model scan, state, selection, HTTP surface | **Request path complete** | `cargo test -p manarouter-relay` → 138 pass |
-| `manarouter-conductor` — auth | **Auth complete** | 27 pass |
-| `manarouter-conductor` — API, state, serving | **Not built** | no `api.rs`, `state.rs`, `serve.rs` |
-| `mr-cli` | **Not built** | 23-line stub |
-| `panel/` | **Written, never rendered** | 10 views, 164 KB raw / 43.9 KB gzip; no browser was available to run it |
-| OAuth flows | **Not implemented** | `crates/mr-core/src/oauth/` is empty |
-| `mr-core::store` | **Not implemented** | 29-line stub |
-| `tools/mock-upstream`, `tools/bench` | **Skeletons** | own `[workspace]` tables; `mock-upstream` has no source yet |
+| `mr-core` — config, snapshot compiler, vault, usage store, OAuth scaffolding | **Substantial, not complete** | Workspace tests pass; Antigravity OAuth methods are explicit unsupported errors. |
+| `mr-dialects` — OpenAI, Anthropic, Responses, Google, Command Code translation | **Reachable, test coverage uneven** | Relay dispatches request and response translation per selected step. Responses implementation needs focused regression tests. |
+| `manarouter-relay` — HTTP API, auth, snapshot, account selection, translation | **Runs; hedging not wired** | Sequential step loop remains the request executor; `hedge_decide` is not called by the relay. |
+| `manarouter-conductor` — auth, API, state, serving, quota query | **Implemented** | API routes and Store-backed `/api/quota` exist. Verify live separately; no conductor was running during this audit. |
+| `mr-cli` | **Partial** | Account/provider/combo/key/model families dispatch; `serve`, `doctor`, `migrate`, `config`, and `vault` still return not-implemented errors. |
+| `panel/` | **Implemented, browser behavior unverified** | JS syntax checks pass and bootstrap now displays failures; no browser-driven route/login verification completed. |
+| OAuth | **Partial; existing flows wired** | Conductor OAuth session routes and panel sign-in now cover Codex browser/PKCE and GitHub Copilot device flow; tokens are vault-backed, metadata lives in SQLite, and relay resolves/refreshes/apply-headers. Antigravity and Cline remain unavailable; only these two providers are registered. No live provider login was exercised. |
+| `tools/mock-upstream` | **Fault control API wired; behaviors partial** | Detached crate tests pass; `POST /__control` and request-local `x-mock-fault` merge patches are reachable. Not every field in `Fault` is yet applied to response generation. |
+| `tools/bench` | **Absent** | No harness currently enforces the latency budget. |
 
-Full gate, all green at the commit above:
+Verification run during this session:
+
+```sh
+cargo test --workspace
+cargo fmt --manifest-path tools/mock-upstream/Cargo.toml
+cargo test --manifest-path tools/mock-upstream/Cargo.toml  # 22 passed
+node --check panel/app.js
+```
+Workspace tests exited successfully. Re-run the full quality gates before release:
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace          # 388 pass, 0 fail
-cargo run -p manarouter-relay -- --port 20900   # boots, serves /healthz on loopback
+cargo test --workspace
 bash scripts/check-secrets.sh
 ```
 
@@ -67,24 +73,33 @@ The remaining work is a runner that spawns the participants, feeds `Participant`
 `hedge_decide`, and cancels losers under the `MidstreamPolicy` guard. That guard — refusing to splice
 once any `tool_calls` delta has been emitted — is the reason this is not a small change.
 
-## 4. Other properties that are claimed and true
+## 4. Verified implementation properties and limits
 
-* **Zero interpretation on the request path.** The model field is found by a `memchr` scan, not a JSON
-  parse, and the body is forwarded byte-for-byte. This is what Q8 ratified. It is *not* "zero-copy" —
-  the body is buffered — and the documentation never says zero-copy.
-* **No lock on the request path.** The snapshot is installed via `ArcSwap`; account health is read as
-  one immutable view per request.
-* **No credential in a URL.** `AuthKind::QueryParam` is recognised and deliberately not applied.
+* **The relay avoids full JSON interpretation for model lookup.** It scans the buffered body for the
+  model and forwards original bytes on passthrough paths. This is *not* zero-copy: the request body is
+  buffered. Cross-dialect routes do parse and translate bodies, as required.
+* **No conductor IPC on the request path.** The relay reads the compiled snapshot and uses ArcSwap;
+  account health is read as one immutable view per request.
+* **No credential in a URL.** `AuthKind::QueryParam` is recognized and deliberately not applied.
 * **`/v1/models` contacts no provider.** It is served from the compiled snapshot.
+* **Dialect translation is reachable.** Request translation is selected per step, with response
+  translation, translator path overrides, and forced-stream metadata applied in the relay.
+* **Conductor API/store exist.** The panel API includes CRUD routes and `/api/quota`; quota currently
+  reports persisted aggregate usage rather than live provider billing windows.
 
-## 5. Claims that would be false
+## 5. Claims that remain unverified or false
 
-* That hedging is live. See §3.
-* That OAuth login works for Codex, Antigravity or Copilot. The *constants* and the dossier-derived
-  flow descriptions exist in `docs/10`–`docs/14` and `mr-core::published`; no code performs a flow.
-* That the provider catalogue was executed against all 55 entries. `docs/providers/catalog.md` marks
-  10 UNCERTAIN, and each was written from documentation rather than a live call.
-* That the panel works. It has never been rendered — there is no browser on this machine. `panel/README.md` carries a seven-step manual checklist and names six response shapes that were inferred because the conductor API does not exist to check them against.
+* That hedging is live. See §3: runner remains sequential.
+* That Antigravity OAuth works end to end. Its authorization, exchange, refresh, identity, and relay
+  project injection/context are incomplete. Codex and Copilot OAuth code exists, but still needs
+  real-provider opt-in smoke verification.
+* That the provider catalogue was executed against every entry. `docs/providers/catalog.md` marks
+  uncertain entries and the catalogue is not a live reachability guarantee.
+* That the panel works in a real browser. Syntax and asset/API checks are not a substitute for browser
+  interaction; login and all nine routes remain unverified. The boot failure path is now visible.
+* That all mock fault fields are effective: control and request-local patch endpoints are wired, but
+  a subset of fault knobs still needs implementation/coverage.
+* That the latency budget is enforced. `tools/bench/` has no harness.
 
 ## 6. Preserved partial attempts
 

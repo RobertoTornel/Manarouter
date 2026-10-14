@@ -10,7 +10,7 @@
 
 use manarouter_conductor::auth::PanelAuth;
 use manarouter_conductor::serve;
-use manarouter_conductor::state::{AppState, ServeDirs};
+use manarouter_conductor::state::{AppState, ServeDirs, StateFiles};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -54,12 +54,15 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(
         config,
-        config_path,
-        snapshot_path,
+        StateFiles {
+            config_path,
+            snapshot_path,
+            database_path: mr_core::config::database_path(),
+            dirs: ServeDirs::discover(),
+        },
         auth,
         running_relay_port,
         0, // the control port is stored once the listener exists (serve.rs)
-        ServeDirs::discover(),
     )
     .map_err(|e| anyhow::anyhow!("the control plane could not start: {e}"))?;
 

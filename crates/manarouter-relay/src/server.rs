@@ -33,6 +33,8 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, BodyStream, StreamBody};
 use mr_core::dialect::{AuthKind, Dialect, RouteKind};
+use mr_core::oauth::platform as oauth_platform;
+use mr_core::oauth::refresh::Refresher;
 use mr_core::secret::Vault;
 use mr_core::snapshot::{Resolution, StepPlan};
 
@@ -106,6 +108,10 @@ pub struct AppState {
     /// an AEAD operation between a client and its answer is exactly the cost this architecture
     /// exists to remove.
     pub vault: Arc<Vault>,
+    /// Per-platform refreshers over the shared vault.
+    pub oauth_refreshers: Arc<std::collections::HashMap<String, Arc<Refresher>>>,
+    /// Metadata lookup for OAuth references attached to snapshot accounts.
+    pub oauth_store: Arc<mr_core::store::Store>,
 }
 
 /// Build the route table.
@@ -320,32 +326,68 @@ async fn dispatch(
         };
 
         // The credential comes from the vault, never from the configuration, and is never logged.
-        let credential = match account.secret_ref.as_deref() {
-            Some(id) => match app.vault.get(id) {
-                Ok(Some(v)) => Some(v),
-                Ok(None) => {
-                    tracing::warn!(account = %account.id, "no credential in the vault for this account");
-                    let reason = select::CooldownReason::AuthFailed;
-                    app.health.cool_down(
-                        account.id.as_str(),
-                        select::cooldown_until(reason, 0, None, &quota),
-                        reason,
-                    );
+        // OAuth references resolve to a full token set and platform-specific request headers.
+        let mut oauth_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
+        let mut oauth_tokens: Option<mr_core::oauth::TokenSet> = None;
+        let credential = if let Some(oauth_ref) = account.oauth_ref.as_deref() {
+            let oauth_id = mr_core::OAuthCredentialId::from_raw(oauth_ref);
+            let AuthKind::OAuth { platform } = &step.auth else {
+                tracing::error!(account = %account.id, "OAuth account is attached to non-OAuth provider auth");
+                continue;
+            };
+            let record = match app.oauth_store.get_oauth_credential(&oauth_id) {
+                Ok(Some(record)) if record.platform == *platform => record,
+                _ => {
+                    tracing::warn!(account = %account.id, "OAuth credential metadata is missing or mismatched");
                     continue;
                 }
-                Err(e) => {
-                    // A vault that cannot be decrypted is not an account problem, and cooling the
-                    // account down would hide the real cause behind a symptom.
-                    tracing::error!(error = %e, "the credential vault could not be read");
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        client_dialect,
-                        "vault_error",
-                        "the credential vault could not be read",
-                    );
+            };
+            let Some(oauth_platform) = oauth_platform(platform) else {
+                tracing::error!(platform, "OAuth platform is not available in this build");
+                continue;
+            };
+            let Some(refresher) = app.oauth_refreshers.get(platform) else {
+                continue;
+            };
+            match refresher.ensure_fresh(&record.vault_ref, false).await {
+                Ok(tokens) => {
+                    oauth_headers = oauth_platform.apply_credential(&tokens);
+                    oauth_tokens = Some(tokens.clone());
+                    Some(tokens.access_token.clone())
                 }
-            },
-            None => None,
+                Err(failure) => {
+                    tracing::warn!(platform, class = %failure.class, "OAuth credential refresh failed");
+                    continue;
+                }
+            }
+        } else {
+            match account.secret_ref.as_deref() {
+                Some(id) => match app.vault.get(id) {
+                    Ok(Some(v)) => Some(v),
+                    Ok(None) => {
+                        tracing::warn!(account = %account.id, "no credential in the vault for this account");
+                        let reason = select::CooldownReason::AuthFailed;
+                        app.health.cool_down(
+                            account.id.as_str(),
+                            select::cooldown_until(reason, 0, None, &quota),
+                            reason,
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        // A vault that cannot be decrypted is not an account problem, and cooling the
+                        // account down would hide the real cause behind a symptom.
+                        tracing::error!(error = %e, "the credential vault could not be read");
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            client_dialect,
+                            "vault_error",
+                            "the credential vault could not be read",
+                        );
+                    }
+                },
+                None => None,
+            }
         };
 
         // --- Dialect translation, per step, because the upstream dialect belongs to the provider
@@ -392,12 +434,25 @@ async fn dispatch(
         // A path the translator named wins over the provider's route override. The translator knows
         // which dialect it just wrote the body for; a route override is keyed by the *client's*
         // route, and says nothing about an upstream that does not follow OpenAI's path convention.
-        let Some(url) = build_url(
-            step,
+        let copilot_host = oauth_tokens
+            .as_ref()
+            .and_then(|t| t.extra_str("copilot_api_host"));
+        let mut url_step = (*step).clone();
+        if step.dialect == Dialect::Copilot {
+            if let Some(host) =
+                copilot_host.filter(|host| host.starts_with("https://") && !host.contains('@'))
+            {
+                url_step.base_url = host.trim_end_matches('/').to_owned();
+            }
+        }
+        let copilot_override = if step.dialect == Dialect::Copilot {
+            dialect_path.as_ref()
+        } else {
             dialect_path
                 .as_ref()
-                .or_else(|| provider.route_overrides.get(route_key(&uri))),
-        ) else {
+                .or_else(|| provider.route_overrides.get(route_key(&uri)))
+        };
+        let Some(url) = build_url(&url_step, copilot_override) else {
             continue;
         };
 
@@ -412,6 +467,7 @@ async fn dispatch(
                 &head,
                 force_stream,
                 dialect_content_type,
+                &oauth_headers,
             ),
             body: outgoing,
             http2: provider.http2,
@@ -646,9 +702,9 @@ fn upstream_headers(
     head: &RequestHead,
     force_stream: bool,
     translated_content_type: Option<&'static str>,
+    oauth_headers: &[(HeaderName, HeaderValue)],
 ) -> HeaderMap {
     let mut map = HeaderMap::with_capacity(provider.headers.len() + 3);
-
     for (name, value) in &provider.headers {
         let (Ok(n), Ok(v)) = (
             HeaderName::from_bytes(name.as_bytes()),
@@ -663,6 +719,9 @@ fn upstream_headers(
     }
 
     apply_auth(&mut map, &step.auth, credential);
+    for (name, value) in oauth_headers {
+        map.insert(name.clone(), value.clone());
+    }
 
     // A translated body is JSON by construction, so the client's content type is dropped for it —
     // forwarding `multipart/form-data` alongside a JSON body would be a lie the upstream acts on.
@@ -1323,6 +1382,7 @@ mod tests {
             &head,
             true,
             None,
+            &[],
         );
         assert_eq!(out.get("accept").unwrap(), "text/event-stream");
     }
@@ -1339,6 +1399,7 @@ mod tests {
             &head,
             false,
             None,
+            &[],
         );
         assert_eq!(
             out.get("x-command-code-version").unwrap(),
@@ -1362,6 +1423,7 @@ mod tests {
             &head,
             false,
             None,
+            &[],
         );
         assert!(!out.contains_key("x-command-code-version"));
     }
@@ -1384,6 +1446,7 @@ mod tests {
             &head,
             false,
             Some("application/json"),
+            &[],
         );
         assert_eq!(out.get("content-type").unwrap(), "application/json");
     }
@@ -1405,6 +1468,7 @@ mod tests {
             &head,
             false,
             None,
+            &[],
         );
         assert_eq!(
             out.get("content-type").unwrap(),
@@ -1514,7 +1578,7 @@ mod tests {
         p.headers.insert("bad header".into(), "value".into());
         let s = step(Dialect::OpenAi, "https://example.com");
         let head = scan_request_head(br#"{"model":"m"}"#);
-        let out = upstream_headers(&p, &s, None, &HeaderMap::new(), &head, false, None);
+        let out = upstream_headers(&p, &s, None, &HeaderMap::new(), &head, false, None, &[]);
         assert!(out.contains_key("good"));
         assert_eq!(out.len(), 1, "the malformed header must not be forwarded");
     }

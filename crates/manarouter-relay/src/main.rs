@@ -172,10 +172,34 @@ fn main() -> anyhow::Result<()> {
             }
         };
 
+        let refresh_vault =
+            Vault::open(mr_core::config::config_dir()).expect("vault was just opened successfully");
+        let refresh_store = Arc::new(mr_core::oauth::refresh::VaultStore::new(refresh_vault));
+        let oauth_refreshers = mr_core::oauth::platforms()
+            .iter()
+            .map(|platform| {
+                (
+                    platform.id().to_owned(),
+                    Arc::new(mr_core::oauth::refresh::Refresher::new(
+                        *platform,
+                        refresh_store.clone(),
+                    )),
+                )
+            })
+            .collect();
+        let oauth_store = match mr_core::store::Store::open(&mr_core::config::database_path()) {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                eprintln!("manarouter-relay: could not open OAuth metadata store: {e}");
+                std::process::exit(2);
+            }
+        };
         let state = AppState {
             relay,
             health: Arc::new(Health::new()),
             vault,
+            oauth_refreshers: Arc::new(oauth_refreshers),
+            oauth_store,
         };
 
         if let Err(e) = server::serve(state, addr).await {

@@ -43,9 +43,11 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::rt::TokioExecutor;
 use mr_core::config::Config;
+use mr_core::oauth::{platform as oauth_platform, session::PollResult};
 use mr_core::secret::{
     account_secret_id, client_key_secret_id, fingerprint, looks_like_a_credential,
 };
+use mr_core::store::OAuthCredentialRecord;
 use mr_core::{
     Account, AccountId, AuthKind, ClientKey, ClientKeyId, Combo, ComboId, Millis, ModelEntry,
     ModelSource, ProviderId,
@@ -82,6 +84,12 @@ pub(crate) fn guarded_router(state: AppState) -> Router<AppState> {
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/password", post(change_password))
+        // --- interactive OAuth ---
+        .route("/api/oauth", get(oauth_platforms))
+        .route("/api/oauth/{platform}/authorize", post(oauth_authorize))
+        .route("/api/oauth/{platform}/device-code", post(oauth_device_code))
+        .route("/api/oauth/sessions/{id}/poll", post(oauth_poll))
+        .route("/api/oauth/sessions/{id}/complete", post(oauth_complete))
         // --- configuration ---
         .route("/api/config", get(get_config).put(put_config))
         .route("/api/config/validate", get(config_validate))
@@ -105,6 +113,7 @@ pub(crate) fn guarded_router(state: AppState) -> Router<AppState> {
         // --- combos, aliases, keys ---
         .route("/api/combos", get(list_combos).post(create_combo))
         .route("/api/combos/{id}", put(update_combo).delete(delete_combo))
+        .route("/api/quota", get(get_quota))
         .route("/api/aliases", get(list_aliases).post(create_alias))
         .route("/api/aliases/{name}", delete(delete_alias))
         .route("/api/keys", get(list_keys).post(create_key))
@@ -261,6 +270,10 @@ impl ApiError {
     }
 
     /// 502/504 for an upstream that refused or never answered during model discovery.
+    fn bad_gateway(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, "oauth_error", message)
+    }
+
     fn upstream(status: StatusCode, message: impl Into<String>) -> Self {
         Self::new(status, "upstream", message)
     }
@@ -1219,6 +1232,321 @@ async fn request_restart(State(state): State<AppState>) -> Json<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// OAuth
+// ---------------------------------------------------------------------------
+
+async fn oauth_platforms() -> Json<Value> {
+    Json(
+        json!({"platforms": mr_core::oauth::platforms().iter().map(|p| json!({
+        "id": p.id(), "label": p.label(), "description": p.description(), "flow": if p.begins_with_loopback() { "browser" } else { "device" }
+    })).collect::<Vec<_>>() }),
+    )
+}
+
+async fn oauth_authorize(
+    State(state): State<AppState>,
+    Path(platform): Path<String>,
+    JsonBody(body): JsonBody,
+) -> ApiResult<Json<Value>> {
+    let body = object_body(body, "OAuth start")?;
+    let provider_id = body
+        .get("provider_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad("missing_provider", "provider_id is required"))?
+        .to_owned();
+    validate_oauth_provider(&state, &provider_id, &platform).await?;
+    let platform = oauth_platform(&platform)
+        .ok_or_else(|| ApiError::not_found("unknown or unavailable OAuth platform"))?;
+    let (id, authorization_url) = state
+        .oauth_sessions
+        .start_browser(platform, provider_id)
+        .await
+        .map_err(ApiError::bad_gateway)?;
+    Ok(Json(
+        json!({"session_id": id, "authorization_url": authorization_url}),
+    ))
+}
+
+async fn oauth_device_code(
+    State(state): State<AppState>,
+    Path(platform): Path<String>,
+    JsonBody(body): JsonBody,
+) -> ApiResult<Json<Value>> {
+    let body = object_body(body, "OAuth device start")?;
+    let provider_id = body
+        .get("provider_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad("missing_provider", "provider_id is required"))?
+        .to_owned();
+    validate_oauth_provider(&state, &provider_id, &platform).await?;
+    let platform = oauth_platform(&platform)
+        .ok_or_else(|| ApiError::not_found("unknown or unavailable OAuth platform"))?;
+    let (id, authorization) = state
+        .oauth_sessions
+        .start_device(platform, provider_id)
+        .await
+        .map_err(ApiError::bad_gateway)?;
+    Ok(Json(
+        json!({"session_id": id, "user_code": authorization.user_code, "verification_uri": authorization.verification_uri,
+        "verification_uri_complete": authorization.verification_uri_complete, "expires_in_seconds": authorization.expires_in.as_secs(), "interval_seconds": authorization.interval.as_secs()}),
+    ))
+}
+
+async fn validate_oauth_provider(
+    state: &AppState,
+    provider_id: &str,
+    platform: &str,
+) -> ApiResult<()> {
+    let config = state.current_config().await;
+    let configured = config
+        .providers
+        .iter()
+        .find(|p| p.id.as_str() == provider_id)
+        .ok_or_else(|| ApiError::not_found("OAuth provider not found"))?;
+    if !matches!(&configured.auth, AuthKind::OAuth { platform: configured_platform } if configured_platform == platform)
+    {
+        return Err(ApiError::bad(
+            "oauth_platform_mismatch",
+            "provider does not use this OAuth platform",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct OAuthFinish {
+    provider_id: String,
+}
+
+async fn oauth_complete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody,
+) -> ApiResult<Json<Value>> {
+    let body: OAuthFinish = serde_json::from_value(body).map_err(|e| {
+        ApiError::bad(
+            "invalid_request",
+            format!("invalid OAuth completion request: {e}"),
+        )
+    })?;
+    let config = state.current_config().await;
+    let configured = config
+        .providers
+        .iter()
+        .find(|p| p.id.as_str() == body.provider_id)
+        .ok_or_else(|| ApiError::not_found("OAuth provider not found"))?;
+    let AuthKind::OAuth { platform } = &configured.auth else {
+        return Err(ApiError::bad(
+            "not_oauth_provider",
+            "provider does not have an available OAuth platform",
+        ));
+    };
+    if oauth_platform(platform).is_none() {
+        return Err(ApiError::bad(
+            "oauth_unavailable",
+            "provider OAuth platform is unavailable",
+        ));
+    }
+    state
+        .oauth_sessions
+        .validate_binding(&id, &body.provider_id, platform)
+        .await
+        .map_err(|message| ApiError::bad("oauth_session_mismatch", message))?;
+    let (tokens, identity) = state
+        .oauth_sessions
+        .finish_browser(&id, &body.provider_id)
+        .await
+        .map_err(ApiError::bad_gateway)?;
+    let provider = configured.clone();
+    drop(config);
+    let account = persist_oauth_account(&state, &provider, tokens, identity).await?;
+    state
+        .oauth_sessions
+        .acknowledge(&id, &body.provider_id)
+        .await
+        .map_err(|message| {
+            ApiError::internal(format!("OAuth session cleanup failed: {message}"))
+        })?;
+    Ok(Json(json!({"account": account})))
+}
+
+async fn oauth_poll(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody,
+) -> ApiResult<Json<Value>> {
+    let body: OAuthFinish = serde_json::from_value(body).map_err(|e| {
+        ApiError::bad(
+            "invalid_request",
+            format!("invalid OAuth poll request: {e}"),
+        )
+    })?;
+    let config = state.current_config().await;
+    let configured = config
+        .providers
+        .iter()
+        .find(|p| p.id.as_str() == body.provider_id)
+        .ok_or_else(|| ApiError::not_found("OAuth provider not found"))?;
+    let AuthKind::OAuth { platform } = &configured.auth else {
+        return Err(ApiError::bad(
+            "not_oauth_provider",
+            "provider does not have an available OAuth platform",
+        ));
+    };
+    if oauth_platform(platform).is_none() {
+        return Err(ApiError::bad(
+            "oauth_unavailable",
+            "provider OAuth platform is unavailable",
+        ));
+    }
+    state
+        .oauth_sessions
+        .validate_binding(&id, &body.provider_id, platform)
+        .await
+        .map_err(|message| ApiError::bad("oauth_session_mismatch", message))?;
+    match state
+        .oauth_sessions
+        .poll_device(&id, &body.provider_id)
+        .await
+        .map_err(ApiError::bad_gateway)?
+    {
+        PollResult::Pending {
+            retry_after_seconds,
+        } => Ok(Json(
+            json!({"status":"pending", "retry_after_seconds": retry_after_seconds}),
+        )),
+        PollResult::SlowDown { interval_seconds } => Ok(Json(
+            json!({"status":"slow-down", "interval_seconds": interval_seconds}),
+        )),
+        PollResult::Failed { message } => Ok(Json(json!({"status":"failed", "message": message}))),
+        PollResult::Complete { tokens, identity } => {
+            let provider = configured.clone();
+            drop(config);
+            let account = persist_oauth_account(&state, &provider, tokens, identity).await?;
+            state
+                .oauth_sessions
+                .acknowledge(&id, &body.provider_id)
+                .await
+                .map_err(|message| {
+                    ApiError::internal(format!("OAuth session cleanup failed: {message}"))
+                })?;
+            Ok(Json(json!({"status":"complete", "account": account})))
+        }
+    }
+}
+
+async fn persist_oauth_account(
+    state: &AppState,
+    provider_snapshot: &mr_core::model::Provider,
+    tokens: mr_core::oauth::TokenSet,
+    identity: mr_core::oauth::AccountIdentity,
+) -> ApiResult<Value> {
+    let _mutation = state.mutation_lock.lock().await;
+    let provider_id = provider_snapshot.id.as_str();
+    let mut config = state.current_config().await;
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|p| p.id.as_str() == provider_id)
+        .ok_or_else(|| ApiError::not_found(format!("no provider with id {provider_id}")))?;
+    if provider.auth != provider_snapshot.auth {
+        return Err(ApiError::conflict(
+            "provider OAuth configuration changed during authorization; start again",
+        ));
+    }
+    let AuthKind::OAuth { platform } = &provider.auth else {
+        return Err(ApiError::bad(
+            "not_oauth_provider",
+            "provider is not configured for OAuth",
+        ));
+    };
+    if oauth_platform(platform).is_none() {
+        return Err(ApiError::bad(
+            "oauth_unavailable",
+            "provider OAuth platform is not implemented",
+        ));
+    }
+    if let Some(existing) = provider.accounts.iter().find(|account| {
+        account.identity.as_deref() == identity.email.as_deref() && identity.email.is_some()
+    }) {
+        if let Some(existing_ref) = existing.oauth_ref.as_ref() {
+            if let Ok(Some(existing_record)) = state.store.get_oauth_credential(existing_ref) {
+                let mut tx = VaultTx::default();
+                let serialized = serde_json::to_string(&tokens).map_err(|e| {
+                    ApiError::internal(format!("OAuth tokens could not be encoded: {e}"))
+                })?;
+                state
+                    .tx_put(&mut tx, &existing_record.vault_ref, &serialized)
+                    .await
+                    .map_err(ApiError::internal)?;
+                let mut record = existing_record;
+                record.label = identity.label.clone();
+                record.scopes = tokens.scopes.clone();
+                record.expires_at = (tokens.expires_at.0 > 0).then_some(tokens.expires_at);
+                if let Err(error) = state.store.put_oauth_credential(&record, Millis::now()) {
+                    state.tx_rollback(tx).await;
+                    return Err(ApiError::internal(format!(
+                        "OAuth credential metadata could not be saved: {error}"
+                    )));
+                }
+                return Ok(
+                    json!({"id": existing.id, "label": existing.label, "identity": existing.identity, "oauth_ref": existing.oauth_ref}),
+                );
+            }
+        }
+    }
+    let oauth_ref = mr_core::OAuthCredentialId::generate();
+    let vault_ref = format!("provider/{provider_id}/oauth/{}", oauth_ref.as_str());
+    let mut tx = VaultTx::default();
+    let serialized = serde_json::to_string(&tokens)
+        .map_err(|e| ApiError::internal(format!("OAuth tokens could not be encoded: {e}")))?;
+    state
+        .tx_put(&mut tx, &vault_ref, &serialized)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut record = OAuthCredentialRecord::new(platform, vault_ref.clone())
+        .with_label(identity.label.clone())
+        .with_scopes(tokens.scopes.clone());
+    record.id = oauth_ref.clone();
+    if tokens.expires_at.0 > 0 {
+        record.expires_at = Some(tokens.expires_at);
+    }
+    if let Err(error) = state.store.put_oauth_credential(&record, Millis::now()) {
+        state.tx_rollback(tx).await;
+        return Err(ApiError::internal(format!(
+            "OAuth credential metadata could not be saved: {error}"
+        )));
+    }
+    let account_id = AccountId::generate();
+    let account = Account {
+        id: account_id.clone(),
+        label: Some(identity.label.clone()),
+        identity: identity.email.clone(),
+        secret_ref: None,
+        oauth_ref: Some(oauth_ref.clone()),
+        priority: 0,
+        weight: 0,
+        enabled: true,
+        max_concurrent: 0,
+        models_allow: Vec::new(),
+        models_deny: Vec::new(),
+        quota: Vec::new(),
+        extra: Default::default(),
+    };
+    provider.accounts.push(account.clone());
+    if let Err(error) = state.commit(config).await {
+        state.tx_rollback(tx).await;
+        let _ = state
+            .store
+            .delete_oauth_credential(&oauth_ref, Millis::now());
+        return Err(error.into());
+    }
+    Ok(
+        json!({"id": account.id, "label": account.label, "identity": account.identity, "oauth_ref": account.oauth_ref}),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Providers
 // ---------------------------------------------------------------------------
 
@@ -1563,6 +1891,14 @@ async fn delete_account(
     // After the commit, so a rejected edit can never have destroyed the credential.
     if let Some(vault_id) = removed.secret_ref {
         state.delete_secret(&vault_id).await;
+    }
+    if let Some(oauth_id) = removed.oauth_ref {
+        if let Ok(Some(record)) = state.store.get_oauth_credential(&oauth_id) {
+            let _ = state
+                .store
+                .delete_oauth_credential(&oauth_id, Millis::now());
+            state.delete_secret(&record.vault_ref).await;
+        }
     }
     Ok(Json(json!({"deleted": account_id})))
 }
@@ -2090,6 +2426,55 @@ async fn delete_combo(
 // ---------------------------------------------------------------------------
 // Aliases
 // ---------------------------------------------------------------------------
+
+/// Observed usage per account, over all recorded time.
+///
+/// A bare JSON array, because that is the shape the panel tables. Each row carries its provider id
+/// as well as its account id so the panel does not have to join anything to say where a number came
+/// from.
+///
+/// The window is `[0, now)`, which is every row ever recorded. Deliberately not "the current billing
+/// period": the store records when a request *happened*, and a window is a property of a provider's
+/// plan, which this process cannot infer. A caller that wants a narrower window can add one; a
+/// caller given a silently narrower one would read a partial sum as a total.
+async fn get_quota(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let groups = state
+        .store
+        .usage_by_account(Millis(0), Millis(mr_core::ids::now_millis()))
+        .map_err(|e| ApiError::internal(format!("could not read recorded usage: {e}")))?;
+
+    // Account id to provider id, built once. An account whose provider was deleted since the traffic
+    // was recorded still gets a row — the usage is real even when the owner is gone, and dropping it
+    // would make the totals disagree with the traffic that actually happened.
+    let config = state.current_config().await;
+    let mut owner = std::collections::BTreeMap::new();
+    for provider in &config.providers {
+        for account in &provider.accounts {
+            owner.insert(
+                account.id.as_str().to_owned(),
+                provider.id.as_str().to_owned(),
+            );
+        }
+    }
+
+    let rows: Vec<Value> = groups
+        .into_iter()
+        .map(|group| {
+            let t = group.totals;
+            json!({
+                "account": group.key,
+                "provider": owner.get(&group.key).cloned().unwrap_or_else(|| "(removed)".to_owned()),
+                "requests": t.requests,
+                "prompt_tokens": t.prompt_tokens,
+                "completion_tokens": t.completion_tokens,
+                "total_duration_ms": t.total_duration_ms,
+                "max_duration_ms": t.max_duration_ms,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!(rows)))
+}
 
 async fn list_aliases(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let config = state.current_config().await;

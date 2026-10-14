@@ -294,7 +294,8 @@ impl CredentialStore for VaultStore {
         // A poisoned mutex means *some* holder panicked while holding it; the vault data
         // itself is unaffected (writes are atomic temp+rename), so recovering is safe — and
         // panicking here would abort the process anyway (`panic = "abort"`).
-        let vault: &Vault = &lock_std(&self.vault);
+        let mut vault = lock_std(&self.vault);
+        vault.reload_from_disk()?;
         match vault.get(key)? {
             None => Ok(None),
             Some(raw) => {

@@ -235,16 +235,9 @@ mod tests {
 
     #[test]
     fn tiers_are_selectable_but_only_ide_is_registered() {
-        let registered = crate::oauth::platform(Antigravity::ID).expect("antigravity registered");
-        // The catalogue ships the Antigravity (T2) identity: the registry entry must be the
-        // `IDE` static itself, so the registered platform speaks as T2, not as gemini-cli.
-        // Compared by data address — `ptr::eq` on the fat pointers would additionally require
-        // identical vtables, and codegen units are allowed to duplicate those.
-        let registered_data = registered as *const dyn OAuthPlatform as *const ();
-        let ide_data = &IDE as *const dyn OAuthPlatform as *const ();
-        assert_eq!(
-            registered_data, ide_data,
-            "registry must serve antigravity::IDE"
+        assert!(
+            crate::oauth::platform(Antigravity::ID).is_none(),
+            "incomplete Antigravity protocol must not be advertised as working"
         );
         assert_eq!(IDE.tier(), "ide");
         assert_eq!(Antigravity::gemini_cli().tier(), "gemini-cli");
