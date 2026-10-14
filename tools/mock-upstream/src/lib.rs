@@ -4,7 +4,8 @@
 //! network, credentials or spend: it must answer `/v1/chat/completions`, optionally stream, be
 //! able to stall (so the hedged race and the TTFB timeout have something to race against), and be
 //! able to fail with a rate-limit answer a client will believe (so retry and account-fallback
-//! paths can be exercised end to end).
+//! paths can be exercised end to end). It also serves a minimal CommandCode-style `/alpha/generate`
+//! stream, so the relay's OpenAI-to-CommandCode adapter can be tested without the private service.
 //!
 //! This crate is **detached from the workspace** (its own `[workspace]` table in `Cargo.toml`) so
 //! that a fixture can never break `cargo check --workspace`, and a fixture dependency bump can
@@ -22,7 +23,13 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod faults;
+pub use faults::{ErrorBody, Fault, FaultPatch};
+
+const DEFAULT_CONTENT: &str = "Hello from mock-upstream.";
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -110,9 +117,10 @@ where
     // the cursor would also borrow it for the rest of the loop body.
     macro_rules! value {
         ($flag:literal) => {{
-            let v = args.get(i).cloned().ok_or_else(|| {
-                Exit::Usage(format!("{} needs a value\n{USAGE}", $flag))
-            })?;
+            let v = args
+                .get(i)
+                .cloned()
+                .ok_or_else(|| Exit::Usage(format!("{} needs a value\n{USAGE}", $flag)))?;
             i += 1;
             v
         }};
@@ -138,7 +146,9 @@ where
             "--delay" => {
                 let v = value!("--delay");
                 let ms = v.parse::<u64>().map_err(|_| {
-                    Exit::Usage(format!("--delay: {v:?} is not a millisecond count\n{USAGE}"))
+                    Exit::Usage(format!(
+                        "--delay: {v:?} is not a millisecond count\n{USAGE}"
+                    ))
                 })?;
                 opts.delay = Duration::from_millis(ms);
             }
@@ -146,7 +156,9 @@ where
             "--retry-after" => {
                 let v = value!("--retry-after");
                 opts.retry_after_secs = v.parse::<u64>().map_err(|_| {
-                    Exit::Usage(format!("--retry-after: {v:?} is not a second count\n{USAGE}"))
+                    Exit::Usage(format!(
+                        "--retry-after: {v:?} is not a second count\n{USAGE}"
+                    ))
                 })?;
             }
             "--die-after" => {
@@ -165,35 +177,131 @@ where
 pub struct Mock {
     /// How to behave, as parsed from the command line.
     pub opts: Options,
+    /// Mutable process-wide fault; request-local patches never modify it.
+    fault: RwLock<Fault>,
     /// Monotonic id suffix, so two responses in one test are distinguishable.
     seq: AtomicU64,
 }
 
 impl Mock {
     fn new(opts: Options) -> Self {
+        let mut fault = Fault::default();
+        fault.delay_ms = opts.delay.as_millis().min(u64::MAX as u128) as u64;
+        if opts.fail {
+            fault.status = StatusCode::TOO_MANY_REQUESTS.as_u16();
+            fault.retry_after_secs = opts.retry_after_secs;
+        }
+        fault.fail_after_chunks = opts.die_after;
         Self {
             opts,
+            fault: RwLock::new(fault),
             seq: AtomicU64::new(1),
         }
+    }
+
+    fn current_fault(&self, headers: &HeaderMap) -> Fault {
+        let base = self.fault.read().unwrap_or_else(|e| e.into_inner()).clone();
+        headers
+            .get("x-mock-fault")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| serde_json::from_str::<FaultPatch>(v).ok())
+            .map(|patch| base.merge(&patch))
+            .unwrap_or(base)
+    }
+
+    fn update_fault(&self, patch: FaultPatch) -> Fault {
+        let mut fault = self.fault.write().unwrap_or_else(|e| e.into_inner());
+        *fault = fault.merge(&patch);
+        fault.clone()
     }
 }
 
 /// Build the route table.
 ///
-/// Three routes only. Anything else gets axum's 404, which is the honest answer from a provider
-/// that does not implement the endpoint — a relay bug that forwards to a path no upstream serves
-/// should surface as a 404 here, not as a plausible-looking success.
+/// Provider routes plus a deliberately separate fault-control endpoint.
 pub fn app(opts: Options) -> Router {
-    let mock = std::sync::Arc::new(Mock::new(opts));
+    let mock = Arc::new(Mock::new(opts));
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/alpha/generate", post(commandcode_generate))
         .route("/v1/models", get(models))
         .route("/healthz", get(healthz))
+        .route("/__control", post(control))
         .with_state(mock)
+}
+
+/// Apply a process-wide partial fault patch and return the resulting complete configuration.
+async fn control(State(mock): State<Arc<Mock>>, body: Bytes) -> Response {
+    let patch: FaultPatch = match serde_json::from_slice(&body) {
+        Ok(patch) => patch,
+        Err(err) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("invalid fault patch: {err}")}),
+            )
+        }
+    };
+    json_response(
+        StatusCode::OK,
+        serde_json::to_value(mock.update_fault(patch))
+            .unwrap_or_else(|_| json!({"error":"serialization failed"})),
+    )
 }
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// Minimal CommandCode-compatible SSE stream for exercising the relay's dialect adapter.
+async fn commandcode_generate(
+    State(mock): State<Arc<Mock>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fault = mock.current_fault(&headers);
+    let _sequence = mock.seq.fetch_add(1, Ordering::Relaxed);
+    let _model = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("params")?
+                .get("model")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "mock-model".to_owned());
+    if fault.forces_error() {
+        let status = StatusCode::from_u16(fault.effective_status())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let envelope = faults::error_envelope(
+            fault.error_body.resolve(),
+            status.as_u16(),
+            fault.content_or_default(),
+            fault.retry_after_secs,
+        );
+        return json_response(
+            status,
+            serde_json::from_str(&envelope)
+                .unwrap_or_else(|_| json!({"success":false,"error":{"message":"invalid configured error envelope"}})),
+        );
+    }
+    if fault.ttfb_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(fault.ttfb_ms)).await;
+    }
+    let content = fault.content_or_default();
+    let frames = [
+        json!({"type":"text-delta","text":content}),
+        json!({"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":16,"outputTokens":8}}),
+    ];
+    let stream = futures_util::stream::iter(frames.into_iter().map(|event| {
+        Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {}\n\n", event)))
+    }));
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert("content-type", "text/event-stream".parse().unwrap());
+    response
 }
 
 /// The model list, in OpenAI's shape.
@@ -212,36 +320,37 @@ async fn models(State(_): State<std::sync::Arc<Mock>>) -> Response {
 /// The whole point of the crate: an OpenAI-shaped chat completion, optionally streamed, with the
 /// latency and failure knobs applied.
 async fn chat_completions(
-    State(mock): State<std::sync::Arc<Mock>>,
+    State(mock): State<Arc<Mock>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // Delay first, so `--delay --fail` behaves like a slow rate-limited provider rather than like
-    // a fast one. The hedge window measures TTFB, and TTFB is what this sleeps.
-    if !mock.opts.delay.is_zero() {
-        tokio::time::sleep(mock.opts.delay).await;
+    let fault = mock.current_fault(&headers);
+    if fault.delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(fault.delay_ms)).await;
     }
-
-    if mock.opts.fail {
-        let mut resp = json_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            json!({
-                "error": {
-                    "message": "mock-upstream: injected failure (--fail)",
-                    "type": "rate_limit_error",
-                    "code": "rate_limit_exceeded",
-                    "param": null,
-                }
-            }),
+    if fault.forces_error() {
+        let status = StatusCode::from_u16(fault.effective_status())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let envelope = faults::error_envelope(
+            fault.error_body.resolve(),
+            status.as_u16(),
+            fault.content_or_default(),
+            fault.retry_after_secs,
         );
-        // `retry-after` is what the relay's rate-limit signal extraction and any client-side
-        // backoff look for; a 429 without it forces those paths to guess.
-        if let Ok(v) = mock.opts.retry_after_secs.to_string().parse() {
-            resp.headers_mut().insert("retry-after", v);
+        let mut resp = json_response(
+            status,
+            serde_json::from_str(&envelope).unwrap_or_else(
+                |_| json!({"error":{"message":"invalid configured error envelope"}}),
+            ),
+        );
+        if fault.retry_after_secs > 0 {
+            if let Ok(v) = fault.retry_after_secs.to_string().parse() {
+                resp.headers_mut().insert("retry-after", v);
+            }
         }
         attach_echo_headers(resp, &headers, body.len())
     } else {
-        respond(&mock, &headers, body)
+        respond(&mock, &headers, body, fault)
     }
 }
 
@@ -250,7 +359,7 @@ async fn chat_completions(
 /// A body that is not JSON is answered with a 400 in the upstream's own error shape: that is what
 /// a real provider does, and a relay test that accidentally forwards garbage should see a
 /// plausible upstream rejection rather than a mock-specific one.
-fn respond(mock: &Mock, headers: &HeaderMap, body: Bytes) -> Response {
+fn respond(mock: &Mock, headers: &HeaderMap, body: Bytes, fault: Fault) -> Response {
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -280,17 +389,14 @@ fn respond(mock: &Mock, headers: &HeaderMap, body: Bytes) -> Response {
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let id = format!(
-        "chatcmpl-mock-{}",
-        mock.seq.fetch_add(1, Ordering::Relaxed)
-    );
+    let id = format!("chatcmpl-mock-{}", mock.seq.fetch_add(1, Ordering::Relaxed));
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
     let resp = if wants_stream {
-        sse_response(mock, &id, model, created)
+        sse_response(mock, &id, model, created, &fault)
     } else {
         json_response(
             StatusCode::OK,
@@ -301,8 +407,8 @@ fn respond(mock: &Mock, headers: &HeaderMap, body: Bytes) -> Response {
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "message": { "role": "assistant", "content": "Hello from mock-upstream." },
-                    "finish_reason": "stop",
+                    "message": if fault.include_tool_call { json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_mock","type":"function","function":{"name":"mock_tool","arguments":"{}"}}]}) } else { json!({"role":"assistant","content":fault.content_or_default()}) },
+                    "finish_reason": if fault.include_tool_call { "tool_calls" } else { "stop" },
                     "logprobs": null,
                 }],
                 "usage": { "prompt_tokens": 16, "completion_tokens": 8, "total_tokens": 24 },
@@ -321,7 +427,7 @@ fn respond(mock: &Mock, headers: &HeaderMap, body: Bytes) -> Response {
 }
 
 /// An SSE completion whose frames can be cut short by `--die-after`.
-fn sse_response(mock: &Mock, id: &str, model: &str, created: u64) -> Response {
+fn sse_response(_mock: &Mock, id: &str, model: &str, created: u64, fault: &Fault) -> Response {
     let chunk = |delta: Value, finish: Value| -> String {
         format!(
             "data: {}\n\n",
@@ -335,15 +441,18 @@ fn sse_response(mock: &Mock, id: &str, model: &str, created: u64) -> Response {
         )
     };
 
+    if fault.ttfb_ms > 0 {
+        std::thread::sleep(Duration::from_millis(fault.ttfb_ms));
+    }
+    let content = fault.content_or_default();
     let mut frames: Vec<String> = vec![
         chunk(json!({ "role": "assistant", "content": "" }), Value::Null),
-        chunk(json!({ "content": "Hello from " }), Value::Null),
-        chunk(json!({ "content": "mock-upstream." }), Value::Null),
+        chunk(json!({ "content": content }), Value::Null),
         chunk(json!({}), json!("stop")),
         "data: [DONE]\n\n".to_string(),
     ];
 
-    let die = mock.opts.die_after;
+    let die = fault.fail_after_chunks;
     let dying = die > 0 && die <= frames.len();
     if dying {
         frames.truncate(die);
@@ -563,7 +672,10 @@ mod tests {
     /// truncated stream (the mid-answer death fault) simply stops mid-chunk, so the decoder stops
     /// with it instead of requiring a terminating zero chunk.
     fn dechunk(head: &str, body: &str) -> String {
-        if !head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        if !head
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
             return body.to_string();
         }
         let data = body.as_bytes();
@@ -591,9 +703,46 @@ mod tests {
                 _ => break,
             };
             out.extend_from_slice(&data[start..end]);
-            pos = if end + 2 <= data.len() { end + 2 } else { data.len() };
+            pos = if end + 2 <= data.len() {
+                end + 2
+            } else {
+                data.len()
+            };
         }
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[tokio::test]
+    async fn control_endpoint_changes_process_default_and_header_overrides_one_request() {
+        let addr = spawn(Options::default()).await;
+        let patch = r#"{"content":"controlled answer"}"#;
+        let response = send(addr, &format!(
+            "POST /__control HTTP/1.1\r\nhost: mock\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            patch.len(), patch
+        )).await;
+        let (head, body) = split_response(&response);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(body.contains("controlled answer"), "{body}");
+
+        let response = send(addr, &chat_request(r#"{"model":"m"}"#, "")).await;
+        let (_, body) = split_response(&response);
+        assert!(body.contains("controlled answer"), "{body}");
+
+        let override_patch = r#"{"content":"one request only"}"#;
+        let response = send(
+            addr,
+            &chat_request(
+                r#"{"model":"m"}"#,
+                &format!("x-mock-fault: {}\r\n", override_patch),
+            ),
+        )
+        .await;
+        let (_, body) = split_response(&response);
+        assert!(body.contains("one request only"), "{body}");
+
+        let response = send(addr, &chat_request(r#"{"model":"m"}"#, "")).await;
+        let (_, body) = split_response(&response);
+        assert!(body.contains("controlled answer"), "{body}");
     }
 
     #[tokio::test]
@@ -709,7 +858,10 @@ mod tests {
         // Two data frames made it; the terminator and [DONE] did not — the connection died, which
         // is what the relay's mid-stream failure paths need to observe.
         assert!(!body.contains("[DONE]"), "body was {body}");
-        assert!(!body.contains("\"finish_reason\":\"stop\""), "body was {body}");
+        assert!(
+            !body.contains("\"finish_reason\":\"stop\""),
+            "body was {body}"
+        );
         let frames = body.matches("data: ").count();
         assert_eq!(frames, 2, "body was {body}");
     }

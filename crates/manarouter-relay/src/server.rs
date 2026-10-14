@@ -417,7 +417,8 @@ async fn dispatch(
             http2: provider.http2,
             connect_timeout: Duration::from_millis(step.connect_timeout_ms),
             ttfb_timeout: Duration::from_millis(step.ttfb_timeout_ms),
-            total_timeout: Some(Duration::from_millis(step.total_timeout_ms)),
+            total_timeout: (step.total_timeout_ms > 0)
+                .then(|| Duration::from_millis(step.total_timeout_ms)),
         };
 
         match app.relay.upstream().send(request).await {
