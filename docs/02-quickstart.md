@@ -294,12 +294,26 @@ client that insists on one form can still talk to the surface that normally uses
 
 ## 8. Start it and open the panel
 
-Two processes, two terminals (or two unit files):
+For manual startup, run the panel/control plane and router/API relay as two processes:
 
 ```bash
 ./target/release/manarouter-conductor     # control plane, panel on :20901
 ./target/release/manarouter-relay         # data plane, traffic on :20900
 ```
+
+On Linux, the repository installer can instead install both as systemd user services:
+
+```bash
+# In a local repository checkout:
+./installer.sh --from-checkout --systemd-user
+
+# For an installed checkout, update then restart both units:
+~/.local/share/manarouter/source/installer.sh --systemd-user
+
+The installer builds release binaries, installs the user units, enables them, and starts/restarts
+both. Use `systemctl --user status manarouter-conductor manarouter-relay` and
+`journalctl --user -u manarouter-conductor -u manarouter-relay -f` to inspect them. For the user
+services to remain active when logged out, enable lingering with `loginctl enable-linger "$USER"`.
 
 The conductor must run first in the intended design: it owns `config.json` and compiles the snapshot
 the relay loads. The relay's load path treats a missing snapshot as a cold start rather than a fatal

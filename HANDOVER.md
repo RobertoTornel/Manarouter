@@ -253,10 +253,7 @@ ship, 17 excluded — 6 of those because cookie auth is forbidden by decision Q6
   in a fresh clone.
 - **One writer per file.** Committing into a file whose author was still writing added a
   duplicate `impl` and broke the build.
-- **The secrets scanner matches `sk_` followed by 17+ identifier characters.** A test named
-  `mask_reveals_nothing_for_a_short_secret` matched, via the `sk_` inside `mask_`. Renaming
-  is the fix; a marker comment cannot be used there, because `rustfmt` moves a comment after
-  an opening brace into the block.
+- **The secrets scanner matches a provider-key prefix followed by 17+ identifier characters.** A test name containing that prefix as part of a longer word triggered it. Renaming is the fix; a marker comment cannot be used there, because `rustfmt` moves a comment after an opening brace into the block.
 - **US privacy constraint (decision Q6): never support cookie auth, at all.**
 
 ---

@@ -89,6 +89,20 @@ instruction, open a new terminal, and check the install:
 mr --help
 ```
 
+On Linux with systemd, install both the web panel/control plane (conductor) and the API router
+(relay) as user services with:
+
+```bash
+~/.local/share/manarouter/source/installer.sh --systemd-user
+```
+
+When installing directly from the repository checkout, use `./installer.sh --from-checkout --systemd-user`. Adding `--no-start` installs the units without enabling or starting them.
+The installer enables and starts `manarouter-conductor.service` and `manarouter-relay.service`;
+updates with those options rebuild the binaries and restart both services. Check them with
+`systemctl --user status manarouter-conductor manarouter-relay`, and logs with
+`journalctl --user -u manarouter-conductor -u manarouter-relay -f`. To keep them running after logout
+or on boot without a login session, enable user lingering with `loginctl enable-linger "$USER"`.
+
 ### Add a provider and your upstream key
 
 For example, to connect an OpenAI-compatible provider:
@@ -184,7 +198,7 @@ For humans:
 | [The hedged race](docs/07-hedged-race.md) | The eligibility gate, in detail |
 | [Quota tracking](docs/08-quota-tracking.md) | Signals, windows, cooldowns |
 | [Reset-aware priority](docs/09-reset-aware-priority.md) | Demote, never remove |
-| [OAuth](docs/10-oauth-overview.md) · [Codex](docs/11-oauth-codex.md) · [Antigravity](docs/12-oauth-antigravity.md) · [Copilot](docs/13-oauth-copilot.md) · [Adding a platform](docs/14-oauth-adding-a-platform.md) | Logins |
+| [OAuth](docs/10-oauth-overview.md) · [Codex](docs/11-oauth-codex.md) · [Antigravity](docs/12-oauth-antigravity.md) · [Copilot](docs/13-oauth-copilot.md) · [Adding a platform](docs/14-oauth-adding-a-platform.md) · [OmniRoute OAuth parity and client-key rotation](docs/oauth-omniroute-parity.md) | Logins and key management |
 | [Web panel](docs/15-web-panel.md) | Views, API and design |
 | [Latency engineering](docs/16-latency-engineering.md) | Every decision, and the rejected ones |
 | [Migrating from OmniRoute](docs/17-migrating-from-omniroute.md) | Providers, combos, credentials |

@@ -7,8 +7,9 @@
 //! |--------------------|----------------------|-----------------------------------|
 //! | `openai-codex`     | [`codex::Codex`]     | loopback authorization code + PKCE (S256) |
 //! | `github-copilot`   | [`copilot::Copilot`] | GitHub device code                |
-//! | `antigravity`      | not registered       | protocol implementation incomplete (Google) |
+//! | `antigravity`      | [`antigravity::Antigravity`] | loopback authorization code (T2 experimental, T1 selectable) |
 //! | `cline`            | not registered       | no verified interactive flow      |
+//! | OmniRoute additional providers | not ported | provider-specific review required |
 //!
 //! ## Rules this module exists to enforce
 //!
@@ -497,8 +498,33 @@ pub trait OAuthPlatform: Send + Sync {
     /// success. Implementations must not persist on their own.
     async fn refresh(&self, refresh_token: &str) -> Result<TokenSet>;
 
+    /// Refresh with access to the prior provider context. The default delegates to `refresh`;
+    /// implementations that bind durable account metadata may preserve only approved fields.
+    async fn refresh_with_context(
+        &self,
+        refresh_token: &str,
+        _previous: &TokenSet,
+    ) -> Result<TokenSet> {
+        self.refresh(refresh_token).await
+    }
+
     /// Resolve a token set to the human/account it belongs to (multi-account identity).
     async fn account_identity(&self, tokens: &TokenSet) -> Result<AccountIdentity>;
+
+    /// Fetch provider-owned post-login metadata before credentials are persisted. Most OAuth
+    /// platforms have no such step; Google Code Assist uses this for project onboarding.
+    async fn complete_login(&self, _tokens: &mut TokenSet) -> Result<()> {
+        Ok(())
+    }
+
+    /// Test seam for deterministic protocol tests; production implementations may use shared HTTP.
+    async fn complete_login_with(
+        &self,
+        tokens: &mut TokenSet,
+        _http: &dyn flow::OAuthHttp,
+    ) -> Result<()> {
+        self.complete_login(tokens).await
+    }
 
     /// Credential-derived request headers (the bearer plus provider-specific identity headers).
     ///
@@ -545,14 +571,16 @@ pub trait OAuthPlatform: Send + Sync {
 
 // The registry. Each platform type carries its own `pub const ID` (see the trait docs); the
 // statics below exist so `platforms()` can hand out `&'static dyn OAuthPlatform`.
+use antigravity::Antigravity;
 use codex::Codex;
 use copilot::Copilot;
 
 static CODEX: Codex = Codex;
 static COPILOT: Copilot = Copilot;
+static ANTIGRAVITY: Antigravity = Antigravity::ide();
 
-/// Registration order for complete and supported implementations, matching `catalog/providers.toml`.
-static PLATFORMS: [&'static dyn OAuthPlatform; 2] = [&CODEX, &COPILOT];
+/// Registration order for implemented platforms, matching `catalog/providers.toml`.
+static PLATFORMS: [&'static dyn OAuthPlatform; 3] = [&CODEX, &COPILOT, &ANTIGRAVITY];
 
 /// Every registered platform. Required to resolve every `AuthKind::OAuth` catalogue id — see
 /// the tests at the bottom of this file, which check both directions.
@@ -575,7 +603,9 @@ mod tests {
     /// Providers whose catalogue note admits the platform is not implemented in this build.
     /// Each such entry must say so in its own note — an undocumented gap would silently route
     /// an operator into a login that cannot exist.
-    const NOT_IMPLEMENTED: &[&str] = &["antigravity", "cline"];
+    // Catalog targets intentionally withheld pending vendor flow validation; see
+    // docs/oauth-omniroute-parity.md for the broader OmniRoute inventory.
+    const NOT_IMPLEMENTED: &[&str] = &["cline"];
     const NON_INTERACTIVE: &[&str] = &["xai"];
 
     fn oauth_platform_ids() -> Vec<String> {
@@ -676,8 +706,10 @@ mod tests {
             platform("github-copilot").unwrap().refresh_lead(),
             Duration::from_secs(300)
         );
-        // The incomplete Antigravity implementation is intentionally not registered.
-        assert!(platform("antigravity").is_none());
+        assert_eq!(
+            platform("antigravity").unwrap().refresh_lead(),
+            Duration::from_secs(60)
+        );
     }
 
     #[test]
@@ -727,7 +759,7 @@ mod tests {
         assert_eq!(ports.candidates(), vec![1455, 1457]);
         assert_eq!(ports.path, "/auth/callback");
 
-        assert!(platform("antigravity").is_none());
+        assert!(platform("antigravity").is_some());
 
         let copilot = platform("github-copilot").unwrap();
         assert!(!copilot.begins_with_loopback());
@@ -748,7 +780,7 @@ mod tests {
             ports.redirect_uri(1457),
             "http://127.0.0.1:1457/auth/callback"
         );
-        assert!(platform("antigravity").is_none());
+        assert!(platform("antigravity").is_some());
     }
 
     #[tokio::test]

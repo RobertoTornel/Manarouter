@@ -14,8 +14,6 @@
 //!   self-contained HTML page and never echoes the code back to the browser.
 
 use std::io;
-use std::net::Ipv4Addr;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -30,6 +28,7 @@ use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::rt::TokioExecutor;
 use rand::rngs::OsRng;
 use rand::RngCore as _;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -165,6 +164,47 @@ pub struct Http {
     client: HttpsClient,
 }
 
+/// Transport seam used by OAuth protocols and deterministic unit tests.
+#[async_trait::async_trait]
+pub trait OAuthHttp: Send + Sync {
+    async fn post_form(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        pairs: &[(&str, &str)],
+    ) -> Result<HttpReply>;
+    async fn post_json(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: String,
+    ) -> Result<HttpReply>;
+    async fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpReply>;
+}
+
+#[async_trait::async_trait]
+impl OAuthHttp for Http {
+    async fn post_form(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        pairs: &[(&str, &str)],
+    ) -> Result<HttpReply> {
+        Http::post_form(self, url, headers, pairs).await
+    }
+    async fn post_json(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: String,
+    ) -> Result<HttpReply> {
+        Http::post_json(self, url, headers, body).await
+    }
+    async fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpReply> {
+        Http::get(self, url, headers).await
+    }
+}
+
 impl Http {
     /// Build the client. The webpki roots are loaded once per process — they never change.
     pub fn new() -> Result<Self> {
@@ -191,7 +231,7 @@ impl Http {
 
     /// The process-wide instance, built on first use.
     pub fn shared() -> Result<&'static Http> {
-        static HTTP: OnceLock<Http> = OnceLock::new();
+        static HTTP: std::sync::OnceLock<Http> = std::sync::OnceLock::new();
         if let Some(existing) = HTTP.get() {
             return Ok(existing);
         }
@@ -401,15 +441,22 @@ pub struct Loopback {
     port: u16,
 }
 
+async fn bind_dual_stack_localhost(port: u16) -> io::Result<TcpListener> {
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(false)?;
+    socket.set_nonblocking(true)?;
+    let address = std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, port, 0, 0);
+    socket.bind(&address.into())?;
+    socket.listen(128)?;
+    let listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(listener)
+}
+
 impl Loopback {
     /// Bind the platform's redirect ports **in order**, first one that accepts wins.
     ///
-    /// The host is always `127.0.0.1` for the *socket*, whatever host the redirect URI spells:
-    /// `localhost` in Antigravity's registered URI may resolve to `::1` in the browser
-    /// (UNCERTAIN: browsers normally fall back to IPv4 for `localhost` within milliseconds; if
-    /// one did not, the callback would time out and the terminal would report a timeout rather
-    /// than a wrong-destination failure — the registered URI forces the `localhost` spelling, so
-    /// the socket stays on IPv4 where a mismatch is visible instead of silent).
+    /// The socket family follows the registered redirect host. For `localhost`, IPv6 loopback
+    /// is preferred (with IPv4 fallback), matching browsers that resolve localhost to `::1`.
     ///
     /// `validate_port` is the platform's [`OAuthPlatform::validates_redirect_port`] contract:
     /// refuse to publish a redirect for anything outside the declared set (an ephemeral port
@@ -418,17 +465,21 @@ impl Loopback {
         let candidates = redirects.candidates();
         let mut failures: Vec<String> = Vec::new();
         for port in candidates.clone() {
-            match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+            // For registered localhost, make an IPv6 dual-stack socket (IPV6_V6ONLY=false),
+            // so browsers resolving to either ::1 or 127.0.0.1 reach this same listener.
+            let bind_result = if redirects.host == "localhost" {
+                bind_dual_stack_localhost(port).await
+            } else {
+                TcpListener::bind((redirects.host, port)).await
+            };
+            match bind_result {
                 Ok(listener) => {
                     let actual = listener
                         .local_addr()
                         .map_err(|e| oauth_error(format!("bound socket has no address: {e}")))?
                         .port();
                     if validate_port && !candidates.contains(&actual) {
-                        return Err(oauth_error(format!(
-                            "loopback bound port {actual}, which is outside the platform's \
-                             declared redirect set {candidates:?}; refusing to publish it"
-                        )));
+                        return Err(oauth_error(format!("loopback bound port {actual} is outside the platform's declared redirect set {candidates:?}")));
                     }
                     return Ok(Self {
                         listener,
@@ -783,6 +834,7 @@ pub async fn drive_device_polls(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::net::Ipv4Addr;
     use std::sync::Mutex;
 
     use async_trait::async_trait;

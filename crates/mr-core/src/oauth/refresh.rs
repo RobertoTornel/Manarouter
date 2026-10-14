@@ -518,8 +518,13 @@ impl Refresher {
             return Err(refresh_failure);
         };
 
-        let refreshed = match self.platform.refresh(&refresh_token).await {
+        let refreshed = match self
+            .platform
+            .refresh_with_context(&refresh_token, &tokens)
+            .await
+        {
             Ok(fresh) => fresh,
+
             Err(error) => {
                 let refresh_failure = RefreshFailure {
                     class: classify(&error),

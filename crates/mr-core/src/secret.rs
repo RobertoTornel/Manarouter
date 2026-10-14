@@ -178,7 +178,9 @@ impl Vault {
     ///
     /// The id doubles as AES-GCM associated data, which binds the ciphertext to its slot.
     pub fn put(&mut self, id: &str, value: &str) -> Result<()> {
-        self.reload_from_disk()?;
+        if !self.dirty {
+            self.reload_from_disk()?;
+        }
         let mut nonce_bytes = [0u8; NONCE_LEN];
         rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -568,7 +570,9 @@ mod tests {
         // point provider A at provider B's key.
         let (_d, mut v) = vault();
         v.put("a", "value-a").unwrap();
+        v.flush().unwrap();
         v.put("b", "value-b").unwrap();
+        v.flush().unwrap();
         let a_ct = v.file.entries["a"].ct.clone();
         v.file.entries.get_mut("b").unwrap().ct = a_ct;
         let err = v.get("b").unwrap_err().to_string();

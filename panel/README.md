@@ -37,7 +37,7 @@ spec. The panel is defensive about list envelopes: `extractList(data, ...keys)` 
 array or `{ providers: [...] }` / `{ keys: [...] }` / `{ combos: [...] }` / `{ aliases: [...] }`
 / `{ docs: [...] }`.
 
-Assumptions worth re-checking when the conductor lands (each is one localised call site):
+Contracts verified against the conductor implementation (still verify interactively in a browser):
 
 1. **Account creation** — `POST /api/providers/{id}/accounts` is sent `{ label, identity, secret }`
    (the `Account` struct's fields; the secret is expected to become a server-side `secret_ref`).
@@ -45,12 +45,13 @@ Assumptions worth re-checking when the conductor lands (each is one localised ca
    full model object with `hidden` flipped (`hidden` is authored metadata; manual entries win
    over syncs per `docs/03-configuration.md`). If the backend grows a dedicated toggle route,
    change `toggleModelHidden` (providers view) and `toggleHidden` (models view).
-3. **Quota usage** — `GET /api/quota` is attempted once; any failure renders an honest “not
-   available yet” state. No invented data anywhere.
-4. **Hedge enum** — `hedge.on_winner_fail` is parsed/built as the externally tagged serde form
+3. **Key rotation** — `POST /api/keys/{id}/rotate` replaces a client key's secret in place, preserves its id and policy, invalidates the old secret after commit, and reveals the new plaintext once. The panel asks for confirmation and uses the one-time copy dialog. This rotates Manarouter client credentials, not upstream provider keys.
+4. **Quota usage** — `GET /api/quota` returns persisted per-account usage aggregates (all recorded
+   time; it is not a live billing-window quota signal). A failure renders an honest unavailable state.
+5. **Hedge enum** — `hedge.on_winner_fail` is parsed/built as the externally tagged serde form
    `{"rerun-excluding":{"max_rounds":2}}` / `{"stable-fallback":{"step":1}}` /
    `{"pick-highest-passed":null}`; a bare string form is tolerated on read.
-5. **Auth kinds** — provider auth is sent as the internally tagged form `{"type":"bearer"}`,
+6. **Auth kinds** — provider auth is sent as the internally tagged form `{"type":"bearer"}`,
    `{"type":"api-key-header","header":…}`, `{"type":"header","name":…,"prefix":…}`,
    `{"type":"query-param","param":…}`, `{"type":"oauth","platform":…}`.
 

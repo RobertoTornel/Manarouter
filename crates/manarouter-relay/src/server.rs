@@ -217,6 +217,30 @@ async fn list_models(State(app): State<AppState>, headers: HeaderMap) -> Respons
 }
 
 /// The shared path for every model route.
+fn inject_antigravity_project(
+    outgoing: &[u8],
+    tokens: Option<&mr_core::oauth::TokenSet>,
+) -> Result<Vec<u8>, &'static str> {
+    let project = tokens
+        .and_then(|t| t.extra.get("cloudcode_project_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 256
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        })
+        .ok_or("Antigravity Cloud Code project metadata is missing or malformed")?;
+    let mut envelope: serde_json::Value = serde_json::from_slice(outgoing)
+        .map_err(|_| "Antigravity request must be a JSON envelope")?;
+    let object = envelope
+        .as_object_mut()
+        .ok_or("Antigravity request envelope must be a JSON object")?;
+    object.insert("project".into(), serde_json::Value::String(project.into()));
+    serde_json::to_vec(&envelope).map_err(|_| "failed to encode Antigravity request envelope")
+}
+
 async fn dispatch(
     app: AppState,
     client_dialect: Dialect,
@@ -419,7 +443,7 @@ async fn dispatch(
         // Destructured in one move rather than read field-by-field: taking `path_override` by
         // reference and then moving `body` out of the same value is a borrow conflict, and cloning
         // the body to sidestep it would copy the whole request for every translated call.
-        let (outgoing, force_stream, dialect_content_type, dialect_path, translated_body) =
+        let (mut outgoing, force_stream, dialect_content_type, dialect_path, translated_body) =
             match translated {
                 Some(t) => (
                     t.body,
@@ -430,6 +454,19 @@ async fn dispatch(
                 ),
                 None => (bytes.clone(), false, None, None, false),
             };
+        if step.dialect == Dialect::Antigravity {
+            match inject_antigravity_project(&outgoing, oauth_tokens.as_ref()) {
+                Ok(body) => outgoing = body.into(),
+                Err(message) => {
+                    return error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        client_dialect,
+                        "server_error",
+                        message,
+                    )
+                }
+            }
+        }
 
         // A path the translator named wins over the provider's route override. The translator knows
         // which dialect it just wrote the body for; a route override is keyed by the *client's*
@@ -694,6 +731,7 @@ fn default_path(dialect: Dialect) -> &'static str {
 }
 
 /// Build the outgoing headers for one attempt.
+#[allow(clippy::too_many_arguments)]
 fn upstream_headers(
     provider: &mr_core::snapshot::ProviderPlan,
     step: &StepPlan,
@@ -1127,6 +1165,25 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_project_is_injected_for_translated_and_raw_envelopes() {
+        let mut tokens = mr_core::oauth::TokenSet::new("secret");
+        tokens.extra.insert(
+            "cloudcode_project_id".into(),
+            serde_json::Value::String("account-project".into()),
+        );
+        for input in [
+            br#"{"model":"m"}"#.as_slice(),
+            br#"{"model":"m","project":"attacker"}"#.as_slice(),
+        ] {
+            let output = inject_antigravity_project(input, Some(&tokens)).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(value["project"], "account-project");
+        }
+        assert!(inject_antigravity_project(br#"{}"#, None).is_err());
+        assert!(inject_antigravity_project(b"not-json", Some(&tokens)).is_err());
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();

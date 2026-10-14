@@ -1196,3 +1196,26 @@ pub fn sse_to_pivot(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<String>> {
         frames_for(ctx, chunks, terminate)
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn responses_client_suppresses_done_but_chat_client_gets_it() {
+        let responses = TranslateCtx::new(RouteKind::Responses, Dialect::Codex, "gpt-5");
+        assert!(sse_to_pivot(&responses, SSE_DONE).unwrap().is_empty());
+        let payload =
+            r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#;
+        assert_eq!(sse_to_pivot(&responses, payload).unwrap(), vec![payload]);
+
+        let chat = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Codex, "gpt-5");
+        reset_stream_state();
+        let event = r#"{"type":"response.output_text.delta","delta":"hello"}"#;
+        assert!(!sse_to_pivot(&chat, event).unwrap().is_empty());
+        let terminal = r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}"#;
+        let frames = sse_to_pivot(&chat, terminal).unwrap();
+        assert!(frames.iter().any(|frame| frame.contains(SSE_DONE)));
+        reset_stream_state();
+    }
+}

@@ -96,7 +96,7 @@ base_url = "https://cloudcode-pa.googleapis.com"
 auth = { type = "oauth", platform = "antigravity" }
 oauth_platform = "antigravity"
 capabilities = ["chat", "models", "tool-calling", "reasoning", "vision"]
-note = "This catalog entry records the migration target only: OAuth login, refresh, identity extraction and project onboarding are not implemented, so the OAuth platform is unavailable in this build. Do not use until those flows are implemented and verified."
+note = "OAuth code exchange, refresh and standard Google userinfo identity are implemented. Antigravity IDE (T2) client metadata, PKCE and Cloud Code project onboarding remain reverse-engineered/unverified; the Gemini CLI T1 identity is selectable in code but does not impersonate the IDE. Cloud Code inference is an internal API and is experimental; login supports free-tier onboardUser and bounded operation polling; paid-tier onboarding fails closed unless an explicit project is supplied, so validate account/project eligibility before production use."
 oauth_generate_path = "/v1internal:generateContent"
 oauth_stream_path = "/v1internal:streamGenerateContent?alt=sse"
 oauth_onboard_path = "/v1internal:onboardUser"

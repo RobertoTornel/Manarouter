@@ -25,6 +25,14 @@ pub enum KeyCmd {
     Create(CreateArgs),
     /// List keys: id, label, prefix, permissions. Never a key or its hash.
     List,
+    /// Rotate a key in place; the replacement plaintext is printed once. This invalidates the old key.
+    Rotate {
+        /// Key id or label.
+        id: String,
+        /// Print only the bare key on stdout.
+        #[arg(long)]
+        print: bool,
+    },
     /// Re-enable a disabled key.
     Enable {
         /// Key id.
@@ -97,6 +105,7 @@ pub async fn run(cmd: KeyCmd, ctx: &Ctx) -> Result<(), CliError> {
     match cmd {
         KeyCmd::Create(a) => create(ctx, a),
         KeyCmd::List => list(ctx),
+        KeyCmd::Rotate { id, print } => rotate(ctx, &id, print),
         KeyCmd::Enable { id } => set_enabled(ctx, &id, true),
         KeyCmd::Disable { id } => set_enabled(ctx, &id, false),
         KeyCmd::Remove { id } => remove(ctx, &id),
@@ -370,6 +379,39 @@ fn find_key_mut(cfg: &mut Config, id: &str) -> Result<(usize, String), CliError>
     Ok((position, cfg.client_keys[position].id.as_str().to_owned()))
 }
 
+fn rotate(ctx: &Ctx, id: &str, print: bool) -> Result<(), CliError> {
+    let mut cfg = ctx.load()?;
+    let (position, key_id) = find_key_mut(&mut cfg, id)?;
+    let plaintext = generate_client_key();
+    let key = &mut cfg.client_keys[position];
+    key.key_hash = sha256_hex(&plaintext);
+    key.prefix = Some(key_prefix(&plaintext));
+    let label = key.label.clone();
+    let key_json = sanitized(key);
+    let out = ctx.save(&cfg)?;
+
+    if ctx.json {
+        let mut doc = key_json;
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert("plaintext".into(), serde_json::Value::String(plaintext));
+        }
+        return ctx.finish(&out, Vec::new(), doc);
+    }
+    if print {
+        println!("{plaintext}");
+        eprintln!("key `{label}` ({key_id}) rotated; previous key is invalid");
+        eprintln!("the replacement is shown once and never again");
+        return Ok(());
+    }
+    ctx.finish(
+        &out,
+        vec![format!(
+            "{plaintext} (shown once; previous key is now invalid)"
+        )],
+        serde_json::json!({"id": key_id, "label": label, "rotated": true}),
+    )
+}
+
 fn set_enabled(ctx: &Ctx, id: &str, enabled: bool) -> Result<(), CliError> {
     let mut cfg = ctx.load()?;
     let (position, key_id) = find_key_mut(&mut cfg, id)?;
@@ -578,6 +620,44 @@ mod tests {
             list(&ctx).unwrap();
             let ctx = Ctx { json: true };
             list(&ctx).unwrap();
+        });
+    }
+
+    #[test]
+    fn rotate_replaces_only_secret_and_preserves_policy() {
+        with_config_dir("key-rotate", |_dir| {
+            let mut cfg = Config::default();
+            let (mut key, old_plaintext) = build_key(
+                &cfg,
+                &CreateArgs {
+                    label: Some("editor".into()),
+                    print: false,
+                    allow_models: vec!["gpt-*".into()],
+                    allow_routes: vec!["chat".into()],
+                    limit_requests: Some(9),
+                    note: Some("test".into()),
+                },
+            )
+            .unwrap();
+            key.enabled = false;
+            let id = key.id.as_str().to_owned();
+            let old_hash = key.key_hash.clone();
+            cfg.client_keys.push(key);
+            cfg.save_default().unwrap();
+
+            rotate(&Ctx { json: false }, &id, false).unwrap();
+            let updated = Config::load_default().unwrap();
+            let key = &updated.client_keys[0];
+            assert_eq!(key.id.as_str(), id);
+            assert_ne!(key.key_hash, old_hash);
+            assert_ne!(key.prefix.as_deref(), Some(&old_plaintext[..7]));
+            assert_eq!(key.label, "editor");
+            assert_eq!(key.allow_models, vec!["gpt-*"]);
+            assert_eq!(key.allow_routes, vec!["chat.completions"]);
+            assert_eq!(key.limit_requests, 9);
+            assert_eq!(key.note.as_deref(), Some("test"));
+            assert!(!key.enabled);
+            assert_ne!(key.key_hash, old_plaintext);
         });
     }
 

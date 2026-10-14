@@ -336,24 +336,28 @@ window.addEventListener('hashchange', () => {
   renderRoute();
 });
 
+function showBootError(err) {
+  // Never leave both roots hidden: even an unexpected error during login/app startup must
+  // produce a visible, actionable screen rather than a blank dark page.
+  poller.stop();
+  shell.hidden = false;
+  loginRoot.hidden = true;
+  clear(mainEl);
+  const box = errorBlock(err);
+  const retry = h('button', { class: 'btn btn-primary', type: 'button' }, 'Retry');
+  retry.addEventListener('click', () => location.reload());
+  box.append(h('div', { class: 'dialog-actions' }, retry));
+  mainEl.append(box);
+  document.getElementById('topbar-title').textContent = 'Manarouter';
+}
+
 (async function boot() {
   try {
     state.session = await api.get('/api/session');
+    if (state.session.password_required && !state.session.authenticated) showLogin();
+    else await enterApp();
   } catch (err) {
-    // Control plane unreachable: show a full-screen honest error with a retry — the only screen
-    // that is allowed to be useless, because there is nothing to show.
-    shell.hidden = false;
-    loginRoot.hidden = true;
-    clear(mainEl);
-    const box = errorBlock(err);
-    const retry = h('button', { class: 'btn btn-primary', type: 'button' }, 'Retry');
-    retry.addEventListener('click', () => location.reload());
-    box.append(h('div', { class: 'dialog-actions' }, retry));
-    mainEl.append(box);
-    document.getElementById('topbar-title').textContent = 'Manarouter';
-    return;
+    // Covers both a failed session request and errors later in login/app startup.
+    showBootError(err);
   }
-
-  if (state.session.password_required && !state.session.authenticated) showLogin();
-  else await enterApp();
 })();

@@ -73,9 +73,8 @@ pub fn from_pivot_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Transla
             envelope.insert("request".into(), Value::Object(gemini));
             envelope.insert("userAgent".into(), json!("antigravity"));
             envelope.insert("requestId".into(), json!(mr_core::ids::new_id()));
-            // `project` is deliberately absent: it belongs to the onboarding row the OAuth
-            // credential was minted from, and TranslateCtx carries only conversation-scoped
-            // state, so the relay's endpoint layer must add it from the credential.
+            // `project` comes from account-specific Cloud Code onboarding and is not client input.
+            // The relay adds this value from the encrypted OAuth token metadata before dispatch.
             let p = if stream {
                 "v1internal:streamGenerateContent?alt=sse"
             } else {

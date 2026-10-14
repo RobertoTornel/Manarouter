@@ -52,7 +52,7 @@ upstream work at all — was **5.2 – 9.2 seconds**.
 | Work on the hedged race | `docs/07-hedged-race.md` — read all of it; the semantics are counterintuitive |
 | Change account/key selection | `docs/05-key-selection.md`, `mr-core/src/dialect.rs` (`KeyStrategy`) |
 | Work on quota | `docs/08-quota-tracking.md`, `docs/09-reset-aware-priority.md` |
-| Add an OAuth platform | `docs/14-oauth-adding-a-platform.md` |
+| Add an OAuth platform | `docs/14-oauth-adding-a-platform.md`, `docs/oauth-omniroute-parity.md` |
 | Touch credentials or secrets | `docs/21-security.md` — read before writing any code |
 | Change the configuration schema | `docs/03-configuration.md` §1 first — unknown-key preservation is mandatory |
 | Change the snapshot format | `docs/04-routing-snapshot.md` — a format change requires a version bump |
@@ -79,7 +79,7 @@ Router/
 │   └── check-secrets.sh           ★ CI guard: fails on a credential-shaped string
 ├── tools/
 │   ├── mock-upstream/             deterministic fault-injecting fake provider (detached crate)
-│   └── bench/                     latency benchmark vs the mock
+│   └── bench/                     planned; no benchmark harness exists yet
 └── crates/
     ├── mr-core/                    shared types; no network code at all
     │   └── src/
@@ -130,7 +130,7 @@ client ──► relay :20900
              └─ 9. emit usage              fire-and-forget; dropped rather than backpressured
 ```
 
-Only steps 3–6 are constants. `docs/16-latency-engineering.md` §6 states the per-step budget.
+Dialect translation is reachable per selected step when the client and upstream shapes differ; translated requests may override the path or force streaming. Matching dialects keep the original bytes. Hedged winner-policy helpers exist, but concurrent hedged execution is not wired: steps currently execute sequentially. `docs/16-latency-engineering.md` §6 states the per-step budget.
 
 ---
 
@@ -170,9 +170,7 @@ Anything not listed is a validation error.
 ### `Dialect` — how a provider speaks
 `open-ai` · `anthropic` · `google` · `codex` · `copilot` · `antigravity` · `command-code`
 
-Passthrough pairs (forwarded verbatim, no translation): `open-ai → open-ai`,
-`anthropic → anthropic`. Also `open-ai → copilot` and `open-ai → antigravity` for the body, because
-both expose an OpenAI-shaped chat surface once the credential is attached.
+Passthrough pairs include `open-ai → open-ai`, `anthropic → anthropic`, and OpenAI chat to Copilot's OpenAI-shaped surface. OpenAI chat to Antigravity is **not** a body passthrough: it uses the Google/Antigravity translator and still lacks OAuth/project-context completion.
 
 ### `Capability` — what a provider or model can serve
 `chat` · `responses` · `embeddings` · `audio.transcription` · `audio.speech` · `images.generations` ·
@@ -346,6 +344,7 @@ trigger.
     { "path": "docs/12-oauth-antigravity.md", "purpose": "The Antigravity login, project onboarding and Cloud Code inference", "read_when": "working on Antigravity" },
     { "path": "docs/13-oauth-copilot.md", "purpose": "The GitHub Copilot device flow and mandatory headers", "read_when": "working on Copilot" },
     { "path": "docs/14-oauth-adding-a-platform.md", "purpose": "A worked example of adding a new OAuth platform", "read_when": "adding a platform" },
+    { "path": "docs/oauth-omniroute-parity.md", "purpose": "Audited OmniRoute OAuth provider inventory, current Manarouter coverage, and client-key rotation scope", "read_when": "comparing OAuth or key-rotation parity" },
     { "path": "docs/15-web-panel.md", "purpose": "The panel: views, API, port editor, design language", "read_when": "touching the UI" },
     { "path": "docs/16-latency-engineering.md", "purpose": "Every latency decision, the rejected ones, and the per-step budget", "read_when": "changing the hot path" },
     { "path": "docs/17-migrating-from-omniroute.md", "purpose": "Importing providers, combos and credentials safely", "read_when": "migrating or touching the importer" },

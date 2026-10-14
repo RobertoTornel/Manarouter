@@ -47,6 +47,7 @@ enum PendingKind {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // Public result shape is stable; device flow is infrequent.
 pub enum PollResult {
     Pending {
         retry_after_seconds: u64,
@@ -197,8 +198,17 @@ impl OAuthSessions {
                 self.reinsert(id.to_owned(), pending).await?;
                 return Ok(result);
             }
-            let tokens = tokens.clone();
+            let mut tokens = tokens.clone();
             let platform = pending.platform;
+            if let Err(error) = platform.complete_login(&mut tokens).await {
+                pending.kind = PendingKind::BrowserComplete {
+                    tokens,
+                    identity: None,
+                };
+                pending.busy = false;
+                self.reinsert(id.to_owned(), pending).await?;
+                return Err(safe_error(error));
+            }
             let identity = match platform.account_identity(&tokens).await {
                 Ok(identity) => identity,
                 Err(error) => {
@@ -241,6 +251,15 @@ impl OAuthSessions {
                 return Err(safe_error(error));
             }
         };
+        let mut tokens = tokens;
+        if let Err(error) = pending.platform.complete_login(&mut tokens).await {
+            pending.kind = PendingKind::BrowserComplete {
+                tokens,
+                identity: None,
+            };
+            self.reinsert(id.to_owned(), pending).await?;
+            return Err(safe_error(error));
+        }
         let identity = match pending.platform.account_identity(&tokens).await {
             Ok(identity) => identity,
             Err(error) => {

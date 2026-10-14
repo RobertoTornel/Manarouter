@@ -118,6 +118,8 @@ pub(crate) fn guarded_router(state: AppState) -> Router<AppState> {
         .route("/api/aliases/{name}", delete(delete_alias))
         .route("/api/keys", get(list_keys).post(create_key))
         .route("/api/keys/{id}", put(update_key).delete(delete_key))
+        .route("/api/keys/{id}/rotate", post(rotate_key))
+        .route("/api/keys/{id}/regenerate", post(rotate_key))
         // --- documentation ---
         .route("/api/docs", get(list_docs))
         .route("/api/docs/{name}", get(get_doc))
@@ -2557,6 +2559,7 @@ async fn create_key(
     State(state): State<AppState>,
     JsonBody(body): JsonBody,
 ) -> ApiResult<Response> {
+    let _mutation = state.mutation_lock.lock().await;
     let mut key_body = object_body(body, "key")?;
     // Minting happens here, in one place: the plaintext exists only in this response, the config
     // receives only its hash and prefix. Any `key`/`key_hash` the body carried is discarded.
@@ -2616,6 +2619,7 @@ async fn update_key(
     Path(id): Path<String>,
     JsonBody(body): JsonBody,
 ) -> ApiResult<Json<Value>> {
+    let _mutation = state.mutation_lock.lock().await;
     let mut key_body = object_body(body, "key")?;
     key_body.insert("id".to_owned(), Value::String(id.clone()));
 
@@ -2652,10 +2656,37 @@ async fn update_key(
     Ok(Json(key_view(updated)?))
 }
 
+/// Rotate one client key in place. Its stable id and policy remain; the prior plaintext stops
+/// authenticating as soon as the committed hash replaces it. The new plaintext is returned once.
+async fn rotate_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let _mutation = state.mutation_lock.lock().await;
+    let mut next = state.current_config().await;
+    let key = next
+        .client_keys
+        .iter_mut()
+        .find(|key| key.id.as_str() == id)
+        .ok_or_else(|| ApiError::not_found(format!("no client key with id {id}")))?;
+    let plaintext = generate_client_key();
+    key.key_hash = sha256_hex(&plaintext);
+    key.prefix = Some(key_prefix(&plaintext));
+    let rotated = key.clone();
+    state.commit(next).await?;
+
+    let mut view = key_view(&rotated)?;
+    if let Some(obj) = view.as_object_mut() {
+        obj.insert("key".to_owned(), Value::String(plaintext));
+    }
+    Ok(Json(view))
+}
+
 async fn delete_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
+    let _mutation = state.mutation_lock.lock().await;
     let mut config = state.current_config().await;
     let position = config
         .client_keys

@@ -10,12 +10,13 @@ Login is documented in [OAuth: Antigravity](../12-oauth-antigravity.md). This pa
 
 | Tier | Client | Provenance | Status |
 |---|---|---|---|
-| **T1** | gemini-cli | Google's own open-source repository | **Default.** |
-| **T2** | Antigravity IDE | Extracted from the shipped application | Selectable. **UNCERTAIN.** |
+| **T1** | gemini-cli | Google's own open-source repository | Code-level constructor only; not runtime registered. |
+| **T2** | Antigravity IDE | Extracted from the shipped application | Runtime registry default; **UNCERTAIN / experimental.** |
 
-T1 is the default because its client id and secret are published deliberately by Google, with an
-in-source comment saying the secret is not treated as a secret for an installed application. T2's came
-from a shipped bundle, so its longevity is not guaranteed and its use is a judgement call the operator
+The OAuth registry defaults to T2 because the provider catalogue is specifically an Antigravity IDE
+client. The Google-published T1 client is available as an explicit code-level alternative, but is not
+a runtime panel choice and its account identity/quota behavior does not impersonate Antigravity. T2's
+client came from a shipped bundle, so its longevity is not guaranteed and its use is a judgement call the operator
 makes explicitly.
 
 **UNCERTAIN (T2):** because it was reverse-engineered rather than published, a change in the shipped
@@ -75,6 +76,8 @@ always this rule.
 
 ## Scopes
 
+The implementation currently supports no paid-tier selection: without an explicitly supplied project it fails closed. Free-tier onboarding omits all project fields and polls a bounded number of times for the managed project. T2's client metadata remains experimental; do not treat the reverse-engineered flow as provider-verified.
+
 The gemini-cli tier requests:
 
 ```
@@ -99,7 +102,7 @@ An earlier internal summary claimed the Antigravity flow uses **no PKCE**. The r
 its authorization URL carrying `code_challenge` and `code_challenge_method=S256`, and its token
 exchange carrying `code_verifier`.
 
-**The dossier wins.** PKCE is used. The distinction is not academic: a token exchange that omits
+**Implementation assumption, not verification:** this build sends S256 PKCE, following the dossier despite conflicting evidence. The distinction is not academic: a token exchange that omits
 `code_verifier` against a flow that set a challenge is rejected with `invalid_grant`, which is
 indistinguishable from a wrong or expired code and sends you looking in the wrong place.
 

@@ -31,6 +31,7 @@ password-hash = { workspace = true }
 tracing = { workspace = true }
 memchr = { workspace = true }
 http = { workspace = true }
+socket2 = { workspace = true }
 httpdate = { workspace = true }
 # OAuth (crates/mr-core/src/oauth) is the one part of this crate that reaches the network: the
 # authorization-code exchange, refresh and device-code polls all speak HTTPS. These are workspace

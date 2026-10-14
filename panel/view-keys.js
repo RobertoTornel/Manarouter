@@ -53,6 +53,8 @@ export async function renderKeys(mount, ctx) {
     for (const k of keys) {
       const editBtn = h('button', { class: 'btn btn-sm', type: 'button' }, 'Edit');
       editBtn.addEventListener('click', () => { editingId = k.id; renderForm(k); tableWrap.scrollIntoView({ block: 'nearest' }); });
+      const rotateBtn = h('button', { class: 'btn btn-sm', type: 'button' }, 'Rotate');
+      rotateBtn.addEventListener('click', () => rotateKey(k));
       const delBtn = h('button', { class: 'btn btn-danger btn-sm', type: 'button' }, 'Delete');
       delBtn.addEventListener('click', () => deleteKey(k));
       tbody.append(h('tr', {},
@@ -62,7 +64,7 @@ export async function renderKeys(mount, ctx) {
         h('td', { class: 'mono' }, allowSummary(k.allow_models)),
         h('td', { class: 'mono' }, allowSummary(k.allow_routes)),
         h('td', { class: 'num' }, k.limit_requests ? formatCompact(k.limit_requests) : '∞'),
-        h('td', { class: 'actions' }, editBtn, delBtn)));
+        h('td', { class: 'actions' }, editBtn, rotateBtn, delBtn)));
     }
     tableWrap.replaceChildren(h('table', { class: 'tbl' },
       h('thead', {}, h('tr', {},
@@ -152,6 +154,26 @@ export async function renderKeys(mount, ctx) {
 
     formSlot.replaceChildren(h('div', { class: 'card' }, h('h2', {}, isEdit ? `Edit key ${k.id}` : 'New client key'), form));
     label.focus();
+  }
+
+  async function rotateKey(k) {
+    const ok = await ctx.confirm({
+      title: `Rotate key “${k.label || k.id}”?`,
+      message: 'The current key will stop working immediately. Save the replacement shown once after rotation.',
+      confirmLabel: 'Rotate key',
+    });
+    if (!ok) return;
+    try {
+      const result = await api.post(`/api/keys/${encodeURIComponent(k.id)}/rotate`, {});
+      if (typeof result.key === 'string') {
+        await ctx.secretKey({ key: result.key, label: `Replacement key — ${k.label || k.id}` });
+      } else {
+        ctx.toast.warning('Key rotated, but the response did not include the replacement plaintext.');
+      }
+      await reload();
+    } catch (err) {
+      ctx.toast.error('Key rotation failed', err);
+    }
   }
 
   async function deleteKey(k) {

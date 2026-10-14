@@ -187,9 +187,7 @@ impl Fault {
             status: patch.status.unwrap_or(self.status),
             retry_after_secs: patch.retry_after_secs.unwrap_or(self.retry_after_secs),
             error_body: patch.error_body.unwrap_or(self.error_body),
-            fail_after_chunks: patch
-                .fail_after_chunks
-                .unwrap_or(self.fail_after_chunks),
+            fail_after_chunks: patch.fail_after_chunks.unwrap_or(self.fail_after_chunks),
             fail_after_bytes: patch.fail_after_bytes.unwrap_or(self.fail_after_bytes),
             malformed_json: patch.malformed_json.unwrap_or(self.malformed_json),
             content: patch.content.clone().or_else(|| self.content.clone()),
@@ -322,7 +320,12 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// and `retry_after`/`reset_at` are included exactly when a retry hint exists, matching the
 /// provider contract described in the module docs. [`ErrorBody::Auto`] resolves to the OpenAI
 /// envelope; callers resolve it to the endpoint's dialect first when that matters.
-pub fn error_envelope(style: ErrorBody, status: u16, message: &str, retry_after_secs: u64) -> String {
+pub fn error_envelope(
+    style: ErrorBody,
+    status: u16,
+    message: &str,
+    retry_after_secs: u64,
+) -> String {
     let retry_hint = retry_after_secs > 0;
     let reset = reset_at(retry_after_secs);
     match style.resolve() {
@@ -339,7 +342,8 @@ pub fn error_envelope(style: ErrorBody, status: u16, message: &str, retry_after_
                 err.insert("retry_after".into(), retry_after_secs.into());
                 err.insert("reset_at".into(), reset.as_str().into());
             }
-            serde_json::json!({"type": "error", "error": serde_json::Value::Object(err)}).to_string()
+            serde_json::json!({"type": "error", "error": serde_json::Value::Object(err)})
+                .to_string()
         }
         ErrorBody::CommandCode => {
             let mut err = serde_json::Map::new();
@@ -348,7 +352,8 @@ pub fn error_envelope(style: ErrorBody, status: u16, message: &str, retry_after_
                 err.insert("retry_after".into(), retry_after_secs.into());
                 err.insert("reset_at".into(), reset.as_str().into());
             }
-            serde_json::json!({"success": false, "error": serde_json::Value::Object(err)}).to_string()
+            serde_json::json!({"success": false, "error": serde_json::Value::Object(err)})
+                .to_string()
         }
         ErrorBody::Empty => String::new(),
         // Auto has already resolved; this arm is only reachable if a future variant forgets to.
@@ -358,7 +363,11 @@ pub fn error_envelope(style: ErrorBody, status: u16, message: &str, retry_after_
                 s if (400..500).contains(&s) => "invalid_request_error",
                 _ => "server_error",
             };
-            let code = if status == 429 { "rate_limit_exceeded" } else { "mock_error" };
+            let code = if status == 429 {
+                "rate_limit_exceeded"
+            } else {
+                "mock_error"
+            };
             let mut err = serde_json::Map::new();
             err.insert("message".into(), message.into());
             err.insert("type".into(), kind.into());
@@ -494,7 +503,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&c).unwrap();
         assert_eq!(v["success"], false);
         assert_eq!(v["error"]["message"], "boom");
-        assert!(v["error"].get("retry_after").is_none(), "no hint requested, none sent");
+        assert!(
+            v["error"].get("retry_after").is_none(),
+            "no hint requested, none sent"
+        );
 
         // Auto resolves to the OpenAI envelope rather than failing.
         let auto = error_envelope(ErrorBody::Auto, 500, "boom", 0);

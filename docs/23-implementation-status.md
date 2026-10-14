@@ -10,13 +10,13 @@ given so you can re-run it.
 
 | Component | State | Evidence / limitation |
 |---|---|---|
-| `mr-core` — config, snapshot compiler, vault, usage store, OAuth scaffolding | **Substantial, not complete** | Workspace tests pass; Antigravity OAuth methods are explicit unsupported errors. |
+| `mr-core` — config, snapshot compiler, vault, usage store, OAuth | **Substantial, not complete** | Codex, Copilot, and Antigravity OAuth authorization/token exchange/refresh/Google userinfo identity code is wired; Antigravity IDE client details remain reverse-engineered and unverified. |
 | `mr-dialects` — OpenAI, Anthropic, Responses, Google, Command Code translation | **Reachable, test coverage uneven** | Relay dispatches request and response translation per selected step. Responses implementation needs focused regression tests. |
 | `manarouter-relay` — HTTP API, auth, snapshot, account selection, translation | **Runs; hedging not wired** | Sequential step loop remains the request executor; `hedge_decide` is not called by the relay. |
 | `manarouter-conductor` — auth, API, state, serving, quota query | **Implemented** | API routes and Store-backed `/api/quota` exist. Verify live separately; no conductor was running during this audit. |
-| `mr-cli` | **Partial** | Account/provider/combo/key/model families dispatch; `serve`, `doctor`, `migrate`, `config`, and `vault` still return not-implemented errors. |
+| `mr-cli` | **Partial** | Account/provider/combo/key/model families dispatch; client keys can now be rotated in place via `mr key rotate`; `serve`, `doctor`, `migrate`, `config`, and `vault` still return not-implemented errors. |
 | `panel/` | **Implemented, browser behavior unverified** | JS syntax checks pass and bootstrap now displays failures; no browser-driven route/login verification completed. |
-| OAuth | **Partial; existing flows wired** | Conductor OAuth session routes and panel sign-in now cover Codex browser/PKCE and GitHub Copilot device flow; tokens are vault-backed, metadata lives in SQLite, and relay resolves/refreshes/apply-headers. Antigravity and Cline remain unavailable; only these two providers are registered. No live provider login was exercised. |
+| OAuth | **Partial; flows wired** | Conductor OAuth routes cover Codex, Copilot, and Antigravity authorization code flows; tokens are vault-backed, metadata lives in SQLite, and relay resolves/refreshes credentials. Antigravity's interactive loopback OAuth exchange/refresh, v2 userinfo identity, free-tier Cloud Code onboarding with bounded LRO polling, encrypted token context persistence, and account-bound relay project injection are implemented. Paid-tier onboarding remains fail-closed without explicit project input. T2 client metadata and PKCE are reverse-engineered/unverified; no live Google login or Cloud Code request was exercised. Cline remains unavailable. |
 | `tools/mock-upstream` | **Fault control API wired; behaviors partial** | Detached crate tests pass; `POST /__control` and request-local `x-mock-fault` merge patches are reachable. Not every field in `Fault` is yet applied to response generation. |
 | `tools/bench` | **Absent** | No harness currently enforces the latency budget. |
 
@@ -90,9 +90,11 @@ once any `tool_calls` delta has been emitted — is the reason this is not a sma
 ## 5. Claims that remain unverified or false
 
 * That hedging is live. See §3: runner remains sequential.
-* That Antigravity OAuth works end to end. Its authorization, exchange, refresh, identity, and relay
-  project injection/context are incomplete. Codex and Copilot OAuth code exists, but still needs
-  real-provider opt-in smoke verification.
+* That Antigravity works end to end. Authorization, token exchange, refresh, and Google userinfo
+  identity are implemented, but Cloud Code onboarding and project injection/context are incomplete.
+  The registered T2 OAuth client/PKCE behavior is reverse-engineered and unverified; do not rely on
+  production access until a user explicitly opts into a live login and validates the upstream API.
+  Codex and Copilot also still need real-provider opt-in smoke verification.
 * That the provider catalogue was executed against every entry. `docs/providers/catalog.md` marks
   uncertain entries and the catalogue is not a live reachability guarantee.
 * That the panel works in a real browser. Syntax and asset/API checks are not a substitute for browser
