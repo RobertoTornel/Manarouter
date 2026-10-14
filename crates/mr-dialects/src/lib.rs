@@ -182,6 +182,15 @@ pub fn translate_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Option<T
         // google translator below instead — see `docs/providers/antigravity.md` and the request
         // body in `docs/12-oauth-antigravity.md` §5.
         (Dialect::OpenAi, Dialect::Copilot) => Ok(None),
+        // The Anthropic half of this pair had no arm on ANY of the three functions: Unsupported
+        // before a byte moved. Copilot's shape says it belongs here — `docs/providers/copilot.md`
+        // gives `/chat/completions` as "OpenAI Chat Completions", and `catalog/providers.toml`
+        // lists `dialect = "copilot"` under `id = "github-copilot"` with a `messages` capability,
+        // i.e. Claude Code sessions are meant to reach it. It takes the same direct
+        // Anthropic-to-OpenAI pair `(Anthropic, OpenAi)` uses below, not a double pivot.
+        (Dialect::Anthropic, Dialect::Copilot) => {
+            openai::from_anthropic_request(ctx, body).map(Some)
+        }
 
         (Dialect::OpenAi, Dialect::Anthropic) => {
             anthropic::from_openai_request(ctx, body).map(Some)
@@ -222,6 +231,13 @@ pub fn translate_response_body(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<By
     match (ctx.client_dialect, ctx.upstream_dialect) {
         (Dialect::OpenAi, Dialect::Anthropic) => anthropic::to_openai_response(ctx, body),
         (Dialect::Anthropic, Dialect::OpenAi) => openai::to_anthropic_response(ctx, body),
+        // Copilot's chat surface answers in OpenAI Chat JSON, so an OpenAI client's answer is
+        // byte-identical — the generic passthrough guard below cannot carry this, because mr-core
+        // allows it only for identical dialects — and an Anthropic client gets the same direct
+        // OpenAI-to-Anthropic pair `(Anthropic, OpenAi)` uses. Without these arms a Copilot
+        // round trip failed with Unsupported at the response even though the request succeeded.
+        (Dialect::OpenAi, Dialect::Copilot) => Ok(Bytes::copy_from_slice(body)),
+        (Dialect::Anthropic, Dialect::Copilot) => openai::to_anthropic_response(ctx, body),
         // `google::to_pivot_response` unwraps the Cloud Code `{response: {...}, traceId}`
         // envelope when the upstream is Antigravity, so both Gemini pairings answer here.
         (Dialect::OpenAi, Dialect::Google)
@@ -255,6 +271,11 @@ pub fn translate_sse_data(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<Stri
     match (ctx.client_dialect, ctx.upstream_dialect) {
         (Dialect::OpenAi, Dialect::Anthropic) => anthropic::sse_to_openai(ctx, data),
         (Dialect::Anthropic, Dialect::OpenAi) => openai::sse_to_anthropic(ctx, data),
+        // Same shapes as the response half: Copilot's stream is OpenAI SSE end to end, so the
+        // frames ride through untouched for an OpenAI client and into the Anthropic adapter for
+        // the rest.
+        (Dialect::OpenAi, Dialect::Copilot) => Ok(vec![data.to_owned()]),
+        (Dialect::Anthropic, Dialect::Copilot) => openai::sse_to_anthropic(ctx, data),
         (Dialect::OpenAi, Dialect::CommandCode) | (Dialect::Anthropic, Dialect::CommandCode) => {
             commandcode::sse_to_pivot(ctx, data)
         }
@@ -389,6 +410,81 @@ mod tests {
         assert!(
             translate_request(&anthropic_ctx, br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn copilot_upstreams_reach_the_right_translator_on_every_half() {
+        // Reachability, not correctness — the same defect class as the Antigravity test above.
+        // Before this change (Anthropic, Copilot) was Unsupported on all three functions, and
+        // the OpenAI client's response and SSE halves were too: mr-core's passthrough guard
+        // covers identical dialects only, so no generic arm ever fired for Copilot either.
+        // The shapes are settled by docs/providers/copilot.md (`/chat/completions` = "OpenAI
+        // Chat Completions") and catalog/providers.toml (`dialect = "copilot"`, capabilities
+        // chat + messages): byte-identical for an OpenAI client, the direct Anthropic-to-OpenAI
+        // pair for an Anthropic one, answers inverted on the way back.
+        let openai_ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Copilot, "gpt-4o");
+        let anthropic_ctx = TranslateCtx::new(RouteKind::Messages, Dialect::Copilot, "gpt-4o");
+
+        let req = translate_request(
+            &openai_ctx,
+            br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .expect("an OpenAI client must reach Copilot");
+        assert!(
+            req.is_none(),
+            "and its body travels untouched: for Copilot only headers change"
+        );
+
+        let req = translate_request(
+            &anthropic_ctx,
+            br#"{"model":"claude-sonnet-4","max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#,
+        )
+        .expect("an Anthropic client must reach Copilot, not Unsupported")
+        .expect("an Anthropic body is not byte-compatible with /chat/completions");
+        let doc: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(doc["messages"][0]["content"], "hi");
+        assert_eq!(
+            req.path_override.as_deref(),
+            Some("chat/completions"),
+            "Copilot's chat endpoint is named the same way the direct pair names it"
+        );
+
+        let raw = br#"{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hey"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
+        let resp = translate_response_body(&openai_ctx, raw)
+            .expect("an OpenAI client's Copilot answer must not report Unsupported");
+        assert_eq!(
+            resp.as_ref(),
+            &raw[..],
+            "byte-identical: an OpenAI answer for an OpenAI client needs no re-serialisation"
+        );
+
+        let resp = translate_response_body(&anthropic_ctx, raw)
+            .expect("an Anthropic client's Copilot answer must invert, not report Unsupported");
+        let msg: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(msg["type"], "message");
+        assert_eq!(msg["content"][0]["type"], "text");
+        assert_eq!(msg["content"][0]["text"], "hey");
+        assert_eq!(msg["stop_reason"], "end_turn");
+        assert_eq!(msg["usage"]["input_tokens"], 1);
+
+        let payload = r#"{"choices":[{"delta":{"content":"a"}}]}"#;
+        let frames = translate_sse_data(&openai_ctx, payload)
+            .expect("an OpenAI client's Copilot stream must not report Unsupported");
+        assert_eq!(frames.len(), 1, "one upstream frame, one client frame");
+        assert_eq!(frames[0], payload, "and untouched");
+
+        openai::reset_stream_state();
+        let start = translate_sse_data(&anthropic_ctx, r#"{"choices":[{"delta":{"role":"assistant"}}]}"#)
+            .expect("an Anthropic client's Copilot stream must reach the adapter");
+        assert!(start.join("").contains("message_start"));
+        let end = translate_sse_data(&anthropic_ctx, "[DONE]")
+            .expect("the stream must be allowed to close");
+        let end = end.join("");
+        assert!(end.contains("message_stop"), "the message must terminate");
+        assert!(
+            !end.contains("data: [DONE]"),
+            "an Anthropic SDK rejects the OpenAI terminator"
         );
     }
 }
