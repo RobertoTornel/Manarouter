@@ -339,6 +339,14 @@ impl Upstream {
         Self::new(Duration::from_secs(90), 4)
     }
 
+    /// Build an upstream client using the global latency pool configuration.
+    pub fn from_latency(latency: &mr_core::config::LatencyConfig) -> Result<Self> {
+        Self::new(
+            Duration::from_secs(latency.pool_idle_secs),
+            latency.pool_max_idle_per_host,
+        )
+    }
+
     /// The pool settings this client was built with.
     pub fn pool_settings(&self) -> (Duration, usize) {
         self.inner.pool_settings()

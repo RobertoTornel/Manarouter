@@ -84,7 +84,7 @@ pub const SNAPSHOT_MAGIC: [u8; 8] = *b"MROUTES1";
 /// Bumped whenever the compiled layout changes. The relay keeps serving its previous snapshot
 /// rather than loading one it does not understand, so a version skew degrades to stale routing
 /// instead of to a crash.
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 /// Current on-disk database schema version.
 ///

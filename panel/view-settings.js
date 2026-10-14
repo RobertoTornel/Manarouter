@@ -1,5 +1,5 @@
-// view-settings.js — ports (with the next-restart warning), the panel password, and the raw
-// configuration editor with validate + save.
+// view-settings.js — ports and relay pool settings (with restart warnings), panel password, and
+// the raw configuration editor with validate + save.
 
 import { api } from './api.js';
 import { h, chip, field, errorBlock, applyFieldErrors, clearFieldErrors } from './dom.js';
@@ -7,11 +7,12 @@ import { describePortChange } from './format.js';
 
 export async function renderSettings(mount, ctx) {
   const portsCard = h('div', { class: 'card' }, h('h2', {}, 'Listen ports'));
+  const latencyCard = h('div', { class: 'card' }, h('h2', {}, 'Relay connection pool'));
   const passwordCard = h('div', { class: 'card' }, h('h2', {}, 'Panel password'));
   const rawCard = h('div', { class: 'card' }, h('h2', {}, 'Raw configuration'));
-  mount.replaceChildren(portsCard, passwordCard, rawCard);
+  mount.replaceChildren(portsCard, latencyCard, passwordCard, rawCard);
 
-  await Promise.all([renderPorts(), renderPassword()]);
+  await Promise.all([renderPorts(), renderPassword(), renderLatency()]);
   renderRaw(); // sequential on purpose: the textarea is heavy and it can stream in last
 
   // ------------------------------------------------------------------ ports
@@ -160,6 +161,108 @@ export async function renderSettings(mount, ctx) {
     });
 
     passwordCard.replaceChildren(h('h2', {}, 'Panel password'), form);
+  }
+
+  // --------------------------------------------------------- global connection pool
+
+  async function renderLatency() {
+    latencyCard.append('loading…');
+    let raw;
+    try {
+      raw = await api.getRaw('/api/config/raw');
+    } catch (err) {
+      latencyCard.replaceChildren(h('h2', {}, 'Relay connection pool'), errorBlock(err));
+      return;
+    }
+
+    let config;
+    try {
+      config = JSON.parse(raw);
+      if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('Configuration must be an object.');
+    } catch (err) {
+      latencyCard.replaceChildren(
+        h('h2', {}, 'Relay connection pool'),
+        h('p', { class: 'hint' }, 'Could not safely read the current configuration. Use the raw configuration editor to inspect it.'),
+        errorBlock(err),
+      );
+      return;
+    }
+
+    const latency = config.latency && typeof config.latency === 'object' && !Array.isArray(config.latency)
+      ? config.latency : {};
+    const defaults = { pool_idle_secs: 90, pool_max_idle_per_host: 4 };
+    const effective = {
+      pool_idle_secs: Number.isInteger(latency.pool_idle_secs) && latency.pool_idle_secs >= 0
+        ? latency.pool_idle_secs : defaults.pool_idle_secs,
+      pool_max_idle_per_host: Number.isInteger(latency.pool_max_idle_per_host) && latency.pool_max_idle_per_host >= 1
+        ? latency.pool_max_idle_per_host : defaults.pool_max_idle_per_host,
+    };
+    const lowResource = effective.pool_idle_secs === 30 && effective.pool_max_idle_per_host === 2;
+    const profile = h('input', { type: 'checkbox', 'aria-label': 'Low-resource profile', checked: lowResource });
+    const advanced = h('details', { style: 'margin:12px 0;padding:10px;border:1px solid var(--line);border-radius:8px;' });
+    const idleSecs = h('input', { class: 'input mono', type: 'number', min: '0', max: '86400', step: '1', value: String(effective.pool_idle_secs), 'aria-label': 'Idle connection lifetime in seconds' });
+    const maxIdle = h('input', { class: 'input mono', type: 'number', min: '1', step: '1', value: String(effective.pool_max_idle_per_host), 'aria-label': 'Maximum idle connections per host' });
+    const status = h('div');
+    const save = h('button', { class: 'btn btn-primary', type: 'button' }, 'Save pool settings');
+    const restart = h('p', { class: 'hint' }, 'Relay restart required: saving updates conductor configuration, but the running relay does not hot-reload these pool settings.');
+
+    function updateProfileFromValues() {
+      profile.checked = Number(idleSecs.value) === 30 && Number(maxIdle.value) === 2;
+    }
+    profile.addEventListener('change', () => {
+      if (profile.checked) {
+        idleSecs.value = '30';
+        maxIdle.value = '2';
+      } else {
+        idleSecs.value = String(defaults.pool_idle_secs);
+        maxIdle.value = String(defaults.pool_max_idle_per_host);
+      }
+    });
+    idleSecs.addEventListener('input', updateProfileFromValues);
+    maxIdle.addEventListener('input', updateProfileFromValues);
+    advanced.open = !lowResource;
+
+    save.addEventListener('click', async () => {
+      clearFieldErrors(latencyCard);
+      status.replaceChildren();
+      const idleValue = Number(idleSecs.value);
+      const maxValue = Number(maxIdle.value);
+      if (!Number.isInteger(idleValue) || idleValue < 0 || idleValue > 86400) {
+        applyFieldErrors(latencyCard, { message: 'Idle connection lifetime must be an integer from 0 to 86400 seconds.', details: [] });
+        return;
+      }
+      if (!Number.isInteger(maxValue) || maxValue < 1) {
+        applyFieldErrors(latencyCard, { message: 'Maximum idle connections per host must be an integer of at least 1.', details: [] });
+        return;
+      }
+      save.disabled = true;
+      try {
+        // Preserve every raw/unknown field; only patch the two settings this view owns.
+        config.latency = { ...latency, pool_idle_secs: idleValue, pool_max_idle_per_host: maxValue };
+        await api.putRaw('/api/config/raw', JSON.stringify(config, null, 2));
+        status.replaceChildren(chip('Saved · relay restart required', 'warn'), restart);
+        ctx.toast.warning('Pool settings saved. Restart the relay for them to take effect.', null);
+      } catch (err) {
+        applyFieldErrors(latencyCard, err);
+        if (!err.details?.length) status.replaceChildren(errorBlock(err));
+      }
+      save.disabled = false;
+    });
+
+    advanced.append(
+      h('summary', {}, 'Advanced controls'),
+      field('Idle connection lifetime (seconds)', idleSecs, { hint: '0–86400; shorter lifetimes release idle sockets sooner.' }),
+      field('Maximum idle connections per host', maxIdle, { hint: 'At least 1; lower values reduce retained sockets across provider hosts.' }),
+    );
+    latencyCard.replaceChildren(
+      h('h2', {}, 'Relay connection pool'),
+      h('p', { class: 'hint' }, `Effective settings: ${effective.pool_idle_secs}s idle lifetime · ${effective.pool_max_idle_per_host} idle connection(s) per host. These values are read from the effective configuration, using defaults only when fields are absent or invalid.`),
+      h('label', { style: 'display:flex;align-items:center;gap:10px;margin:12px 0;' }, profile, h('span', {}, 'Low-resource profile (30s idle, 2 connections per host)')),
+      advanced,
+      restart,
+      h('div', { style: 'display:flex;gap:8px;margin-top:12px;' }, save),
+      status,
+    );
   }
 
   // ------------------------------------------------------------------ raw config

@@ -30,6 +30,7 @@ let keyRecords = [];
 let nextKeyId = 1;
 let nextSecret = 1;
 let resetCalls = 0;
+let configRaw = JSON.stringify({ latency: { pool_idle_secs: 90, pool_max_idle_per_host: 4, hedge_width: 7, future_tuning: 'keep-me' }, providers: [] }, null, 2);
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   if (url.pathname === '/panel' || url.pathname === '/panel/') {
@@ -75,6 +76,20 @@ const server = createServer(async (req, res) => {
     return send(401, { error: { code: 'unauthorized', message: 'Sign in required.' } });
   }
   if (url.pathname === '/api/health') return send(200, { version: 'e2e', uptime_secs: 1, snapshot: { digest: 'test' }, counts: { providers: 0, combos: 0, aliases: 0, keys: keyRecords.length, accounts: 0 } });
+  if (url.pathname === '/api/config/raw' && req.method === 'GET') {
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    return res.end(configRaw);
+  }
+  if (url.pathname === '/api/config/raw' && req.method === 'PUT') {
+    configRaw = await new Promise((resolve, reject) => {
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => resolve(body));
+      req.on('error', reject);
+    });
+    return send(200, JSON.parse(configRaw));
+  }
   if (url.pathname === '/api/ports') return send(200, { relay: { host: '127.0.0.1', port: 20900, running_port: 20900 }, control: { host: '127.0.0.1', port: 20901, running_port: 20901 } });
   if (url.pathname === '/api/keys' && req.method === 'GET') return send(200, { keys: keyRecords });
   if (url.pathname === '/api/keys' && req.method === 'POST') {
@@ -132,7 +147,17 @@ try {
   assert.equal(resetCalls, 1, 'rotation should call the mock API once');
   await rotatedDialog.getByRole('button', { name: 'I’ve stored it — close' }).click();
   assert.equal((await page.locator('body').innerText()).includes('mr-e2e-secret-2'), false, 'the plaintext key must not remain rendered after its reveal dialog closes');
-  console.log('PASS: login, create one-time client key, confirm rotation, and one-time rotated-key reveal');
+  await page.getByRole('link', { name: 'Settings' }).click();
+  const lowResource = page.getByRole('checkbox', { name: 'Low-resource profile' });
+  await lowResource.check();
+  await page.getByRole('button', { name: 'Save pool settings' }).click();
+  await assertEventually(() => page.getByText('Saved · relay restart required').count().then((count) => count === 1));
+  const savedConfig = JSON.parse(configRaw);
+  assert.equal(savedConfig.latency.pool_idle_secs, 30);
+  assert.equal(savedConfig.latency.pool_max_idle_per_host, 2);
+  assert.equal(savedConfig.latency.hedge_width, 7, 'unrelated latency values must be preserved');
+  assert.equal(savedConfig.latency.future_tuning, 'keep-me', 'unknown raw fields must be preserved');
+  console.log('PASS: login, one-time client-key lifecycle, and low-resource pool settings save');
 } finally {
   await browser.close();
   await new Promise((resolve) => server.close(resolve));

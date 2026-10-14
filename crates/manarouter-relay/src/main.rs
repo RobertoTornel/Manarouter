@@ -200,6 +200,7 @@ fn main() -> anyhow::Result<()> {
             vault,
             oauth_refreshers: Arc::new(oauth_refreshers),
             oauth_store,
+            sticky_success: Arc::new(manarouter_relay::sticky::StickySuccess::default()),
         };
 
         if let Err(e) = server::serve(state, addr).await {

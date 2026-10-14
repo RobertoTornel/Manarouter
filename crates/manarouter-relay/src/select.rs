@@ -183,6 +183,19 @@ pub fn step_available(
         .any(|a| account_available(a.id.as_str(), health, now_ms))
 }
 
+/// Whether a step has at least one usable account that allows the requested model.
+pub fn step_has_usable_account(
+    provider: &ProviderPlan,
+    health: &HashMap<String, Cooldown>,
+    now_ms: u64,
+    model: &str,
+) -> bool {
+    provider
+        .accounts
+        .iter()
+        .any(|a| account_available(a.id.as_str(), health, now_ms) && account_allows_model(a, model))
+}
+
 /// The order in which a combo's steps should be tried, as indices into `combo.steps`.
 ///
 /// # The strategy rules
@@ -598,6 +611,7 @@ mod tests {
                 loser_grace_ms: 0,
             },
             midstream_policy: Default::default(),
+            sticky_success_window_secs: 1800,
             max_retries: 0,
             retry_delay_ms: 0,
             affinity: false,

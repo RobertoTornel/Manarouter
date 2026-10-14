@@ -724,9 +724,14 @@ pub struct Combo {
     /// How the steps are traversed.
     #[serde(default)]
     pub strategy: ComboStrategy,
-    /// The hedged race configuration.
+    /// The hedged race configuration. `enabled` also opts priority combos into sticky-success
+    /// selection; concurrent hedged execution remains a separate capability.
     #[serde(default)]
     pub hedge: HedgeSpec,
+    /// Inactivity window in seconds for combo-wide sticky-success selection. Used only when
+    /// strategy is priority and hedge is enabled. Zero disables remembered preference.
+    #[serde(default = "default_sticky_success_window_secs")]
+    pub sticky_success_window_secs: u32,
     /// What to do when the committed model dies after bytes have been sent.
     #[serde(default)]
     pub midstream_policy: MidstreamPolicy,
@@ -765,6 +770,9 @@ pub struct Combo {
 fn default_combo_max_retries() -> u8 {
     1
 }
+fn default_sticky_success_window_secs() -> u32 {
+    1_800
+}
 fn default_retry_delay_ms() -> u64 {
     2_000
 }
@@ -779,6 +787,7 @@ impl Combo {
             steps: vec![first],
             strategy: ComboStrategy::default(),
             hedge: HedgeSpec::default(),
+            sticky_success_window_secs: default_sticky_success_window_secs(),
             midstream_policy: MidstreamPolicy::default(),
             max_retries: default_combo_max_retries(),
             retry_delay_ms: default_retry_delay_ms(),
@@ -905,6 +914,7 @@ impl Combo {
         let mut h = fnv1a64(self.name.as_bytes());
         h ^= fnv1a64(&(self.strategy as u8).to_le_bytes());
         h ^= fnv1a64(&(self.hedge.enabled as u8).to_le_bytes());
+        h ^= fnv1a64(&self.sticky_success_window_secs.to_le_bytes());
         h ^= fnv1a64(&self.hedge.window_ms.to_le_bytes());
         h ^= fnv1a64(&self.hedge.count.to_le_bytes());
         h ^= fnv1a64(&(self.midstream_policy as u8).to_le_bytes());

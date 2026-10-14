@@ -498,8 +498,13 @@ impl Config {
         if self.latency.hedge_max_requests == 0 {
             problems.push("latency.hedge_max_requests must be at least 1".to_string());
         }
+        // Zero idle timeout means disable idle connection retention. The max-idle count must be
+        // positive: hyper's zero handling is implementation-specific and a zero cap obscures intent.
         if self.latency.pool_max_idle_per_host == 0 {
             problems.push("latency.pool_max_idle_per_host must be at least 1".to_string());
+        }
+        if self.latency.pool_idle_secs > 86_400 {
+            problems.push("latency.pool_idle_secs must not exceed 86400 seconds".to_string());
         }
 
         problems
@@ -893,6 +898,21 @@ mod tests {
         let mut cfg = Config::default();
         cfg.latency.hedge_width = 0;
         assert!(cfg.validate().iter().any(|m| m.contains("hedge_width")));
+    }
+
+    #[test]
+    fn pool_idle_zero_disables_retention_and_excessive_idle_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.latency.pool_idle_secs = 0;
+        assert!(!cfg.validate().iter().any(|m| m.contains("pool_idle_secs")));
+        cfg.latency.pool_idle_secs = 86_401;
+        assert!(cfg.validate().iter().any(|m| m.contains("pool_idle_secs")));
+        cfg.latency.pool_idle_secs = 90;
+        cfg.latency.pool_max_idle_per_host = 0;
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|m| m.contains("pool_max_idle_per_host")));
     }
 
     #[test]

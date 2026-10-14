@@ -37,6 +37,10 @@ against a deterministic mock upstream. See [`docs/16-latency-engineering.md`](do
 
 ---
 
+## Local latency benchmark
+
+For an isolated, report-only comparison of direct loopback mock requests versus relay-routed mock requests, see [`docs/local-latency-benchmark.md`](docs/local-latency-benchmark.md). It uses release binaries and a temporary config/vault, makes no external calls, and is deliberately excluded from CI thresholds.
+
 ## What it does
 
 | | |

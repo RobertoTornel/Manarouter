@@ -112,6 +112,8 @@ pub struct AppState {
     pub oauth_refreshers: Arc<std::collections::HashMap<String, Arc<Refresher>>>,
     /// Metadata lookup for OAuth references attached to snapshot accounts.
     pub oauth_store: Arc<mr_core::store::Store>,
+    /// Bounded combo-wide successful-step memory; reset when the relay process restarts.
+    pub sticky_success: Arc<crate::sticky::StickySuccess>,
 }
 
 /// Build the route table.
@@ -307,11 +309,43 @@ async fn dispatch(
     let now_ms = mr_core::ids::now_millis().max(0) as u64;
 
     // --- Step order. ---
+    let mut sticky_index = None;
     let steps: Vec<&StepPlan> = match (combo, direct) {
         (_, Some(step)) => vec![step],
         (Some(combo), None) => {
             let counter = table.advance_rr(&combo.id);
-            select::order_steps(combo, table.snapshot.providers(), &health, counter, now_ms)
+            let order =
+                select::order_steps(combo, table.snapshot.providers(), &health, counter, now_ms);
+            let sticky_enabled = combo.strategy == mr_core::ComboStrategy::Priority
+                && combo.hedge.enabled
+                && combo.sticky_success_window_secs > 0;
+            if sticky_enabled {
+                sticky_index = app.sticky_success.preferred_index(
+                    &combo.id,
+                    &combo.steps,
+                    |step| {
+                        table
+                            .snapshot
+                            .providers()
+                            .get(step.provider_index as usize)
+                            .is_some_and(|provider| {
+                                select::step_has_usable_account(
+                                    provider,
+                                    &health,
+                                    now_ms,
+                                    &step.model,
+                                )
+                            })
+                    },
+                    std::time::Instant::now(),
+                );
+            }
+            let mut indices = order;
+            if let Some(index) = sticky_index {
+                indices.retain(|i| *i != index);
+                indices.insert(0, index);
+            }
+            indices
                 .into_iter()
                 .filter_map(|i| combo.steps.get(i))
                 .collect()
@@ -333,7 +367,20 @@ async fn dispatch(
     let quota = mr_core::config::QuotaConfig::default();
 
     for step in &steps {
+        let is_sticky_step = sticky_index.is_some_and(|i| {
+            combo.is_some_and(|c| {
+                c.steps
+                    .get(i)
+                    .is_some_and(|candidate| std::ptr::eq(candidate, *step))
+            })
+        });
         let Some(provider) = table.snapshot.providers().get(step.provider_index as usize) else {
+            if is_sticky_step {
+                if let Some(combo) = combo {
+                    app.sticky_success.clear(&combo.id);
+                }
+                sticky_index = None;
+            }
             continue;
         };
 
@@ -346,6 +393,12 @@ async fn dispatch(
             now_ms,
             &step.model,
         ) else {
+            if is_sticky_step {
+                if let Some(combo) = combo {
+                    app.sticky_success.clear(&combo.id);
+                }
+                sticky_index = None;
+            }
             continue;
         };
 
@@ -517,6 +570,18 @@ async fn dispatch(
         match app.relay.upstream().send(request).await {
             Ok(response) if response.status.is_success() => {
                 app.health.record_success(account.id.as_str());
+                if let Some(combo) = combo.filter(|c| {
+                    c.strategy == mr_core::ComboStrategy::Priority
+                        && c.hedge.enabled
+                        && c.sticky_success_window_secs > 0
+                }) {
+                    app.sticky_success.record_success(
+                        &combo.id,
+                        step,
+                        Duration::from_secs(combo.sticky_success_window_secs as u64),
+                        std::time::Instant::now(),
+                    );
+                }
                 tracing::debug!(
                     model = model_name,
                     provider = %step.provider_id,
@@ -529,6 +594,12 @@ async fn dispatch(
                 return build_client_response(ctx, translated_body, response).await;
             }
             Ok(response) => {
+                if is_sticky_step {
+                    if let Some(combo) = combo {
+                        app.sticky_success.clear(&combo.id);
+                    }
+                    sticky_index = None;
+                }
                 let reason = classify_status(response.status);
                 app.health.cool_down(
                     account.id.as_str(),
@@ -538,6 +609,12 @@ async fn dispatch(
                 last_failure = Some(build_response(response));
             }
             Err(e) => {
+                if is_sticky_step {
+                    if let Some(combo) = combo {
+                        app.sticky_success.clear(&combo.id);
+                    }
+                    sticky_index = None;
+                }
                 let reason = select::CooldownReason::Backoff;
                 app.health.cool_down(
                     account.id.as_str(),

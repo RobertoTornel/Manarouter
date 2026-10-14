@@ -203,6 +203,8 @@ pub struct ComboPlan {
     pub steps: Vec<StepPlan>,
     /// The hedged race, with participant indices already remapped onto `steps`.
     pub hedge: HedgePlan,
+    /// Sticky-success expiry after inactivity, in seconds; zero disables it.
+    pub sticky_success_window_secs: u32,
     /// What to do when the committed model dies after bytes have been sent.
     pub midstream_policy: MidstreamPolicy,
     /// Attempts allowed before the combo gives up.
@@ -559,6 +561,7 @@ impl RoutingSnapshot {
                 strategy: combo.strategy,
                 steps,
                 hedge,
+                sticky_success_window_secs: combo.sticky_success_window_secs,
                 midstream_policy: combo.midstream_policy,
                 max_retries: combo.max_retries,
                 retry_delay_ms: combo.retry_delay_ms,
@@ -1181,6 +1184,7 @@ fn plan_signature(plan: &ComboPlan) -> u64 {
     hash ^= fnv1a64(&plan.max_retries.to_le_bytes());
     hash ^= fnv1a64(&plan.retry_delay_ms.to_le_bytes());
     hash ^= fnv1a64(&[plan.affinity as u8]);
+    hash ^= fnv1a64(&plan.sticky_success_window_secs.to_le_bytes());
     hash ^= fnv1a64(&[plan.compression.enabled as u8]);
     hash ^= fnv1a64(&[compression_mode_tag(plan.compression.mode)]);
     hash ^= fnv1a64(&(plan.compression.min_bytes as u64).to_le_bytes());
@@ -1366,6 +1370,7 @@ fn encode_combo(encoder: &mut Encoder, combo: &ComboPlan) {
     encoder.put_bool(combo.compression.never_grow);
     encoder.put_bool(combo.compression.never_empty);
     encoder.put_bool(combo.hedge.enabled);
+    encoder.put_u32(combo.sticky_success_window_secs);
     encoder.put_u16(combo.hedge.window_ms);
     encoder.put_u16(combo.hedge.loser_grace_ms);
     encoder.put_u8(combo.hedge.winner_metric as u8);
@@ -1546,6 +1551,7 @@ fn decode_combos(
         };
 
         let hedge_enabled = reader.bool()?;
+        let sticky_success_window_secs = reader.u32()?;
         let window_ms = reader.u16()?;
         let loser_grace_ms = reader.u16()?;
         let winner_metric = winner_metric_from_tag(reader.u8()?)?;
@@ -1606,6 +1612,7 @@ fn decode_combos(
                 cancel_losers,
                 loser_grace_ms,
             },
+            sticky_success_window_secs,
             midstream_policy,
             max_retries,
             retry_delay_ms,
@@ -2378,6 +2385,7 @@ mod tests {
                 cancel_losers: true,
                 loser_grace_ms: 0,
             },
+            sticky_success_window_secs: 1800,
             midstream_policy: MidstreamPolicy::Restart,
             max_retries: 1,
             retry_delay_ms: 0,

@@ -105,6 +105,7 @@ export async function renderCombos(mount, ctx, selectedId) {
     // editor, and the defaults here mirror the backend's (count 3, window 800 ms, TTFB metric).
     draft.hedge = {
       enabled: draft.hedge?.enabled ?? false,
+      sticky_success_window_secs: draft.sticky_success_window_secs ?? 1800,
       participants: draft.hedge?.participants ?? [],
       count: draft.hedge?.count ?? 3,
       window_ms: draft.hedge?.window_ms ?? 800,
@@ -171,6 +172,8 @@ export async function renderCombos(mount, ctx, selectedId) {
     // --- hedge ---
     const hedgeOn = h('input', { type: 'checkbox' });
     hedgeOn.checked = Boolean(draft.hedge?.enabled);
+    const stickyWindowInput = h('input', { class: 'input', type: 'number', min: '0', max: '604800', value: draft.sticky_success_window_secs });
+    const stickyWindowBox = field('Sticky success window (seconds)', stickyWindowInput, { hint: 'Priority combos only; enabled with hedge. Default 1800s (30 minutes). Combo-wide across callers; inactivity refreshes after a successful response. Set 0 to disable.' });
     const hedgeCount = h('input', { class: 'input', type: 'number', min: '2', max: '255', 'data-field': 'count', value: draft.hedge?.count ?? 3 });
     const hedgeWindow = h('input', { class: 'input', type: 'number', min: '0', 'data-field': 'window_ms', value: draft.hedge?.window_ms ?? 800 });
     const metricSel = h('select', { class: 'input', 'data-field': 'winner_metric' });
@@ -208,7 +211,8 @@ export async function renderCombos(mount, ctx, selectedId) {
     }
 
     const hedgeBox = h('fieldset', { class: 'hedge' },
-      h('legend', {}, 'Hedged race'),
+      h('legend', {}, 'Hedged race and sticky success'),
+      stickyWindowBox,
       h('div', { class: 'check-row' }, hedgeOn, h('label', {}, 'Enable the hedged race for this combo')),
       h('p', { class: 'hint', style: 'margin-bottom:8px;' },
         'The window is an eligibility gate, not a stopwatch race: the winner is the highest-priority participant that produced a valid reply within the window. A lower-priority model answering faster does not win; if nobody answers in time, nothing is re-spent.'),
@@ -225,7 +229,7 @@ export async function renderCombos(mount, ctx, selectedId) {
         field('Loser grace (ms)', loserGrace, { hint: '0 = cancel immediately.' })),
       participantSummary,
     );
-    hedgeOn.addEventListener('change', () => { hedgeBox.style.opacity = hedgeOn.checked ? '1' : '0.55'; });
+    hedgeOn.addEventListener('change', () => { hedgeBox.style.opacity = hedgeOn.checked ? '1' : '0.55'; stickyWindowBox.style.opacity = hedgeOn.checked ? '1' : '0.55'; });
     hedgeBox.style.opacity = hedgeOn.checked ? '1' : '0.55';
     renderStableSelect(); renderFailExtras(); renderParticipantSummary();
     updateStrategyHint(); updateMetricHint(); updateFailHint();
@@ -265,6 +269,7 @@ export async function renderCombos(mount, ctx, selectedId) {
       const payload = {
         ...draft,
         name: draft.name.trim(),
+        sticky_success_window_secs: Number(stickyWindowInput.value) || 0,
         steps: draft.steps.map((s) => ({ ...s, note: s.note || undefined })),
         hedge: {
           enabled: hedgeOn.checked,

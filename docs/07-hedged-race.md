@@ -13,7 +13,7 @@ consequences carefully.
 
 > **Implementation status:** this page describes the intended hedge policy. The relay currently runs
 > combo steps sequentially; hedged execution, winner recovery, mid-stream switching, and session
-> affinity described below are not wired. `hedge.enabled` does not yet start concurrent requests.
+> affinity described below are not wired. `hedge.enabled` does not start concurrent requests. It now also opts a `priority` combo into the separate sticky-success preference: after a successful call the relay prefers that provider/model for the configured inactivity window (default 1800 seconds), subject to current eligibility. This preference is combo-wide across callers, process-local, bounded, and makes no inference or keepalive calls. Because the relay streams responses once upstream headers/first byte succeed, success for stickiness is committed at header/HTTP 2xx receipt; if an upstream stream breaks mid-body after headers, the relay does not retroactively clear the pin on that request. It changes only the next call's preference; normal priority fallback remains available.
 
 ---
 

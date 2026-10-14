@@ -45,4 +45,5 @@ pub mod model_scan;
 pub mod select;
 pub mod server;
 pub mod state;
+pub mod sticky;
 pub mod upstream;

@@ -217,7 +217,7 @@ impl RelayState {
             }
         };
 
-        let upstream = Upstream::default_pool().map_err(|e| {
+        let upstream = Upstream::from_latency(&config.latency).map_err(|e| {
             // The client is built from a static root store and ALPN list, so this cannot fail for
             // anything the operator did. Surfacing it as a configuration error would send them
             // looking in `config.json` for a problem that is not there.
@@ -493,5 +493,17 @@ mod tests {
         let key = client_key("k-good", "good", &hex, true);
         let entry = KeyEntry::from_config(&key).expect("a well-formed hash parses");
         assert!(entry.matches(&hash));
+    }
+
+    #[test]
+    fn upstream_wires_configured_latency_pool_settings() {
+        let mut cfg = Config::default();
+        cfg.latency.pool_idle_secs = 42;
+        cfg.latency.pool_max_idle_per_host = 7;
+        let client = Upstream::from_latency(&cfg.latency).unwrap();
+        assert_eq!(
+            client.pool_settings(),
+            (std::time::Duration::from_secs(42), 7)
+        );
     }
 }
