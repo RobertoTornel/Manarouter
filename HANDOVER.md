@@ -1,6 +1,6 @@
 # Handover — project state and what still needs implementing
 
-State of the tree: **`9ec3284`** on `main`, **8 commits ahead of `origin/main`** and not yet pushed.
+State of the tree: **`9b7c47c`** on `main`, **10 commits ahead of `origin/main`** and not yet pushed.
 Everything below was checked against this working tree and, where stated, against a running server.
 Where a claim is unverified, it says so. Nothing here is recalled from an earlier session.
 
@@ -17,6 +17,8 @@ Yes, within these limits:
 | Gate | Result |
 |---|---|
 | `cargo test --workspace --all-targets` | **731 passed, 0 failed**, 1 ignored (opt-in live test) |
+| `cargo test -p mr-core --test imported_grants_are_independent -- --ignored` | passes; 10/10 imported grants usable with the reference stopped |
+| same test with `MANAROUTER_FORCE_REFRESH=1` | **9/10 refresh**; the tenth is the account an earlier destructive test killed (see §3) |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | `cargo fmt --all -- --check` | clean |
 | `bash scripts/check-secrets.sh` | `check-secrets: OK` (134 files) |
@@ -114,8 +116,10 @@ installed-app client identities** (`crates/mr-core/src/published.rs` already ass
 a refresh token issued to one is accepted by the other. The migration does one refresh per account and
 stores the result, so the reference becomes irrelevant afterwards.
 
-Verified against the live installation: **10 grants imported, all 10 re-refreshed with the reference
-stopped**, and a real completion served through the relay. Four findings worth keeping:
+Verified against the live installation: **10 grants imported**, all usable with the reference stopped,
+and a real completion served through the relay. **Nine of the ten still refresh**; the tenth is dead
+because an earlier version of the verification test spent its single-use token without persisting the
+replacement (last entry below). Findings worth keeping:
 
 - **Codex needs its `id_token`** — the relay reads `chatgpt-account-id` from it; without it every
   request is a hard 400.
@@ -132,6 +136,21 @@ stopped**, and a real completion served through the relay. Four findings worth k
   the suffixed names registered as aliases onto them. A genuinely suffixed model (Antigravity's
   `gemini-3.8-flash-high`) is kept, and the distinction is drawn from the listing itself rather than a
   hardcoded vocabulary.
+- **Importing Codex is a *move*, not a copy** (`9b7c47c`). Codex refresh tokens are single-use, so the
+  import consumes the reference's copy: after a Codex import OmniRoute cannot refresh that account
+  without its own re-login. Antigravity's tokens are *reusable*, so an Antigravity import leaves the
+  reference working. Verified both directions against the live installation. This asymmetry is
+  dangerous precisely because it is invisible: a test written against Antigravity passes while Codex
+  accounts are being consumed.
+- **A verification test killed a live account, and that is a lesson about the test, not the feature.**
+  The first version of `imported_grants_are_independent` called `refresh_with_context` directly to
+  "check" the credentials. That method returns the rotated set and persists nothing, so every run
+  rotated up to six single-use tokens and discarded the replacements. One account
+  (`jujupatata038@gmail.com`) is now permanently dead — the reference's copy died with it — and only
+  an interactive re-login can restore it. **Nine of ten accounts still work.** The test now uses
+  `Refresher::ensure_fresh(.., false)`, the production path, which persists any rotation and makes no
+  network call when the token is not due. A diagnostic that wants to *check* a credential must never
+  be able to *spend* it.
 
 Also in this commit: model lists carry labels, context windows and output limits across, because a
 provider with no model entries resolves nothing and the account would be live but unreachable.

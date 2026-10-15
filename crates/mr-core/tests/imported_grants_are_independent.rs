@@ -26,10 +26,16 @@
 //! imported account — rather than assuming a particular account needed a network round trip.
 //!
 //! Ignored by default: it needs a real installation and may make network calls, so it must never
-//! run in CI. Run it deliberately:
+//! run in CI. Run it deliberately, and set `MANAROUTER_FORCE_REFRESH=1` for the stronger claim:
 //!
 //! ```text
+//! # cheap: proves every imported credential is present and usable
 //! cargo test -p mr-core --test imported_grants_are_independent -- --ignored --nocapture
+//!
+//! # strong: forces a real rotation from every provider, proving the grants are independently
+//! # refreshable. Spends a single-use refresh token per account, so do not run it in a loop.
+//! MANAROUTER_FORCE_REFRESH=1 \
+//!   cargo test -p mr-core --test imported_grants_are_independent -- --ignored --nocapture
 //! ```
 
 use std::sync::Arc;
@@ -74,6 +80,19 @@ async fn imported_grants_refresh_without_the_reference() {
         "no OAuth credentials are installed; run `mr migrate omniroute --apply` first"
     );
 
+    // `MANAROUTER_FORCE_REFRESH=1` additionally demands a real network rotation from every
+    // credential, which is a strictly stronger claim than "usable": with `force = false` the
+    // refresher returns the stored token unchanged whenever it is not yet due, so the test can pass
+    // in milliseconds without proving the grant can still be *refreshed*. Both modes are useful —
+    // the default is cheap and safe to run often, the forced mode is the one that actually exercises
+    // the reference-independence claim, at the cost of spending a single-use token per account.
+    //
+    // Forced mode is opt-in because on a single-use platform it is mildly destructive even when it
+    // succeeds: the run rotates every token and persists the replacements, so any *other* copy of
+    // those credentials (the reference's) is left dead. It persists what it rotates, which is what
+    // makes that acceptable rather than fatal.
+    let force = std::env::var("MANAROUTER_FORCE_REFRESH").is_ok_and(|v| v == "1");
+
     let mut usable = 0usize;
     let mut failures: Vec<String> = Vec::new();
 
@@ -103,9 +122,9 @@ async fn imported_grants_refresh_without_the_reference() {
             }),
         );
 
-        match refresher.ensure_fresh(&row.vault_ref, false).await {
+        match refresher.ensure_fresh(&row.vault_ref, force).await {
             Ok(tokens) if !tokens.access_token.is_empty() => {
-                println!("usable  {label}");
+                println!("{}  {label}", if force { "refreshed" } else { "usable   " });
                 usable += 1;
             }
             Ok(_) => failures.push(format!(
@@ -122,5 +141,10 @@ async fn imported_grants_refresh_without_the_reference() {
         rows.len(),
         failures.join("\n  ")
     );
-    println!("{usable} imported grants are usable without the reference");
+    let verb = if force {
+        "refreshed through the provider"
+    } else {
+        "usable without the reference"
+    };
+    println!("{usable} imported grants are {verb}");
 }

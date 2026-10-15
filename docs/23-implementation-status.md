@@ -37,11 +37,25 @@ The OmniRoute migration was verified against a live installation as well, which 
 and so is not part of the list above:
 
 ```sh
+# Cheap: proves every imported credential is present, readable and usable. Returns the stored
+# token without a network call when it is not yet due, so it is safe to re-run.
 cargo test -p mr-core --test imported_grants_are_independent -- --ignored --nocapture
+
+# Strong: forces a real rotation from every provider, proving the grants are independently
+# refreshable. Spends one single-use refresh token per account. Do not run it in a loop.
+MANAROUTER_FORCE_REFRESH=1 \
+  cargo test -p mr-core --test imported_grants_are_independent -- --ignored --nocapture
 ```
 
-That test reads this installation's vault and store only — the reference database is not opened — and
-requires every imported grant to refresh. It passed with the reference fully stopped.
+Both read this installation's vault and store only — the reference database is never opened — and both
+were run with the reference fully stopped. On the live installation the cheap mode reports **10 of 10**
+grants usable and the forced mode reports **9 of 10** refreshing: one Codex account was killed by an
+earlier, destructive version of this test, which called `refresh_with_context` directly. That method
+returns a rotated token set and persists nothing, so on a single-use platform the replacement was
+discarded and the account became unusable, in the reference as well as here. The test now goes through
+`Refresher::ensure_fresh`, the production path, which persists rotation; the dead account needs an
+interactive re-login and nothing in the repository can repair it. See
+[the Codex "move, not a copy" warning](17-migrating-from-omniroute.md#warning-for-codex-this-is-a-move-not-a-copy).
 
 ## 2. What running it found
 
