@@ -22,14 +22,14 @@ Symptom → cause → fix. Start with `mr doctor`, which checks most of this in 
 
 | Cause | How to confirm | Fix |
 |---|---|---|
-| The port is in use | `ss -ltnp \| grep 20900` | Stop the other process, or `mr config set-port relay 20910` and restart. |
-| The configuration is invalid | `mr config validate` | It prints **every** problem, so fix them in one pass rather than one at a time. |
-| The snapshot is missing | The error names `snapshot.bin` | `mr config validate` then any `mr combo` command recompiles it. |
+| The port is in use | `ss -ltnp \| grep 20900` | Stop the other process, or change `relay.port` in `config.json` and restart (`mr config set-port` is not implemented yet). |
+| The configuration is invalid | Any `mr` command that saves refuses and prints **every** problem | Fix them in one pass rather than one at a time. |
+| The snapshot is missing | The relay logs `no usable compiled snapshot; compiling from the configuration` | Nothing to fix: the relay recompiles `routes.snapshot` from `config.json` on load, and any `mr` command that saves rewrites it. |
 | The snapshot is corrupt | A checksum error naming a mismatch | Delete the snapshot; it is derived data and is regenerated from `config.json`. |
 | A non-loopback bind with no password | The message says so explicitly | Set a password, or bind loopback. This is refused by design, not a bug. |
 
-Deleting `snapshot.bin` is always safe. It is compiled from `config.json`, and if the two disagree the
-config wins.
+Deleting `routes.snapshot` is always safe. It is compiled from `config.json`, and if the two disagree
+the config wins.
 
 ---
 
@@ -109,10 +109,10 @@ Four different problems, and they need different fixes. Distinguish them:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| The **first** request after a restart is slow, the rest are fast | A cold connection pool: TCP and TLS handshakes | Expected. `prewarm` opens the connections at startup so the first real request does not pay for them. |
+| The **first** request after a restart is slow, the rest are fast | A cold connection pool: TCP and TLS handshakes | Expected. The `prewarm` flag is carried in the configuration but nothing calls the prewarm routine yet, so the first real request still pays for the handshakes. |
 | Every request is consistently slow | A distant provider, or a model that is genuinely slow | Compare `mr provider test` across providers. The router adds microseconds; a provider adds hundreds of milliseconds. |
-| Latency is **highly variable** and no model is consistently chosen | A hedge whose window is too short | If nobody replies inside `window_ms`, the priority ordering stops mattering and the race resolves by the fallback rule. Widen the window or check that the top participant is actually reachable. |
-| Slow only for one combo | A step earlier in the list is slow but not failing | `priority` has no opinion on latency. Reorder, or use a hedge ([Combo cookbook recipe 3](combo-cookbook.md#3-fastest-wins--a-hedged-race)). |
+| Latency is **highly variable** and no model is consistently chosen | A hedge whose window is too short | Cannot be the cause yet: hedging is not wired up — `hedge_decide` is never called by the relay — so this row describes the intended design. |
+| Slow only for one combo | A step earlier in the list is slow but not failing | `priority` has no opinion on latency. Reorder; a hedge ([Combo cookbook recipe 3](combo-cookbook.md#3-fastest-wins--a-hedged-race)) is not wired up yet either. |
 
 **The router is almost never the cause of a slow request.** Its budget is under a millisecond of added
 overhead against providers whose own TTFB is hundreds of milliseconds. If you suspect it anyway, see
@@ -140,9 +140,9 @@ overhead against providers whose own TTFB is hundreds of milliseconds. If you su
 | Bound to loopback and you are on another machine | That is the default. Tunnel it (`ssh -L 20901:127.0.0.1:20901 host`) rather than exposing it — the panel holds provider credentials. |
 | Non-loopback bind with no password | **Refused at startup by design**, with a message saying how to set one. This is not a bug. |
 | A reverse proxy strips the `Origin` header | Mutations are refused. Configure the proxy to preserve `Origin`, or use the CLI. |
-| The port is wrong | `mr config path`, then read the `ports` section. A pending change needs a restart. |
+| The port is wrong | `mr version` prints the config path; read the `relay`/`control` `port` fields there (`mr config path` is not implemented yet). A pending change needs a restart. |
 | The conductor is not running | The panel is served by the conductor on its own port. `mr serve` starts both. |
-| A service is `inactive` after a reboot but `systemctl --user start` works | Suspect a **systemd ordering cycle**, not a crash. A unit that is both `WantedBy=default.target` and `After=default.target` deadlocks at boot; systemd breaks the cycle by deleting a start job, so the unit is never started and is *not* marked failed. Check with `systemd --user --test` (reports `Found ordering cycle`) or `scripts/check-systemd-cycle.py <unit-dir>`. `systemd-analyze verify` does not detect this. |
+| A service is `inactive` after a reboot but `systemctl --user start` works | Suspect a **systemd ordering cycle**, not a crash. A unit that is both `WantedBy=default.target` and `After=default.target` deadlocks at boot; systemd breaks the cycle by deleting a start job, so the unit is never started and is *not* marked failed. Check with `systemd --user --test` (reports `Found ordering cycle`) or `scripts/check-systemd-cycle.py <unit-dir>`. `scripts/post-reboot-check.sh` runs this and the rest of the post-boot checks in one command. `systemd-analyze verify` does not detect this. |
 
 The panel runs on a **different port from the relay** and is never on the request path, so a panel
 problem never affects a completion, and a completion problem is never the panel.
@@ -190,7 +190,12 @@ change is pending produces a confusing failure later.
 
 ## A streamed response is truncated after a failover
 
-Working as intended, in one specific case.
+Working as intended, in one specific case — once mid-stream failover is wired up. In this tree
+`midstream_policy` is compiled into the routing snapshot but the relay does not consult it: failover
+happens only on the upstream response status, before any byte reaches the client. A stream that fails
+after the first byte reaches the client is terminated with a body error; the relay does not restart it
+on another model and does not emit the `manarouter.retry` boundary, so the guard described below is not
+reached. Everything from here to the next section describes the intended design.
 
 When the winning model dies mid-stream, `midstream_policy` decides between restarting and terminating.
 But under **both** policies there is a hard guard: **once any `tool_calls` delta has been emitted, the
@@ -243,7 +248,7 @@ something is missing from that table, that is a bug.
 
 ```bash
 # Raise verbosity for one run.
-RUST_LOG=manarouter=debug,mr_core=debug mr serve
+RUST_LOG=manarouter_relay=debug,manarouter_conductor=debug,mr_core=debug mr serve
 
 # Per-component.
 RUST_LOG=manarouter_relay=trace mr serve      # the request path
