@@ -6,15 +6,7 @@
 //!
 //! The global allocator is declared in `lib.rs` for the same reason.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-
 use clap::Parser;
-use manarouter_relay::select::Health;
-use manarouter_relay::server::{self, AppState};
-use manarouter_relay::state::RelayState;
-use mr_core::config::Config;
-use mr_core::secret::Vault;
 
 /// The data plane: accepts OpenAI- and Anthropic-shaped requests and routes them.
 ///
@@ -74,213 +66,36 @@ fn main() -> anyhow::Result<()> {
         "manarouter-relay starting"
     );
 
-    // The configuration is loaded here, in the binary, as well as inside `RelayState::load`. That is
-    // not redundancy for its own sake: the listener settings live in the same file, and reading it
-    // once here means a malformed configuration is reported as a startup error with a path in it,
-    // rather than surfacing later as a routing failure inside a request.
-    let config = match Config::load_default() {
-        Ok(c) => c,
-        Err(e) => {
-            // A missing file is the normal first run, not an error worth a stack trace. Anything else
-            // is a real problem the operator has to fix, and it is printed rather than panicked
-            // because release builds set `panic = "abort"`.
-            eprintln!("manarouter-relay: could not read the configuration: {e}");
-            eprintln!(
-                "manarouter-relay: looked in {}",
-                mr_core::config::config_path().display()
-            );
-            std::process::exit(2);
-        }
-    };
+    // The startup sequence lives in `manarouter_relay::startup` so `mr serve` composes exactly the
+    // same code path. `main` only owns the two things a library must not: the process-wide log
+    // subscriber and the environment, both set above, plus the exit code below.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("could not start the async runtime: {e}"))?;
 
-    // `validate` returns every problem it found rather than the first, so an operator fixing a
-    // configuration sees the whole list once instead of one error per edit.
-    let problems = config.validate();
-    if !problems.is_empty() {
-        eprintln!("manarouter-relay: the configuration is not valid:");
-        for p in &problems {
-            eprintln!("  - {p}");
-        }
-        std::process::exit(2);
-    }
+    let outcome = runtime.block_on(async move {
+        manarouter_relay::startup::serve(manarouter_relay::startup::RelayOptions {
+            host: args.host.clone(),
+            port: args.port,
+        })
+        .await
+    });
 
-    let addr = match resolve_addr(&args, &config) {
-        Ok(a) => a,
+    // A startup refusal is **exit code 2**, and that is documented: `docs/23-implementation-status.md`
+    // says the keyless-bind refusal exits 2. It is also the code an operator's script can distinguish
+    // from a crash. Returning `Err` here would make it 1 through the `anyhow` path, which is why this
+    // is a return code rather than a propagated error.
+    //
+    // The prefix is added here rather than in the library so the message reads as coming from this
+    // binary, which is what it says in a log or a systemd journal.
+    match outcome {
+        Ok(()) => Ok(()),
         Err(e) => {
             eprintln!("manarouter-relay: {e}");
             std::process::exit(2);
         }
-    };
-
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("manarouter-relay: could not start the async runtime: {e}");
-            std::process::exit(2);
-        }
-    };
-
-    runtime.block_on(async move {
-        let relay = match RelayState::load() {
-            Ok(r) => Arc::new(r),
-            Err(e) => {
-                eprintln!("manarouter-relay: could not load the routing table: {e}");
-                std::process::exit(2);
-            }
-        };
-
-        // With no client keys configured the relay serves **everyone**: `authenticate` answers
-        // `Open`, because a fresh install that rejected all requests would be unusable and the
-        // operator would have no way to reach the panel and create a key.
-        //
-        // That is a reasonable trade on loopback and an unacceptable one anywhere else, so the two
-        // conditions are checked together. Binding a keyless relay to a reachable interface would
-        // hand this machine's provider credentials to anyone who can route to it, and no warning in a
-        // log is a sufficient answer to that.
-        if !relay.keys_are_configured() {
-            if !keyless_bind_is_allowed(addr, false) {
-                eprintln!(
-                    "manarouter-relay: refusing to bind {addr} with no client keys configured.\n\
-                     manarouter-relay: a relay with no keys serves every request to anyone who can \
-                     reach it,\n\
-                     manarouter-relay: and it holds this machine's provider credentials.\n\
-                     manarouter-relay: create a key with `mr key create`, or bind 127.0.0.1."
-                );
-                std::process::exit(2);
-            }
-            tracing::warn!(
-                bind = %addr,
-                "no client keys are configured, so every request is accepted on this loopback \
-                 address. Create one with `mr key create`."
-            );
-        }
-        tracing::info!(
-            keys = relay.key_count(),
-            combos = relay.table().snapshot.combos().len(),
-            providers = relay.table().snapshot.providers().len(),
-            "routing table loaded"
-        );
-
-        let vault = match Vault::open_default() {
-            Ok(v) => Arc::new(v),
-            Err(e) => {
-                eprintln!("manarouter-relay: could not open the credential vault: {e}");
-                std::process::exit(2);
-            }
-        };
-
-        let refresh_vault =
-            Vault::open(mr_core::config::config_dir()).expect("vault was just opened successfully");
-        let refresh_store = Arc::new(mr_core::oauth::refresh::VaultStore::new(refresh_vault));
-        let oauth_refreshers = mr_core::oauth::platforms()
-            .iter()
-            .map(|platform| {
-                (
-                    platform.id().to_owned(),
-                    Arc::new(mr_core::oauth::refresh::Refresher::new(
-                        *platform,
-                        refresh_store.clone(),
-                    )),
-                )
-            })
-            .collect();
-        let oauth_store = match mr_core::store::Store::open(&mr_core::config::database_path()) {
-            Ok(store) => Arc::new(store),
-            Err(e) => {
-                eprintln!("manarouter-relay: could not open OAuth metadata store: {e}");
-                std::process::exit(2);
-            }
-        };
-        // The reloader needs its own handle, taken before `relay` is moved into the state.
-        let reload_handle = Arc::clone(&relay);
-
-        let state = AppState {
-            relay,
-            health: Arc::new(Health::new()),
-            vault,
-            oauth_refreshers: Arc::new(oauth_refreshers),
-            oauth_store,
-            sticky_success: Arc::new(manarouter_relay::sticky::StickySuccess::default()),
-        };
-
-        // Adopt routing changes written by the control plane, without a restart.
-        //
-        // The control plane compiles the snapshot and writes `config.json`, but the relay holds its
-        // own copy in memory from startup. Until this existed, every import or model addition
-        // required stopping and starting the relay — and the failure was quiet: `/v1/models` listed
-        // the old set and a request for a new model was a 404 that looked like a typo.
-        //
-        // A polling task rather than an inotify watcher: the file is small, this is off the request
-        // path, and a poll cannot miss an event that an editor's rename dance would confuse. One
-        // `stat` per interval is cheaper than the machinery that would replace it.
-        spawn_config_reloader(reload_handle);
-
-        if let Err(e) = server::serve(state, addr).await {
-            eprintln!("manarouter-relay: the listener failed: {e}");
-            std::process::exit(1);
-        }
-    });
-
-    Ok(())
-}
-
-/// Re-read the configuration periodically and install a freshly compiled snapshot when it changed.
-///
-/// Failures are logged and the loop continues: a configuration that momentarily will not parse (a
-/// half-written file, a hand-edit in progress) must not take down a relay that is serving traffic.
-/// The previously installed snapshot keeps working, which is the whole point of keeping routing data
-/// in an atomically swappable handle.
-fn spawn_config_reloader(relay: Arc<RelayState>) {
-    tokio::spawn(async move {
-        let path = mr_core::config::config_path();
-        let mut last_seen = config_fingerprint(&path);
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
-        // The first tick fires immediately; the initial state was just loaded, so skip it.
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            let now = config_fingerprint(&path);
-            if now == last_seen {
-                continue;
-            }
-            // Record before attempting the reload: a file that will not compile must not be retried
-            // on every tick forever, and once it *does* compile the mtime changes again.
-            last_seen = now;
-            match relay.reload() {
-                Ok(digest) => tracing::info!(
-                    digest,
-                    providers = relay.table().snapshot.providers().len(),
-                    "routing table reloaded from an external configuration change"
-                ),
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "a configuration change was detected but could not be applied; keeping the \
-                     current routing table"
-                ),
-            }
-        }
-    });
-}
-
-/// `(mtime, length)` of a file, or `None` when it cannot be read.
-///
-/// Length is included because filesystem timestamps can be coarse here: an edit landing in the same
-/// timestamp tick as the previous read would otherwise be invisible. A path is taken rather than
-/// read from the global config location so the rule can be tested against a temp file.
-fn config_fingerprint(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
-}
-
-/// Whether a keyless relay may bind this address.
-///
-/// Split out from the process so the rule can be tested: everything that calls `exit` is untestable,
-/// and this is exactly the kind of rule that should have a test rather than a comment.
-fn keyless_bind_is_allowed(addr: SocketAddr, keys_configured: bool) -> bool {
-    keys_configured || addr.ip().is_loopback()
+    }
 }
 
 /// Install the log subscriber.
@@ -303,201 +118,9 @@ fn init_tracing(flag: Option<&str>) {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-/// Work out where to listen.
-///
-/// Precedence is the flag, then the configuration file, then the struct default. The flag has to win
-/// — someone who typed `--port` means it — and the file has to beat the default, or a configuration
-/// that says where to listen would be ignored.
-fn resolve_addr(args: &Args, config: &Config) -> Result<SocketAddr, String> {
-    let host = args
-        .host
-        .clone()
-        .unwrap_or_else(|| config.relay.host.clone());
-    let port = args.port.unwrap_or(config.relay.port);
-
-    // An IPv6 literal contains colons, so `{host}:{port}` is ambiguous and does not parse:
-    // `::1:20900` is read as a malformed address rather than as port 20900 on `::1`. Bracketing is
-    // how a socket address disambiguates, and an operator typing `--host ::1` should not have to know
-    // that — the error message would send them looking for a networking problem instead of a syntax
-    // one.
-    let rendered = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    };
-
-    rendered
-        .parse()
-        .map_err(|e| format!("could not interpret \"{host}\" and port {port} as an address: {e}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn args(host: Option<&str>, port: Option<u16>) -> Args {
-        Args {
-            host: host.map(str::to_owned),
-            port,
-            config_dir: None,
-            log: None,
-        }
-    }
-
-    fn config(host: &str, port: u16) -> Config {
-        let mut c = Config::default();
-        c.relay.host = host.to_owned();
-        c.relay.port = port;
-        c
-    }
-
-    #[test]
-    fn with_no_flags_the_configuration_file_decides() {
-        // Otherwise a configuration that says where to listen would be ignored, which makes the file
-        // a decoration.
-        let a = args(None, None);
-        let c = config("0.0.0.0", 12345);
-        assert_eq!(
-            resolve_addr(&a, &c).unwrap(),
-            "0.0.0.0:12345".parse::<SocketAddr>().unwrap()
-        );
-    }
-
-    #[test]
-    fn a_port_flag_beats_the_configuration_file() {
-        // Someone who typed `--port` means it.
-        let a = args(None, Some(9999));
-        let c = config("127.0.0.1", 20900);
-        assert_eq!(
-            resolve_addr(&a, &c).unwrap(),
-            "127.0.0.1:9999".parse::<SocketAddr>().unwrap()
-        );
-    }
-
-    #[test]
-    fn a_host_flag_beats_the_configuration_file() {
-        let a = args(Some("10.0.0.7"), None);
-        let c = config("127.0.0.1", 20900);
-        assert_eq!(
-            resolve_addr(&a, &c).unwrap(),
-            "10.0.0.7:20900".parse::<SocketAddr>().unwrap()
-        );
-    }
-
-    #[test]
-    fn both_flags_together_beat_the_configuration_file() {
-        let a = args(Some("10.0.0.7"), Some(9999));
-        let c = config("127.0.0.1", 20900);
-        assert_eq!(
-            resolve_addr(&a, &c).unwrap(),
-            "10.0.0.7:9999".parse::<SocketAddr>().unwrap()
-        );
-    }
-
-    #[test]
-    fn the_default_configuration_binds_loopback() {
-        // The process holds credentials. A default that bound every interface would expose them on
-        // any network the machine happens to be on, which is not a mistake worth allowing by
-        // accident.
-        let a = args(None, None);
-        let c = Config::default();
-        let addr = resolve_addr(&a, &c).unwrap();
-        assert!(
-            addr.ip().is_loopback(),
-            "the default must not be a public bind"
-        );
-        assert_eq!(addr.port(), 20900);
-    }
-
-    #[test]
-    fn a_bindable_default_is_chosen_over_a_free_port() {
-        // Not a port-availability test: a documented port is worth more than a random one, because a
-        // client has to be told where to connect. This pins the documented value.
-        assert_eq!(mr_core::DEFAULT_RELAY_PORT, 20900);
-    }
-
-    #[test]
-    fn a_bare_ipv6_literal_is_bracketed_for_the_operator() {
-        // `--host ::1` is what somebody types. Without bracketing it does not parse, and the error
-        // sends them looking for a networking problem instead of a syntax one.
-        let a = args(Some("::1"), Some(20900));
-        let c = Config::default();
-        let addr = resolve_addr(&a, &c).unwrap();
-        assert!(addr.ip().is_loopback());
-        assert_eq!(addr.port(), 20900);
-    }
-
-    #[test]
-    fn an_already_bracketed_ipv6_literal_is_not_bracketed_twice() {
-        let a = args(Some("[::1]"), Some(20900));
-        let c = Config::default();
-        assert_eq!(resolve_addr(&a, &c).unwrap().port(), 20900);
-    }
-
-    #[test]
-    fn the_ipv6_any_address_is_recognised_as_reachable() {
-        // `::` is IPv6's `0.0.0.0` and must be treated as the exposure it is.
-        let a = args(Some("::"), Some(20900));
-        let c = Config::default();
-        let addr = resolve_addr(&a, &c).unwrap();
-        assert!(!addr.ip().is_loopback());
-        assert!(!keyless_bind_is_allowed(addr, false));
-    }
-
-    #[test]
-    fn a_hostname_that_does_not_resolve_is_a_clean_error() {
-        // It must not panic: release builds set `panic = "abort"`, so a panic here is a process that
-        // dies without telling anyone why.
-        let a = args(Some("this is not an address"), Some(1));
-        let c = Config::default();
-        let err = resolve_addr(&a, &c).unwrap_err();
-        assert!(err.contains("could not interpret"), "got: {err}");
-    }
-
-    #[test]
-    fn an_unparseable_log_filter_falls_back_rather_than_dying() {
-        // A typo in a log filter must not be the reason a router will not start.
-        let filter = tracing_subscriber::EnvFilter::try_new("[[[not a filter");
-        assert!(filter.is_err());
-        let fallback = tracing_subscriber::EnvFilter::new("manarouter_relay=info");
-        assert!(!fallback.to_string().is_empty());
-    }
-
-    #[test]
-    fn a_keyless_relay_may_bind_loopback() {
-        // The bring-up order has to stay possible: start the relay, reach the panel, create a key.
-        // IPv6 literals need brackets in a socket address, which is the form the flag has to accept
-        // too — `--host ::1` is what an operator will type, and `update` below is not the only place
-        // that has to cope with it.
-        for host in ["127.0.0.1", "[::1]"] {
-            let addr: SocketAddr = format!("{host}:20900").parse().unwrap();
-            assert!(
-                keyless_bind_is_allowed(addr, false),
-                "{host} must be allowed without keys"
-            );
-        }
-    }
-
-    #[test]
-    fn a_keyless_relay_may_not_bind_a_reachable_address() {
-        // It holds this machine's provider credentials, and with no keys it serves every request to
-        // anyone who can route to it. No log line is a sufficient answer to that.
-        for host in ["0.0.0.0", "10.0.0.7", "192.168.1.10", "[::]"] {
-            let addr: SocketAddr = format!("{host}:20900").parse().unwrap();
-            assert!(
-                !keyless_bind_is_allowed(addr, false),
-                "{host} must be refused without keys"
-            );
-        }
-    }
-
-    #[test]
-    fn a_relay_with_keys_may_bind_anywhere() {
-        // Once a key exists the operator has made an explicit choice, and binding a reachable
-        // interface is how the router is used from another machine.
-        let addr: SocketAddr = "0.0.0.0:20900".parse().unwrap();
-        assert!(keyless_bind_is_allowed(addr, true));
-    }
 
     #[test]
     fn the_arguments_are_all_optional() {
@@ -520,41 +143,5 @@ mod tests {
     fn a_port_that_is_not_a_number_is_rejected_by_clap() {
         // clap produces the message and the exit code, which is why this is not hand-rolled.
         assert!(Args::try_parse_from(["manarouter-relay", "--port", "not-a-port"]).is_err());
-    }
-
-    // ----- configuration fingerprint ----------------------------------------
-
-    #[test]
-    fn a_missing_configuration_has_no_fingerprint() {
-        // `None` rather than an error: on a first run the file does not exist yet, and the reloader
-        // must treat that as "nothing changed" instead of retrying forever.
-        let dir = tempfile::tempdir().expect("temp dir");
-        assert_eq!(config_fingerprint(&dir.path().join("nope.json")), None);
-    }
-
-    #[test]
-    fn a_growing_file_changes_its_fingerprint() {
-        // The length component is what makes this work: an edit that lands within the same
-        // filesystem timestamp tick as the previous read would otherwise look unchanged.
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("config.json");
-        std::fs::write(&path, b"{}").expect("write");
-        let before = config_fingerprint(&path).expect("fingerprint");
-        std::fs::write(&path, b"{\"providers\":[]}").expect("write");
-        let after = config_fingerprint(&path).expect("fingerprint");
-        assert_ne!(
-            before, after,
-            "a length change must be visible even when the timestamp tick is the same"
-        );
-    }
-
-    #[test]
-    fn an_unchanged_file_keeps_its_fingerprint() {
-        // The common case, and the one the reloader's cost depends on: an untouched configuration
-        // must compare equal so no parse happens at all.
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("config.json");
-        std::fs::write(&path, b"{\"a\":1}").expect("write");
-        assert_eq!(config_fingerprint(&path), config_fingerprint(&path));
     }
 }

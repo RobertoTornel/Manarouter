@@ -22,12 +22,37 @@ async fn main() -> anyhow::Result<()> {
         .init();
     tracing::info!("manarouter-conductor {}", env!("CARGO_PKG_VERSION"));
 
-    let config = mr_core::config::Config::load_default().map_err(|e| {
+    let mut config = mr_core::config::Config::load_default().map_err(|e| {
         anyhow::anyhow!(
             "could not load the configuration: {e}. Fix the file it names, or delete it to \
              start from defaults."
         )
     })?;
+
+    // A one-run override of the panel port, used by `mr serve --control-port`.
+    //
+    // This binary parses no command-line arguments, so an environment variable is the channel a
+    // parent process can use without a flag surface here that could drift from the panel's own
+    // Settings view. It is read before authentication is resolved and before anything binds, so a
+    // port change cannot arrive after the listener exists.
+    //
+    // An unparseable value is an error rather than a silent fallback: silently binding the configured
+    // port instead would make `mr serve --control-port 3000` appear to work while the panel listened
+    // somewhere else.
+    if let Some(raw) = std::env::var_os("MANAROUTER_CONTROL_PORT") {
+        let text = raw.to_string_lossy().to_string();
+        let port: u16 = text.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "MANAROUTER_CONTROL_PORT is not a valid port: {text:?} (expected 0-65535)"
+            )
+        })?;
+        tracing::info!(
+            configured = config.control.port,
+            override_port = port,
+            "MANAROUTER_CONTROL_PORT overrides control.port for this run"
+        );
+        config.control.port = port;
+    }
 
     // Authentication is resolved *before* anything is opened or bound: a panel that would be
     // exposed without a password must fail here, with the reason, rather than after the socket

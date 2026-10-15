@@ -11,8 +11,9 @@ an **upstream provider** configuration (and stores the provider's credential) an
 is supplied by a provider; a *combo* is an operator-created route that can combine multiple models.
 
 For a default local setup, the OpenAI-compatible API is `http://127.0.0.1:20900/v1` and the web
-panel is `http://127.0.0.1:20901`. The relay and conductor are separate processes; run
-`manarouter-conductor` and `manarouter-relay` in separate terminals. The panel is for local use and
+panel is `http://127.0.0.1:20901`. The relay and conductor are separate processes with separate
+runtimes; `mr serve` starts both in the foreground, and the README documents launching them
+individually. The panel is for local use and
 must not be exposed to an untrusted network without deliberate authentication and network setup.
 
 ## Help a person get started
@@ -38,9 +39,11 @@ Useful CLI commands (use `mr <command> --help` for exact options):
 - `mr combo add/list/show ...`
 - `mr key create/list/disable ...`
 
-Do not tell people to run `mr serve` as the normal launch path: it is not implemented yet. The README
-has the supported two-process launch instructions. Likewise, consult `docs/23-implementation-status.md`
-before claiming a feature is implemented; command names may exist before all behavior does.
+`mr serve` now runs both processes together for a foreground session, and is the quickest way to
+start everything; the README still documents the two-process launch and the systemd units, which are
+the supported way to run it unattended. `mr config` and `mr vault` are not implemented yet. Likewise,
+consult `docs/23-implementation-status.md` before claiming a feature is implemented; command names may
+exist before all behavior does.
 
 ## Calling the API
 

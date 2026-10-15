@@ -44,6 +44,7 @@ static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 pub mod model_scan;
 pub mod select;
 pub mod server;
+pub mod startup;
 pub mod state;
 pub mod sticky;
 pub mod upstream;

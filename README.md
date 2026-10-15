@@ -176,8 +176,10 @@ each terminal. Configuration and encrypted credentials are kept under `~/.config
 [`docs/02-quickstart.md`](docs/02-quickstart.md) for configuration, model aliases, combos, API
 clients and troubleshooting.
 
-**Current implementation note:** `mr serve` and `mr doctor` are not implemented yet, so start the
-conductor and relay as separate processes as shown. The product is under active development; see
+**Current implementation note:** `mr serve` runs both processes together with one Ctrl-C to stop
+them — it spawns the conductor and relay as child processes, so they keep the separate runtimes the
+[architecture](docs/01-architecture.md#2-why-two-processes) depends on. `mr config` and `mr vault`
+are still not implemented. The product is under active development; see
 [`docs/23-implementation-status.md`](docs/23-implementation-status.md) for current limitations.
 
 ---
