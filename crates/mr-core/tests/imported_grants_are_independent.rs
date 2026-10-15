@@ -2,31 +2,69 @@
 //!
 //! `docs/17-migrating-from-omniroute.md` claimed OAuth tokens could not be migrated. The migration
 //! refutes that by construction: it never copies a stored access token, it hands the reference's
-//! *refresh* token to the platform's own `refresh_with_context` and stores whatever comes back.
+//! *refresh* token to the platform's own refresh implementation and stores whatever comes back.
 //! After that the credential in Manarouter's vault is one Manarouter obtained for itself, so the
 //! reference's copy is irrelevant and the reference need not be running.
 //!
 //! This test is the executable form of that argument. It reads Manarouter's own vault and store —
-//! it never opens the reference database — refreshes every imported credential with Manarouter's
-//! own platform implementation, and requires all of them to succeed.
+//! it never opens the reference database — and requires every imported credential to be usable.
 //!
-//! Ignored by default: it needs a real installation and makes network calls, so it must never run
-//! in CI. Run it deliberately:
+//! ## Why it goes through `Refresher`, and not the platform directly
+//!
+//! **Calling `refresh_with_context` directly is destructive**, and an earlier version of this test
+//! did exactly that and burned a live credential. Codex and Antigravity issue *single-use* refresh
+//! tokens: presenting one returns a new token and invalidates the old. The platform method returns
+//! the rotated set but persists nothing, so the vault keeps the now-dead token and the account is
+//! broken from then on — with the failure surfacing later, on a real request, as a 401 that looks
+//! like a provider outage rather than a test's side effect.
+//!
+//! [`Refresher::ensure_fresh`] is the production path, and it persists the rotation through the
+//! credential store. It is also single-flight per credential and honours the platform's refresh
+//! lead, so a credential that is not yet due is served from the vault without a network call at
+//! all. That makes this test safe to re-run: it exercises the real code path, and it cannot leave a
+//! stored token stale. It asserts the *observable outcome* — a usable access token for every
+//! imported account — rather than assuming a particular account needed a network round trip.
+//!
+//! Ignored by default: it needs a real installation and may make network calls, so it must never
+//! run in CI. Run it deliberately:
 //!
 //! ```text
 //! cargo test -p mr-core --test imported_grants_are_independent -- --ignored --nocapture
 //! ```
 
+use std::sync::Arc;
+
+use mr_core::oauth::refresh::{CredentialStore, Refresher, VaultStore};
 use mr_core::oauth::{platform, TokenSet};
 use mr_core::secret::Vault;
 use mr_core::store::Store;
 
+/// A thin wrapper so the refresher owns the write path while the test keeps its own handle.
+///
+/// `Refresher` takes an `Arc<dyn CredentialStore>`; `VaultStore` already implements the trait, so
+/// this only exists to make the delegation explicit at the call site.
+struct ReportingStore {
+    inner: VaultStore,
+}
+
+impl CredentialStore for ReportingStore {
+    fn load(&self, key: &str) -> mr_core::error::Result<Option<TokenSet>> {
+        self.inner.load(key)
+    }
+
+    fn save(&self, key: &str, tokens: &TokenSet) -> mr_core::error::Result<()> {
+        self.inner.save(key, tokens)
+    }
+}
+
 #[tokio::test]
-#[ignore = "requires a real installation and makes network calls"]
+#[ignore = "requires a real installation and may make network calls"]
 async fn imported_grants_refresh_without_the_reference() {
     let store = Store::open(&mr_core::config::state_dir().join("state.sqlite"))
         .expect("open the state database");
-    let vault = Vault::open_default().expect("open the vault");
+    // Opened once up front purely to prove the vault is readable; each refresher then takes its
+    // own handle, because `Vault` owns a file lock and is not `Clone`.
+    Vault::open_default().expect("open the vault");
 
     let rows = store
         .list_oauth_credentials(false)
@@ -36,7 +74,7 @@ async fn imported_grants_refresh_without_the_reference() {
         "no OAuth credentials are installed; run `mr migrate omniroute --apply` first"
     );
 
-    let mut refreshed = 0usize;
+    let mut usable = 0usize;
     let mut failures: Vec<String> = Vec::new();
 
     for row in &rows {
@@ -46,6 +84,9 @@ async fn imported_grants_refresh_without_the_reference() {
         } else {
             row.label.clone()
         };
+
+        // The record states where its credential lives, and the platform its own id. Neither is
+        // re-derived here, because the id spelling is the record's business.
         let Some(platform_id) = platform(&row.platform) else {
             failures.push(format!(
                 "{label}: {} is not a platform in this build",
@@ -53,48 +94,33 @@ async fn imported_grants_refresh_without_the_reference() {
             ));
             continue;
         };
-        // The record states where its credential lives; the id is not re-derived here, because
-        // two conventions exist in this codebase and only the record knows which one it used.
-        let Some(raw) = vault.get(&row.vault_ref).expect("read the vault") else {
-            failures.push(format!("{label}: no vault entry at {}", row.vault_ref));
-            continue;
-        };
-        let tokens: TokenSet = match serde_json::from_str(&raw) {
-            Ok(t) => t,
-            Err(e) => {
-                failures.push(format!("{label}: the stored token set is unreadable ({e})"));
-                continue;
-            }
-        };
-        let Some(refresh_token) = tokens.refresh_token.clone() else {
-            failures.push(format!("{label}: no refresh token is stored"));
-            continue;
-        };
 
-        // The claim under test: this succeeds using only Manarouter's credential and the
-        // platform's own public client identity. Nothing here opens the reference.
-        match platform_id
-            .refresh_with_context(&refresh_token, &tokens)
-            .await
-        {
-            Ok(next) => {
-                assert!(
-                    !next.access_token.is_empty(),
-                    "{label}: the refresh returned an empty access token"
-                );
-                println!("refreshed  {label}");
-                refreshed += 1;
+        // The production refresher, so any rotation is persisted rather than lost.
+        let refresher = Refresher::new(
+            platform_id,
+            Arc::new(ReportingStore {
+                inner: VaultStore::open_default().expect("open the vault"),
+            }),
+        );
+
+        match refresher.ensure_fresh(&row.vault_ref, false).await {
+            Ok(tokens) if !tokens.access_token.is_empty() => {
+                println!("usable  {label}");
+                usable += 1;
             }
+            Ok(_) => failures.push(format!(
+                "{label}: the refresh returned an empty access token"
+            )),
             Err(e) => failures.push(format!("{label}: refresh failed: {e}")),
         }
     }
 
     assert!(
         failures.is_empty(),
-        "{} of {} imported grants did not refresh:\n  {}",
+        "{} of {} imported grants are not usable:\n  {}",
         failures.len(),
         rows.len(),
         failures.join("\n  ")
     );
-    println!("{refreshed} imported grants refreshed without the reference");
+    println!("{usable} imported grants are usable without the reference");
 }

@@ -972,6 +972,13 @@ async fn import_one(
     let serialized = serde_json::to_string(&tokens)
         .map_err(|e| Error::InvalidState(format!("tokens could not be encoded: {e}")))?;
     vault.put(&vault_ref, &serialized)?;
+    // Flush *now*, not at the end of the run. `Vault::put` only marks the file dirty, and the
+    // token being written here is the replacement for a **single-use** refresh token that the
+    // provider has already invalidated. Between this point and the run's final `flush` the only
+    // copy of a working credential lives in process memory, so a crash, a SIGKILL or a power loss
+    // would destroy the account outright rather than leave it recoverable. The cost is one small
+    // atomic file write per imported account, which is nothing next to a network refresh.
+    vault.flush()?;
 
     let mut record = OAuthCredentialRecord::new(transfer.platform, vault_ref.clone())
         .with_label(identity.label.clone())
@@ -981,9 +988,25 @@ async fn import_one(
         record.expires_at = Some(tokens.expires_at);
     }
     if let Err(e) = store.put_oauth_credential(&record, Millis::now()) {
-        let _ = vault.delete(&vault_ref);
+        // The vault entry is deliberately **left in place**. It holds the only surviving copy of a
+        // credential whose predecessor the provider has already invalidated, so deleting it would
+        // convert a recoverable failure (an orphaned secret) into an unrecoverable one (a
+        // permanently dead account, needing an interactive re-login). This is the same asymmetry
+        // the ordering above relies on: a credential with no row is invisible and harmless, a row
+        // with no credential is a broken account.
+        //
+        // Recovery is manual on purpose. A re-run would *not* re-import this account: existing
+        // accounts are recognised from the configuration, not from the store, so with no account
+        // row written there is nothing to match against and the reference's token would be
+        // presented a second time — which cannot work, because that is the very token this refresh
+        // just consumed. The operator's own copy of the credential is the only thing that can be
+        // re-attached, so the message names its exact vault key rather than promising an automatic
+        // repair that does not exist.
         return Err(Error::Store(format!(
-            "the credential metadata could not be saved: {e}"
+            "the credential metadata could not be saved: {e}; the imported credential was kept \
+             under the vault key {vault_ref} so it is not lost, but it has no account row — that \
+             key cannot be re-imported automatically because the reference's token for it has \
+             already been spent; attach it by hand or log in again"
         )));
     }
 

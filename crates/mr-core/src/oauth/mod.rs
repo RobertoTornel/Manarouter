@@ -498,6 +498,22 @@ pub trait OAuthPlatform: Send + Sync {
     /// that produced it, so the caller ([`refresh::Refresher`]) guarantees that only one refresh
     /// for a given credential is ever in flight, and persists the result before reporting
     /// success. Implementations must not persist on their own.
+    ///
+    /// # Calling this directly destroys the credential unless you persist the result
+    ///
+    /// Because a single-use refresh token is invalidated the moment this succeeds, a caller that
+    /// invokes it and then discards the returned [`TokenSet`] has permanently broken the account:
+    /// the stored token is dead, the replacement was never saved, and the failure only surfaces
+    /// later — usually as a `401` on a real request, which reads as a provider outage rather than
+    /// as the caller's side effect. Codex behaves exactly this way; Antigravity's refresh tokens
+    /// are reusable, so it tolerates the mistake, and a test written against one platform can
+    /// therefore pass while silently killing another.
+    ///
+    /// Prefer [`refresh::Refresher::ensure_fresh`], which serialises per credential and persists
+    /// the rotation. If you must call this directly (a one-shot import, for example — see
+    /// [`migrate`]), the rotated set has to be durably stored before anything else is attempted,
+    /// and a diagnostic that only wants to *check* a credential should use the refresher with
+    /// `force = false`, which returns the stored token without a network call when it is not due.
     async fn refresh(&self, refresh_token: &str) -> Result<TokenSet>;
 
     /// Refresh with access to the prior provider context. The default delegates to `refresh`;

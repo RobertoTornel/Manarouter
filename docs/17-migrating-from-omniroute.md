@@ -45,7 +45,37 @@ The migration therefore does **one refresh per account** and stores the result:
 After step 3 the credential belongs to *this* installation and the reference is irrelevant: it can be
 stopped, uninstalled or deleted. `crates/mr-core/tests/imported_grants_are_independent.rs` is the
 executable form of that claim — it reads this installation's vault with the reference database
-closed and requires every imported grant to refresh.
+closed and requires every imported grant to work.
+
+#### WARNING: for Codex this is a *move*, not a copy
+
+**Importing a Codex account consumes the reference's copy of it.** Codex issues *single-use* refresh
+tokens: the moment the migration presents one, the provider returns a new token and invalidates the
+old. After a successful import, OmniRoute's stored refresh token for that account is dead, and
+OmniRoute will need its own re-login if you intend to keep using it.
+
+This is a property of the provider, not a choice made here, and it is worth being blunt about because
+it is invisible until it bites. Antigravity issues *reusable* refresh tokens, so an Antigravity import
+leaves the reference still working — which means a test written against Antigravity alone would pass
+while Codex accounts were irreversibly consumed.
+
+Practical consequences:
+
+- **Do not run `--apply` against a live reference you still depend on** unless you accept that its
+  Codex accounts will stop working there. Do a dry run first and read the list.
+- **A dry run is completely safe.** It performs no refresh and touches no credential.
+- **Re-running `--apply` is safe for accounts already imported.** They are recognised as
+  `already present` and skipped without a network call, so no second refresh is attempted (and a
+  second refresh would fail anyway, for the reason above).
+- **The failure is loud, not silent.** A consumed token answers `401 invalid_request_error — "Your
+  refresh token has already been used to generate a new access token"`, which is distinguishable
+  from an expired one ("sign in again" alone) and from a wrong client (`invalid_client`).
+- **A test or diagnostic must not refresh a credential it will not persist.** This was learned the
+  hard way during development: a verification test that called `refresh_with_context` directly to
+  "check" the accounts rotated 6 live Codex tokens and discarded the replacements, permanently
+  killing one account. `Refresher::ensure_fresh(.., false)` is the safe read: it returns the stored
+  token without a network call when it is not yet due, and persists any rotation when it is. The
+  test now uses that path.
 
 #### What each platform carries
 
@@ -346,6 +376,8 @@ deleting.
 | `no catalogue entry` for a provider | A private or new endpoint | Add it by hand with `mr provider add`, or contribute it to `catalog/providers.toml`. |
 | A combo imported with a disabled step | Its provider did not come across | Expected. Fix the provider, then re-enable the step. |
 | Nothing at all was imported | `--apply` was not passed | The dry run is the default. Read its output, then re-run with `--apply`. |
+| `the credential metadata could not be saved` | The state database could not be written after a successful refresh | The imported credential is **kept in the vault** under the key named in the message, because deleting it would permanently destroy an account whose reference token has already been spent. Re-attach it by hand or log in again; re-running `--apply` cannot recover it, because the reference's token for that account is already consumed. |
+| A Codex account that worked yesterday now returns `401 ... refresh token has already been used` | Its single-use refresh token was rotated by something that did not persist the replacement — the migration itself, or a diagnostic that refreshed without saving | Nothing in the reference can help: that token is spent too. Log in again through the panel. See [WARNING: for Codex this is a *move*, not a copy](#warning-for-codex-this-is-a-move-not-a-copy). |
 
 ## See also
 
