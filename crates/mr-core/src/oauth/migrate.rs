@@ -1476,7 +1476,9 @@ mod tests {
         let mut c = connection("github", None);
         c.refresh_token = None;
         c.access_token = Some(crate::oauth::reference::DecryptedToken::new(
-            "ghu_01234567890123456789012345678901234567".into(),
+            // Not a credential: a sequential-digit fixture chosen so the prefix under test is
+            // realistic while the value is obviously fake.
+            "ghu_01234567890123456789012345678901234567".into(), // secret-scan: allow
         ));
         assert_eq!(
             plan_connection(&c, &BTreeMap::new()),
@@ -1485,7 +1487,8 @@ mod tests {
         // …while a real OAuth App token still imports, because the test is the prefix and not a
         // blanket refusal of the platform.
         c.access_token = Some(crate::oauth::reference::DecryptedToken::new(
-            "gho_01234567890123456789012345678901234567".into(),
+            // The same fixture, with the prefix an approved client produces.
+            "gho_01234567890123456789012345678901234567".into(), // secret-scan: allow
         ));
         assert_eq!(
             plan_connection(&c, &BTreeMap::new()),
