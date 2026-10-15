@@ -1,6 +1,6 @@
 # Handover — project state and what still needs implementing
 
-State of the tree: **`9b7c47c`** on `main`, **10 commits ahead of `origin/main`** and not yet pushed.
+State of the tree: **`a89d959`** on `main`, **11 commits ahead of `origin/main`** and not yet pushed.
 Everything below was checked against this working tree and, where stated, against a running server.
 Where a claim is unverified, it says so. Nothing here is recalled from an earlier session.
 
@@ -242,7 +242,7 @@ repository and re-derive them.
   (`crates/mr-core/src/oauth/refresh.rs:51`), so this earlier item is closed. The `oauth[permanent] …`
   text is now only the `Display` form at the head of an `InvalidState` message (`:123`).
 - **Cross-instance sync** (`docs/22-sync-design.md`) is inert groundwork by decision Q15.
-- **8 commits are unpushed.** `origin/main` is 8 behind; the earlier handover's URL is the right
+- **11 commits are unpushed.** `origin/main` is 11 behind; the earlier handover's URL is the right
   remote. Push before the machine changes hands.
 
 ---
