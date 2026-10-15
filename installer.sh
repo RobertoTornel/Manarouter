@@ -89,10 +89,17 @@ if [[ "$INSTALL_USER_SERVICES" == "1" ]]; then
   UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
   mkdir -p "$UNIT_DIR" "$HOME/.config/manarouter" "$HOME/.local/state/manarouter"
   chmod 0700 "$HOME/.config/manarouter" "$HOME/.local/state/manarouter"
+  # Ordering note, because this exact mistake cost a boot: the conductor must NOT be ordered
+  # `After=default.target`. `default.target` is what pulls these units in via `WantedBy`, so a unit
+  # that is both wanted-by and ordered-after it forms a cycle with anything that waits for that unit
+  # — which is precisely what the relay does. systemd breaks the cycle by *deleting a start job*,
+  # and the deletion is silent from the outside: the relay simply never starts, `systemctl is-active`
+  # says inactive, and there is no failed unit to notice. It reproduces only on a real boot, since
+  # starting a unit by hand does not re-evaluate `default.target`'s ordering.
   cat >"$UNIT_DIR/manarouter-conductor.service" <<EOF
 [Unit]
 Description=Manarouter control plane and web panel
-After=default.target
+After=network.target
 
 [Service]
 Type=simple

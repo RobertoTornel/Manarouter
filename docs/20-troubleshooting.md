@@ -142,6 +142,7 @@ overhead against providers whose own TTFB is hundreds of milliseconds. If you su
 | A reverse proxy strips the `Origin` header | Mutations are refused. Configure the proxy to preserve `Origin`, or use the CLI. |
 | The port is wrong | `mr config path`, then read the `ports` section. A pending change needs a restart. |
 | The conductor is not running | The panel is served by the conductor on its own port. `mr serve` starts both. |
+| A service is `inactive` after a reboot but `systemctl --user start` works | Suspect a **systemd ordering cycle**, not a crash. A unit that is both `WantedBy=default.target` and `After=default.target` deadlocks at boot; systemd breaks the cycle by deleting a start job, so the unit is never started and is *not* marked failed. Check with `systemd --user --test` (reports `Found ordering cycle`) or `scripts/check-systemd-cycle.py <unit-dir>`. `systemd-analyze verify` does not detect this. |
 
 The panel runs on a **different port from the relay** and is never on the request path, so a panel
 problem never affects a completion, and a completion problem is never the panel.

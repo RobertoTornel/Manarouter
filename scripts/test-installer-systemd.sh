@@ -84,6 +84,21 @@ assert_contains "$RELAY" 'After=manarouter-conductor.service'
 assert_contains "$RELAY" 'Wants=manarouter-conductor.service'
 assert_contains "$RELAY" 'Restart=on-failure'
 
+# The generated units must not form an ordering cycle.
+#
+# This is the check that a real reboot taught us to have. An earlier release ordered the conductor
+# `After=default.target` while also installing it `WantedBy=default.target`; at boot systemd found
+# the cycle, deleted the relay's start job, and the relay never came up — with no failed unit and no
+# error, just `inactive`. Nothing else in this file could catch it: `systemd-analyze verify` does not
+# examine the ordering graph, and starting a unit by hand does not reproduce the boot-time ordering.
+if command -v python3 >/dev/null 2>&1; then
+  python3 "$ROOT/scripts/check-systemd-cycle.py" "$UNIT_DIR" ||
+    fail 'the generated systemd units contain an ordering cycle (see above)'
+else
+  # A missing python3 must not silently retire the check.
+  fail 'python3 is required to check the generated units for ordering cycles'
+fi
+
 # Systemctl must only have been invoked through the fake and installation calls include enable+restart.
 assert_contains "$MOCK_LOG" 'systemctl --user daemon-reload'
 assert_contains "$MOCK_LOG" 'systemctl --user enable manarouter-conductor.service manarouter-relay.service'

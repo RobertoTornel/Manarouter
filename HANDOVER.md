@@ -252,6 +252,16 @@ repository and re-derive them.
 
 ## 5. Traps that will cost you a day if you do not know them
 
+- **A systemd ordering cycle can leave a service silently never started.** The generated units once
+  ordered the conductor `After=default.target` while also installing it `WantedBy=default.target`;
+  at boot `default.target` wants the relay, the relay wants the conductor, and the conductor waits
+  for `default.target` — a deadlock systemd breaks by **deleting a start job**. The victim is not
+  `failed`, it is `inactive`, with one journal line and nothing to notice. It reproduces **only** on
+  a real boot, so `systemctl --user start` looks perfectly healthy. Two things catch it:
+  `systemd --user --test` (the real loader — needs a live user manager) and
+  `scripts/check-systemd-cycle.py`, which the installer test runs and which is the portable
+  equivalent. Note `systemd-analyze verify` does **not** check the ordering graph, so it reports
+  these units as fine.
 - **`export PATH="$HOME/.cargo/bin:$PATH"`** in every shell, or `cargo` is not found.
 - **Configuration changes are picked up without a restart, by both processes — but through two
   different mechanisms, and the difference explains most "it works in the panel but not the API"
