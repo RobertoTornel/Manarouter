@@ -58,3 +58,7 @@ tokio-rustls = { workspace = true }
 hyper-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 urlencoding = "2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tower = { workspace = true }

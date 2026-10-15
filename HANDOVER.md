@@ -76,12 +76,15 @@ On this machine both run as user services:
 
 ```bash
 systemctl --user status  manarouter-relay.service manarouter-conductor.service
-systemctl --user restart manarouter-relay.service     # needed after a config/snapshot change
+systemctl --user restart manarouter-relay.service     # only after upgrading the binary
 ```
 
-**The relay reads the compiled snapshot at startup.** It holds a `reload()` that re-reads the config
-and recompiles (`crates/manarouter-relay/src/state.rs:260`), but **nothing calls it** — so editing the
-config or importing accounts has no effect until the relay is restarted. See §4.
+**Both processes adopt configuration changes without a restart.** The relay reads the compiled
+snapshot at startup and then polls `config.json` every 2 s, recompiling through its existing
+`reload()` (`crates/manarouter-relay/src/state.rs:260`) whenever the file's mtime or length moved —
+so an `mr migrate` or a model import is live within about two seconds, with no restart and no
+`systemctl` step. The conductor does the same on the next authenticated `GET`. Restart only to pick
+up a new binary. See §4 and §5 for why the two use different triggers.
 
 ### Shape of the codebase
 
@@ -250,8 +253,17 @@ repository and re-derive them.
 ## 5. Traps that will cost you a day if you do not know them
 
 - **`export PATH="$HOME/.cargo/bin:$PATH"`** in every shell, or `cargo` is not found.
-- **The relay does not hot-reload.** `State::reload()` exists and nothing calls it. After any config
-  or snapshot change, `systemctl --user restart manarouter-relay.service`.
+- **Configuration changes are picked up without a restart, by both processes — but through two
+  different mechanisms, and the difference explains most "it works in the panel but not the API"
+  reports.** The conductor re-reads `config.json` on the next authenticated `GET` (a `stat`, then a
+  parse only when the file actually moved), so the panel reflects an external `mr migrate` /
+  `mr provider add` immediately. The relay polls the same file every 2 s and recompiles its snapshot,
+  so a call to a just-imported model can 404 for up to ~2 s after the panel starts showing it. That
+  window is deliberate: the relay is on the request path and polling costs one `stat`, where an
+  inotify watcher would add a dependency and can still lose events across an editor's rename dance.
+  If you are changing routing code, note that neither process reloads on a *write* — only the
+  conductor's `GET` hook reloads, so a change made through the API is already in memory and needs no
+  re-read, and an external change is adopted by whichever process notices the file next.
 - **The panel browser test needs a resolvable Playwright, and the error is misleading.** The module is
   not a project dependency, so `node panel/test/browser.e2e.mjs` exits 2 telling you to install it. On
   a machine where browsers are already cached, point it at any resolvable copy and the **matching**

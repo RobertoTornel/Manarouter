@@ -194,6 +194,9 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(2);
             }
         };
+        // The reloader needs its own handle, taken before `relay` is moved into the state.
+        let reload_handle = Arc::clone(&relay);
+
         let state = AppState {
             relay,
             health: Arc::new(Health::new()),
@@ -203,6 +206,18 @@ fn main() -> anyhow::Result<()> {
             sticky_success: Arc::new(manarouter_relay::sticky::StickySuccess::default()),
         };
 
+        // Adopt routing changes written by the control plane, without a restart.
+        //
+        // The control plane compiles the snapshot and writes `config.json`, but the relay holds its
+        // own copy in memory from startup. Until this existed, every import or model addition
+        // required stopping and starting the relay — and the failure was quiet: `/v1/models` listed
+        // the old set and a request for a new model was a 404 that looked like a typo.
+        //
+        // A polling task rather than an inotify watcher: the file is small, this is off the request
+        // path, and a poll cannot miss an event that an editor's rename dance would confuse. One
+        // `stat` per interval is cheaper than the machinery that would replace it.
+        spawn_config_reloader(reload_handle);
+
         if let Err(e) = server::serve(state, addr).await {
             eprintln!("manarouter-relay: the listener failed: {e}");
             std::process::exit(1);
@@ -210,6 +225,54 @@ fn main() -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+/// Re-read the configuration periodically and install a freshly compiled snapshot when it changed.
+///
+/// Failures are logged and the loop continues: a configuration that momentarily will not parse (a
+/// half-written file, a hand-edit in progress) must not take down a relay that is serving traffic.
+/// The previously installed snapshot keeps working, which is the whole point of keeping routing data
+/// in an atomically swappable handle.
+fn spawn_config_reloader(relay: Arc<RelayState>) {
+    tokio::spawn(async move {
+        let path = mr_core::config::config_path();
+        let mut last_seen = config_fingerprint(&path);
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+        // The first tick fires immediately; the initial state was just loaded, so skip it.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let now = config_fingerprint(&path);
+            if now == last_seen {
+                continue;
+            }
+            // Record before attempting the reload: a file that will not compile must not be retried
+            // on every tick forever, and once it *does* compile the mtime changes again.
+            last_seen = now;
+            match relay.reload() {
+                Ok(digest) => tracing::info!(
+                    digest,
+                    providers = relay.table().snapshot.providers().len(),
+                    "routing table reloaded from an external configuration change"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "a configuration change was detected but could not be applied; keeping the \
+                     current routing table"
+                ),
+            }
+        }
+    });
+}
+
+/// `(mtime, length)` of a file, or `None` when it cannot be read.
+///
+/// Length is included because filesystem timestamps can be coarse here: an edit landing in the same
+/// timestamp tick as the previous read would otherwise be invisible. A path is taken rather than
+/// read from the global config location so the rule can be tested against a temp file.
+fn config_fingerprint(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 /// Whether a keyless relay may bind this address.
@@ -457,5 +520,41 @@ mod tests {
     fn a_port_that_is_not_a_number_is_rejected_by_clap() {
         // clap produces the message and the exit code, which is why this is not hand-rolled.
         assert!(Args::try_parse_from(["manarouter-relay", "--port", "not-a-port"]).is_err());
+    }
+
+    // ----- configuration fingerprint ----------------------------------------
+
+    #[test]
+    fn a_missing_configuration_has_no_fingerprint() {
+        // `None` rather than an error: on a first run the file does not exist yet, and the reloader
+        // must treat that as "nothing changed" instead of retrying forever.
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert_eq!(config_fingerprint(&dir.path().join("nope.json")), None);
+    }
+
+    #[test]
+    fn a_growing_file_changes_its_fingerprint() {
+        // The length component is what makes this work: an edit that lands within the same
+        // filesystem timestamp tick as the previous read would otherwise look unchanged.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"{}").expect("write");
+        let before = config_fingerprint(&path).expect("fingerprint");
+        std::fs::write(&path, b"{\"providers\":[]}").expect("write");
+        let after = config_fingerprint(&path).expect("fingerprint");
+        assert_ne!(
+            before, after,
+            "a length change must be visible even when the timestamp tick is the same"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_file_keeps_its_fingerprint() {
+        // The common case, and the one the reloader's cost depends on: an untouched configuration
+        // must compare equal so no parse happens at all.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"{\"a\":1}").expect("write");
+        assert_eq!(config_fingerprint(&path), config_fingerprint(&path));
     }
 }

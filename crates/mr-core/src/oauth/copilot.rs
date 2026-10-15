@@ -389,7 +389,8 @@ impl OAuthPlatform for Copilot {
     /// One poll: classify the reply (pure, [`poll_classify`]) and, on approval, mint the
     /// session token. A transport error is a blip, not a refusal — the code still has
     /// minutes of life, so keep polling rather than failing the whole flow.
-    async fn device_poll(&self, device_code: &str) -> Result<DevicePoll> {
+    async fn device_poll(&self, authorization: &DeviceAuthorization) -> Result<DevicePoll> {
+        let device_code = authorization.device_code.as_str();
         let http = Http::shared()?;
         let reply = match http
             .post_json(

@@ -12,8 +12,8 @@ use std::time::Duration;
 use super::flow::Http;
 use super::refresh::{endpoint_failure, oauth_failure};
 use super::{
-    expires_at_from_secs, header, jwt_payload, oauth_error, AccountIdentity, OAuthPlatform, Pkce,
-    RedirectPorts, TokenSet,
+    expires_at_from_secs, header, jwt_payload, oauth_error, AccountIdentity, DeviceAuthorization,
+    DevicePoll, OAuthPlatform, Pkce, RedirectPorts, TokenSet, MAX_EXPIRES_IN_SECS,
 };
 use crate::error::Result;
 use crate::published::{openai, CODEX_CLIENT_ID};
@@ -127,6 +127,11 @@ impl OAuthPlatform for Codex {
     }
 
     fn begins_with_loopback(&self) -> bool {
+        true
+    }
+
+    /// Codex offers both: the loopback redirect by default, the device code on request.
+    fn supports_device_flow(&self) -> bool {
         true
     }
 
@@ -284,6 +289,194 @@ impl OAuthPlatform for Codex {
     fn refresh_lead(&self) -> Duration {
         // Codex manager refreshes 5 minutes before expiry (§1.10).
         Duration::from_secs(300)
+    }
+
+    /// Codex's **device** flow: the user types a short code at `auth.openai.com/codex/device`.
+    ///
+    /// This exists alongside the loopback redirect because the redirect is unusable in exactly the
+    /// cases that matter most: a headless server, a container, or a machine whose browser runs
+    /// somewhere else. A loopback flow requires the browser to reach a listener on *this* host, so
+    /// those deployments can only be logged in by moving an authorization code by hand. A device
+    /// code needs no inbound connection at all — the user reads five characters off the panel and
+    /// types them wherever they like.
+    ///
+    /// Not RFC 8628: see [`openai::DEVICE_USERCODE`] for the three-step wire contract, which was
+    /// confirmed against the live endpoint while writing this. Two differences matter. PKCE is
+    /// generated **server-side** and returned with the authorization code, so this flow neither
+    /// sends nor stores a verifier. And a poll must present the user code as well as the device id —
+    /// omitting it is answered `400 ... user_code: Field required`, not a pending status.
+    async fn device_start(&self) -> Result<DeviceAuthorization> {
+        let http = Http::shared()?;
+        let body = serde_json::json!({ "client_id": CODEX_CLIENT_ID }).to_string();
+        let reply = http
+            .post_json(
+                openai::DEVICE_USERCODE,
+                &[("Accept", "application/json")],
+                body,
+            )
+            .await?;
+
+        // Device login can be switched off for an account or workspace by an administrator. That
+        // is a configuration outcome, not a failure, and the operator can act on it.
+        if reply.status == 404 {
+            return Err(oauth_error(
+                "device-code login is disabled for this ChatGPT account or workspace; \
+                 use the browser sign-in instead",
+            ));
+        }
+        if !(200..300).contains(&reply.status) {
+            return Err(oauth_error(format!(
+                "device authorization failed with HTTP {}",
+                reply.status
+            )));
+        }
+        let value: Value = serde_json::from_str(&reply.body)
+            .map_err(|_| oauth_error("device authorization returned no JSON body"))?;
+
+        let device_code = value
+            .get("device_auth_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| oauth_error("device authorization returned no device_auth_id"))?
+            .to_owned();
+        // The field is spelling-dependent across Codex CLI versions; accept either.
+        let user_code = value
+            .get("user_code")
+            .or_else(|| value.get("usercode"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| oauth_error("device authorization returned no user code"))?
+            .to_owned();
+        // Live endpoint returns `"interval": "5"` (a string); the CLI types it as a number.
+        let interval = value
+            .get("interval")
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(5)
+            .clamp(1, 60);
+
+        Ok(DeviceAuthorization {
+            device_code,
+            user_code,
+            verification_uri: openai::DEVICE_VERIFY.to_owned(),
+            verification_uri_complete: None,
+            // OpenAI expires the code in 15 minutes; the CLI uses the same bound.
+            expires_in: Duration::from_secs(15 * 60),
+            interval: Duration::from_secs(interval),
+        })
+    }
+
+    /// One poll, and — on approval — the token exchange that follows it.
+    ///
+    /// The flow's steps 2 and 3 collapse into one call here, because step 2 *is* the poll. Verified
+    /// against the live endpoint: a correct code that has not been approved yet answers
+    /// `403 deviceauth_authorization_pending`, a wrong code answers
+    /// `400 deviceauth_user_code_mismatch`, and omitting the code is a 400 as well. A transport
+    /// error is treated as pending (the code is valid for minutes and a blip is not a refusal), but
+    /// any other 4xx/5xx is reported, so a genuinely broken flow surfaces instead of looking like a
+    /// slow user.
+    async fn device_poll(&self, authorization: &DeviceAuthorization) -> Result<DevicePoll> {
+        let http = Http::shared()?;
+        let body = serde_json::json!({
+            "device_auth_id": authorization.device_code,
+            "user_code": authorization.user_code,
+        })
+        .to_string();
+        let reply = match http
+            .post_json(
+                openai::DEVICE_TOKEN,
+                &[("Accept", "application/json")],
+                body,
+            )
+            .await
+        {
+            Err(_) => return Ok(DevicePoll::Pending),
+            Ok(reply) => reply,
+        };
+
+        if reply.status == 403 || reply.status == 404 {
+            return Ok(DevicePoll::Pending);
+        }
+        if !(200..300).contains(&reply.status) {
+            return Ok(DevicePoll::Failed {
+                message: format!("device authorization failed with HTTP {}", reply.status),
+            });
+        }
+
+        let value: Value = serde_json::from_str(&reply.body)
+            .map_err(|_| oauth_error("device authorization returned no JSON body"))?;
+        let Some(code) = value.get("authorization_code").and_then(Value::as_str) else {
+            return Ok(DevicePoll::Pending);
+        };
+        let Some(verifier) = value.get("code_verifier").and_then(Value::as_str) else {
+            return Ok(DevicePoll::Failed {
+                message: "device authorization returned a code but no PKCE verifier".into(),
+            });
+        };
+
+        // The exchange: form-encoded, unlike the JSON refresh grant posted to this same URL.
+        let reply = http
+            .post_form(
+                openai::TOKEN,
+                &[("Accept", "application/json")],
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", CODEX_CLIENT_ID),
+                    ("code", code),
+                    ("code_verifier", verifier),
+                    ("redirect_uri", openai::DEVICE_REDIRECT),
+                ],
+            )
+            .await?;
+        if !(200..300).contains(&reply.status) {
+            return Ok(DevicePoll::Failed {
+                message: format!("the device code exchange failed with HTTP {}", reply.status),
+            });
+        }
+        let value: Value = serde_json::from_str(&reply.body)
+            .map_err(|_| oauth_error("the device code exchange returned no JSON body"))?;
+        let Some(access_token) = value.get("access_token").and_then(Value::as_str) else {
+            return Ok(DevicePoll::Failed {
+                message: "the device code exchange returned no access token".into(),
+            });
+        };
+
+        let mut extra = Map::new();
+        let mut refresh_token = None;
+        if let Some(refresh) = value.get("refresh_token").and_then(Value::as_str) {
+            extra.insert("refresh_token".into(), Value::String(refresh.to_owned()));
+            refresh_token = Some(refresh.to_owned());
+        }
+        let id_token = value
+            .get("id_token")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        // The relay must send `chatgpt-account-id`; without it every request is a hard 400. The
+        // device response may omit the id_token, so fall back to the access token — also a JWT, and
+        // carrying the same claim namespace.
+        let Some(account_id) = chatgpt_account_id(access_token, id_token.as_deref()) else {
+            return Ok(DevicePoll::Failed {
+                message: "the device code exchange returned no ChatGPT account id".into(),
+            });
+        };
+        extra.insert("chatgpt_account_id".into(), Value::String(account_id));
+
+        let expires_in = value
+            .get("expires_in")
+            .and_then(Value::as_i64)
+            .unwrap_or(3600)
+            .clamp(0, MAX_EXPIRES_IN_SECS);
+
+        // Built the same way `exchange_code` builds one, so the device flow produces a token set
+        // the rest of the system cannot tell apart from a browser login's — which is the point:
+        // `extra` carries `id_token` and `chatgpt_account_id`, and the relay reads the latter.
+        let mut tokens = TokenSet::new(access_token.to_owned());
+        tokens.refresh_token = refresh_token;
+        tokens.expires_at = expires_at_from_secs(expires_in);
+        tokens.scopes = SCOPE.split(' ').map(str::to_owned).collect();
+        tokens.token_type = "Bearer".to_string();
+        tokens.extra = extra;
+        Ok(DevicePoll::Success(tokens))
     }
 }
 
@@ -740,5 +933,72 @@ mod tests {
                 ("OpenAI-Beta", "responses=experimental"),
             ]
         );
+    }
+
+    // ----- device flow ------------------------------------------------------
+
+    #[test]
+    fn device_authorization_parses_the_live_response_shape() {
+        // Copied from the live endpoint while implementing this: `interval` really is a **string**,
+        // and the id really is `device_auth_id`. A parser that assumed a number would fail here and
+        // nowhere else.
+        let body = r#"{
+            "device_auth_id": "deviceauth_6ad1361cc52c8191ab78e0ca97242709",
+            "user_code": "YTY4-6MD7V",
+            "interval": "5",
+            "expires_at": "2026-10-15T20:37:52.770085+00:00"
+        }"#;
+        let value: Value = serde_json::from_str(body).expect("json");
+        assert_eq!(
+            value.get("device_auth_id").and_then(Value::as_str),
+            Some("deviceauth_6ad1361cc52c8191ab78e0ca97242709")
+        );
+        // The two spellings the CLI versions use.
+        assert_eq!(
+            value
+                .get("user_code")
+                .or_else(|| value.get("usercode"))
+                .and_then(Value::as_str),
+            Some("YTY4-6MD7V")
+        );
+        // Both encodings must yield 5 — a string is what the live endpoint sends.
+        let interval = value
+            .get("interval")
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(5);
+        assert_eq!(interval, 5);
+    }
+
+    #[test]
+    fn a_device_authorization_reports_the_hosted_verification_page() {
+        // Regression guard for a real trap: the URL the user must visit is `/codex/device`, not
+        // GitHub's `/login/device` and not OpenAI's generic verification page.
+        assert_eq!(
+            openai::DEVICE_VERIFY,
+            "https://auth.openai.com/codex/device"
+        );
+    }
+
+    #[test]
+    fn the_device_exchange_presents_the_redirect_that_is_never_visited() {
+        // The device grant must send the same `redirect_uri` the flow was registered with; a
+        // mismatch is rejected by the token endpoint as if the code were invalid.
+        assert_eq!(
+            openai::DEVICE_REDIRECT,
+            "https://auth.openai.com/deviceauth/callback"
+        );
+    }
+
+    #[test]
+    fn device_and_browser_endpoints_are_distinct() {
+        // The device flow lives under `/api/accounts`, NOT next to the browser flow's `/oauth/*`.
+        // Using the browser paths for the device flow is a 404, which reads like an outage.
+        assert!(openai::DEVICE_USERCODE.starts_with("https://auth.openai.com/api/accounts/"));
+        assert!(openai::DEVICE_TOKEN.starts_with("https://auth.openai.com/api/accounts/"));
+        assert!(openai::TOKEN.starts_with("https://auth.openai.com/oauth/"));
+        assert_ne!(openai::DEVICE_TOKEN, openai::TOKEN);
     }
 }

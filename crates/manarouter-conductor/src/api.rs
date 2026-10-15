@@ -174,6 +174,26 @@ async fn guard(State(state): State<AppState>, req: Request, next: Next) -> Respo
         }
     }
 
+    // Adopt any configuration another process wrote, before the handler reads it.
+    //
+    // This is here, in the one place every routed API request passes through, rather than in each
+    // read handler: a handler that forgot the call would serve a stale view, and the whole content
+    // of this bug was a view that was stale without saying so. `mr migrate omniroute`, `mr account
+    // add` and `mr provider add` write the same file this process is serving from, so without this
+    // an imported provider is invisible in the panel until the process is restarted — the data was
+    // never missing, only the reader was.
+    //
+    // Scoped to read methods deliberately. A reload under a `POST`/`PUT` would put a disk read and
+    // a possible snapshot compile in front of every write, and a write already begins by taking the
+    // configuration it intends to modify — assembling a change on top of one made elsewhere is a
+    // merge, which is not something to do implicitly.
+    //
+    // Cost: one `stat` on the common path, and a parse only when the file actually changed. The
+    // method returns immediately when nothing moved, which is the overwhelming majority of reads.
+    if method == Method::GET {
+        state.reload_from_disk().await;
+    }
+
     next.run(req).await
 }
 
@@ -1238,11 +1258,31 @@ async fn request_restart(State(state): State<AppState>) -> Json<Value> {
 // ---------------------------------------------------------------------------
 
 async fn oauth_platforms() -> Json<Value> {
-    Json(
-        json!({"platforms": mr_core::oauth::platforms().iter().map(|p| json!({
-        "id": p.id(), "label": p.label(), "description": p.description(), "flow": if p.begins_with_loopback() { "browser" } else { "device" }
-    })).collect::<Vec<_>>() }),
-    )
+    let platforms: Vec<Value> = mr_core::oauth::platforms()
+        .iter()
+        .map(|p| {
+            // `flow` remains the *default* the panel offers first, so an existing client keeps
+            // working unchanged. `flows` lists everything the platform can do: Codex is
+            // `["browser", "device"]`, because a headless server or a browser on another host
+            // cannot complete a loopback redirect and should be offered the alternative rather
+            // than a dead end.
+            let mut flows: Vec<&str> = Vec::new();
+            if p.begins_with_loopback() {
+                flows.push("browser");
+            }
+            if p.supports_device_flow() {
+                flows.push("device");
+            }
+            json!({
+                "id": p.id(),
+                "label": p.label(),
+                "description": p.description(),
+                "flow": if p.begins_with_loopback() { "browser" } else { "device" },
+                "flows": flows,
+            })
+        })
+        .collect();
+    Json(json!({ "platforms": platforms }))
 }
 
 async fn oauth_authorize(
@@ -2815,3 +2855,103 @@ fn resolve_doc(dir: Option<&FsPath>, name: &str) -> ApiResult<std::path::PathBuf
 }
 
 // ---8<--- tests appended below ---
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::PanelAuth;
+    use crate::state::{ServeDirs, StateFiles};
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use mr_core::dialect::Dialect;
+    use mr_core::model::{Account, Provider};
+    use tower::ServiceExt;
+
+    /// State on a private temp directory: no test may touch the real installation.
+    fn state_in(dir: &std::path::Path) -> (AppState, std::path::PathBuf) {
+        let config_path = dir.join("config.json");
+        let config = Config::default();
+        config.save(&config_path).expect("write the initial config");
+        let state = AppState::new(
+            config,
+            StateFiles {
+                config_path: config_path.clone(),
+                snapshot_path: dir.join("routes.snapshot"),
+                database_path: dir.join("state.sqlite"),
+                dirs: ServeDirs {
+                    panel: None,
+                    docs: None,
+                },
+            },
+            PanelAuth::resolve("127.0.0.1", None, false).expect("loopback panel"),
+            20900,
+            20901,
+        )
+        .expect("build state");
+        (state, config_path)
+    }
+
+    fn config_with_provider(label: &str) -> Config {
+        let mut config = Config::default();
+        let mut provider = Provider::new("example", Dialect::OpenAi, "https://api.example.test/v1");
+        provider.label = Some(label.to_owned());
+        provider.accounts.push(Account::new("test account"));
+        config.providers.push(provider);
+        config
+    }
+
+    /// The wiring, not just the method.
+    ///
+    /// `state.rs` proves `reload_from_disk` is correct in isolation. This proves it is actually
+    /// *called* on a read — which is the part the original bug was made of. `hedge_decide` and the
+    /// Responses dialect arms were both once correct and unreachable, and a unit test on the
+    /// function would not have noticed either.
+    #[tokio::test]
+    async fn a_get_adopts_an_external_write_before_the_handler_reads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (state, config_path) = state_in(dir.path());
+
+        // A `GET /api/providers` served before any external edit sees nothing.
+        let body = get_providers(&state).await;
+        assert_eq!(body["providers"].as_array().expect("array").len(), 0);
+
+        // Exactly what `mr migrate omniroute` / `mr provider add` do: write the file directly.
+        config_with_provider("written by another process")
+            .save(&config_path)
+            .expect("external write");
+
+        // No restart, no commit, no explicit reload — just a read through the router.
+        let body = get_providers(&state).await;
+        let providers = body["providers"].as_array().expect("array");
+        assert_eq!(
+            providers.len(),
+            1,
+            "the read must have adopted the external write"
+        );
+        assert_eq!(
+            providers[0]["label"].as_str(),
+            Some("written by another process")
+        );
+    }
+
+    async fn get_providers(state: &AppState) -> Value {
+        let response = router(state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/api/providers")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router responded");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+}

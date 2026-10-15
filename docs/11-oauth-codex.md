@@ -37,7 +37,8 @@ for operators.
 
 ## 2. Flow: authorization code with PKCE
 
-The flow is authorization code + PKCE (`S256` only), loopback redirect, no client secret.
+The default flow is authorization code + PKCE (`S256` only), loopback redirect, no client secret.
+Codex also supports a **device-code** flow (§2a), which needs no inbound connection at all.
 
 ### Redirect
 
@@ -65,6 +66,40 @@ mistake is sending the raw verifier as the challenge, or using standard base64 (
 the URL-safe alphabet. Both produce a challenge the provider will not match at token time, and the
 failure is `invalid_grant` at the exchange — after the user has already completed the browser step,
 which is the most expensive place to discover it.
+
+### 2a. Device-code flow (headless and remote)
+
+The loopback flow requires the browser to reach a listener on **the machine running the router**. A
+headless server, a container, or a browser on another host cannot do that, so those deployments need a
+flow with no inbound connection. Codex offers one — the same flow the Codex CLI uses — and the panel
+offers it as "Use a device code instead".
+
+This is **not** RFC 8628, and the differences are the whole difficulty:
+
+| Step | Endpoint | Notes |
+|---|---|---|
+| 1. Start | `POST https://auth.openai.com/api/accounts/deviceauth/usercode` | JSON body `{"client_id":…}`. Returns `device_auth_id`, `user_code`, `interval`. |
+| 2. Poll | `POST …/deviceauth/token` | JSON body `{"device_auth_id":…, "user_code":…}`. On approval returns `authorization_code` **and** `code_verifier`. |
+| 3. Exchange | `POST https://auth.openai.com/oauth/token` | Form-encoded `authorization_code` grant with `redirect_uri = https://auth.openai.com/deviceauth/callback`. |
+
+Four things that cost time to rediscover, all confirmed against the live endpoint:
+
+- **The poll needs the `user_code` as well as the device id.** Omitting it is
+  `400 … user_code: Field required`, not a pending status. A wrong code is
+  `400 deviceauth_user_code_mismatch`. This is why `device_poll` takes the whole
+  `DeviceAuthorization` rather than just `device_code` — GitHub's RFC 8628 flow needs only the device
+  code, and a signature passing one string cannot serve both.
+- **The pending state is `403`** with `code: deviceauth_authorization_pending`.
+- **PKCE is generated server-side** and returned with the authorization code. This flow neither sends
+  a `code_challenge` nor stores a verifier; step 2's `code_verifier` is used verbatim at step 3.
+- **`interval` is a string** (`"5"`), though the CLI types it as a number. Parse both.
+
+A `404` at step 1 means device login is disabled for the account or workspace by an administrator.
+That is reported as a configuration outcome with the browser sign-in suggested, not as a failure.
+
+The step-3 response is turned into the same `TokenSet` the browser flow produces, including
+`chatgpt_account_id` in `extra` — without it every relay request is a hard `400`, so `device_poll`
+refuses to report success when the claim is missing rather than storing a credential that cannot work.
 
 ### Scopes
 

@@ -32,7 +32,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::{oauth_error, DevicePoll, OAuthPlatform, RedirectPorts};
+use super::{oauth_error, DeviceAuthorization, DevicePoll, OAuthPlatform, RedirectPorts};
 use crate::error::{Error, Result};
 
 /// Upper bound on a single token-endpoint exchange or refresh.
@@ -804,7 +804,7 @@ impl DeviceSchedule {
 /// [`DeviceSchedule`], which the tests exercise without a socket.
 pub async fn drive_device_polls(
     platform: &dyn OAuthPlatform,
-    device_code: &str,
+    authorization: &DeviceAuthorization,
     interval: Duration,
     expires_in: Duration,
 ) -> Result<DevicePoll> {
@@ -821,7 +821,7 @@ pub async fn drive_device_polls(
             return Ok(DevicePoll::ExpiredToken);
         }
 
-        let outcome = platform.device_poll(device_code).await?;
+        let outcome = platform.device_poll(authorization).await?;
         match schedule.apply(&outcome) {
             // Next iteration sleeps `schedule.interval()`, which is exactly the Wait value
             // (Pending keeps it, SlowDown grew it) — advancing here would double-count.
@@ -840,6 +840,18 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
+
+    /// A device authorization for driver tests; only the fields the driver reads matter.
+    fn test_authorization() -> DeviceAuthorization {
+        DeviceAuthorization {
+            device_code: "device-code".into(),
+            user_code: "TEST-CODE".into(),
+            verification_uri: "https://example.test/device".into(),
+            verification_uri_complete: None,
+            expires_in: Duration::from_secs(60),
+            interval: Duration::from_secs(1),
+        }
+    }
     use crate::oauth::{AccountIdentity, Pkce, TokenSet};
 
     // ----- encoding -------------------------------------------------------
@@ -1153,7 +1165,7 @@ mod tests {
         fn refresh_lead(&self) -> Duration {
             Duration::from_secs(60)
         }
-        async fn device_poll(&self, _device_code: &str) -> Result<DevicePoll> {
+        async fn device_poll(&self, _authorization: &DeviceAuthorization) -> Result<DevicePoll> {
             *self.polls.lock().unwrap() += 1;
             let mut script = self.script.lock().unwrap();
             Ok(script.pop_front().unwrap_or_else(|| DevicePoll::Failed {
@@ -1174,7 +1186,7 @@ mod tests {
         ]);
         let outcome = drive_device_polls(
             &fake,
-            "device-code",
+            &test_authorization(),
             Duration::from_millis(5),
             Duration::from_secs(5),
         )
@@ -1190,7 +1202,7 @@ mod tests {
         let started = std::time::Instant::now();
         let outcome = drive_device_polls(
             &fake,
-            "device-code",
+            &test_authorization(),
             Duration::from_millis(5),
             Duration::from_secs(30),
         )
@@ -1210,7 +1222,7 @@ mod tests {
         let fake = FakeDevice::new(vec![DevicePoll::Pending; 1000]);
         let outcome = drive_device_polls(
             &fake,
-            "device-code",
+            &test_authorization(),
             Duration::from_millis(5),
             Duration::from_millis(25),
         )

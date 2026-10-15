@@ -161,6 +161,27 @@ pub mod openai {
     pub const TOKEN: &str = "https://auth.openai.com/oauth/token";
     /// The inference endpoint. Note that it is not `api.openai.com`.
     pub const INFERENCE: &str = "https://chatgpt.com/backend-api/codex/responses";
+    /// Where Codex's *device* flow asks for a user code.
+    ///
+    /// This is **not** RFC 8628. OpenAI runs a custom `deviceauth` flow under `/api/accounts`,
+    /// documented in the Codex CLI (`codex-rs/login/src/device_code_auth.rs`) and reproduced here
+    /// from OmniRoute's `src/lib/oauth/codexDeviceFlow.ts`:
+    ///
+    /// 1. `POST .../deviceauth/usercode` with `{client_id}` → `{device_auth_id, user_code, interval}`
+    /// 2. `POST .../deviceauth/token` with `{device_auth_id, user_code}` → `{authorization_code,
+    ///    code_verifier}`, or 403/404 while still pending. **PKCE is generated server-side.**
+    /// 3. `POST {TOKEN}` as a form `authorization_code` grant with that code, that verifier, and
+    ///    `redirect_uri = {DEVICE_REDIRECT}`.
+    ///
+    /// 404 from step 1 means device login is disabled for the account or workspace (admin gating),
+    /// which is worth reporting as itself rather than as a generic failure.
+    pub const DEVICE_USERCODE: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+    /// Where Codex's device flow is polled (see [`DEVICE_USERCODE`]).
+    pub const DEVICE_TOKEN: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+    /// The `redirect_uri` the device exchange must present. It is never actually visited.
+    pub const DEVICE_REDIRECT: &str = "https://auth.openai.com/deviceauth/callback";
+    /// Where a human types the user code for the device flow.
+    pub const DEVICE_VERIFY: &str = "https://auth.openai.com/codex/device";
 }
 
 /// The GitHub endpoints used by the Copilot flow.

@@ -75,6 +75,11 @@ export async function renderProviders(mount, ctx) {
       const openBtn = h('button', { class: 'btn btn-sm', type: 'button' }, 'Open');
       openBtn.addEventListener('click', (e) => { e.stopPropagation(); openDetailDrawer(p); });
 
+      // An OAuth provider with no accounts cannot serve anything, and the fix is a single action.
+      // Surfacing it on the row means "sign in" is one click from the list rather than: open the
+      // drawer, scroll to Accounts, find Connect account.
+      const needsOauth = p.auth?.type === 'oauth' && accounts.length === 0;
+
       const tr = h('tr', { class: 'row-click', tabindex: '0' },
         h('td', { class: 'mono' }, p.id),
         h('td', {}, p.label ?? ''),
@@ -82,7 +87,15 @@ export async function renderProviders(mount, ctx) {
         h('td', {}, accountSummary(accounts, enabledCount)),
         h('td', { class: 'num' }, String(models.length)),
         h('td', {}, chip(health.label, health.cls, `health: ${health.key}`)),
-        h('td', { class: 'actions' }, openBtn),
+        h('td', { class: 'actions' },
+          ...(needsOauth
+            ? [(() => {
+                const connect = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, 'Connect');
+                connect.addEventListener('click', (e) => { e.stopPropagation(); openDetailDrawer(p); });
+                return connect;
+              })()]
+            : []),
+          openBtn),
       );
       const activate = () => openDetailDrawer(p);
       tr.addEventListener('click', activate);
@@ -262,7 +275,10 @@ export async function renderProviders(mount, ctx) {
             h('th', { scope: 'col' }, 'Weight'), h('th', { scope: 'col' }, ''))),
           tb)));
     } else {
-      accSection.append(emptyState('No accounts.', 'Add an account to give this provider credentials.'));
+      accSection.append(emptyState('No accounts.',
+        p.auth?.type === 'oauth'
+          ? 'Connect an account below to let this provider serve requests.'
+          : 'Add an account to give this provider credentials.'));
     }
     accSection.append(buildAccountForm(p));
     body.append(accSection);
@@ -425,42 +441,113 @@ export async function renderProviders(mount, ctx) {
     return form;
   }
 
+  // ------------------------------------------------------------------ OAuth
+
+  /// The one-click sign-in for an OAuth provider.
+  ///
+  /// Two flows are offered where the platform supports both. The browser redirect is the default
+  /// because on the usual deployment — router and browser on one machine — it is a single click.
+  /// The device code exists for the cases where a redirect cannot work at all: a headless server, a
+  /// container, or a browser on a different host. Offering only the redirect would make those
+  /// deployments impossible to log in from the panel.
   function buildOAuthAccountForm(p) {
     const status = h('p', { class: 'muted' }, 'OAuth credentials are stored only in the encrypted local vault.');
-    const connect = h('button', { class: 'btn primary', type: 'button' }, 'Connect account');
-    const form = h('div', {}, status, connect);
-    connect.addEventListener('click', async () => {
-      connect.disabled = true;
+    const progress = h('p', { class: 'muted' });
+    const actions = h('div', { class: 'toolbar', style: 'padding:0;border:0;background:none;' });
+    const form = h('div', {}, status, actions, progress);
+
+    let details = null;
+
+    // Discover what this platform can do before drawing buttons, so the panel never offers a flow
+    // that would fail. Until that answers, no button exists — a button that 404s is worse than a
+    // brief absence.
+    (async () => {
       try {
-        const platform = p.auth.platform;
         const { platforms = [] } = await api.get('/api/oauth');
-        const details = platforms.find((x) => x.id === platform);
-        if (!details) throw new Error(`OAuth platform “${platform}” is unavailable in this build.`);
-        if (details.flow === 'browser') {
-          const start = await api.post(`/api/oauth/${encodeURIComponent(platform)}/authorize`, { provider_id: p.id });
-          window.open(start.authorization_url, '_blank', 'noopener,noreferrer');
-          status.textContent = 'Complete sign-in in the browser. This router must be running on the same machine as the browser callback.';
-          const done = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/complete`, { provider_id: p.id });
-          ctx.toast.success(`Connected ${done.account.label || 'OAuth account'}.`);
-        } else {
-          const start = await api.post(`/api/oauth/${encodeURIComponent(platform)}/device-code`, { provider_id: p.id });
-          status.replaceChildren(h('span', {}, `Enter code ${start.user_code} at `), h('a', { href: start.verification_uri, target: '_blank', rel: 'noopener noreferrer' }, start.verification_uri));
-          const deadline = Date.now() + start.expires_in_seconds * 1000;
-          while (Date.now() < deadline) {
-            await new Promise((resolve) => setTimeout(resolve, Math.max(1000, start.interval_seconds * 1000)));
-            const result = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/poll`, { provider_id: p.id });
-            if (result.status === 'complete') { ctx.toast.success(`Connected ${result.account.label || 'OAuth account'}.`); await reload(true); return; }
-            if (result.status === 'failed') throw new Error(result.message);
-            if (result.interval_seconds) start.interval_seconds = result.interval_seconds;
-            if (result.retry_after_seconds) start.interval_seconds = Math.max(start.interval_seconds, result.retry_after_seconds);
-          }
-          if (Date.now() >= deadline) throw new Error('OAuth device code expired. Start again.');
+        details = platforms.find((x) => x.id === p.auth.platform) || null;
+      } catch {
+        details = null;
+      }
+      if (!details) {
+        form.replaceChildren(h('p', { class: 'muted' },
+          `OAuth platform “${p.auth.platform}” is unavailable in this build.`));
+        return;
+      }
+      const flows = Array.isArray(details.flows) && details.flows.length ? details.flows : [details.flow];
+      actions.replaceChildren(
+        ...(flows.includes('browser')
+          ? [actionButton('Connect with browser', 'btn btn-primary', () => runBrowser() )]
+          : []),
+        ...(flows.includes('device')
+          ? [actionButton(flows.includes('browser') ? 'Use a device code instead' : 'Connect with a device code',
+              flows.includes('browser') ? 'btn' : 'btn btn-primary', () => runDevice())]
+          : []),
+      );
+    })();
+
+    function actionButton(label, cls, onClick) {
+      const b = h('button', { class: cls, type: 'button' }, label);
+      b.addEventListener('click', () => {
+        for (const el of actions.querySelectorAll('button')) el.disabled = true;
+        onClick()
+          .catch((err) => {
+            // `details` carries the server's own explanation where there is one.
+            ctx.toast.error('OAuth sign-in failed', err);
+            progress.replaceChildren(errorBlock(err));
+          })
+          .finally(() => {
+            for (const el of actions.querySelectorAll('button')) el.disabled = false;
+          });
+      });
+      return b;
+    }
+
+    /// Open the provider's page, then wait for the loopback callback.
+    ///
+    /// The completion call is issued *after* the tab is opened and blocks until the browser comes
+    /// back, which is what makes this a single click: the operator approves in the tab and this
+    /// resolves on its own. The window is opened before the await so the browser does not treat it
+    /// as a popup triggered by nothing.
+    async function runBrowser() {
+      const start = await api.post(`/api/oauth/${encodeURIComponent(details.id)}/authorize`, { provider_id: p.id });
+      window.open(start.authorization_url, '_blank', 'noopener,noreferrer');
+      progress.replaceChildren(
+        h('span', {}, 'Waiting for you to finish signing in… '),
+        h('a', { href: start.authorization_url, target: '_blank', rel: 'noopener noreferrer' }, 'Reopen the page'),
+      );
+      const done = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/complete`, { provider_id: p.id });
+      progress.replaceChildren(h('span', {}, 'Connected.'));
+      ctx.toast.success(`Connected ${done.account?.label || 'OAuth account'}.`);
+      await reload(true);
+    }
+
+    async function runDevice() {
+      const start = await api.post(`/api/oauth/${encodeURIComponent(details.id)}/device-code`, { provider_id: p.id });
+      progress.replaceChildren(
+        h('span', {}, 'Open '),
+        h('a', { href: start.verification_uri, target: '_blank', rel: 'noopener noreferrer' }, start.verification_uri),
+        h('span', {}, ' and enter this code: '),
+        h('strong', { class: 'mono', style: 'letter-spacing:2px;font-size:15px;' }, start.user_code),
+      );
+      window.open(start.verification_uri, '_blank', 'noopener,noreferrer');
+      const deadline = Date.now() + start.expires_in_seconds * 1000;
+      let intervalMs = Math.max(1000, start.interval_seconds * 1000);
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+        const result = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/poll`, { provider_id: p.id });
+        if (result.status === 'complete') {
+          progress.replaceChildren(h('span', {}, 'Connected.'));
+          ctx.toast.success(`Connected ${result.account?.label || 'OAuth account'}.`);
+          await reload(true);
+          return;
         }
-        await reload(true);
-      } catch (err) {
-        ctx.toast.error('OAuth sign-in failed', err);
-      } finally { connect.disabled = false; }
-    });
+        if (result.status === 'failed') throw new Error(result.message);
+        if (result.interval_seconds) intervalMs = Math.max(intervalMs, result.interval_seconds * 1000);
+        if (result.retry_after_seconds) intervalMs = Math.max(intervalMs, result.retry_after_seconds * 1000);
+      }
+      throw new Error('The device code expired before it was approved. Start again.');
+    }
+
     return form;
   }
 

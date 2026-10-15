@@ -466,7 +466,26 @@ pub trait OAuthPlatform: Send + Sync {
 
     /// Whether login starts by binding a loopback HTTP listener and opening the browser at a
     /// redirect it will receive; `false` means the device-code flow instead.
+    ///
+    /// This is the platform's **default** flow, not necessarily its only one: a platform may also
+    /// implement [`supports_device_flow`](Self::supports_device_flow) and be started either way.
+    /// Read this as "what happens when the operator just clicks Connect".
     fn begins_with_loopback(&self) -> bool;
+
+    /// Whether this platform can *also* be logged in with a device code.
+    ///
+    /// Codex answers `true` while still defaulting to the loopback redirect, because the two flows
+    /// serve genuinely different deployments. A browser on the same machine as the router is the
+    /// smoother path and stays the default; a headless server, a container, or a browser on another
+    /// host cannot complete a loopback redirect at all, and there the device code is the only way
+    /// to log in without moving an authorization code by hand.
+    ///
+    /// The two flags are not interchangeable in the other direction: a platform whose only flow is
+    /// the device code (Copilot) returns `false` for [`begins_with_loopback`](Self::begins_with_loopback)
+    /// and `true` here.
+    fn supports_device_flow(&self) -> bool {
+        !self.begins_with_loopback()
+    }
 
     /// Where a browser-based login may send the user back. Device platforms return an inert
     /// value (`primary` 0, no path); check [`begins_with_loopback`](Self::begins_with_loopback)
@@ -578,8 +597,16 @@ pub trait OAuthPlatform: Send + Sync {
 
     /// One poll of the device-code endpoint. Platforms that start with a loopback listener
     /// inherit this error.
-    async fn device_poll(&self, device_code: &str) -> Result<DevicePoll> {
-        let _ = device_code;
+    ///
+    /// Takes the whole [`DeviceAuthorization`] rather than just `device_code`, because providers
+    /// differ in what a poll must present. GitHub (RFC 8628) needs only the device code. OpenAI's
+    /// Codex device flow needs the device id **and** the user code the human was shown — the
+    /// endpoint rejects a poll without it (`400 ... user_code: Field required`) and answers
+    /// `403 deviceauth_authorization_pending` while the human has not finished. Handing over the
+    /// authorization lets each platform use what its protocol actually requires instead of the
+    /// caller guessing which fields matter.
+    async fn device_poll(&self, authorization: &DeviceAuthorization) -> Result<DevicePoll> {
+        let _ = authorization;
         Err(oauth_error(format!(
             "{} does not use the device-code flow",
             self.id()
@@ -803,15 +830,52 @@ mod tests {
 
     #[tokio::test]
     async fn flow_directions_reject_the_wrong_entry_point() {
-        // Loopback platforms have no device flow …
-        for id in ["openai-codex"] {
-            let p = platform(id).unwrap();
-            assert!(p.device_start().await.is_err(), "{id}");
-            assert!(p.device_poll("anything").await.is_err(), "{id}");
-        }
-        // … and the device platform has no authorize URL to pre-build.
+        // The device-only platform has no authorize URL to pre-build, and says so rather than
+        // producing a URL nothing will ever receive.
         let copilot = platform("github-copilot").unwrap();
         assert!(copilot.authorization_url("state", None, 0).is_err());
+        assert!(!copilot.begins_with_loopback());
+        assert!(copilot.supports_device_flow());
+    }
+
+    #[test]
+    fn codex_offers_both_flows_and_still_defaults_to_the_browser() {
+        // Codex gained a device flow because a loopback redirect cannot work on a headless server,
+        // in a container, or with the browser on another host. The **default** must stay the
+        // browser: on the common case — router and browser on one machine — it is fewer steps, and
+        // silently switching an existing deployment to a code the user must retype would be a
+        // regression dressed up as a feature.
+        let codex = platform("openai-codex").unwrap();
+        assert!(
+            codex.begins_with_loopback(),
+            "the browser flow must remain the default"
+        );
+        assert!(
+            codex.supports_device_flow(),
+            "Codex must also be loggable in with a device code"
+        );
+        // A device-capable platform is still redirect-bound for PKCE purposes when it defaults to
+        // the browser. The two flags are independent, and conflating them is what this guards.
+        assert!(codex.requires_pkce());
+    }
+
+    #[tokio::test]
+    async fn the_device_flow_is_offered_only_where_it_is_implemented() {
+        // `start_device` must refuse a platform that cannot do it, and accept one that can: this is
+        // the guard that keeps a panel button from existing for a flow the platform would fail.
+        let sessions = crate::oauth::session::OAuthSessions::new();
+        let antigravity = platform("antigravity").unwrap();
+        assert!(
+            !antigravity.supports_device_flow(),
+            "Antigravity begins with loopback and implements no device flow"
+        );
+        assert!(
+            sessions
+                .start_device(antigravity, "antigravity".to_owned())
+                .await
+                .is_err(),
+            "a platform without a device flow must be refused"
+        );
     }
 
     #[test]

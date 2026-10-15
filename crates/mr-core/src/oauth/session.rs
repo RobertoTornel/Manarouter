@@ -114,7 +114,7 @@ impl OAuthSessions {
         platform: &'static dyn OAuthPlatform,
         provider_id: String,
     ) -> Result<(String, DeviceAuthorization), String> {
-        if platform.begins_with_loopback() {
+        if !platform.supports_device_flow() {
             return Err("platform requires browser redirect authorization".into());
         }
         self.ensure_capacity().await?;
@@ -319,11 +319,7 @@ impl OAuthSessions {
             }
         }
         pending.last_polled = Some(now);
-        let outcome = match pending
-            .platform
-            .device_poll(&authorization.device_code)
-            .await
-        {
+        let outcome = match pending.platform.device_poll(authorization).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.reinsert(id.to_owned(), pending).await?;

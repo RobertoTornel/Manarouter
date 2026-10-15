@@ -27,8 +27,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Instant, SystemTime};
 
 use mr_core::config::Config;
 use mr_core::secret::Vault;
@@ -135,6 +135,15 @@ pub struct AppState {
     pub dirs: ServeDirs,
     /// For uptime in `GET /api/health`.
     pub started_at: Instant,
+    /// `(modified, length)` of `config.json` as of the last time this process read or wrote it.
+    ///
+    /// Used by [`Self::reload_from_disk`] to decide whether re-parsing the file could possibly
+    /// discover anything. A `stat` is a few microseconds against a parse of a document with dozens of
+    /// providers, so the endpoint layer can call the reload on every read without the panel paying
+    /// for it. Length is checked as well as mtime because filesystem timestamp granularity is coarse
+    /// enough (and the fast path cheap enough) that an edit within the same tick should still be
+    /// noticed.
+    pub config_seen: Arc<StdMutex<Option<(SystemTime, u64)>>>,
 }
 
 /// The ports this process believes are live.
@@ -270,7 +279,7 @@ impl AppState {
         // file is new, so a fresh install gets an empty usage history rather than an error.
         let store = mr_core::store::Store::open(&database_path)
             .map_err(|e| format!("cannot open {}: {e}", database_path.display()))?;
-        Ok(Self {
+        let state = Self {
             config: Arc::new(RwLock::new(config)),
             config_path,
             snapshot_path,
@@ -287,12 +296,148 @@ impl AppState {
             }),
             dirs,
             started_at: Instant::now(),
-        })
+            config_seen: Arc::new(StdMutex::new(None)),
+        };
+        // Seed the fingerprint with what we just loaded, so the first read after startup does not
+        // mistake the file we started from for an external edit.
+        state.mark_config_seen();
+        Ok(state)
     }
 
     /// Clone the current configuration.
     pub async fn current_config(&self) -> Config {
         self.config.read().await.clone()
+    }
+
+    /// Re-read `config.json` from disk and adopt it if it changed underneath us.
+    ///
+    /// # Why this exists
+    ///
+    /// The conductor holds the authored configuration in memory, and until now the only way it
+    /// learned about an edit made by *another* process was to be restarted. `mr migrate
+    /// omniroute`, `mr account add`, `mr provider add` and `mr key create` all write the same file
+    /// the conductor is serving from, so an operator who imported accounts with the CLI saw a panel
+    /// that did not list them — the providers and their models were on disk the whole time, and the
+    /// panel was faithfully rendering a snapshot from before the import. Restarting the process
+    /// "fixed" it, which is the tell that this is a cache-coherence bug and not a data problem.
+    ///
+    /// This is the read half of a watch: the endpoint layer calls it before serving a view of the
+    /// configuration, so any API read reflects what is on disk. It is deliberately *not* a file
+    /// watcher thread, because a watcher can only make reads faster, never more correct, and the
+    /// cheap version has no background task, no debounce window and no events to lose.
+    ///
+    /// # What it will not do
+    ///
+    /// * **It never writes.** No save, no snapshot rewrite, no vault touch — those belong to
+    ///   [`Self::commit`]. Reloading is not a way to persist an in-memory edit; that still requires
+    ///   an explicit commit.
+    /// * **It refuses a configuration that does not compile.** A file that was hand-edited into an
+    ///   invalid state is reported and the previous configuration keeps serving, exactly as a
+    ///   rejected commit behaves. A broken file must not take the panel down with it, because the
+    ///   panel is how the operator would fix it.
+    /// * **It does not fight a concurrent mutation.** The mutation lock is taken for the swap, so a
+    ///   reload cannot interleave with a handler that is mid-edit and resurrect a stale view.
+    ///
+    /// Returns `true` when a different configuration was adopted.
+    pub async fn reload_from_disk(&self) -> bool {
+        // Fast path: unchanged since we last looked. This is what makes it affordable to call on
+        // every panel read rather than only on a heuristic schedule.
+        if !self.config_file_changed() {
+            return false;
+        }
+
+        // Take the lock first: a mutation in flight is about to write the file *and* the memory
+        // copy, so reading between its write and its publish would install a stale config.
+        let _guard = self.mutation_lock.lock().await;
+
+        // Re-check under the lock. A mutation that completed while we waited has already published
+        // the new configuration, so re-reading here would be redundant rather than wrong.
+        if !self.config_file_changed() {
+            return false;
+        }
+
+        let on_disk = match Config::load(&self.config_path) {
+            Ok(config) => config,
+            // A missing file is the normal "never edited by hand" case, not an error worth
+            // logging on every read.
+            Err(_) if !self.config_path.exists() => {
+                tracing::debug!(path = %self.config_path.display(), "no configuration file to reload");
+                return false;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %self.config_path.display(),
+                    error = %e,
+                    "configuration could not be re-read; keeping the running copy"
+                );
+                return false;
+            }
+        };
+        // Record what we read *before* comparing, so a later edit is still detected even when this
+        // one turns out to be a no-op. A hand-edit that reorders keys, or a rewrite with identical
+        // content, should not cause the same file to be re-parsed on every subsequent request.
+        self.mark_config_seen();
+
+        {
+            let current = self.config.read().await;
+            if *current == on_disk {
+                return false;
+            }
+        }
+
+        // Compile before adopting: an uncompilable file must not replace a working snapshot.
+        let snapshot = match RoutingSnapshot::compile(&on_disk) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                tracing::warn!(
+                    path = %self.config_path.display(),
+                    error = %e,
+                    "the configuration on disk would not compile; keeping the running copy"
+                );
+                return false;
+            }
+        };
+
+        // Install the snapshot first, so the relay-facing table and the panel's view never
+        // disagree about which configuration is live.
+        self.snapshot.install(snapshot);
+        *self.config.write().await = on_disk;
+        tracing::info!("configuration reloaded from disk");
+        true
+    }
+
+    /// `(mtime, length)` of the configuration file, or `None` when it cannot be stat'd.
+    fn config_fingerprint(&self) -> Option<(SystemTime, u64)> {
+        let meta = std::fs::metadata(&self.config_path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    /// Whether the file differs from the last fingerprint this process recorded.
+    ///
+    /// An unreadable or absent file reports `false`: there is nothing to reload, and treating a
+    /// transient stat failure as a change would mean re-parsing (and possibly re-publishing) on
+    /// every read.
+    fn config_file_changed(&self) -> bool {
+        let Some(now) = self.config_fingerprint() else {
+            return false;
+        };
+        let seen = self
+            .config_seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *seen != Some(now)
+    }
+
+    /// Record the file's current fingerprint as seen.
+    fn mark_config_seen(&self) {
+        let Some(now) = self.config_fingerprint() else {
+            return;
+        };
+        let mut seen = self
+            .config_seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *seen = Some(now);
     }
 
     /// The port the control plane is actually listening on (falls back to the configured one
@@ -357,6 +502,9 @@ impl AppState {
         // (5) Publish.
         self.snapshot.install(snapshot);
         *self.config.write().await = next;
+        // (6) Record what we just wrote, so the next read does not reload our own save. Without
+        // this a commit would be followed by a re-parse of the file it wrote, on every read.
+        self.mark_config_seen();
         Ok(())
     }
 
@@ -484,4 +632,149 @@ pub fn compile_initial(config: &Config, path: &Path) -> Result<RoutingSnapshot, 
         );
     }
     Ok(snapshot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mr_core::dialect::Dialect;
+    use mr_core::model::Provider;
+
+    /// A minimal state on a private temp directory, so no test touches the real installation.
+    fn state_in(dir: &Path) -> (AppState, PathBuf) {
+        let config_path = dir.join("config.json");
+        let snapshot_path = dir.join("routes.snapshot");
+        let database_path = dir.join("state.sqlite");
+        let config = Config::default();
+        config.save(&config_path).expect("write the initial config");
+        let state = AppState::new(
+            config,
+            StateFiles {
+                config_path: config_path.clone(),
+                snapshot_path,
+                database_path,
+                dirs: ServeDirs {
+                    panel: None,
+                    docs: None,
+                },
+            },
+            PanelAuth::resolve("127.0.0.1", None, false).expect("loopback panel needs no password"),
+            20900,
+            20901,
+        )
+        .expect("build state");
+        (state, config_path)
+    }
+
+    /// A configuration with one enabled provider, so a reload has something observable to change.
+    fn with_provider(label: &str) -> Config {
+        let mut config = Config::default();
+        let mut provider = Provider::new("example", Dialect::OpenAi, "https://api.example.test/v1");
+        provider.label = Some(label.to_owned());
+        // A provider with no accounts is refused by `validate`, and these tests commit one, so the
+        // fixture has to be a configuration the router would actually accept.
+        provider
+            .accounts
+            .push(mr_core::model::Account::new("test account"));
+        config.providers.push(provider);
+        config
+    }
+
+    #[tokio::test]
+    async fn an_external_edit_is_adopted_without_a_restart() {
+        // The bug this exists for: `mr migrate omniroute` writes the config the conductor is
+        // serving from, and the panel kept rendering the pre-import document until the process was
+        // restarted. The data was never missing — only the reader was stale.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (state, path) = state_in(dir.path());
+
+        assert!(state.current_config().await.providers.is_empty());
+        assert!(
+            !state.reload_from_disk().await,
+            "nothing changed yet, so nothing should reload"
+        );
+
+        with_provider("written by another process")
+            .save(&path)
+            .expect("simulate a CLI write");
+
+        assert!(
+            state.reload_from_disk().await,
+            "an external write must be adopted"
+        );
+        let config = state.current_config().await;
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(
+            config.providers[0].label.as_deref(),
+            Some("written by another process")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_is_idempotent() {
+        // The reload runs on every authenticated GET, so a second call with no intervening write
+        // must be a no-op rather than re-parsing and re-installing the same document.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (state, path) = state_in(dir.path());
+        with_provider("once").save(&path).expect("external write");
+
+        assert!(state.reload_from_disk().await, "first reload adopts it");
+        assert!(
+            !state.reload_from_disk().await,
+            "a second reload with nothing changed must not report a change"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_is_not_immediately_re_read() {
+        // A commit writes the file *and* publishes the configuration. Recording the fingerprint at
+        // the end of the commit is what stops the next read from re-parsing what we just wrote.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (state, _path) = state_in(dir.path());
+
+        state
+            .commit(with_provider("committed"))
+            .await
+            .expect("commit");
+        assert!(
+            !state.reload_from_disk().await,
+            "our own save must not look like an external edit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broken_file_does_not_replace_a_working_configuration() {
+        // A hand-edit that does not compile must leave the running configuration alone: the panel
+        // is how the operator would repair it, so a bad file must not take the panel down.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (state, path) = state_in(dir.path());
+        with_provider("good").save(&path).expect("external write");
+        assert!(state.reload_from_disk().await, "adopt the good revision");
+
+        std::fs::write(&path, b"{ this is not json").expect("write a broken file");
+
+        assert!(
+            !state.reload_from_disk().await,
+            "an unparseable file must be refused"
+        );
+        let config = state.current_config().await;
+        assert_eq!(
+            config.providers.len(),
+            1,
+            "the working revision must still be serving"
+        );
+        assert_eq!(config.providers[0].label.as_deref(), Some("good"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_file_is_not_an_error() {
+        // A fresh install with no config.json is normal. Treating it as a change would mean a
+        // warning on every read.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (state, path) = state_in(dir.path());
+        std::fs::remove_file(&path).expect("remove the config");
+
+        assert!(!state.reload_from_disk().await);
+        assert!(state.current_config().await.providers.is_empty());
+    }
 }
