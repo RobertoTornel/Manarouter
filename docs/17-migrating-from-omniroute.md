@@ -19,19 +19,79 @@ Everything else in this document follows from those.
 | Client keys | Yes | The hash is carried over, so existing client configurations keep working. |
 | Settings | Partially | Ports, timeouts and quota policy map. Anything with no equivalent is reported. |
 | Usage history | No | Different schema, different meaning. Left behind. |
-| OAuth grants | **No** | See below. This is not an oversight. |
+| OAuth grants | Yes, for supported platforms | Imported by **one refresh**, never by copying an access token. See below. |
 
-### Why OAuth tokens cannot be migrated
+### How OAuth grants are migrated
 
-An OAuth grant is bound to the client that obtained it. The access and refresh tokens in the
-reference database were issued to *that* client, with *its* redirect URI and *its* client id, and
-the token endpoint will reject a refresh presented by a different client — usually with
-`invalid_grant`, which is indistinguishable from an expired token.
+An OAuth grant is normally bound to the client that obtained it, and a token endpoint will reject a
+refresh presented by a different client. That is the general rule, and it is why the first version of
+this document said grants could not be migrated at all. For these platforms the rule does not bite,
+and the reason is checkable rather than a matter of trust:
 
-Importing them would produce accounts that look configured, pass a superficial check, and then fail
-on the first real request with an authentication error. Reporting them as "needs a fresh login" is
-the honest outcome, and the migration does exactly that. See
-[OAuth overview](10-oauth-overview.md) for how to log in afterwards.
+**The reference and this project ship the same public installed-app client identities.** The Codex
+client id, and the Antigravity client id and secret, are the ones published in each vendor's own
+open-source CLI. Both projects copied the same constants, so a refresh token issued to one is
+accepted from the other. `crates/mr-core/src/published.rs` holds them, and there is a test asserting
+each digest, so a future edit that changed one would fail the build rather than silently break
+migration.
+
+The migration therefore does **one refresh per account** and stores the result:
+
+1. Read the reference's **refresh** token (never its stored access token, which is stale within the
+   hour).
+2. Hand it to the platform's own `refresh_with_context` — the same code the login flow uses.
+3. Store whatever that returns in this installation's vault.
+
+After step 3 the credential belongs to *this* installation and the reference is irrelevant: it can be
+stopped, uninstalled or deleted. `crates/mr-core/tests/imported_grants_are_independent.rs` is the
+executable form of that claim — it reads this installation's vault with the reference database
+closed and requires every imported grant to refresh.
+
+#### What each platform carries
+
+| Platform | Durable credential | Also carried |
+|---|---|---|
+| `openai-codex` | The refresh token | **The `id_token`**, because the relay reads `chatgpt-account-id` from it; without it every request is a hard 400. |
+| `antigravity` | The refresh token | The **Cloud Code project id**, which the relay injects into the request envelope. |
+| `github-copilot` | The long-lived **GitHub** token, which the reference keeps in its access-token column | Nothing else; the migration moves it to `refresh_token` so a session token can be minted from it. |
+
+#### Why an account can still need a fresh login
+
+Not every grant transfers, and the migration says which and why rather than importing something that
+will fail later:
+
+- **Copilot tokens GitHub will not honour.** A GitHub token the vendor refuses to mint a Copilot
+  session from cannot become a working account. GitHub answers the mint endpoint with
+  `403 programmatic_token_generation, approved clients only` for a token it does not consider to come
+  from an approved client — which is what a `ghu_` GitHub **App** token gets, as opposed to the
+  `gho_` OAuth App token this build's own device flow produces. The prefix is visible without a
+  network call, so the migration checks it up front instead of importing an account that fails every
+  request.
+- **Antigravity grants with no Cloud Code project.** The request envelope needs a project id, and the
+  reference writes the literal `__REQUIRES_GCP_PROJECT__` when it has none. Importing that would
+  produce a configured account that cannot serve a request. `--apply` tries to onboard a project
+  first and only creates the account if that succeeds; a dry run reports the account as
+  `(needs Cloud Code onboarding)`.
+
+#### Model lists come across too
+
+A provider with no model entries resolves nothing, so an account imported without its models would be
+live and unreachable. The migration therefore also carries the reference's saved model lists, along
+with the labels, context windows and output limits it recorded. Two details are worth knowing:
+
+- **The reference lists synthetic reasoning-effort variants that are not real model ids.** For a
+  reasoning model it lists the model once and then repeats it per effort — `gpt-6-luna`, then
+  `gpt-6-luna-high`, `gpt-6-luna-low`, and so on. Only the base id exists upstream; the suffixed ones
+  are names the reference resolves to *base model + reasoning effort* before it calls the provider.
+  Sending them verbatim is answered with `400 The 'gpt-6-luna-high' model is not supported when using
+  Codex with a ChatGPT account`. The migration imports the base model and registers the suffixed
+  names as **aliases** onto it, in both the bare and `provider/model` spellings, so a client that has
+  been calling the suffixed name keeps working.
+- **A genuinely suffixed model is kept.** Antigravity really does serve `gemini-3.8-flash-high` and
+  `gpt-oss-120b-medium`; these have no base entry in the list, so they are models and are imported as
+  such. The distinction is drawn from the listing itself rather than from a hardcoded vocabulary.
+
+See [OAuth overview](10-oauth-overview.md) for how to log in when a fresh login really is needed.
 
 ### Why the provider count is not what the plan said
 
@@ -105,9 +165,15 @@ Accounts to import   7
   anthropic / main             (credential present, sk-ant-…7712)
   ...
 
-OAuth accounts needing a fresh login   2
-  github-copilot / work        grant is bound to the other client
-  openai-codex / personal      grant is bound to the other client
+OAuth accounts to import   3
+  openai-codex / personal      credential …4f21c8ab  refreshable
+  antigravity / work           credential …9ab03d17  refreshable  project aicode-consumers
+  github-copilot / work        credential …7712ee04  refreshable
+
+OAuth accounts needing a fresh login   1
+  github-copilot / personal    GitHub will not mint a Copilot session from this token (it is a
+                               GitHub App `ghu_` token, and the mint endpoint accepts approved
+                               clients only); log in again through the panel
 
 Combos to import     4
   coding            priority        3 steps
@@ -117,8 +183,9 @@ Combos to import     4
   ...
 
 Aliases to import    9
-  gpt-5-codex -> openai-codex/gpt-5-codex
-  sonnet      -> anthropic/claude-sonnet-4-5
+  gpt-6-luna-high -> gpt-6-luna
+  gpt-5-codex     -> openai-codex/gpt-5-codex
+  sonnet          -> anthropic/claude-sonnet-4-5
   ...
 
 Nothing was written. Re-run with --apply to perform the import.
@@ -129,6 +196,20 @@ Credentials are shown **masked**, and never in full, even here.
 The reference database path defaults to `~/.omniroute/storage.sqlite` and can be overridden with
 `--db`. If the file is not where expected, the migration says where it looked rather than failing
 with a bare "not found".
+
+Two further flags narrow a run:
+
+- `--data-dir <DIR>` — where to find the reference's `.env` (which holds `STORAGE_ENCRYPTION_KEY`).
+  Defaults to the directory holding the database.
+- `--only <provider>` — consider just these reference providers, repeatable. Useful for re-importing
+  a single platform without re-reading the whole plan, for example `--only codex --only agy`.
+
+`--json` prints the same report as a machine-readable object.
+
+The reference database is opened as a **copy**: the migration copies the file and its `-wal`/`-shm`
+siblings, folds the write-ahead log into the copy, reads it read-only, and deletes it. The original is
+never written to, which is why a running OmniRoute is not a problem — if it changes the file mid-read,
+the migration reports that rather than failing, because the copy it read is the one it hashed.
 
 ### 2. Apply
 
@@ -227,9 +308,14 @@ conflict and leaving the local combo intact is the only safe outcome.
 A checklist, because the migration deliberately does not do these:
 
 - [ ] **Sync models per provider.** `mr models sync <provider>` — discovery is a network operation,
-      so it is not part of an import that is meant to be offline and repeatable.
-- [ ] **Log in to the OAuth platforms again.** `mr account add` for each. The grants could not be
-      migrated.
+      so it is not part of an import that is meant to be offline and repeatable. Providers whose
+      models came from the reference already have entries, so this is a top-up rather than a
+      prerequisite.
+- [ ] **Check the accounts reported as needing a fresh login.** `mr account list <provider>`. Each
+      one is listed with the reason it could not be imported; log in with `mr account add` only for
+      those.
+- [ ] **Restart the relay.** The imported accounts are in the compiled snapshot, which the relay
+      reads at startup. `systemctl --user restart manarouter-relay.service`.
 - [ ] **Review any combo with a missing step.** A step whose provider did not come across is
       reported, and the combo is kept with that step disabled rather than silently shortened.
 - [ ] **Check the alias list.** `mr alias list`. Particularly the bare aliases, which are only

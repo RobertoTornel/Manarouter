@@ -57,12 +57,22 @@ indexmap = { version = "2", features = ["serde"] }
 
 # --- storage ---
 rusqlite = { version = "0.37", features = ["bundled", "serde_json", "time"] }
+# Used by the OmniRoute migration for the private directory its database copy lives in. It is
+# already in the tree as a dev-dependency, so promoting it costs no new crate; it is here rather
+# than hand-rolled because the copy contains credential ciphertext and `tempfile` creates the
+# directory `0700` with `O_EXCL` naming, which is the part worth not getting wrong.
+tempfile = "3"
 
 # --- crypto / ids ---
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 sha2 = "0.10"
 hmac = "0.12"
 aes-gcm = "0.10"
+# scrypt is needed for exactly one thing: reading the reference OmniRoute database, whose
+# credential columns are AES-256-GCM ciphertext under a scrypt-derived key. Nothing on the runtime
+# request path uses it (`oauth/migrate.rs` is the only caller). Pinned to 0.11 on purpose: 0.12
+# raises the minimum compiler version above this workspace's rust-version.
+scrypt = "0.11"
 rand = "0.8"
 base64 = "0.22"
 subtle = "2"

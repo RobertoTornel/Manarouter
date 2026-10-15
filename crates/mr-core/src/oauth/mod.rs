@@ -41,6 +41,8 @@ pub mod antigravity;
 pub mod codex;
 pub mod copilot;
 pub mod flow;
+pub mod migrate;
+pub mod reference;
 pub mod refresh;
 pub mod session;
 

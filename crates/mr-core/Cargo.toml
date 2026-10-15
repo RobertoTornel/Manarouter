@@ -21,11 +21,15 @@ time = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
+tempfile = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
 zeroize = { workspace = true }
 aes-gcm = { workspace = true }
+# Only `oauth/migrate.rs` uses this: the reference OmniRoute database derives its field-encryption
+# key with scrypt, so reading those tokens requires it. The runtime never calls into that module.
+scrypt = { workspace = true }
 argon2 = { workspace = true }
 password-hash = { workspace = true }
 tracing = { workspace = true }
@@ -46,4 +50,4 @@ webpki-roots = { workspace = true }
 http-body-util = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }

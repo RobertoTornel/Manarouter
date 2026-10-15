@@ -14,9 +14,9 @@ given so you can re-run it.
 | `mr-dialects` — OpenAI, Anthropic, Responses, Google, Command Code translation | **Reachable, test coverage uneven** | Relay dispatches request and response translation per selected step. Responses implementation needs focused regression tests. |
 | `manarouter-relay` — HTTP API, auth, snapshot, account selection, translation | **Runs; concurrent hedging not wired** | Sequential step loop remains the request executor; `hedge_decide` is not called by the relay. Priority combos with `hedge.enabled` now remember the successful provider/model for a configurable inactivity window (default 1800s), combo-wide across callers; the preference is process-local and rechecked against current eligibility on each request. Client-key scan exits at first match (a deliberate latency tradeoff that reveals configured match position to a local timing observer). |
 | `manarouter-conductor` — auth, API, state, serving, quota query | **Implemented** | API routes and Store-backed `/api/quota` exist. Verify live separately; no conductor was running during this audit. |
-| `mr-cli` | **Partial** | Account/provider/combo/key/model families dispatch; `mr key rotate` is supported; `mr doctor` performs read-only config, vault metadata, snapshot freshness, and listener exposure checks; it fails if no enabled client key is present while relay bind is not confirmed loopback-only. `serve`, `migrate`, `config`, and `vault` remain unimplemented. |
+| `mr-cli` | **Partial** | Account/provider/combo/key/model families dispatch; `mr key rotate` is supported; `mr doctor` performs read-only config, vault metadata, snapshot freshness, and listener exposure checks; it fails if no enabled client key is present while relay bind is not confirmed loopback-only. `mr migrate omniroute` imports OAuth grants (by one refresh), model lists and effort-variant aliases — dry run by default, `--apply` to write, reading a copy of the reference database. `serve`, `config`, and `vault` remain unimplemented. |
 | `panel/` | **Implemented; critical browser workflow verified** | Firefox E2E covers panel login, client-key creation, and rotation against an isolated mock API; other routes remain unverified. |
-| OAuth | **Partial; flows wired** | Conductor OAuth routes cover Codex, Copilot, and Antigravity authorization code flows; tokens are vault-backed, metadata lives in SQLite, and relay resolves/refreshes credentials. Antigravity's interactive loopback OAuth exchange/refresh, v2 userinfo identity, free-tier Cloud Code onboarding with bounded LRO polling, encrypted token context persistence, and account-bound relay project injection are implemented. Paid-tier onboarding remains fail-closed without explicit project input. T2 client metadata and PKCE are reverse-engineered/unverified; no live Google login or Cloud Code request was exercised. Cline remains unavailable. |
+| OAuth | **Partial; flows wired, migration verified live** | Conductor OAuth routes cover Codex, Copilot, and Antigravity authorization code flows; tokens are vault-backed, metadata lives in SQLite, and relay resolves/refreshes credentials. Antigravity's interactive loopback OAuth exchange/refresh, v2 userinfo identity, free-tier Cloud Code onboarding with bounded LRO polling, encrypted token context persistence, and account-bound relay project injection are implemented. Paid-tier onboarding remains fail-closed without explicit project input. `mr migrate omniroute` transfers Codex and Antigravity grants by one refresh each, using the client identities in `mr-core/src/published.rs`; this was exercised against a live installation (10 grants imported, all re-refreshed with the reference stopped, and a real completion served through the relay). Copilot tokens issued as `ghu_` GitHub App tokens are refused by GitHub's mint endpoint and are reported as needing a fresh login. T2 client metadata and PKCE remain reverse-engineered/unverified. Cline remains unavailable. |
 | `tools/mock-upstream` | **Fault control API wired; behaviors partial** | Detached crate tests pass; `POST /__control` and request-local `x-mock-fault` merge patches are reachable. Not every field in `Fault` is yet applied to response generation. |
 | `tools/bench` | **Absent** | No harness currently enforces the latency budget. |
 
@@ -32,6 +32,16 @@ PATH="$HOME/.cargo/bin:$PATH" python3 tests/smoke_e2e.py
 BROWSER=firefox PLAYWRIGHT_MODULE=/path/to/playwright FIREFOX_EXECUTABLE=/path/to/firefox node panel/test/browser.e2e.mjs
 ```
 Workspace tests, lint, secret scan, installer simulation, mock-upstream E2E smoke, and Firefox panel workflow all passed locally. The smoke and installer tests are wired into CI; the browser test remains a local opt-in because Playwright/browser binaries are not project dependencies.
+
+The OmniRoute migration was verified against a live installation as well, which is a network operation
+and so is not part of the list above:
+
+```sh
+cargo test -p mr-core --test imported_grants_are_independent -- --ignored --nocapture
+```
+
+That test reads this installation's vault and store only — the reference database is not opened — and
+requires every imported grant to refresh. It passed with the reference fully stopped.
 
 ## 2. What running it found
 

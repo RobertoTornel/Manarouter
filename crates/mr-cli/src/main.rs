@@ -808,10 +808,18 @@ mod tests {
             other => panic!("{other:?}"),
         }
         match parse(&["mr", "migrate", "omniroute"]).unwrap().command {
-            Command::Migrate(migrate::MigrateCmd { source, apply, db }) => {
+            Command::Migrate(migrate::MigrateCmd {
+                source,
+                apply,
+                db,
+                data_dir,
+                only,
+            }) => {
                 assert_eq!(source, migrate::Source::Omniroute);
                 assert!(!apply);
                 assert!(db.is_none());
+                assert!(data_dir.is_none());
+                assert!(only.is_empty());
             }
             other => panic!("{other:?}"),
         }
