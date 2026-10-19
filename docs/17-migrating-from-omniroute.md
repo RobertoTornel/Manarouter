@@ -8,6 +8,15 @@ OmniRoute installation. It is designed around two rules that override convenienc
 
 Everything else in this document follows from those.
 
+**What OmniRoute is, here:** the author's own personal router, run on their own machine mostly for
+testing and for comparison. Manarouter is not a port of it and is not expected to match it. This
+document describes an **import path** — how to bring a configuration across once — not a
+compatibility target, and nothing in the catalogue is required to match the other router. What the
+catalogue derived from that install is marked **UNCERTAIN** in
+[the provider catalogue](providers/catalog.md), the MIT attribution for the derived work is in
+[the credits](credits.md), and the provider inventory it was built from is kept as
+[reference notes](omniroute-reference.md).
+
 ## What can be imported
 
 | Item | Imported | Notes |

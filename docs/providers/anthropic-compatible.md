@@ -97,9 +97,35 @@ model plus another's is a function call that may be valid and wrong.
 
 ## Count tokens
 
-`POST /v1/messages/count_tokens` is passed through to an Anthropic-shaped provider. Where the target
-is not Anthropic-shaped, the relay estimates rather than forwarding, and the response says it is an
-estimate. An estimate presented as an authoritative count would be worse than no endpoint at all.
+`POST /v1/messages/count_tokens` asks a provider how many tokens a request would cost. Only an
+Anthropic-shaped upstream can answer that question, so the relay splits the route in two.
+
+**Against an Anthropic provider** the request is forwarded to the upstream's own
+`/v1/messages/count_tokens`, untranslated, and the upstream's answer is returned as it arrived.
+
+**Against any other provider** the upstream is **not called at all**. Asking a provider that has no
+counting endpoint would mean asking for a *generation* instead — a billed answer, in the wrong
+shape, to a question that was not a question. So the relay answers locally:
+
+```json
+{ "input_tokens": 42 }
+```
+
+and says so in the response header:
+
+```
+x-manarouter-count-tokens-estimate: true
+```
+
+The number is a **character-based approximation, not the provider's tokenizer**: the UTF-8 byte
+length of every string value in the request body, the top-level `model` excluded, divided by four
+and rounded up, never less than one. A body that is not JSON falls back to its raw length the same
+way. An estimate presented as an authoritative count would be worse than no endpoint at all, which
+is why the header is there: a client that needs the provider's exact number can tell the two apart,
+and can point itself at an Anthropic upstream when the difference matters.
+
+The local answer costs nothing — no account is selected, no credential is read, and no upstream is
+billed.
 
 ## See also
 

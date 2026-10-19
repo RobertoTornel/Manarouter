@@ -7,6 +7,13 @@ a machine-readable `MANIFEST` block so you can pick the right file without crawl
 **Read this file first, then follow the pointers. Do not guess at an implementation detail from a
 filename — the file that documents it is listed below.**
 
+**Two series, two audiences.** The documents in `docs/` are the **build-side** reference: how the
+project is put together, what each part does, and where a change belongs. The documents in
+`docs/user/` are the **operator and agent** series: how to run the gateway, how to put a provider
+behind it, and how to call it. The panel serves the operator series and nothing else, so the two
+sets are listed separately in the `MANIFEST` below. If the question is "how do I use this", read
+`docs/user/INDEX.md`; if it is "how does this work, or where do I change it", keep reading here.
+
 ---
 
 ## 1. Project summary
@@ -50,6 +57,7 @@ measured baseline of an existing Javascript router on the development machine �
 | Task | Read |
 |---|---|
 | Understand the whole system | `docs/01-architecture.md` |
+| Help somebody **use** Manarouter | `docs/user/INDEX.md` — the operator and agent series; the panel serves it |
 | Change something on the request path | `docs/01-architecture.md`, `docs/16-latency-engineering.md` |
 | Add a provider | `docs/providers/README.md`, `catalog/providers.toml`, `crates/mr-core/src/model.rs` |
 | Add a dialect or translator | `crates/mr-dialects/src/lib.rs`, `docs/24-provider-dialects.md`, `docs/18-api-reference.md` |
@@ -57,7 +65,7 @@ measured baseline of an existing Javascript router on the development machine �
 | Work on the hedged race | `docs/07-hedged-race.md` — read all of it; the semantics are counterintuitive |
 | Change account/key selection | `docs/05-key-selection.md`, `crates/mr-core/src/dialect.rs` (`KeyStrategy`) |
 | Work on quota | `docs/08-quota-tracking.md`, `docs/09-reset-aware-priority.md` |
-| Add an OAuth platform | `docs/14-oauth-adding-a-platform.md`, `docs/oauth-omniroute-parity.md` |
+| Add an OAuth platform | `docs/14-oauth-adding-a-platform.md`, `docs/omniroute-reference.md` |
 | Touch credentials or secrets | `docs/21-security.md` — read before writing any code |
 | Change the configuration schema | `docs/03-configuration.md` §1 first — unknown-key preservation is mandatory |
 | Change the snapshot format | `docs/04-routing-snapshot.md` — a format change requires a version bump; the current version is **4** |
@@ -119,6 +127,7 @@ Router/
     │       ├── main.rs             thin binary
     │       ├── startup.rs          ★ load config, resolve bind, open vault, build state (shared with `mr serve`)
     │       ├── server.rs           ★ the HTTP route table, request path and accept loop
+    │       ├── count_tokens.rs     the local token-count estimate (Anthropic's route, other providers' answer)
     │       ├── select.rs           ★ step/account selection and the hedged-race policy (pure functions)
     │       ├── upstream.rs         pooled upstream client, the four timeouts, streaming passthrough
     │       ├── state.rs            snapshot handle, upstream client, client keys
@@ -407,7 +416,7 @@ trigger.
     { "path": "docs/12-oauth-antigravity.md", "purpose": "The Antigravity login, project onboarding and Cloud Code inference", "read_when": "working on Antigravity" },
     { "path": "docs/13-oauth-copilot.md", "purpose": "The GitHub Copilot device flow and mandatory headers", "read_when": "working on Copilot" },
     { "path": "docs/14-oauth-adding-a-platform.md", "purpose": "A worked example of adding a new OAuth platform", "read_when": "adding a platform" },
-    { "path": "docs/oauth-omniroute-parity.md", "purpose": "Audited OmniRoute OAuth provider inventory, current Manarouter coverage, and client-key rotation scope", "read_when": "comparing OAuth or key-rotation parity" },
+    { "path": "docs/omniroute-reference.md", "purpose": "Reference notes on the author's own OmniRoute install: the provider-flow inventory the catalogue was built from, and the client-key rotation scope", "read_when": "reading a catalogue note's provenance or the client-key rotation scope" },
     { "path": "docs/15-web-panel.md", "purpose": "The panel: views, API, port editor, design language", "read_when": "touching the UI" },
     { "path": "docs/16-latency-engineering.md", "purpose": "Every latency decision, the rejected ones, and the per-step budget", "read_when": "changing the hot path" },
     { "path": "docs/17-migrating-from-omniroute.md", "purpose": "Importing providers, combos and credentials safely", "read_when": "migrating or touching the importer" },
@@ -428,7 +437,21 @@ trigger.
     { "path": "docs/providers/codex.md", "purpose": "The Codex provider: OAuth, fingerprint headers and the Responses surface", "read_when": "working on Codex" },
     { "path": "docs/providers/antigravity.md", "purpose": "The Antigravity provider: tiers, Cloud Code onboarding and scopes", "read_when": "working on Antigravity" },
     { "path": "docs/providers/copilot.md", "purpose": "The GitHub Copilot provider: the device flow and the mandatory fingerprint headers", "read_when": "working on Copilot" },
-    { "path": "docs/local-latency-benchmark.md", "purpose": "The report-only local benchmark method and its caveats", "read_when": "running tests/local_latency_bench.py" }
+    { "path": "docs/local-latency-benchmark.md", "purpose": "The report-only local benchmark method and its caveats", "read_when": "running tests/local_latency_bench.py" },
+    { "path": "docs/user/INDEX.md", "purpose": "The operator and agent series: what it covers, in which order to read it, and how the panel serves it", "read_when": "pointing somebody at the user-facing documentation" },
+    { "path": "docs/user/00-getting-started.md", "purpose": "From a fresh install to the first request through the gateway", "read_when": "setting Manarouter up" },
+    { "path": "docs/user/01-add-a-provider.md", "purpose": "Choosing an upstream, storing its credential safely, confirming reachability", "read_when": "adding a provider" },
+    { "path": "docs/user/02-client-keys.md", "purpose": "Creating and protecting the client key an app sends, and keeping it separate from the provider credential", "read_when": "wiring an app to the gateway" },
+    { "path": "docs/user/03-calling-the-api.md", "purpose": "The two client surfaces, request examples, and how to read the first response", "read_when": "calling the relay" },
+    { "path": "docs/user/04-models-and-reasoning-levels.md", "purpose": "Which model names the relay resolves, and how to request a reasoning level", "read_when": "choosing a model name" },
+    { "path": "docs/user/05-combos.md", "purpose": "Creating and maintaining named model routes over several providers", "read_when": "building a combo" },
+    { "path": "docs/user/06-quota.md", "purpose": "Configured quota windows, transient cooldowns, and the usage data the panel does not yet show", "read_when": "setting a quota" },
+    { "path": "docs/user/07-images-audio-video.md", "purpose": "The media routes and which providers accept them", "read_when": "calling an image, audio or video route" },
+    { "path": "docs/user/08-proxies.md", "purpose": "Sending upstream traffic through a proxy", "read_when": "configuring egress" },
+    { "path": "docs/user/09-pricing.md", "purpose": "What a request costs upstream and how the relay counts it", "read_when": "estimating cost" },
+    { "path": "docs/user/10-troubleshooting.md", "purpose": "The failures an operator hits most, and what causes each", "read_when": "something is failing for a user" },
+    { "path": "docs/user/11-security.md", "purpose": "The vault, the panel's access controls, and what must not be exposed", "read_when": "reviewing a deployment" },
+    { "path": "docs/user/12-cli-reference.md", "purpose": "Every mr command with its flags", "read_when": "looking up a command" }
   ],
   "machine_readable_state": {
     "compiled_snapshot": "crates/mr-core/src/snapshot.rs",

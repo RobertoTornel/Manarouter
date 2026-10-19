@@ -425,6 +425,12 @@ participants all fail, and a combo without the hedge calling only its first step
 - **A loser's cancellation is local.** Dropping the loser closes this relay's connection to the
   provider, but the provider may keep generating and keep billing. A hedge can therefore cost a full
   completion on every participant it dispatched.
+- **An estimate can win a race.** The token-counting route answers locally and instantly for a
+  non-Anthropic provider (`crates/manarouter-relay/src/count_tokens.rs`), so inside a race such a
+  participant can beat an Anthropic participant that would have counted exactly. The race's own
+  rule decides. Making an estimate lose would need a new `Attempt` variant and a change to the
+  winner rule — the same decision as the `winner_metric` question above, so it was not made
+  unilaterally.
 
 **Interaction with the latency constraint.** The standing requirement is that the relay is optimised
 obsessively for latency and combo logic lives outside it. Concurrent dispatch adds a join and
@@ -458,45 +464,69 @@ and tests the crate (so it cannot rot) but does not assert the threshold.
 
 The six **per-stage** rows of the budget table are still unmeasured; only the total row is.
 
-### P2 — OmniRoute fidelity is second-hand
+### P2 — OmniRoute is a reference, not a target
 
-`github.com/diegosouzapw/OmniRoute` was never cloned. Provider behaviour was ported from summaries of
-the bundled runtime at `~/.omniroute/`. The migration work in `9ec3284` narrowed this gap for the
-three OAuth platforms, because it read the reference's **live database** — real encrypted tokens,
-real model lists, real health fields — and the decode is pinned by a cross-implementation test vector.
-The detail confirmed by that reading is recorded in `docs/17`. For the remaining **52 API-key
-providers** the original caveat stands: before trusting any one provider's details, clone the real
-repository and re-derive them.
+`github.com/diegosouzapw/OmniRoute` is the **author's own personal router**, run on their own
+machine mostly for testing and for comparison. Manarouter is not a port of it, does not mirror it,
+and is not expected to match it; where the two differ, the difference is intentional. There is no
+parity work queued against it, and none is owed.
+
+What the catalogue *knows* about a provider came from reading that install's registry rather than
+from the provider's own documentation, so the entries derived that way are marked **UNCERTAIN** in
+`docs/providers/catalog.md` and their notes say so. Where a provider publishes documentation, that
+is the authority. The OAuth work in `9ec3284` was the last task that read the reference's live
+database, and the detail it confirmed is recorded in `docs/17`; the inventory itself is kept in
+`docs/omniroute-reference.md` as reference notes, and the MIT attribution for the derived work is in
+`docs/credits.md`.
 
 ### P3 — Documentation
 
 - **The provider-dialects document now exists.** `docs/24-provider-dialects.md` covers each of the
   seven dialects, the pivot shape, and what `path_override` / `force_stream` mean.
   `docs/LLM_INDEX.md` lists it, along with `docs/credits.md` and the `docs/providers/*` guides.
-- **The `docs/LLM_INDEX.md` check still needs running after any addition** (28 docs existed before
-  `24-` was added; check after any addition):
+- **The `docs/LLM_INDEX.md` check still needs running after any addition**:
   ```bash
-  for f in docs/*.md; do b=$(basename "$f"); grep -q "$b" docs/LLM_INDEX.md || echo "NOT LISTED: $b"; done
+  for f in docs/*.md docs/*/*.md; do b=$(basename "$f"); grep -q "$b" docs/LLM_INDEX.md || echo "NOT LISTED: $f"; done
   ```
-  The **13 `docs/user/*.md` files are still unindexed** — they are a separate series, and the index
-  does not claim them.
+  The **13 `docs/user/*.md` files are now indexed** — the `MANIFEST` claims the whole operator
+  series, and `docs/user/INDEX.md` is that series' own index (the panel serves it). The build
+  documents are what the operator series deliberately leaves out: it is written for running the
+  gateway, not for changing it.
 - `docs/17-migrating-from-omniroute.md` and `docs/23-implementation-status.md` were both corrected in
   `9ec3284` and now match the code (`docs/23` was corrected again in `65f543d`).
-- **Discrepancies the dialects document found and did not fix**, because each one is a behaviour
-  change rather than a documentation change, and each should be decided rather than quietly patched:
-  `route_overrides` is keyed by the raw request path in the code but by kebab-case `RouteKind` in the
-  docs; a `/v1` base URL together with an absolute `default_path` produces `/v1/v1/…` on the
-  passthrough path; the `count_tokens` estimate in `docs/providers/anthropic-compatible.md` does not
-  exist in the code; the `gemini` template uses query-parameter authentication the relay never
-  sends; and `COMMAND_CODE_VERSION` (1.82.1) overrides the catalogue value (1.79.2). A sixth, found
-  while landing the race: **`latency.hedge_width`, `hedge_window_ms` and `hedge_max_requests` are
-  inert.** They are validated (a zero is refused) and hashed into the snapshot's signature, but no
-  combo inherits them — a hedge's width and window come from the combo's own `hedge` block, whose
-  defaults are the constants `3` and `800 ms`, and `hedge_max_requests` caps nothing. Wiring them
-  means deciding two things the configuration does not say: whether a combo that sets `count`
-  explicitly still inherits the global width (it cannot, as the two are the same field with the
-  same default), and whether `hedge_max_requests` counts the extra calls beyond the first or all
-  of them. That is a decision, not a patch.
+- **The five discrepancies the dialects document found are fixed** — they were behaviour changes, so
+  they were decided and then implemented rather than quietly patched in the prose:
+  1. **`route_overrides` keying.** The relay looked the override up by the raw request path
+     (`uri.path()`), so the documented kebab-case `RouteKind` key could never match. It now looks it
+     up by `RouteKind::as_config_key()` (`crates/mr-core/src/dialect.rs`), a provider whose key starts
+     with `/` gets a warning naming the provider, and the catalogue's own `cloudflare-ai` override
+     fires for the first time.
+  2. **The doubled version.** `build_url` now takes the version segment from the base URL: a base
+     that carries one supplies it and the path gives up its own, a base that carries none gets the
+     dialect's version added, and the version appears exactly once. A translated request and a
+     passed-through one now reach the same upstream at the same URL.
+  3. **The missing `count_tokens` estimate.** The route now has a real upstream call against an
+     Anthropic upstream (`/v1/messages/count_tokens`) and a local estimate against any other, with
+     the response header `x-manarouter-count-tokens-estimate: true` marking the estimated case.
+  4. **The `gemini` template's query-parameter auth.** The relay never puts a credential in a URL,
+     so the template could not authenticate; it now uses `x-goog-api-key`, which Google accepts.
+  5. **`COMMAND_CODE_VERSION`.** The relay pins the header to `1.82.1` whatever the provider
+     configures, so the catalogue entry records `1.82.1` and says so.
+
+  Two more were found while fixing those, and are fixed with them: the dialect default path was
+  **per dialect rather than per client route**, so `/v1/embeddings`, `/v1/responses`,
+  `/v1/audio/*` and `/v1/images/generations` were all sent to `/v1/chat/completions`; and an
+  operator's override is now **the operator's** — it wins over a translator-supplied path, and the
+  version segment in it is never rewritten. The `deepseek` and `perplexity` entries state their
+  versionless paths in `route_overrides` for that reason.
+- **Still open: `latency.hedge_width`, `hedge_window_ms` and `hedge_max_requests` are inert.** They
+  are validated (a zero is refused) and hashed into the snapshot's signature, but no combo inherits
+  them — a hedge's width and window come from the combo's own `hedge` block, whose defaults are the
+  constants `3` and `800 ms`, and `hedge_max_requests` caps nothing. Wiring them means deciding two
+  things the configuration does not say: whether a combo that sets `count` explicitly still inherits
+  the global width (it cannot, as the two are the same field with the same default), and whether
+  `hedge_max_requests` counts the extra calls beyond the first or all of them. That is a decision,
+  not a patch, and it is waiting on the operator's answer.
 
 ### P3 — Release and design debt
 
@@ -505,7 +535,9 @@ repository and re-derive them.
   (`crates/mr-core/src/oauth/refresh.rs:51`), so this earlier item is closed. The `oauth[permanent] …`
   text is now only the `Display` form at the head of an `InvalidState` message (`:123`).
 - **Cross-instance sync** (`docs/22-sync-design.md`) is inert groundwork by decision Q15.
-- **OmniRoute fidelity is second-hand** for the 52 API-key providers — see the P2 above.
+- **OmniRoute is a reference, not a target** — the author's own personal install, used for testing
+  and comparison. The catalogue records what it derived from that install and marks those entries
+  UNCERTAIN. See the P2 above.
 
 ---
 
@@ -594,11 +626,11 @@ tree; this is the disposition, so nobody redoes finished work:
 | P1 Antigravity OAuth incomplete | **Closed** | `antigravity.rs` is 742 lines with `authorization_url` (`:266`), `exchange_code` (`:300`), `refresh` (`:339`), `refresh_with_context` (`:344`), `complete_login` (`:374`) and Google identity parsing (`:114`). The relay injects the project (`server.rs:222`, called at `:511`). |
 | P2 `tools/bench/` empty | **Closed** | The harness exists and measures the relay's added overhead: 14.6 µs p50, 110.5 µs p99 on an idle machine. |
 | P2 `tools/mock-upstream` half-wired | **Closed** | `mod faults;` declared (`lib.rs:29`), `POST /__control` (`:229`), `x-mock-fault` handled (`:205`). |
-| P2 OmniRoute fidelity second-hand | **Partly closed** | OAuth platforms now derived from the live database (§4). 52 API-key providers unchanged. |
+| P2 OmniRoute as a reference | **Not a gap** | OmniRoute is the author's own personal install, used for testing and comparison — not an implementation Manarouter mirrors. The catalogue marks the entries it derived from that install as UNCERTAIN. See §P2. |
 | P3 No provider-dialects doc | **Closed** | `docs/24-provider-dialects.md` exists and is indexed. |
 | P3 `refresh.rs` string marker | **Closed** | Real `FailureClass` enum (`refresh.rs:51`). |
 | P3 No git tag | **Closed** | `v0.1.0` created in the 2026-10-20 revision. |
-| P3 docs index incomplete | **Closed** | `docs/LLM_INDEX.md` now lists the dialects document, `credits.md` and the `docs/providers/*` guides. The 13 `docs/user/*.md` files are a separate series and are still not indexed. |
+| P3 docs index incomplete | **Closed** | `docs/LLM_INDEX.md` lists the dialects document, `credits.md`, the `docs/providers/*` guides and the whole `docs/user/*` operator series (51 manifest entries, every document claimed). The operator series has its own index, `docs/user/INDEX.md`; the build documents are deliberately outside it, because it is written for running the gateway rather than for changing it. |
 
 The old document's advice still holds verbatim and is worth repeating: **green tests are not the same
 as a reachable feature**, and two prior bugs were exactly "arm present, never taken".

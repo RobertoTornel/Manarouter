@@ -34,13 +34,14 @@ So the catalogue is curated data, reviewed like code.
 | `id` | Stable identifier. Referenced by combos as `provider/model`. Renaming one breaks stored combos. |
 | `label` | Display name for the panel. Free to change. |
 | `dialect` | **One of the seven.** Determines request and response translation. |
-| `base_url` | Where requests go. Some catalogues put `/v1` here, some do not — the entry records which. |
-| `auth` | An `AuthKind`: `bearer`, `api-key-header`, `header`, `query-param`, `oauth`. |
+| `base_url` | Where requests go: the prefix the route path is appended to. The version segment, if the provider has one, is part of it. |
+| `auth` | An `AuthKind`: `bearer`, `api-key-header`, `header`, `query-param`, `oauth`. The relay sends `bearer`, `api-key-header` and `header`; it never sends `query-param`, because a credential does not go in a URL. |
 | `capabilities` | Which behaviours are claimed. Drives what the router will even attempt. |
 | `key_strategy` | Default account selection: `priority`, `round-robin`, `random`, `least-used`. |
 | `note` | Free text, displayed in the panel. **Where uncertainty is recorded.** |
 | `docs_url` | For the panel's link. |
 | `headers` | Fingerprint headers sent on every request. |
+| `route_overrides` | Where the provider's paths differ from the dialect's. Keyed by the **client's** route in its kebab-case spelling (`chat-completions`, `responses`, `messages`, …); the value is the path appended to `base_url`, used as written. |
 
 OAuth entries add `oauth_platform`, `oauth_*_url`, `oauth_scopes`, `oauth_redirect_port`,
 `oauth_pkce`, and for the Copilot family `copilot_*` fields. See
@@ -48,7 +49,7 @@ OAuth entries add `oauth_platform`, `oauth_*_url`, `oauth_scopes`, `oauth_redire
 
 ### The seven dialects
 
-`open-ai`, `anthropic`, `google`, `codex`, `copilot`, `antigravity`, `command-code`.
+`open-ai`, `anthropic`, `google`, `codex`, `copilot`, `antigravity`, `command-code-go`.
 
 A dialect must be one of those. There is no "custom" dialect, and that is deliberate: a provider whose
 requests cannot be described by one of these is a provider the router cannot route to, and pretending
@@ -106,7 +107,7 @@ catalogue is a secret.
 
 ## See also
 
-- [The catalogue](catalog.md) — every provider that ships, generated from the TOML.
+- [The catalogue](catalog.md) — every provider that ships. It mirrors `catalog/providers.toml`; there is no generator, so a test in `mr-core` checks the two agree row for row.
 - [OpenAI-compatible](openai-compatible.md) — the largest family by far.
 - [Anthropic-compatible](anthropic-compatible.md)
 - [Command Code](commandcode.md)

@@ -48,13 +48,13 @@ For an isolated, report-only comparison of direct loopback mock requests versus 
 |---|---|
 | **APIs** | OpenAI Chat Completions, Responses, Embeddings, Audio (transcription and speech), Images, Models — and Anthropic Messages with `count_tokens` |
 | **Providers** | Any OpenAI-compatible endpoint, any Anthropic-compatible endpoint, plus first-class adapters for OpenAI Codex, GitHub Copilot, Google Antigravity and Command Code |
-| **Combos** | A combo *is a model name*. Order it yourself; the concurrent race is designed but not wired yet |
+| **Combos** | A combo *is* a model name. Order it yourself; the concurrent race runs when `hedge.enabled` is set |
 | **Key selection** | `priority`, `round-robin`, `random`, `least-used` — always skipping dead accounts |
 | **Health** | Per **account**, never per provider. One revoked key does not take a provider down |
 | **Quota** | Live upstream signals first, your declared windows as an override |
 | **OAuth** | Codex, Copilot, Antigravity — login from the panel; adding a platform is a documented trait |
 | **Panel** | A small web UI for providers, accounts, combos and ports, on its own process |
-| **Migration** | Imports providers, combos and credentials from an OmniRoute database — from a **copy** |
+| **Migration** | Imports providers, combos and credentials from an OmniRoute database — from a **copy**. OmniRoute is the author's own personal router, used for testing and comparison; Manarouter is not a port of it and does not aim to match it |
 
 ---
 
@@ -71,10 +71,13 @@ passed, take the best that passed *on a different provider*, or fall back to a m
 This surprises people, so it is documented in full, with worked timelines:
 [`docs/07-hedged-race.md`](docs/07-hedged-race.md).
 
-**Not wired yet:** the race is compiled and unit-tested, but the relay still walks a combo's steps
-sequentially, so nothing on the request path runs it concurrently. Treat the paragraph above as the
-designed behaviour, not the current one; [`docs/23-implementation-status.md`](docs/23-implementation-status.md)
-is the authoritative list. Priority combos *do* remember the last successful step for a configurable
+**What runs today:** the race itself. A combo with `hedge.enabled` dispatches every participant at
+once, the highest-priority one that replied inside the window is committed, and the losers are
+dropped; the sequential and concurrent paths share one attempt implementation, so they cannot
+drift. **What does not run yet:** the four `on_winner_fail` modes and the mid-stream switch — the
+winner is committed when its response arrives, so a winner that dies afterwards cannot be replaced
+mid-body. [`docs/23-implementation-status.md`](docs/23-implementation-status.md) is the
+authoritative list. Priority combos *do* remember the last successful step for a configurable
 window (`sticky_success_window_secs`, default 1800 s).
 
 ---
@@ -213,7 +216,7 @@ For humans:
 | [The hedged race](docs/07-hedged-race.md) | The eligibility gate, in detail |
 | [Quota tracking](docs/08-quota-tracking.md) | Signals, windows, cooldowns |
 | [Reset-aware priority](docs/09-reset-aware-priority.md) | Demote, never remove |
-| [OAuth](docs/10-oauth-overview.md) · [Codex](docs/11-oauth-codex.md) · [Antigravity](docs/12-oauth-antigravity.md) · [Copilot](docs/13-oauth-copilot.md) · [Adding a platform](docs/14-oauth-adding-a-platform.md) · [OmniRoute OAuth parity and client-key rotation](docs/oauth-omniroute-parity.md) | Logins and key management |
+| [OAuth](docs/10-oauth-overview.md) · [Codex](docs/11-oauth-codex.md) · [Antigravity](docs/12-oauth-antigravity.md) · [Copilot](docs/13-oauth-copilot.md) · [Adding a platform](docs/14-oauth-adding-a-platform.md) · [OmniRoute reference notes and client-key rotation](docs/omniroute-reference.md) | Logins and key management |
 | [Web panel](docs/15-web-panel.md) | Views, API and design |
 | [Latency engineering](docs/16-latency-engineering.md) | Every decision, and the rejected ones |
 | [Migrating from OmniRoute](docs/17-migrating-from-omniroute.md) | Providers, combos, credentials |

@@ -27,6 +27,11 @@ The version and environment headers are **fingerprints**, not authentication. Th
 caller as the official CLI, and they are the kind of header that is easy to omit in an adapter and
 then spend an afternoon debugging.
 
+The version is **pinned by the relay**, not by the provider's configuration: the constant
+`COMMAND_CODE_VERSION` in `crates/mr-dialects/src/commandcode.rs` holds `1.82.1`, and the relay
+overwrites whatever a provider's `headers` map says. The catalogue entry records the same value so
+the data and the code agree; change the constant, and the catalogue entry with it.
+
 ## Always SSE
 
 The response is `text/event-stream` **regardless of what the client asked for**. There is no

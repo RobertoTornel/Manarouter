@@ -94,54 +94,80 @@ upstream response straight back.
 | `antigravity` | `v1internal:generateContent` | no | effectively yes | Gemini `generateContent` inside a Cloud Code envelope |
 | `command-code-go` | `alpha/generate` | no | yes | Command Code CLI envelope and private event stream |
 
-The path column is the path a request ends up at: the **dialect default**, unless a translator or a
-provider override names one. Google and Antigravity are always translator-named, because their path
-carries the model id or the Cloud Code method. Two things about the defaults need care.
+The path column is the path a request ends up at: the **dialect default** for the client's route,
+unless the provider's `route_overrides` names one or a translator supplies one. Google and
+Antigravity are always translator-named, because their path carries the model id or the Cloud Code
+method. Two things about the defaults need care.
 
-### Two path conventions
+### How the upstream path is chosen
 
 The upstream URL is `base_url` + a path, and the path is chosen in this order
-(`crates/manarouter-relay/src/server.rs`, `build_url`):
+(`crates/manarouter-relay/src/server.rs`, `upstream_path` and `build_url`):
 
-1. a path the **translator** supplied (`TranslatedRequest::path_override`);
-2. otherwise the provider's `route_overrides` entry for the request path;
-3. otherwise the **dialect default** (`default_path`).
+1. the provider's `route_overrides` entry for the route the **client** called;
+2. otherwise a path the **translator** supplied (`TranslatedRequest::path_override`);
+3. otherwise the **dialect default** for that route (`default_path`).
 
 The two sources do not use the same convention:
 
 | Source | Form | Examples |
 |---|---|---|
 | Translator `path_override` | relative to the base URL | `messages`, `chat/completions`, `models/{model}:generateContent`, `alpha/generate` |
-| Dialect default | absolute, version included | `/v1/chat/completions`, `/v1/messages` |
+| Dialect default | absolute, version included | `/v1/chat/completions`, `/v1/messages`, `/v1/embeddings` |
 
 The Anthropic translator states the translator's convention in a comment: "Anthropic's Messages
 endpoint is not the OpenAI path, so the translator names it. The provider's base URL is expected to
 already end in `/v1`" (`crates/mr-dialects/src/anthropic.rs:43-50`).
 
-The shipped templates for these two dialects do end in `/v1` (`https://api.openai.com/v1`,
-`https://api.anthropic.com/v1` in `catalog/providers.toml`), and
-[the OpenAI-compatible guide](providers/openai-compatible.md) documents that convention explicitly:
-base `https://api.example.com/v1` sends the request to `https://api.example.com/v1/chat/completions`.
-Under the translator's convention that is right. Under the dialect default it is not — the base
-already ends in `/v1` and the default path begins with it, so the version appears twice.
+**The version segment appears exactly once.** The base URL decides whether there is one:
 
-**A request that is translated and the same request passed through therefore reach the same
-upstream at different URLs, and the passthrough one carries the version twice.** This is a defect in
-the tree rather than a documented convention: the two conventions are recorded in different places
-and never reconciled. Where the code and a document disagree, the code wins; here the code
-disagrees with itself, so the safe reading is the one the translator's comment states — the base URL
-is expected to end in `/v1` for the `open-ai` and `anthropic` dialects.
+- a base that ends in a version segment (`/v1`, `/v4`, `/v1beta`) supplies it, and a path that
+  carries a version segment of its own gives it up — so `https://api.openai.com/v1` plus
+  `/v1/chat/completions` is `https://api.openai.com/v1/chat/completions`, not `…/v1/v1/…`;
+- a base that carries none gets the dialect's version added to a translator-supplied path, so
+  `https://api.deepseek.com` plus `chat/completions` is
+  `https://api.deepseek.com/v1/chat/completions`;
+- a path with no version at all and a base with no version at all is the only case where a version
+  is genuinely absent, and the dialect's version is added there too.
 
-### The default path is per dialect, not per client route
+So **a request that is translated and the same request passed through now reach the same upstream
+at the same URL**, which is what the two conventions were always trying to say.
 
-`default_path` takes a `Dialect` and nothing else, so an OpenAI provider is asked for
-`/v1/chat/completions` whatever the client route was. A provider that serves a second OpenAI route
-— `/v1/embeddings`, `/v1/audio/*`, `/v1/images/generations` — has to say so in its `route_overrides`,
-and the key it uses is the **request path** (`/v1/chat/completions`), not a route name: the relay
-looks the override up with `provider.route_overrides.get(route_key(&uri))`, where `route_key` is
-`uri.path()` (`crates/manarouter-relay/src/server.rs`). The catalogue's own header comment and
-`crates/mr-core/src/catalog.rs:62-64` both describe the key as the kebab-case `RouteKind`
-(`chat-completions`), which is not what the relay looks for. Where the two disagree, the code wins.
+**An operator's path is used as written.** A `route_overrides` value is the operator's explicit
+statement of where that provider serves that route; the relay never adds a version to it and never
+replaces the version in it. The one thing it does is drop a version segment that is *exactly* the
+base's, so a base ending in `/v1` and a value of `v1/responses` give `…/v1/responses` rather than
+`…/v1/v1/responses`. A provider whose endpoint is versionless says so in its overrides: the
+`deepseek` and `perplexity` entries both record `chat-completions = "chat/completions"`.
+
+The key is the route the **client** called, in its kebab-case spelling (`chat-completions`,
+`responses`, `embeddings`, `audio-transcription`, `audio-speech`, `images-generations`, `models`,
+`messages`, `count-tokens`) — `RouteKind::as_config_key()`. A key of `/v1/chat/completions` never
+matches, and the relay logs a warning naming the provider when it finds one.
+
+### The default path is per dialect **and** per client route
+
+`default_path` takes a `Dialect` and the client's `RouteKind`, so each OpenAI-shaped route reaches
+the endpoint that belongs to it:
+
+| Client route | OpenAI dialect default |
+|---|---|
+| `/v1/chat/completions` | `/v1/chat/completions` |
+| `/v1/responses` | `/v1/responses` |
+| `/v1/embeddings` | `/v1/embeddings` |
+| `/v1/audio/transcriptions` | `/v1/audio/transcriptions` |
+| `/v1/audio/speech` | `/v1/audio/speech` |
+| `/v1/images/generations` | `/v1/images/generations` |
+
+The Anthropic dialect has two: `/v1/messages` for the Messages route and
+`/v1/messages/count_tokens` for the token-counting route. The other dialects have one each
+(`/v1beta/models:generateContent`, `/v1internal:generateContent`, `/responses`, `/chat/completions`,
+`/alpha/generate`), and Google and Antigravity are always translator-named, because their path
+carries the model id or the Cloud Code method.
+
+A provider that serves a route the convention does not name still has to say so in its
+`route_overrides` — for example an OpenAI-compatible service whose responses endpoint is not
+`/v1/responses`.
 
 ### `force_stream` is a dialect-level statement; the behaviour is per request
 
@@ -351,8 +377,9 @@ that `(Anthropic, OpenAi)` uses, not a double pivot (`lib.rs:185-193`).
 - The base URL can be overridden per credential: the relay uses the `copilot_api_host` from the
   OAuth token metadata when it is an `https://` URL without an `@`
   (`crates/manarouter-relay/src/server.rs`).
-- A Copilot provider's `route_overrides` are ignored: the relay prefers the translator's path for
-  this dialect and never consults the override table (`crates/manarouter-relay/src/server.rs`).
+- A Copilot provider's `route_overrides` are ignored: the relay never consults the override table
+  for this dialect, because the base host comes from the OAuth token and the provider has no
+  upstream path of its own for an override to replace (`crates/manarouter-relay/src/server.rs`).
 
 **Read next.** [Copilot](providers/copilot.md) for the header set and the token exchange.
 
@@ -494,12 +521,27 @@ embeddings body has no `messages`, so it is translated as though it were a chat 
 nothing in it, and whatever the upstream makes of that is what the client gets. Treat the table as
 a statement about *dialects*, and the route list above as a statement about *bodies*.
 
-**`/v1/messages/count_tokens` has no dedicated upstream call.** The route is dispatched as an
-ordinary Anthropic request and, against an Anthropic upstream, its body is forwarded verbatim to the
-upstream's default path — `/v1/messages`, not `/v1/messages/count_tokens` — because the default path
-is per dialect. [The Anthropic guide](providers/anthropic-compatible.md#count-tokens) says the relay
-estimates the count for a non-Anthropic target and marks the response as an estimate; the code in
-this tree has no such estimation on the request path. Where the two disagree, the code wins.
+**`/v1/messages/count_tokens` has two answers, and the relay says which is which.** Only an
+Anthropic-shaped upstream can count tokens — the endpoint exists in Anthropic's API and nowhere
+else — so:
+
+- against an **Anthropic** step the request is forwarded to the upstream's own
+  `/v1/messages/count_tokens`, untranslated, and the upstream's answer is returned as it arrived;
+- against **any other** step the upstream is **not called at all**. The relay answers locally with
+  an estimate and marks it: `200 OK`, the body exactly `{"input_tokens": N}`, and the header
+  `x-manarouter-count-tokens-estimate: true`.
+
+The estimate is a character-based approximation, not a tokenizer: the UTF-8 byte length of every
+string value in the body, top-level `model` excluded, divided by four and rounded up, never less
+than one. A body that is not JSON falls back to its raw length the same way. It is deliberately
+coarse — an estimate presented as an authoritative count would be worse than no endpoint at all.
+
+Two consequences worth knowing. The estimate is produced **before an account is chosen**, so it
+costs nothing: no credential is read, no upstream is billed, and the request is counted with zero
+tokens. And inside a **hedged race** the estimate answers instantly, so a non-Anthropic participant
+can win a race an Anthropic participant would have answered exactly — the race's own rule
+(highest priority that replies inside the window) decides, and the header tells the client what it
+got.
 
 **A provider's declared capabilities do not narrow the matrix.** They are catalogue metadata for
 the panel; the relay's gate is the dialect pairing above.
@@ -598,7 +640,7 @@ both dialects, rather than forwarding a body the upstream will reject with a con
 
 | Question | Read |
 |---|---|
-| Which providers speak which dialect | [The catalogue](providers/catalog.md) — generated from `catalog/providers.toml` |
+| Which providers speak which dialect | [The catalogue](providers/catalog.md) — mirrors `catalog/providers.toml`, and a test checks it does |
 | How a provider is added | [The provider catalogue](providers/README.md) |
 | The dialect enum itself | `crates/mr-core/src/dialect.rs` |
 | The translation dispatch and the pivot | `crates/mr-dialects/src/lib.rs` |

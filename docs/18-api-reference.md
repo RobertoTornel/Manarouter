@@ -26,7 +26,7 @@ Both ports are configurable and both changes apply on **next restart**
 | `POST` | `/v1/images/generations` | OpenAI Images |
 | `GET` | `/v1/models` | OpenAI Models, served from the compiled snapshot |
 | `POST` | `/v1/messages` | **Anthropic** Messages |
-| `POST` | `/v1/messages/count_tokens` | **Anthropic** token counting |
+| `POST` | `/v1/messages/count_tokens` | **Anthropic** token counting — counted upstream for an Anthropic provider, estimated locally (and marked with `x-manarouter-count-tokens-estimate: true`) for any other |
 | `GET` | `/healthz` | Liveness. **Never routed upstream.** |
 
 `/healthz` is deliberately not a model route. A health check that can be satisfied by a model

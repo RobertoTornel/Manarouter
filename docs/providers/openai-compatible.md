@@ -15,32 +15,53 @@ mr provider test myprov
 
 ## Does `/v1` belong in the base URL?
 
-**It depends on the provider, and the catalogue records which.** There is no rule to infer.
-
-The relay appends the route path to the base URL, so:
+**Usually, and the relay will not guess twice.** The base URL is whatever precedes the route, and
+the version segment is handled:
 
 | `base_url` | Request goes to |
 |---|---|
 | `https://api.example.com/v1` | `https://api.example.com/v1/chat/completions` |
-| `https://api.example.com` | `https://api.example.com/chat/completions` |
+| `https://api.example.com` | `https://api.example.com/v1/chat/completions` |
 
-The first is the more common convention, and it is what the shipped templates use. A provider with the
-second will return a 404 on `/chat/completions`, which is at least an unambiguous symptom.
+A base URL that already ends in a version segment (`/v1`, `/v4`, `/v1beta`) supplies it, and the
+relay does not add another. A base URL that carries none gets the dialect's version, so the same
+provider is reached at the same URL whether the request was passed through or translated — which
+is the point: the two used to differ, and a provider that only serves one of them failed half the
+time.
+
+**The exception is a provider whose endpoint has no version at all** — DeepSeek's chat path and
+Perplexity's are both at the origin root. Those are recorded in the catalogue as `route_overrides`,
+and the relay uses them as written:
+
+```jsonc
+{
+  "id": "perplexity",
+  "base_url": "https://api.perplexity.ai",
+  "route_overrides": { "chat-completions": "chat/completions" }
+}
+```
+
+The same mechanism is the escape hatch for any other deviation — a different responses path, a
+model-scoped prefix, an account id in the path. The key is the route the **client** called, in its
+kebab-case spelling (`chat-completions`, `responses`, `embeddings`, `messages`, …), and the value is
+the path appended to the base URL. The full contract is in
+[the configuration guide](../03-configuration.md#route_overrides).
 
 Some providers put the version elsewhere — `https://api.example.com/openai/v1`, or with an account id
-in the path. The base URL is whatever precedes the route.
+in the path. The base URL is whatever precedes the route, and the relay takes the version segment
+from it wherever it sits.
 
 ## Choosing the auth kind
 
 | Kind | What it sends | Use when |
 |---|---|---|
 | `bearer` | `Authorization: Bearer <key>` | The OpenAI convention. Most providers. |
-| `api-key-header` | `api-key: <key>` | Azure OpenAI and friends. |
+| `api-key-header` | `x-api-key: <key>` (the header name is configurable) | Anthropic, Google, and others that name their own header. |
 | `header` | A header of your choosing | Providers with a bespoke header. |
-| `query-param` | `?key=<key>` | Rare, and worth avoiding — a key in a URL ends up in logs, proxies and browser history. |
+| `query-param` | **not sent** | The relay never puts a credential in a URL — a key in a URL ends up in logs, proxies and browser history. A provider that only accepts `?key=` cannot be used as it stands; use a header the provider also accepts. |
 
-A provider that wants `api-key` and receives `Authorization` returns 401, not an error explaining the
-mix-up. That is why the template records it rather than the router trying both: sending a credential
+A provider that wants `x-api-key` and receives `Authorization` returns 401, not an error explaining
+the mix-up. That is why the template records it rather than the router trying both: sending a credential
 in a header the provider does not expect is a credential leaked to a log for no benefit.
 
 ## Why discovery can lie

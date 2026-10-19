@@ -95,7 +95,7 @@ The full request path, step by step, is in [architecture](01-architecture.md).
 | Feature | Status | Document |
 |---|---|---|
 | OpenAI surface: chat, responses, embeddings, audio, images, models | implemented (types, dialects, routes) | [LLM_INDEX](LLM_INDEX.md) §5 |
-| Anthropic Messages and `count_tokens` | implemented (dialect layer) | [LLM_INDEX](LLM_INDEX.md) §5 |
+| Anthropic Messages and `count_tokens` | implemented (dialect layer and relay route; a non-Anthropic provider is counted locally, as an estimate) | [LLM_INDEX](LLM_INDEX.md) §5 |
 | Provider catalogue and `mr provider add` templates | implemented | `catalog/providers.toml` |
 | Encrypted credential vault (AES-256-GCM, per-entry AAD) | implemented | [security](21-security.md) |
 | Authored config load/save/validate, unknown-key preservation | implemented | [configuration](03-configuration.md) |

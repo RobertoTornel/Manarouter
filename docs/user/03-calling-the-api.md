@@ -87,6 +87,8 @@ The relay registers these API paths; whether a selected upstream can serve a rou
 
 For OpenAI-compatible clients, the base URL therefore ends in `/v1`; for Anthropic clients, configure the relay root without `/v1` as the base URL and use the `/v1/messages` path. Use the model-list endpoint to inspect addressable provider models and combos; aliases are not included in the listing, so use `mr alias list` to inspect those. Provider entries include Manarouter metadata such as default reasoning level, supported levels, and input modalities. Authentication applies to `/v1/models` too when client-key authentication is enabled. `/healthz` only reports relay liveness; it does not test a provider or model.
 
+Token counting (`POST /v1/messages/count_tokens`) is counted by the provider when the selected provider speaks Anthropic. Against any other provider the gateway answers with its own estimate and marks the reply with the header `x-manarouter-count-tokens-estimate: true` — the estimate is free and nothing is billed upstream, but it is an approximation, so a client that needs an exact count should use an Anthropic provider.
+
 For the syntax and behavior of reasoning suffixes such as `PROVIDER/MODEL-high`, see [Models and reasoning levels](04-models-and-reasoning-levels.md). For image/audio/video input and fallbacks, see [Images, audio, and video](07-images-audio-video.md).
 
 ## Understand common HTTP responses

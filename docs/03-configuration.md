@@ -207,6 +207,43 @@ How an account is chosen from those that are available. See `docs/05-key-selecti
 All four **skip unusable accounts** — rate-limited, backed off, auth-failed or disabled. Account
 health is never conflated with provider health; see §11.
 
+### `route_overrides`
+
+Where a provider's paths deviate from the dialect's defaults.
+
+The **key** is the route the *client* called, in its kebab-case configuration spelling —
+`chat-completions`, `responses`, `embeddings`, `audio-transcription`, `audio-speech`,
+`images-generations`, `models`, `messages`, `count-tokens`. It is never the upstream path and never
+the raw request path: a key of `"/v1/chat/completions"` never matches, and the relay logs a warning
+naming the provider when it finds one, because a provider that spells its overrides that way is
+silently ignored otherwise.
+
+The **value** is the path appended to `base_url`. The relay picks the upstream path in this order:
+
+1. the provider's `route_overrides` entry for the route the client called;
+2. otherwise a path the **translator** supplied, when the request had to be translated into the
+   provider's dialect;
+3. otherwise the **dialect default** for that route.
+
+An operator's path is used as written. The relay never adds a version segment to it and never
+removes one from it, with one exception: a version segment duplicated at the join is dropped, so a
+base URL ending in `/v1` and a value of `v1/responses` give `…/v1/responses`, not `…/v1/v1/responses`.
+
+Whether a version segment appears at all is the base URL's business. A base that already carries one
+(`/v1`, `/v4`, `/v1beta`) has it, and a dialect path that starts with a version segment of its own
+gives it up, so the URL carries exactly one; a base that carries none gets the dialect's version
+added to a translator-supplied path, so `https://api.deepseek.com` plus `chat/completions` becomes
+`https://api.deepseek.com/v1/chat/completions`. A provider whose real endpoint is versionless says
+so, and the version is left out:
+
+```jsonc
+{
+  "id": "deepseek",
+  "base_url": "https://api.deepseek.com",
+  "route_overrides": { "chat-completions": "chat/completions" }
+}
+```
+
 ### Discovery versus hand entry
 
 Models come from two sources, and both are first class. Entries carry a `source` of `synced`,

@@ -507,7 +507,7 @@ In order. Skipping a step produces a failure at the next one, which is why the o
    `## See also` link to and from `docs/10-oauth-overview.md`.
 6. **Record it in `docs/LLM_INDEX.md`** if a new file was added, so the LLM-facing index stays a
    complete map of the documentation. The OAuth documents already have entries there (10–14 and
-   `oauth-omniroute-parity.md`); a new document needs its own line.
+   `omniroute-reference.md`); a new document needs its own line.
 7. **Run the gate**: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D
    warnings`, `scripts/check-secrets.sh`, `cargo test`. The link check in CI resolves every relative
    Markdown link in `docs/`, so a `## See also` entry pointing at a document that does not exist
