@@ -215,6 +215,10 @@ pub fn order_steps(
     now_ms: u64,
 ) -> Vec<usize> {
     let n = combo.steps.len();
+    // Proxy eligibility belongs here: once proxy selection is available, combine it with account
+    // health before applying priority/round-robin, but keep each candidate as its resolved step
+    // index. A `(provider, model, level)` sibling is a distinct route and must never be deduped by
+    // the bare upstream model id.
     let available: Vec<bool> = (0..n)
         .map(
             |i| match providers.get(combo.steps[i].provider_index as usize) {
@@ -555,6 +559,7 @@ mod tests {
             max_concurrent: 1,
             models_allow: Vec::new(),
             models_deny: Vec::new(),
+            proxy: None,
         }
     }
 
@@ -567,6 +572,7 @@ mod tests {
             auth: mr_core::dialect::AuthKind::Bearer,
             key_strategy: KeyStrategy::Priority,
             accounts,
+            proxy: None,
             capabilities: Vec::new(),
             connect_timeout_ms: 1000,
             ttfb_timeout_ms: 1000,
@@ -592,6 +598,12 @@ mod tests {
             ttfb_timeout_ms: 1000,
             idle_timeout_ms: 1000,
             total_timeout_ms: 1000,
+            level: mr_core::dialect::ReasoningLevel::High.rank(),
+            levels: 0,
+            default_level: mr_core::dialect::ReasoningLevel::High.rank(),
+            reasoning_json: Default::default(),
+            input_modalities: 1,
+            pricing: None,
         }
     }
 
@@ -622,6 +634,26 @@ mod tests {
 
     fn healthy() -> HashMap<String, Cooldown> {
         HashMap::new()
+    }
+
+    #[test]
+    fn two_steps_for_the_same_model_at_distinct_levels_remain_independently_selectable() {
+        let provider = provider("p0", vec![account("a0")]);
+        let mut low = step(0, "reasoning-model");
+        low.level = mr_core::dialect::ReasoningLevel::Low.rank();
+        let mut high = step(0, "reasoning-model");
+        high.level = mr_core::dialect::ReasoningLevel::High.rank();
+        let plan = combo(ComboStrategy::Priority, vec![low, high]);
+
+        // Candidate identity is its resolved step position, not the bare upstream model id. The
+        // order is used by the caller to index `combo.steps`, which preserves each level's wire
+        // fragment and retry/cooldown identity even when the provider/model pair is shared.
+        assert_eq!(
+            order_steps(&plan, &[provider], &healthy(), 0, 100),
+            vec![0, 1]
+        );
+        assert_eq!(plan.steps[0].model, plan.steps[1].model);
+        assert_ne!(plan.steps[0].level, plan.steps[1].level);
     }
 
     #[test]

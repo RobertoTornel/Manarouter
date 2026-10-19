@@ -132,12 +132,17 @@ it red, or operators learn to ignore red.
        (priority moves on, round-robin skips it, least-used ignores it)
                   |
                   v
-       a timer fires at reset_at
+       the entry is left in place; each selection
+       compares now against reset_at (`is_over(now)`)
                   |
                   v
-       account.state = Ready
+       once now >= reset_at the account is eligible again
        a reset-aware combo promotes the step back to its authored position
 ```
+
+There is no timer thread in either process: a cooldown is in-memory state in the relay, and "expired"
+is computed lazily the next time a selection looks at the account. Nothing polls, and nothing wakes
+up at `reset_at`.
 
 Under `reset-aware-priority`, a step whose accounts are **all** cooling down is **demoted below every
 healthy step, never removed** — so the operator's preferred model is the first thing tried again the
@@ -178,6 +183,9 @@ thousand times is never marked dead.
 
 ## Hedging costs quota
 
+> **Status.** This section is prospective: the relay does not yet dispatch concurrent hedged requests,
+> so no hedge is spending quota today. The accounting below is the design.
+
 This is stated plainly because it is a real cost that is easy to forget when reading about the
 latency benefit.
 
@@ -197,14 +205,22 @@ Two consequences:
 
 ## Credit balances
 
-Some providers expose a balance endpoint. Where one is known, the conductor probes it **off the
-request path** on a long interval, and the panel shows the result.
+Some providers expose a balance endpoint. Where one is known, the intended design is for the conductor
+to probe it **off the request path** on a long interval, with the panel showing the result — but no
+balance probe exists in either service today, so a balance is currently always shown as unknown.
 
 A balance that cannot be fetched is shown as **unknown**, never as zero. Displaying an unreadable
 balance as zero would suggest an account is empty when it may be perfectly full, and would send an
 operator hunting for a problem that does not exist.
 
 ## What is recorded per request
+
+> **Status.** Nothing is recorded yet. `Store` has the `usage` table and `record_usage` API, and
+> `/api/quota` can read it, but **no code in the relay or the conductor ever calls the writer** — the
+> relay does not mention usage at all. In a real deployment the table stays empty, so `/api/quota`
+> reports nothing regardless of traffic and no quota window is enforced from recorded usage. What does
+> work today is the live-signal path: a `429`/`401` observed on the request path sets an in-memory
+> cooldown (see `QuotaConfig`). The table below is the intended record.
 
 | Field | Notes |
 |---|---|
@@ -217,15 +233,20 @@ operator hunting for a problem that does not exist.
 
 Token counts are partial by nature. Many providers report no usage on a streamed response, and some
 report it only on the final chunk. A usage figure that looks lower than reality usually means "the
-provider did not tell us", not "the tokens were free", and the panel says which responses lacked
-usage rather than silently summing what it has.
+provider did not tell us", not "the tokens were free", and the panel is meant to say which responses
+lacked usage rather than silently summing what it has.
 
 ## Where the data lives
 
-Usage and quota state live in **`state.sqlite`**, never in `config.json`. This matters for two
-reasons: the configuration is meant to be readable, diffable and version-controllable, and a file
-that changes on every request is none of those. Deleting `state.sqlite` loses history and cooldown
-state but never breaks the router — every account simply starts `Ready`.
+The **intended** home for usage and quota history is **`state.sqlite`**, never `config.json`: the
+configuration is meant to be readable, diffable and version-controllable, and a file that changes on
+every request is none of those. The `usage` and `account_health` tables exist in the schema, and
+`/api/quota` reads them.
+
+What is *not* there today is live cooldown state. The relay's cooldowns (from `429`/`401` signals and
+`QuotaConfig`) are held in memory in the relay process and are never written to the database, so they
+are lost when the relay restarts, and deleting `state.sqlite` does not clear them. Because no usage
+writer exists, deleting the file currently loses nothing but the OAuth credential rows.
 
 Retention is the operator's decision. There is no default pruning, because silently deleting an
 operator's usage history is worse than an unpruned database, and the panel shows the file's size so
@@ -233,16 +254,18 @@ the decision can be made with information.
 
 ## Limitations
 
-Stated so they are not discovered later:
+Stated so they are not discovered later. Most of these describe the intended accounting, and none of
+them is observable yet because no usage writer exists:
 
 - **Usage a provider does not report is not counted.** Streamed responses frequently omit it.
 - **Requests that fail before reaching the provider are not counted against quota**, correctly — they
   did not consume any — but they do appear in the error rate.
 - **Race spend is attributed per account**, not per combo, so a combo's total cost is not a single
   figure.
-- **A dropped usage record is counted, not retried.** The usage channel is bounded so a slow disk
-  cannot stall a request, and when it is full the drop is recorded and surfaced. Losing a usage row
-  is preferable to adding latency to a completion, and pretending the row exists is worse than both.
+- **A dropped usage record is counted, not retried** (by design). The intended usage channel is bounded
+  so a slow disk cannot stall a request, and when it is full the drop is recorded and surfaced. Losing
+  a usage row is preferable to adding latency to a completion, and pretending the row exists is worse
+  than both.
 - **Spend budgets and credit balances are not enforced.** The router can tell you a provider is
   returning 402; it cannot predict it.
 

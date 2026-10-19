@@ -24,6 +24,16 @@
 //! browser drop the cookie and bricks the panel, so `Secure` is conditional on the request's
 //! effective scheme; and a flat serde map would happily absorb a plaintext secret sent under
 //! `secret`, which is why every ingress path strips it before parsing.
+//!
+//! **A fourth job, which is not a control-plane endpoint at all.** The relay's own paths
+//! ([`RELAY_ROOT_PATH`] and its `/v1` surface) are registered here purely to answer a caller who
+//! reached the *wrong port* with the port to use instead ([`wrong_port`]). The panel and the relay
+//! are two processes on two ports, and pointing an OpenAI/Anthropic client at the panel is the
+//! single most common first-run mistake; without these routes it fell through to the panel shell,
+//! so the client reported a JSON parse error and told the operator nothing. These routes are
+//! deliberately outside both the session check and the origin check (see [`guard`]) — the caller
+//! has no control-plane authority to protect, and the message discloses only the two loopback
+//! ports.
 
 use std::path::Path as FsPath;
 use std::time::Duration;
@@ -60,6 +70,38 @@ use crate::auth::{
     SESSION_TTL,
 };
 use crate::state::{AppState, CommitError, VaultTx};
+use crate::{models_api, quota_api};
+
+/// The path prefix an OpenAI-compatible client is pointed at, and the one it should have used
+/// against the relay instead of the control plane. Recorded as a constant so the routes below, the
+/// guard's exemption and `serve.rs` all agree on one spelling.
+pub const RELAY_ROOT_PATH: &str = "/v1";
+
+/// Whether `path` is a relay path that happens to have arrived on the control port.
+///
+/// Both the routes below and [`guard`] ask this, so the "wrong port" answer stays reachable from a
+/// client that sends no `Origin` header and no session — an OpenAI client has neither to offer.
+fn is_relay_path(path: &str) -> bool {
+    path == RELAY_ROOT_PATH || path.starts_with("/v1/")
+}
+
+/// Answer a client that reached the control port with the port it actually wants.
+///
+/// This is the single most common first-run mistake: the panel is `20901` and the relay is
+/// `20900`, and pointing an OpenAI/Anthropic client at the panel used to fall through to the panel
+/// shell, so the client reported a JSON parse error and told the operator nothing about the port.
+/// The message discloses only the two loopback ports, so there is nothing here to protect, and the
+/// route is deliberately outside both the session check and the origin check.
+async fn wrong_port(State(state): State<AppState>) -> Response {
+    let config = state.current_config().await;
+    let relay = format!("http://{}:{}", config.relay.host, config.relay.port);
+    ApiError::not_found(format!(
+        "this is the panel port {}; point the client at the relay port {} instead (the OpenAI \
+         surface is {relay}/v1 and the Anthropic surface is {relay} with /v1/messages)",
+        config.control.port, config.relay.port
+    ))
+    .into_response()
+}
 
 /// Build the control-plane router with its state attached.
 ///
@@ -113,7 +155,6 @@ pub(crate) fn guarded_router(state: AppState) -> Router<AppState> {
         // --- combos, aliases, keys ---
         .route("/api/combos", get(list_combos).post(create_combo))
         .route("/api/combos/{id}", put(update_combo).delete(delete_combo))
-        .route("/api/quota", get(get_quota))
         .route("/api/aliases", get(list_aliases).post(create_alias))
         .route("/api/aliases/{name}", delete(delete_alias))
         .route("/api/keys", get(list_keys).post(create_key))
@@ -123,6 +164,18 @@ pub(crate) fn guarded_router(state: AppState) -> Router<AppState> {
         // --- documentation ---
         .route("/api/docs", get(list_docs))
         .route("/api/docs/{name}", get(get_doc))
+        // --- module-owned route groups ---
+        //
+        // Merged here, ahead of the catch-all, so each of these files owns its own routes and the
+        // shared table below does not have to be edited for every new endpoint.
+        .merge(quota_api::routes())
+        .merge(models_api::routes())
+        // --- a client pointed at the wrong port gets told which one to use ---
+        //
+        // Registered before the `/api/{*rest}` catch-all, and before the panel's static fallback
+        // in `serve.rs`, so the answer is JSON naming the port rather than an HTML shell.
+        .route(RELAY_ROOT_PATH, any(wrong_port))
+        .route("/v1/{*rest}", any(wrong_port))
         // --- unknown API paths keep the JSON envelope ---
         .route("/api", any(api_not_found))
         .route("/api/", any(api_not_found))
@@ -146,7 +199,8 @@ async fn guard(State(state): State<AppState>, req: Request, next: Next) -> Respo
     if matches!(
         method,
         Method::POST | Method::PUT | Method::DELETE | Method::PATCH
-    ) {
+    ) && !is_relay_path(&path)
+    {
         let headers = req.headers();
         let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
         let referer = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
@@ -266,7 +320,7 @@ impl ApiError {
 
     /// 400 for anything the *request* got wrong: unparseable JSON, a port that cannot work, a
     /// configuration `validate()` refuses.
-    fn bad(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn bad(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, code, message)
     }
 
@@ -278,7 +332,7 @@ impl ApiError {
         Self::new(StatusCode::UNAUTHORIZED, "unauthorized", message)
     }
 
-    fn not_found(message: impl Into<String>) -> Self {
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)
     }
 
@@ -287,16 +341,16 @@ impl ApiError {
     }
 
     /// 500 for anything *we* failed at: the vault would not write, the config would not save.
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }
 
     /// 502/504 for an upstream that refused or never answered during model discovery.
-    fn bad_gateway(message: impl Into<String>) -> Self {
+    pub(crate) fn bad_gateway(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_GATEWAY, "oauth_error", message)
     }
 
-    fn upstream(status: StatusCode, message: impl Into<String>) -> Self {
+    pub(crate) fn upstream(status: StatusCode, message: impl Into<String>) -> Self {
         Self::new(status, "upstream", message)
     }
 }
@@ -1573,6 +1627,7 @@ async fn persist_oauth_account(
         models_allow: Vec::new(),
         models_deny: Vec::new(),
         quota: Vec::new(),
+        proxy: None,
         extra: Default::default(),
     };
     provider.accounts.push(account.clone());
@@ -2163,8 +2218,13 @@ async fn sync_models(
                     context_length,
                     max_output_tokens,
                     capabilities: Vec::new(),
+                    input_modalities: Vec::new(),
+                    reasoning_levels: Vec::new(),
+                    default_reasoning_level: None,
+                    reasoning_wire: None,
                     input_price_per_mtok: None,
                     output_price_per_mtok: None,
+                    pricing: None,
                     synced_at: Some(now),
                     hidden: false,
                 });
@@ -2197,7 +2257,7 @@ type SyncClient = LegacyClient<HttpsConnector<HttpConnector>, Full<Bytes>>;
 /// The HTTP client for discovery: webpki roots (no system-store dependency), ALPN `h2` then
 /// `http/1.1`. Construction mirrors `mr-core/src/oauth/flow.rs` and
 /// `manarouter-relay/src/upstream.rs` — the same shape everywhere this repo speaks HTTPS.
-fn sync_client() -> Result<SyncClient, String> {
+pub(crate) fn sync_client() -> Result<SyncClient, String> {
     // rustls 0.23 needs its process-wide provider installed once; `ring` matches the features
     // this crate already compiles. `install_default` is idempotent — a later failure means a
     // different provider already won, which is acceptable as long as TLS works process-wide.
@@ -2469,55 +2529,6 @@ async fn delete_combo(
 // Aliases
 // ---------------------------------------------------------------------------
 
-/// Observed usage per account, over all recorded time.
-///
-/// A bare JSON array, because that is the shape the panel tables. Each row carries its provider id
-/// as well as its account id so the panel does not have to join anything to say where a number came
-/// from.
-///
-/// The window is `[0, now)`, which is every row ever recorded. Deliberately not "the current billing
-/// period": the store records when a request *happened*, and a window is a property of a provider's
-/// plan, which this process cannot infer. A caller that wants a narrower window can add one; a
-/// caller given a silently narrower one would read a partial sum as a total.
-async fn get_quota(State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let groups = state
-        .store
-        .usage_by_account(Millis(0), Millis(mr_core::ids::now_millis()))
-        .map_err(|e| ApiError::internal(format!("could not read recorded usage: {e}")))?;
-
-    // Account id to provider id, built once. An account whose provider was deleted since the traffic
-    // was recorded still gets a row — the usage is real even when the owner is gone, and dropping it
-    // would make the totals disagree with the traffic that actually happened.
-    let config = state.current_config().await;
-    let mut owner = std::collections::BTreeMap::new();
-    for provider in &config.providers {
-        for account in &provider.accounts {
-            owner.insert(
-                account.id.as_str().to_owned(),
-                provider.id.as_str().to_owned(),
-            );
-        }
-    }
-
-    let rows: Vec<Value> = groups
-        .into_iter()
-        .map(|group| {
-            let t = group.totals;
-            json!({
-                "account": group.key,
-                "provider": owner.get(&group.key).cloned().unwrap_or_else(|| "(removed)".to_owned()),
-                "requests": t.requests,
-                "prompt_tokens": t.prompt_tokens,
-                "completion_tokens": t.completion_tokens,
-                "total_duration_ms": t.total_duration_ms,
-                "max_duration_ms": t.max_duration_ms,
-            })
-        })
-        .collect();
-
-    Ok(Json(json!(rows)))
-}
-
 async fn list_aliases(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let config = state.current_config().await;
     Ok(Json(json!({"aliases": config.aliases})))
@@ -2660,30 +2671,41 @@ async fn update_key(
     JsonBody(body): JsonBody,
 ) -> ApiResult<Json<Value>> {
     let _mutation = state.mutation_lock.lock().await;
-    let mut key_body = object_body(body, "key")?;
-    key_body.insert("id".to_owned(), Value::String(id.clone()));
+    let key_body = object_body(body, "key")?;
 
-    let current = state.current_config().await;
-    if !current.client_keys.iter().any(|k| k.id.as_str() == id) {
-        return Err(ApiError::not_found(format!("no client key with id {id}")));
-    }
-
-    // Client keys have no vault material — only a hash and a prefix live in the config — so this
-    // edit needs no journal; a rejected edit simply never commits.
-    let key_value = Value::Object(key_body);
-    let key: ClientKey = serde_json::from_value(key_value).map_err(|err| {
-        ApiError::bad(
-            "config_parse",
-            format!("the client key could not be read: {err}"),
-        )
-    })?;
-
-    let mut next = current;
+    let mut next = state.current_config().await;
     let position = next
         .client_keys
         .iter()
         .position(|k| k.id.as_str() == id)
         .ok_or_else(|| ApiError::not_found(format!("no client key with id {id}")))?;
+    let current = &next.client_keys[position];
+    let mut merged = serde_json::to_value(current)
+        .map_err(|e| ApiError::internal(format!("the client key could not be read: {e}")))?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| ApiError::internal("the client key is not an object"))?;
+    // Immutable identity and credential material always come from the stored record, never input.
+    for protected in ["id", "key_hash", "prefix"] {
+        merged.remove(protected);
+    }
+    for (name, value) in key_body {
+        if matches!(name.as_str(), "id" | "key_hash" | "prefix" | "key") {
+            continue;
+        }
+        merged.insert(name, value);
+    }
+    merged.insert("id".to_owned(), json!(current.id));
+    merged.insert("key_hash".to_owned(), json!(current.key_hash));
+    if let Some(prefix) = &current.prefix {
+        merged.insert("prefix".to_owned(), json!(prefix));
+    }
+    let key: ClientKey = serde_json::from_value(Value::Object(merged)).map_err(|err| {
+        ApiError::bad(
+            "config_parse",
+            format!("the client key could not be read: {err}"),
+        )
+    })?;
     next.client_keys[position] = key;
     state.commit(next).await?;
 
@@ -2761,7 +2783,8 @@ fn list_doc_files(dir: Option<&FsPath>) -> ApiResult<Vec<Value>> {
     let Some(dir) = dir else {
         return Ok(Vec::new());
     };
-    let entries = match std::fs::read_dir(dir) {
+    let dir = dir.join("user");
+    let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(_) => return Ok(Vec::new()),
     };
@@ -2822,7 +2845,7 @@ fn resolve_doc(dir: Option<&FsPath>, name: &str) -> ApiResult<std::path::PathBuf
         ApiError::not_found("no such document")
     }
 
-    let dir = dir.ok_or_else(refuse)?;
+    let dir = dir.ok_or_else(refuse)?.join("user");
     if name.is_empty()
         || name.starts_with('/')
         || name.starts_with('\\')

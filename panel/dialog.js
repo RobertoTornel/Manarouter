@@ -157,3 +157,28 @@ export function closeButton(onClick, label = 'Close') {
   b.addEventListener('click', onClick);
   return b;
 }
+
+let dialogSeq = 0;
+
+/**
+ * A modal whose body the caller builds: `build(body, close)` fills it, and the returned promise
+ * resolves with whatever `close` was called with (dismissal resolves `false`).
+ *
+ * This exists so a view can own its own modal *content* while the focus trap, Escape handling,
+ * backdrop teardown and title plumbing stay in one place. A second `openDialog` inside a view
+ * would be a second copy of the accessibility contract this file's header promises to keep.
+ */
+export function contentDialog(root, title, build, { dismissable = true } = {}) {
+  return openDialog(root, (card, close) => {
+    const headingId = `dlg-title-${++dialogSeq}`;
+    card.setAttribute('aria-labelledby', headingId);
+    const body = h('div', { class: 'dialog-body' });
+    card.append(
+      h('div', { class: 'dialog-head' },
+        h('h2', { id: headingId, class: 'dialog-title' }, title),
+        closeButton(() => close(false), 'Close')),
+      body,
+    );
+    build(body, close);
+  }, { dismissable }).done;
+}

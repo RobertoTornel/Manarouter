@@ -144,6 +144,12 @@ mod tests {
             ttfb_timeout_ms: 100,
             idle_timeout_ms: 100,
             total_timeout_ms: 0,
+            level: mr_core::dialect::ReasoningLevel::High.rank(),
+            levels: 0,
+            default_level: mr_core::dialect::ReasoningLevel::High.rank(),
+            reasoning_json: Default::default(),
+            input_modalities: 1,
+            pricing: None,
         }
     }
 

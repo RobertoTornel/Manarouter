@@ -1,12 +1,36 @@
 # Handover — project state and what still needs implementing
 
-State of the tree: **`a13405e`** on `main`, pushed to `origin/main`.
+State of the tree: `main` as of **2026-10-19**. This handover is committed *together with* the work it
+describes, so the authoritative hash is `git log -1` rather than a number written here that the next
+commit would invalidate. Before the 2026-10-19 work, `main` was at `9439b93` (level with
+`origin/main`) and the tree carried a large body of uncommitted Feature Round 2 work; that work is now
+committed, so **the tree is clean and `git status` is the first thing to check**.
 Everything below was checked against this working tree and, where stated, against a running server.
 Where a claim is unverified, it says so. Nothing here is recalled from an earlier session.
 
-Supersedes the previous handover (which described `a241c25`). Section 6 records what changed since,
-because most of that document's P0/P1 list is now finished and leaving it in place would send the
-next person to work that is already done.
+Supersedes the previous handover (which described `a241c25` and then `65f543d`). Section 6 records
+what changed since, because most of that document's P0/P1 list is now finished and leaving it in place
+would send the next person to work that is already done.
+
+---
+
+## 0. What the 2026-10-19 revision changed
+
+This revision is the Feature Round 2 close-out. What it contains, and what it deliberately does not:
+
+| Area | State | Evidence / limitation |
+|---|---|---|
+| Store schema | **v3**, with the v2 and v3 migrations restored and tested | `crates/mr-core/src/store.rs`: `MIGRATION_V2` (`key_usage`, `provider_quota_state`), `MIGRATION_V3` (`usage_tokens`). A half-applied edit had bumped `SCHEMA_VERSION` to 4 without adding a migration, which broke the build; the constant is back at 3 and the compile-time assert holds. |
+| Per-key usage ledger | **Stored, not enforced** | `record_key_usage`, `key_window_usage`, `key_window_usage_many`, `prune_key_usage` exist and are tested (rolling-window maths, dense many-key map, prune, idempotent re-record). **The relay does not write to it and does not enforce any cap** — see §4. |
+| Provider quota cache | **Wired to the panel** | `put_provider_quota_state` / `provider_quota_state` / `all_provider_quota_state` / `delete_provider_quota_state` back the conductor's `/api/quota` routes. |
+| CI | **Green, and wider than before** | `.github/workflows/ci.yml` runs fmt, strict Clippy, the secret scan, build, workspace tests, release tests, the isolated installer test, the isolated mock-upstream smoke, and the panel Node tests. The standalone `tools/mock-upstream` job passes strict Clippy again (three lints fixed). |
+| Test files | **Tracked again** | The earlier session's staged deletions of `tests/smoke_e2e.py`, `tests/local_latency_bench.py`, `panel/test/browser.e2e.mjs` and `scripts/test-installer-systemd.sh` were reverted: CI now *runs* them, so removing them from the repository would have removed the checks rather than protected them. `.gitignore` no longer ignores `/tests/`, `/panel/test/` or `/scripts/test-*.sh`. |
+| Documentation | **Reconciled with the code** | `plan.md`, `docs/23-implementation-status.md`, `docs/user/08-proxies.md` and this file now say the same thing about what is and is not implemented. A broken relative link in `docs/user/08-proxies.md` was fixed. |
+
+**Still not implemented, and still described as such:** automatic modality fallback (D3, fail-closed
+with HTTP 501), proxy egress (D4, the transport is direct-only), and per-key quota *enforcement*
+(D2, the ledger exists but nothing writes to it yet). The hedged race runner, `responses.rs` test
+coverage, and the `tools/bench/` fixture directory are also still open — see §4.
 
 ---
 
@@ -16,16 +40,31 @@ Yes, within these limits:
 
 | Gate | Result |
 |---|---|
-| `cargo test --workspace --all-targets` | **731 passed, 0 failed**, 1 ignored (opt-in live test) |
-| `cargo test -p mr-core --test imported_grants_are_independent -- --ignored` | passes; 10/10 imported grants usable with the reference stopped |
-| same test with `MANAROUTER_FORCE_REFRESH=1` | **9/10 refresh**; the tenth is the account an earlier destructive test killed (see §3) |
+| `cargo test --workspace --all-targets` | **1 139 passed, 0 failed**, 1 ignored (the opt-in live test) — re-run in this revision |
+| `cargo test --workspace --release` | **passed** (release profile: LTO, `panic = "abort"`, `strip`) — re-run in this revision |
+| `cargo test -p mr-core --lib store` | **50 passed / 0 failed** (7 new: v1→v3 upgrade, rolling window, dense many-key map, prune, idempotent re-record, quota cache CRUD, token breakdown) |
+| `cargo test -p mr-core --test imported_grants_are_independent -- --ignored` | passes; 10/10 imported grants usable with the reference stopped — **not re-run in this revision** (it needs the live reference account) |
+| same test with `MANAROUTER_FORCE_REFRESH=1` | **9/10 refresh**; the tenth is the account an earlier destructive test killed (see §3) — **not re-run in this revision** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | `cargo fmt --all -- --check` | clean |
-| `bash scripts/check-secrets.sh` | `check-secrets: OK` (134 files) |
+| `cargo clippy --all-targets -- -D warnings` in `tools/mock-upstream` | clean (three lints fixed: an unnecessary cast, a field assigned after `default()`, and a `loop` that should be `while let`) |
+| `cargo test` in `tools/mock-upstream` | **22 passed / 0 failed** |
+| `bash scripts/check-secrets.sh` | `check-secrets: OK` (140 files, re-run in this revision) |
+| `python3 tests/smoke_e2e.py` | **PASS** — isolated conductor + relay + mock-upstream, synthetic credential, disposable config and state |
+| `bash scripts/test-installer-systemd.sh` | **passed** — isolated HOME, mocked `git`/`cargo`/`systemctl`; install, update and `--no-start` |
+| `node --test panel/test/*.test.mjs` | **42 passed / 0 failed** (`markdown.test.mjs`, `dom.test.mjs`) |
+| `curl http://127.0.0.1:20900/healthz` | `{"status":"ok"}` — no upstream call |
+
 | `python3 tests/smoke_e2e.py` | PASS — isolated conductor + relay + mock upstream, routed a chat request |
-| `bash scripts/test-installer-systemd.sh` | passed (isolated HOME; install, update, `--no-start`) |
+| `bash scripts/test-installer-systemd.sh` | passed at `a13405e` (isolated HOME; install, update, `--no-start`); `b63fb47` extended it to run `scripts/check-systemd-cycle.py` — the extended script was not re-run here |
 | Panel browser E2E — **Firefox** | PASS: login, one-time client-key lifecycle, low-resource settings save |
 | Panel browser E2E — **Chromium** | PASS (same spec) |
+
+> The clippy, fmt, smoke-E2E and browser-E2E rows record the `a13405e` session. `73bceab` then rewrote
+> the panel's OAuth flow and the `startup.rs`/`serve.rs` changes (now committed in `65f543d`) touch
+> relay startup, so none of those rows covers this revision — re-run them before trusting them here.
+> The test and secret-scan counts are the recorded run plus a source-level count, not a fresh
+> `cargo test`.
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -35,23 +74,31 @@ cargo fmt --all -- --check && bash scripts/check-secrets.sh
 python3 tests/smoke_e2e.py && bash scripts/test-installer-systemd.sh
 ```
 
-Test distribution, so a failure points somewhere:
+Test distribution, so a failure points somewhere. These are the counts from the fresh
+`cargo test --workspace --all-targets` run in this revision, not from counting attributes:
 
 | Target | Tests |
 |---|---|
-| `mr-core` lib | 329 |
-| `manarouter-relay` lib | 137 |
-| `mr-dialects` lib | 133 |
-| `mr-cli` bin | 88 |
-| `manarouter-conductor` lib | 27 |
-| `manarouter-relay` bin | 17 |
+| `mr-core` lib | 641 |
+| `manarouter-relay` lib | 223 |
+| `mr-dialects` lib | 142 |
+| `mr-cli` bin | 96 |
+| `manarouter-conductor` lib | 34 |
+| `manarouter-relay` bin | 3 |
 | `mr-core` integration (`imported_grants_are_independent`) | 1, **ignored by default** |
+| **total (excluding the ignored one)** | **1 139** |
+
+Three more suites live outside the workspace crate list and are run separately:
+`tools/mock-upstream` (22), `panel/test/*.test.mjs` (42, Node) and the two Python/bash harnesses
+(`tests/smoke_e2e.py`, `scripts/test-installer-systemd.sh`).
 
 **Green tests are not the same as a reachable feature.** Three separate bugs in this project's
 history were modules that compiled, passed every unit test, and were never called by anything. The
-most recent example, found and fixed in `9ec3284`, was an imported model list whose *synthetic*
-entries the upstream rejects — the tests were green and the accounts were unusable. Assume more
-exist, and verify by *running the thing*.
+most recent of those, found and fixed in `9ec3284`, was an imported model list whose *synthetic*
+entries the upstream rejects — the tests were green and the accounts were unusable. `b63fb47` is the
+same lesson in a different shape: not a call nobody made but a check nobody ran — the installer test
+passed on every machine while a systemd ordering cycle left the relay `inactive` on every real boot
+(§5). Assume more exist, and verify by *running the thing*.
 
 ---
 
@@ -90,21 +137,23 @@ up a new binary. See §4 and §5 for why the two use different triggers.
 
 | Crate | Lines | Role |
 |---|---|---|
-| `mr-core` | ~20 800 | Config, snapshot compiler, vault, store, OAuth platforms, catalogue |
+| `mr-core` | ~21 200 | Config, snapshot compiler, vault, store, OAuth platforms, catalogue |
 | `mr-dialects` | ~7 600 | Request/response translation against the pivot |
-| `mr-cli` | ~6 800 | `mr` command surface |
-| `manarouter-relay` | ~5 900 | Data plane: auth, routing, upstream dispatch |
-| `manarouter-conductor` | ~4 400 | Control plane and web panel API |
+| `mr-cli` | ~7 200 | `mr` command surface |
+| `manarouter-relay` | ~6 100 | Data plane: auth, routing, upstream dispatch |
+| `manarouter-conductor` | ~4 800 | Control plane and web panel API |
 | `panel/` | 19 files | Panel front end (plain ES modules, no framework) |
 
 `catalog/providers.toml` holds **55 providers**: 49 `open-ai` dialect, and one each of `codex`,
 `copilot`, `antigravity`, `command-code`, `anthropic`, `google`. **Four** declare OAuth —
 `openai-codex`, `github-copilot`, `antigravity` and `cline` — but only three are registered
-(`crates/mr-core/src/oauth/mod.rs:585`). `cline` is deliberately listed in the registry test's
-`NOT_IMPLEMENTED` set (`:610`) with the reason "no verified interactive flow", so the gap is asserted
+(`crates/mr-core/src/oauth/mod.rs:629`). `cline` is deliberately listed in the registry test's
+`NOT_IMPLEMENTED` set (`:654`) with the reason "no verified interactive flow", so the gap is asserted
 rather than latent: a test fails if a catalogue platform has no implementation and is not on that
-list. `mr serve`, `mr config` and
-`mr vault` parse their own help but every body still returns `"is not implemented yet"`.
+list. `mr serve` is now a real supervisor that runs both binaries as children (foreground, one
+Ctrl-C stops both, either child exiting stops the other — see §3); `mr config` and
+`mr vault` still parse their own help but every body returns `"is not implemented yet"`
+(`crates/mr-cli/src/config.rs:46`, `crates/mr-cli/src/vault.rs:24`).
 
 ---
 
@@ -165,11 +214,94 @@ Priority combos with hedging enabled remember the successful provider/model for 
 is a **report-only** comparison of direct vs relay-routed calls to the local mock; no threshold is
 applied and it must not be read as a provider-latency benchmark.
 
+### `73bceab` — external config edits adopted live, and Codex device-code login
+
+Both processes now adopt an external `config.json` write without a restart: the conductor re-reads on
+the next authenticated `GET` behind a `stat` fast path (`crates/manarouter-conductor/src/api.rs:194`,
+`state.rs:342`), and the relay polls every 2 s and recompiles through the `reload()` that previously
+had no caller (`crates/manarouter-relay/src/startup.rs:232`). The panel now offers the OAuth flows a
+platform actually supports and adds a Codex device-code fallback. Its message records **746 tests
+passing, up from 731**, and says the conductor-reload wiring test was mutation-checked.
+
+### `b63fb47` — systemd ordering cycle fixed
+
+The generated conductor unit was ordered `After=default.target` while also installed
+`WantedBy=default.target`, which deadlocked at boot and made systemd delete the relay's start job; the
+conductor is now ordered `After=network.target`. `scripts/check-systemd-cycle.py` and the extended
+`scripts/test-installer-systemd.sh` guard against a regression. See §5.
+
+### `65f543d` — `mr serve` and the `startup.rs` split
+
+`crates/mr-cli/src/serve.rs` grew from a stub into a real supervisor: it locates and runs both
+binaries in their own process groups, forwards signals to the group, stops the sibling when either
+child exits, and propagates the exit code. The relay's startup, flag/config precedence, bind selection
+and config poller moved out of `main.rs` into `crates/manarouter-relay/src/startup.rs` (476 lines, 17
+tests), leaving `main.rs` at 147 lines. Committed and pushed as `65f543d`.
+
 ---
 
 ## 4. What still needs implementing
 
 Ordered by what blocks the most.
+
+### P1 — Per-key quota enforcement (D2): the ledger exists, nothing writes to it
+
+The store side is done and tested: `key_usage` is an immutable ledger, `record_key_usage` appends to
+it, `key_window_usage` / `key_window_usage_many` compute genuinely **rolling** windows from the
+history, and `prune_key_usage` bounds its growth. The `KeyPlan` in the compiled snapshot carries
+`limit_requests` and the per-window `KeyLimits`.
+
+What is missing is the relay half, and it is the half that matters:
+
+- `crates/manarouter-relay/src/state.rs`'s `KeyEntry` holds only `id`, `label`, `hash` and the two
+  allow-lists — **the snapshot's limits never reach the request path**, so the relay cannot know what
+  a key is allowed to spend.
+- Nothing in the relay calls `record_key_usage`; the `UsageTap` measures a response but does not
+  persist it.
+- Enforcement therefore needs, in this order: carry the limits into `KeyEntry`; **admit** atomically
+  before any upstream side effect (a `BEGIN IMMEDIATE` transaction that counts the window and
+  reserves the request); **settle** the actual token spend when the response ends, releasing the
+  reservation on failure or on an abandoned stream; and answer `429` on denial.
+
+A request counter alone is not enough: the configured caps are token caps, and a token cap needs a
+reservation, because the number of tokens is only known after the upstream has answered. The
+`key_usage` ledger is the right place to settle into, but the *admission* decision needs its own
+ledger (in-flight reservations) — a second table, or a `reserved` column — so that two concurrent
+requests cannot both pass a check that only one of them may pass.
+
+### P1 — Automatic modality fallback (D3): fail-closed, deliberately
+
+`upstream::rewrite_model_for_modalities` detects the input modalities, consults `routing.defaults`
+and returns the configured target model. The relay then answers **HTTP 501
+`modality_fallback_unavailable`** rather than sending the rewritten body to the *original* provider
+(`crates/manarouter-relay/src/server.rs`, the modality check inside the step loop).
+
+That refusal is the correct behaviour for a half-built feature: sending an image-bearing body to a
+text-only provider, under the original provider's credentials, would be a silent misroute. But the
+feature is not finished, and the panel and the user guide say so.
+
+To finish it, the fallback must rebuild **everything** for the target — provider, account,
+credential, URL, dialect, headers — from one snapshot generation, not just swap a model string. The
+cleanest shape is a bounded re-dispatch: rewrite the *client* body's `model` to the target and run
+the whole resolution again against the same `RouteTable`, with a depth limit of one so a target that
+also lacks the modality fails instead of looping.
+
+### P1 — Proxy egress (D4): configured, selected, and never used
+
+`crates/manarouter-relay/src/proxy.rs` implements HTTP CONNECT, SOCKS4, SOCKS5 and SOCKS5h
+handshakes, `Config::proxies` carries the pool, and `snapshot::ProxyPlan` plus `ProxyPlan`/`AccountPlan`
+carry the per-provider and per-account assignments. The selector (`proxy::choose`) picks one.
+
+**None of it is on the request path.** `UpstreamRequest.proxy` is set to `None`
+(`crates/manarouter-relay/src/server.rs`), and the relay's hyper client is built on a direct
+`HttpsConnector<HttpConnector>`. So today a configured proxy changes nothing about where traffic
+goes, and `docs/user/08-proxies.md` must keep saying that until it does.
+
+Wiring it is a transport change, not a call-site change: TLS to the proxy and TLS to the origin are
+different handshakes, so the connector has to become per-endpoint, with a pool that cannot mix a
+direct connection with a proxied one. The safe rule is **fail closed**: if a proxy is selected and
+the tunnel fails, the request fails — it must never silently fall back to a direct connection, which
+would defeat the operator's egress policy.
 
 ### P1 — The hedged race has no runner
 
@@ -204,7 +336,7 @@ The one test is the important one — `[DONE]` suppression for Responses clients
 sits under the Codex path, which is the provider this session just made live. `google.rs` has 29
 tests, `commandcode.rs` 28, `openai.rs` 25 by comparison. The `(OpenAi, Responses)` arms in
 particular deserve reachability tests: `route_kind_for("/v1/responses")` is wired
-(`server.rs:884`) and asserted (`:1620`), but translation arms reachable only in combination are
+(`server.rs:884`) and asserted (`:1621`), but translation arms reachable only in combination are
 exactly where the two prior "arm present, never taken" bugs lived.
 
 ### P2 — `tools/bench/` is empty
@@ -236,7 +368,7 @@ repository and re-derive them.
   for f in docs/*.md; do b=$(basename "$f"); grep -q "$b" docs/LLM_INDEX.md || echo "NOT LISTED: $b"; done
   ```
 - `docs/17-migrating-from-omniroute.md` and `docs/23-implementation-status.md` were both corrected in
-  `9ec3284` and now match the code.
+  `9ec3284` and now match the code (`docs/23` was corrected again in `65f543d`).
 
 ### P3 — Release and design debt
 
@@ -245,23 +377,25 @@ repository and re-derive them.
   (`crates/mr-core/src/oauth/refresh.rs:51`), so this earlier item is closed. The `oauth[permanent] …`
   text is now only the `Display` form at the head of an `InvalidState` message (`:123`).
 - **Cross-instance sync** (`docs/22-sync-design.md`) is inert groundwork by decision Q15.
-- **Nothing is unpushed.** `main` is level with `origin/main`
-  (`https://github.com/RobertoTornel/Manarouter.git`).
+- **Nothing is unpushed.** `65f543d` is level with `origin/main`
+  (`https://github.com/RobertoTornel/Manarouter.git`); the only uncommitted work is the working-tree
+  doc/lint edits described at the top of this file.
 
 ---
 
 ## 5. Traps that will cost you a day if you do not know them
 
-- **A systemd ordering cycle can leave a service silently never started.** The generated units once
-  ordered the conductor `After=default.target` while also installing it `WantedBy=default.target`;
-  at boot `default.target` wants the relay, the relay wants the conductor, and the conductor waits
-  for `default.target` — a deadlock systemd breaks by **deleting a start job**. The victim is not
-  `failed`, it is `inactive`, with one journal line and nothing to notice. It reproduces **only** on
-  a real boot, so `systemctl --user start` looks perfectly healthy. Two things catch it:
-  `systemd --user --test` (the real loader — needs a live user manager) and
-  `scripts/check-systemd-cycle.py`, which the installer test runs and which is the portable
-  equivalent. Note `systemd-analyze verify` does **not** check the ordering graph, so it reports
-  these units as fine.
+- **A systemd ordering cycle used to leave the relay silently never started — fixed in `b63fb47`, and
+  now guarded.** The generated conductor unit was ordered `After=default.target` while also installed
+  `WantedBy=default.target`; at boot that closed a loop (`default.target` wants the relay, the relay
+  wants the conductor, the conductor waits for `default.target`), which systemd broke by **deleting a
+  start job**. The victim was not `failed`, it was `inactive`, with one journal line and nothing to
+  notice; and it reproduced **only** on a real boot, so `systemctl --user start` looked perfectly
+  healthy. The conductor is now ordered `After=network.target`, the dependency it actually has. Two
+  things catch a regression: `systemd --user --test` (the real loader — needs a live user manager) and
+  `scripts/check-systemd-cycle.py`, which `scripts/test-installer-systemd.sh` now runs and which is the
+  portable equivalent. Note `systemd-analyze verify` does **not** check the ordering graph, so it
+  reports these units as fine.
 - **`export PATH="$HOME/.cargo/bin:$PATH"`** in every shell, or `cargo` is not found.
 - **Configuration changes are picked up without a restart, by both processes — but through two
   different mechanisms, and the difference explains most "it works in the panel but not the API"

@@ -4,7 +4,18 @@ This file exists because a specification that reads as finished while the code i
 no specification. Everything below is checked against the tree, and the command that checks it is
 given so you can re-run it.
 
-> **Last audited:** working tree based on `main`, with current uncommitted implementation and test changes. The verification list below reflects the current session; rerun before release.
+> **Status note (2026-10-19):** this document retains earlier implementation-history sections below;
+> they are not a comprehensive audit of every Round 2 item. Final checks for this close-out passed:
+> workspace tests (1 139 passed, 1 ignored), the release-profile test run, `cargo fmt --all -- --check`,
+> strict workspace Clippy, strict Clippy and tests in `tools/mock-upstream`, the panel Node tests, the
+> secret scan, the isolated installer test, and the isolated relay/conductor/mock-upstream smoke. The
+> store schema is at **v3**: `key_usage` and `provider_quota_state` (v2) and `usage_tokens` (v3) are
+> present and tested.
+> **D2 remains unimplemented** — the per-key ledger is stored and queryable, but the relay neither
+> writes to it nor enforces a cap; **D3 is partial** (the relay answers HTTP 501 rather than misrouting
+> a fallback model); **proxy egress is not wired** (the transport is direct-only); and the
+> user-guide/E5 reviews are partial. Re-run before release and inspect `git status`.
+
 
 ## 1. What runs
 
@@ -12,9 +23,9 @@ given so you can re-run it.
 |---|---|---|
 | `mr-core` — config, snapshot compiler, vault, usage store, OAuth | **Substantial, not complete** | Codex, Copilot, and Antigravity OAuth authorization/token exchange/refresh/Google userinfo identity code is wired; Antigravity IDE client details remain reverse-engineered and unverified. |
 | `mr-dialects` — OpenAI, Anthropic, Responses, Google, Command Code translation | **Reachable, test coverage uneven** | Relay dispatches request and response translation per selected step. Responses implementation needs focused regression tests. |
-| `manarouter-relay` — HTTP API, auth, snapshot, account selection, translation | **Runs; concurrent hedging not wired** | Sequential step loop remains the request executor; `hedge_decide` is not called by the relay. Priority combos with `hedge.enabled` now remember the successful provider/model for a configurable inactivity window (default 1800s), combo-wide across callers; the preference is process-local and rechecked against current eligibility on each request. Client-key scan exits at first match (a deliberate latency tradeoff that reveals configured match position to a local timing observer). |
-| `manarouter-conductor` — auth, API, state, serving, quota query | **Implemented** | API routes and Store-backed `/api/quota` exist. Verify live separately; no conductor was running during this audit. |
-| `mr-cli` | **Partial** | Account/provider/combo/key/model families dispatch; `mr key rotate` is supported; `mr doctor` performs read-only config, vault metadata, snapshot freshness, and listener exposure checks; it fails if no enabled client key is present while relay bind is not confirmed loopback-only. `mr migrate omniroute` imports OAuth grants (by one refresh), model lists and effort-variant aliases — dry run by default, `--apply` to write, reading a copy of the reference database. `mr serve` runs both service binaries as child processes for a foreground session (one Ctrl-C stops both, either child exiting stops the other, and the child's exit code is propagated); `config` and `vault` remain unimplemented. |
+| `manarouter-relay` — HTTP API, auth, snapshot, account selection, translation | **Runs; concurrent hedging not wired** | Startup, flag/config precedence, listener bind selection and the 2 s `config.json` reload poller live in `crates/manarouter-relay/src/startup.rs` (declared at `crates/manarouter-relay/src/lib.rs:47`; 17 tests). Sequential step loop remains the request executor; `hedge_decide` is not called by the relay. Priority combos with `hedge.enabled` now remember the successful provider/model for a configurable inactivity window (default 1800s), combo-wide across callers; the preference is process-local and rechecked against current eligibility on each request. Client-key scan exits at first match (a deliberate latency tradeoff that reveals configured match position to a local timing observer). |
+| `manarouter-conductor` — auth, API, state, serving, provider quota refresh | **Partial** | `/api/quota` returns cached provider/account quota snapshots and declares refresh routes. Provider-specific OAuth refresh is reported unsupported. Historical request-usage rows are a separate Store ledger and relay currently does not write them. No live/provider refresh was exercised in this audit. |
+| `mr-cli` | **Partial** | Account/provider/combo/key/model families dispatch; `mr key rotate` is supported; `mr doctor` performs read-only config, vault metadata, snapshot freshness, and listener exposure checks; it fails if no enabled client key is present while relay bind is not confirmed loopback-only. `mr migrate omniroute` imports OAuth grants (by one refresh), model lists and effort-variant aliases — dry run by default, `--apply` to write, reading a copy of the reference database. `mr serve` runs both service binaries as child processes for a foreground session (`crates/mr-cli/src/serve.rs`, 6 tests, committed as `65f543d`; one Ctrl-C stops both, either child exiting stops the other, and the failure message names the child and its status — `mr serve` itself exits 1, it does not forward the child's code); `config` and `vault` remain unimplemented (`crates/mr-cli/src/config.rs:46`, `crates/mr-cli/src/vault.rs:24`). |
 | `panel/` | **Implemented; critical browser workflow verified** | Firefox E2E covers panel login, client-key creation, and rotation against an isolated mock API; other routes remain unverified. |
 | OAuth | **Partial; flows wired, migration verified live** | Conductor OAuth routes cover Codex (browser **and** device-code flows), Copilot, and Antigravity authorization code flows. Config changes written by the CLI are adopted without a restart by both the conductor (on the next authenticated `GET`) and the relay (2 s poll of `config.json`); tokens are vault-backed, metadata lives in SQLite, and relay resolves/refreshes credentials. Antigravity's interactive loopback OAuth exchange/refresh, v2 userinfo identity, free-tier Cloud Code onboarding with bounded LRO polling, encrypted token context persistence, and account-bound relay project injection are implemented. Paid-tier onboarding remains fail-closed without explicit project input. `mr migrate omniroute` transfers Codex and Antigravity grants by one refresh each, using the client identities in `mr-core/src/published.rs`; this was exercised against a live installation (10 grants imported, all re-refreshed with the reference stopped, and a real completion served through the relay). Copilot tokens issued as `ghu_` GitHub App tokens are refused by GitHub's mint endpoint and are reported as needing a fresh login. T2 client metadata and PKCE remain reverse-engineered/unverified. Cline remains unavailable. |
 | `tools/mock-upstream` | **Fault control API wired; behaviors partial** | Detached crate tests pass; `POST /__control` and request-local `x-mock-fault` merge patches are reachable. Not every field in `Fault` is yet applied to response generation. |
@@ -26,12 +37,22 @@ Verification run during this session (all local tests used mock/isolated data):
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
+cargo test --workspace --release
 bash scripts/check-secrets.sh
 bash scripts/test-installer-systemd.sh
 PATH="$HOME/.cargo/bin:$PATH" python3 tests/smoke_e2e.py
+node --test panel/test/*.test.mjs
+(cd tools/mock-upstream && cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test)
+# Browser workflow (local opt-in): Playwright and the browser binaries are not project dependencies.
 BROWSER=firefox PLAYWRIGHT_MODULE=/path/to/playwright FIREFOX_EXECUTABLE=/path/to/firefox node panel/test/browser.e2e.mjs
 ```
-Workspace tests, lint, secret scan, installer simulation, mock-upstream E2E smoke, and Firefox panel workflow all passed locally. The smoke and installer tests are wired into CI; the browser test remains a local opt-in because Playwright/browser binaries are not project dependencies.
+Every line above was re-run for the revision described here and passed: **1 139 workspace tests**
+(1 ignored), a clean release-profile run, clean strict Clippy in the workspace *and* in
+`tools/mock-upstream` (22 tests there), `check-secrets: OK` over 140 files, the isolated installer
+simulation, the isolated mock-upstream smoke, and 42/42 panel Node tests. The **smoke test, the
+installer test and the panel Node tests are wired into CI**; the browser test remains a local opt-in
+because Playwright and the browser binaries are not project dependencies.
+
 
 The OmniRoute migration was verified against a live installation as well, which is a network operation
 and so is not part of the list above:
@@ -106,8 +127,10 @@ a mock upstream before enabling it for users.
 * **`/v1/models` contacts no provider.** It is served from the compiled snapshot.
 * **Dialect translation is reachable.** Request translation is selected per step, with response
   translation, translator path overrides, and forced-stream metadata applied in the relay.
-* **Conductor API/store exist.** The panel API includes CRUD routes and `/api/quota`; quota currently
-  reports persisted aggregate usage rather than live provider billing windows.
+* **Quota APIs are distinct.** `/api/quota` returns cached provider/account quota snapshots and
+  supports refresh orchestration for supported integrations; OAuth refresh is reported unsupported.
+  This is not the request-usage ledger. Relay/conductor do not currently write client-request usage
+  rows, and per-key rolling request/token limits are not enforced in relay dispatch.
 
 ## 5. Claims that remain unverified or false
 
@@ -123,6 +146,13 @@ a mock upstream before enabling it for users.
 * That all mock fault fields are effective: control and request-local patch endpoints are wired, but
   a subset of fault knobs still needs implementation/coverage.
 * That the latency budget is enforced. `tools/bench/` has no harness.
+* That the panel's hedge editor round-trips through the backend. It does not: `panel/format.js`
+  (`parseWinnerFail`/`buildWinnerFail`) uses an externally tagged shape for `hedge.on_winner_fail`
+  (`{"rerun-excluding":{"max_rounds":2}}`), while `WinnerFailMode` is internally tagged
+  (`{"mode":"rerun-excluding","max_rounds":2}`) and rejects the panel's shape. Saving hedge settings
+  from the panel therefore cannot store a winner-fail mode, and a config written elsewhere is
+  mis-rendered. `panel/README.md` records the defect; `crates/mr-core/src/dialect.rs` has a
+  regression test pinning the correct form.
 
 ## 6. Preserved partial attempts
 

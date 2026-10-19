@@ -20,6 +20,11 @@ secrets/
 # --- research scratch (kept locally, not published) ---
 /.research/
 
+# --- local test output ---
+/e2e-evidence/
+__pycache__/
+*.pyc
+
 # --- editor / OS ---
 .idea/
 .vscode/

@@ -46,14 +46,20 @@ operator's statement of preference, and it is the tie-breaker of last resort.
     "participants": [0, 1, 2],
     "count": 2,
     "window_ms": 800,
-    "winner_metric": "first_response_byte",
-    "on_winner_fail": "rerun-excluding",
-    "max_rounds": 2
+    "winner_metric": "first-response-byte",
+    "on_winner_fail": { "mode": "rerun-excluding", "max_rounds": 2 }
   },
   "midstream_policy": "restart",
-  "limits": { "max_retries": 1, "retry_delay_ms": 2000 }
+  "max_retries": 1,
+  "retry_delay_ms": 2000
 }
 ```
+
+`on_winner_fail` is an internally tagged enum: the mode name goes in `"mode"` and that mode's own
+fields sit beside it (`max_rounds` for `rerun-excluding`, `step` for `stable-fallback`). The panel's
+own `panel/format.js` still emits and parses a different, externally tagged shape
+(`{"rerun-excluding":{"max_rounds":2}}`); that is a panel bug, not an alternative config form, and the
+Rust wire form above is canonical.
 
 ---
 
@@ -236,8 +242,10 @@ different provider turns a provider outage from a stalled request into a fast, c
 
 ### `stable-fallback`
 
-Jump straight to a user-chosen `stable_model`, which need not be a participant in the competition
-and need not appear anywhere in the combo's steps.
+Jump straight to a fixed `step`, given as an index into the combo's **own** step list (the wire form is
+`{"mode": "stable-fallback", "step": N}`). The step is renumbered by the compiler onto the surviving
+list, so it must be a step of this combo — there is no separate `stable_model` field, and the target
+need not be a hedge participant.
 
 This is the "on fail" model. It is the right choice when the operator has one model they trust to be
 always available and are willing to trade quality for availability exactly when things go wrong.
@@ -255,6 +263,10 @@ models" behaviour, expressed as a default rather than a separate mechanism.
 ---
 
 ## 6. When the winner dies *mid-stream*
+
+> **Status.** This section is the design. `midstream_policy` is compiled into the plan, but nothing in
+> the relay reads it: a step that dies after bytes are on the wire currently ends the client stream
+> as-is, with no second attempt, no `manarouter.retry` boundary and no tool-call guard.
 
 The ratified decision is that the prompt is retried with the next best model according to the mode
 and rules inside the combo. That is a strong behaviour, and it is only safe in two shapes, so
@@ -327,18 +339,36 @@ configuration parsing, no new per-request allocation, no new lookup.
 
 ---
 
-## 8. Session affinity (planned; not wired)
+## 8. Sticky-success preference (implemented) and session affinity (not wired)
 
-Session affinity is a proposed optimization for a future executor, not current relay behavior. The
-current relay does not run hedged races or pin conversations to a selected step.
+Two different ideas are easily confused here, and only one of them runs today.
 
-The intended session key would be the client-supplied `x-manarouter-session` header, or a hash of the
-conversation's first system message plus its first user message. A future relay could keep a small
-sharded LRU map from session key to the chosen step so a conversation remains on that step.
+**Sticky-success is implemented**, in `crates/manarouter-relay/src/sticky.rs` and wired into the
+relay's step loop. After a step answers successfully, the next request for that combo starts at that
+same step instead of at the head of the ordered list. What it actually does is narrow:
 
-Potential benefits if implemented would include racing only the first turn, preserving upstream
-prompt-cache locality, and keeping a multi-turn conversation on one model. These are design goals, not
-verified Manarouter behavior.
+- It is opt-in and only active for a `priority` combo with `hedge.enabled` true and
+  `sticky_success_window_secs` greater than zero. The default window is **1800 s**, and each success
+  resets it (a sliding window).
+- It is **combo-wide**, not per conversation: the cache is keyed by combo id, so every caller of that
+  combo is offered the same preferred step. There is no `x-manarouter-session` key and no
+  conversation hash.
+- It is **process-local and bounded** (at most 256 pins, oldest-touched evicted). A pin survives a
+  snapshot reload or step reorder because it stores the provider id and model rather than a step
+  index, and it is re-checked against current eligibility on every request, so a step whose accounts
+  have gone unavailable is skipped and the pin dropped. It is lost when the process restarts or the
+  window expires.
+- It reorders where the **sequential** loop begins; it does not run anything concurrently.
+
+**Session affinity is not wired.** The intended feature — pinning a whole conversation to a step via
+the client-supplied `x-manarouter-session` header or a hash of the conversation's first system message
+plus its first user message, kept in a sharded LRU — is still a design goal. `Combo::affinity` is
+compiled into the plan but the relay never reads it. The concurrent race is likewise not yet wired;
+sticky-success is a separate, narrower capability.
+
+The rest of this document describes the race as designed. Where a paragraph reads as present-tense
+behaviour that the relay does not yet perform — the concurrent dispatch, the retry pass, the
+mid-stream boundary — the implementation status is the sentence above, not the tense.
 
 ---
 

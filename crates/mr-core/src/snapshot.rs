@@ -69,14 +69,17 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use crate::config::Config;
+use crate::config::{Config, ProxyConfig, ProxyStrategy};
 use crate::dialect::{
-    AuthKind, Capability, ComboStrategy, Dialect, KeyStrategy, MidstreamPolicy, WinnerFailMode,
-    WinnerMetric,
+    AuthKind, Capability, ComboStrategy, Dialect, InputModality, KeyStrategy, MidstreamPolicy,
+    ReasoningLevel, WinnerFailMode, WinnerMetric,
 };
 use crate::error::{Error, Result};
-use crate::ids::{fnv1a64, AccountId, ComboId, Millis, ProviderId};
-use crate::model::{Account, CompressionMode, CompressionSpec, Http2Preference};
+use crate::ids::{fnv1a64, AccountId, ClientKeyId, ComboId, Millis, ProviderId};
+use crate::model::{
+    Account, ClientKey, CompressionMode, CompressionSpec, Http2Preference, KeyLimit, KeyLimits,
+    ModelEntry, PricingPlan, PricingSource,
+};
 use crate::secret::account_secret_id;
 use crate::{SNAPSHOT_MAGIC, SNAPSHOT_VERSION};
 
@@ -97,7 +100,41 @@ const RANK_ALIAS: u8 = 0;
 const RANK_COMBO_ID: u8 = 1;
 const RANK_COMBO_NAME: u8 = 2;
 const RANK_QUALIFIED: u8 = 3;
-const RANK_BARE: u8 = 4;
+// Ranks 4 and below are unused since Feature 3 removed the bare-model fallback. They are left
+// unassigned rather than renumbered so a value written by an older snapshot is *rejected* by
+// `link_entries` instead of silently acquiring a new meaning.
+
+/// The lookup keys that are *derived* from a model id by appending a level suffix.
+///
+/// They rank between a combo name and the model's own id, which is exactly "a real model id wins
+/// over a stripped suffix": `antigravity/gemini-3.8-flash-low` is a model in its own right, so the
+/// rank [`RANK_QUALIFIED`] entry for it is what answers, and the entry derived from
+/// `gemini-3.8-flash` plus the level `low` is only consulted when there is no such model.
+const RANK_QUALIFIED_LEVEL: u8 = 5;
+/// The highest rank any index entry may carry; `link_entries` rejects anything above it.
+const RANK_MAX: u8 = RANK_QUALIFIED_LEVEL;
+
+/// The level-name spellings that may appear as a `-<suffix>` on a model name.
+///
+/// Only the canonical spellings [`ReasoningLevel::parse`] accepts *and* that this table lists. The
+/// table is what makes suffix detection allocation-free and, more importantly, predictable: a model
+/// called `foo-bar` must never be read as a model `foo` at a level `bar`, and it is not, because
+/// `bar` is not in this list.
+const LEVEL_SUFFIXES: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max",
+];
+
+/// The level named by a `-<suffix>` at the end of `name`, if there is one.
+///
+/// `name` is a model id, not a whole request name, so `deepseek/deepseek-v4.1-flash-max` yields
+/// `max` and `some/deepseek` yields `None`.
+fn level_suffix(name: &str) -> Option<ReasoningLevel> {
+    let (_, suffix) = name.rsplit_once('-')?;
+    LEVEL_SUFFIXES
+        .iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(suffix))
+        .and_then(|candidate| ReasoningLevel::parse(candidate))
+}
 
 /// A compiled, immutable routing table.
 ///
@@ -115,6 +152,8 @@ pub struct RoutingSnapshot {
     digest: u64,
     /// When the compiler ran. Kept for the panel and for reload logging; never used for routing.
     built_at: Millis,
+    /// Defaults used to reroute inputs unsupported by the initially selected model.
+    routing_defaults: crate::config::RoutingDefaults,
     /// Providers in configured order, disabled ones removed. This order is also the order of a
     /// bare-model lookup's tie-break.
     providers: Vec<ProviderPlan>,
@@ -122,6 +161,14 @@ pub struct RoutingSnapshot {
     combos: Vec<ComboPlan>,
     /// Aliases with their chains already flattened to a final target.
     aliases: Vec<AliasPlan>,
+    /// Enabled client keys with their rolling quota windows, so the relay enforces a key's budget
+    /// without re-reading the authored configuration on every request.
+    keys: Vec<KeyPlan>,
+    /// Usable proxies, in configured order. Disabled proxies are dropped here rather than skipped
+    /// at dial time, because "configured but never dialled" is a decision, not a runtime check.
+    proxies: Vec<ProxyPlan>,
+    /// How a provider or account with no explicit proxy override picks one.
+    proxy_strategy: ProxyStrategy,
     /// Hash bucket heads: `fnv1a64(folded key)` to an index in `index_entries`.
     index: HashMap<u64, u32>,
     /// Every lookup key, in insertion order. `next` chains entries that share a bucket.
@@ -137,9 +184,13 @@ impl Default for RoutingSnapshot {
         Self {
             digest: 0,
             built_at: Millis::from_millis(0),
+            routing_defaults: crate::config::RoutingDefaults::default(),
             providers: Vec::new(),
             combos: Vec::new(),
             aliases: Vec::new(),
+            keys: Vec::new(),
+            proxies: Vec::new(),
+            proxy_strategy: ProxyStrategy::default(),
             index: HashMap::new(),
             index_entries: Vec::new(),
         }
@@ -168,10 +219,54 @@ struct IndexEntry {
 enum IndexTarget {
     /// Another alias hop. Should not occur after compile-time flattening, but is handled.
     Alias { alias: u32 },
-    /// A combo, by index into the combo list.
-    Combo { combo: u32 },
+    /// A combo, by index into the combo list. `level` is `Some` only when the client named a tier.
+    Combo { combo: u32, level: Option<u8> },
     /// A provider model, by provider index and index into that provider's step list.
-    Step { provider: u32, step: u32 },
+    ///
+    /// `level` is what the request will actually run at; `requested` is what the name asked for.
+    /// When they differ, the requested level was not one the model offers and the model's highest
+    /// available level was substituted, which is the one substitution the design allows instead of
+    /// failing. Both are stored so that comparison is a field read rather than a re-parse of the
+    /// name that produced the entry.
+    Step {
+        provider: u32,
+        step: u32,
+        level: u8,
+        requested: u8,
+    },
+}
+
+/// A placeholder used when a combo names a model the provider no longer carries.
+///
+/// `Config::validate` reports the dangling step, but the compiler must still produce *a* step: it
+/// is a static placeholder so the combo keeps working if the model comes back, and it carries no
+/// reasoning levels and no modalities, which is the honest answer for a model that does not exist.
+static UNKNOWN_MODEL: std::sync::LazyLock<ModelEntry> = std::sync::LazyLock::new(|| ModelEntry {
+    id: String::new(),
+    source: crate::model::ModelSource::Manual,
+    label: None,
+    context_length: None,
+    max_output_tokens: None,
+    capabilities: Vec::new(),
+    input_modalities: Vec::new(),
+    reasoning_levels: Vec::new(),
+    default_reasoning_level: None,
+    reasoning_wire: None,
+    input_price_per_mtok: None,
+    output_price_per_mtok: None,
+    pricing: None,
+    synced_at: None,
+    hidden: false,
+});
+
+/// The highest rank set in a level bitmask, or `None` when it is empty.
+fn highest_rank(mask: u32) -> u8 {
+    ReasoningLevel::ALL
+        .into_iter()
+        .rev()
+        .find(|level| mask & (1u32 << level.rank()) != 0)
+        .map(|level| level.rank())
+        .unwrap_or(ReasoningLevel::None.rank())
 }
 
 /// A compiled alias: the name a client sends mapped to its final target.
@@ -230,13 +325,14 @@ pub struct ComboPlan {
 /// The step is self-contained on purpose. The relay holds a `&StepPlan` and a credential it looked
 /// up by [`AccountPlan`] reference; it never has to chase back into the provider to find a timeout
 /// or a base URL.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StepPlan {
     /// Index into [`RoutingSnapshot::providers`].
     pub provider_index: u32,
     /// The provider's slug, copied here so a step can be logged without another lookup.
     pub provider_id: ProviderId,
-    /// The model id as the upstream expects it.
+    /// The model id as the upstream expects it. **Without** any `-<level>` suffix: the suffix
+    /// selects [`StepPlan::level`], and sending it upstream would name a model that does not exist.
     pub model: String,
     /// The API shape this provider speaks.
     pub dialect: Dialect,
@@ -252,10 +348,69 @@ pub struct StepPlan {
     pub idle_timeout_ms: u64,
     /// Total time allowed for the whole request.
     pub total_timeout_ms: u64,
+    /// The reasoning level this resolution was asked for, as `ReasoningLevel::rank`.
+    pub level: u8,
+    /// Which levels this model offers, as a bitmask over [`ReasoningLevel::rank`].
+    ///
+    /// Zero means the model advertises none, which is a real answer: it is why a `-high` suffix on
+    /// such a model is not a `-<level>` at all but part of the model's own id.
+    pub levels: u32,
+    /// The level used when a request names this model with no suffix.
+    pub default_level: u8,
+    /// The JSON fragment to merge into the upstream body at each level, indexed by level rank.
+    ///
+    /// `None` means "send nothing for this level" — which is the correct answer for `none`, for a
+    /// dialect that has nothing to say, and for a level the model does not offer (that combination
+    /// cannot be resolved to, but the encoding stays honest rather than fabricating a fragment).
+    pub reasoning_json: [Option<String>; 8],
+    /// Which input types this model accepts, as a bitmask over
+    /// [`InputModality`](crate::dialect::InputModality)'s discriminant.
+    pub input_modalities: u32,
+    /// How this model is priced, when anything is known. Compiled in so a cost estimate on the
+    /// request path never reads configuration or the bundled table.
+    pub pricing: Option<PricingPlan>,
+}
+
+impl StepPlan {
+    /// Whether `level` is one this model offers.
+    #[inline]
+    pub fn supports_level(&self, level: ReasoningLevel) -> bool {
+        self.levels & (1u32 << level.rank()) != 0
+    }
+
+    /// The reasoning levels this model offers, ascending.
+    pub fn levels(&self) -> Vec<ReasoningLevel> {
+        ReasoningLevel::ALL
+            .into_iter()
+            .filter(|level| self.supports_level(*level))
+            .collect()
+    }
+
+    /// Whether this model accepts `modality`.
+    #[inline]
+    pub fn accepts_modality(&self, modality: crate::dialect::InputModality) -> bool {
+        self.input_modalities & (1u32 << modality.as_u8()) != 0
+    }
+
+    /// The reasoning fragment to send at `level`, if any.
+    ///
+    /// `None` means "send no reasoning field", which is the correct answer for `none`, for a
+    /// dialect with nothing to say, and for a level this model does not offer. The level is passed
+    /// in rather than read from [`StepPlan::level`] because that field is only the *default*: a
+    /// request that named a tier resolves to a different level, and reading the default here would
+    /// silently send the wrong one.
+    pub fn reasoning_fragment_for(&self, level: ReasoningLevel) -> Option<&str> {
+        self.reasoning_json[level.rank() as usize].as_deref()
+    }
+
+    /// The reasoning fragment to send at this step's default level, if any.
+    pub fn reasoning_fragment(&self) -> Option<&str> {
+        ReasoningLevel::from_u8(self.level).and_then(|level| self.reasoning_fragment_for(level))
+    }
 }
 
 /// A compiled provider: dialect, credential attachment, ordered accounts and per-route settings.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProviderPlan {
     /// The operator-chosen slug.
     pub id: ProviderId,
@@ -274,6 +429,13 @@ pub struct ProviderPlan {
     /// The relay reads this order directly; it must not re-sort, because the authored array order
     /// is the tie-break the operator sees in the panel.
     pub accounts: Vec<AccountPlan>,
+    /// The [`ProxyPlan::id`] this provider's traffic must use, or `None` when the operator set no
+    /// override.
+    ///
+    /// An account-level override takes precedence; when neither is set the snapshot's
+    /// [`ProxyStrategy`] chooses. A reference to a proxy that is missing or disabled compiles to
+    /// `None`, mirroring [`Config::effective_proxy`], which never dials one.
+    pub proxy: Option<String>,
     /// Routes this provider can serve.
     pub capabilities: Vec<Capability>,
     /// Connection-establishment timeout.
@@ -322,6 +484,68 @@ pub struct AccountPlan {
     pub models_allow: Vec<String>,
     /// If non-empty, these model ids may not use this account. Always wins over `models_allow`.
     pub models_deny: Vec<String>,
+    /// The [`ProxyPlan::id`] this account's traffic must use, or `None` when the operator set no
+    /// override here.
+    ///
+    /// The override is per *account* as well as per provider because a single credential may be
+    /// region-locked: moving just that account behind a proxy must not move the whole provider.
+    /// `None` is not "direct": it means the provider's override applies next, and if that is also
+    /// absent the snapshot's [`ProxyStrategy`] decides.
+    pub proxy: Option<String>,
+}
+
+/// A compiled client key: everything the relay needs to authenticate a request and charge it to
+/// the right rolling window.
+///
+/// The key itself is never here — [`Self::key_hash`] is the stored SHA-256, exactly as the config
+/// holds it, so a snapshot file is no more sensitive than the config file it was compiled from.
+///
+/// The quota windows are compiled in because enforcement is a per-request hot path: reading them
+/// out of the authored configuration would mean either re-parsing JSON per request or keeping a
+/// second copy of the config alive in the data plane, and both defeat the point of a snapshot. Only
+/// enabled keys appear; every optional window is preserved exactly as authored, so the relay can
+/// distinguish an absent window from an explicitly configured uncapped window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyPlan {
+    /// Stable identifier, used for usage rows and log fields.
+    pub id: ClientKeyId,
+    /// Human label, for the panel and for logs.
+    pub label: String,
+    /// Lowercase hex SHA-256 of the key. Never the key.
+    pub key_hash: String,
+    /// Short non-secret prefix kept for display, for example `mr-3f9a`.
+    pub prefix: Option<String>,
+    /// If non-empty, the key may only call these model ids (globs allowed).
+    pub allow_models: Vec<String>,
+    /// If non-empty, the key may only call these routes.
+    pub allow_routes: Vec<String>,
+    /// Flat, non-rolling request budget. Zero means unlimited.
+    ///
+    /// Kept alongside [`Self::limits`] because the two are both enforced when both are set; the
+    /// flat budget predates the rolling windows and existing keys still carry it.
+    pub limit_requests: u64,
+    /// Rolling token and request caps, by window.
+    pub limits: KeyLimits,
+}
+
+/// A compiled upstream proxy: where to dial, and the vault reference for its password.
+///
+/// The password is a [`Self::secret_ref`] for the same reason an account credential is: a snapshot
+/// file that leaks must cost the operator a hostname, not a credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyPlan {
+    /// Stable id, referenced by [`ProviderPlan::proxy`] and [`AccountPlan::proxy`].
+    pub id: String,
+    /// Human label for the panel.
+    pub label: Option<String>,
+    /// The endpoint, including its scheme.
+    pub url: String,
+    /// Username, when the proxy authenticates. Not a secret.
+    pub username: Option<String>,
+    /// Reference into the secret vault for the password, when the proxy authenticates.
+    pub secret_ref: Option<String>,
+    /// Lower sorts first under [`ProxyStrategy::Priority`].
+    pub priority: i32,
 }
 
 /// A compiled hedge: who races, and how the race is resolved.
@@ -348,14 +572,43 @@ pub struct HedgePlan {
 }
 
 /// What a requested model name resolved to.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Resolution<'a> {
     /// A combo matched; the relay should walk its steps.
-    Combo(&'a ComboPlan),
-    /// A concrete provider/model matched; the relay should call it directly.
-    Direct(&'a StepPlan),
-    /// Nothing matched. The relay should answer with a routing error.
-    NotFound,
+    ///
+    /// `level` is `Some` only when the client asked for a tier **by name** (`combo-name-high`).
+    /// `None` means the name carried no suffix, and each step then runs at its own model's default
+    /// level — forcing the configuration default onto every step would override a per-model
+    /// `default_reasoning_level` the operator set deliberately.
+    Combo {
+        plan: &'a ComboPlan,
+        level: Option<u8>,
+    },
+    /// A concrete provider/model matched; the relay should call it directly, at `level`.
+    ///
+    /// `substituted` is `true` when the level asked for was not one the model offers and the
+    /// model's highest available level was used instead. The relay logs it and the panel shows it;
+    /// nothing else about the resolution changes.
+    Direct {
+        step: &'a StepPlan,
+        level: u8,
+        substituted: bool,
+    },
+    /// Nothing matched, with a reason specific enough to hand to the operator.
+    ///
+    /// The reason is what makes a 404 actionable: "no combo, alias or model matches" is true but
+    /// useless when what the operator actually typed was a bare model id that used to work, and the
+    /// answer they need is "names must be `provider/model`, or a combo or alias".
+    NotFound { reason: std::borrow::Cow<'a, str> },
+}
+
+impl<'a> Resolution<'a> {
+    /// A `NotFound` with a reason that is already a `String`.
+    fn not_found(reason: String) -> Self {
+        Resolution::NotFound {
+            reason: reason.into(),
+        }
+    }
 }
 
 /// The relay's hot-swap handle for the compiled snapshot.
@@ -425,6 +678,24 @@ impl RoutingSnapshot {
         let built_at = Millis::now();
         let digest = config.routing_digest();
 
+        // Proxies and keys are compiled before providers so that a provider or account override can
+        // be tested against the list of proxies the relay is actually allowed to dial. Doing it the
+        // other way round would leave the relay reconciling a dangling id per request.
+        let proxies: Vec<ProxyPlan> = config
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.enabled)
+            .map(proxy_plan)
+            .collect();
+        let dialable: HashSet<&str> = proxies.iter().map(|proxy| proxy.id.as_str()).collect();
+
+        let keys: Vec<KeyPlan> = config
+            .client_keys
+            .iter()
+            .filter(|key| key.enabled)
+            .map(key_plan)
+            .collect();
+
         let mut providers: Vec<ProviderPlan> = Vec::with_capacity(config.providers.len());
         let mut provider_index: HashMap<&str, u32> = HashMap::with_capacity(config.providers.len());
         let mut disabled_providers: HashSet<&str> = HashSet::new();
@@ -444,7 +715,7 @@ impl RoutingSnapshot {
             accounts.sort_by_key(|a| a.priority);
             let accounts = accounts
                 .into_iter()
-                .map(|a| account_plan(provider.id.as_str(), a))
+                .map(|a| account_plan(provider.id.as_str(), a, &dialable))
                 .collect();
 
             let mut plan = ProviderPlan {
@@ -455,6 +726,7 @@ impl RoutingSnapshot {
                 auth: provider.auth.clone(),
                 key_strategy: provider.key_strategy,
                 accounts,
+                proxy: usable_proxy(provider.proxy.as_deref(), &dialable),
                 capabilities: provider.capabilities.clone(),
                 connect_timeout_ms: provider.connect_timeout_ms,
                 ttfb_timeout_ms: provider.ttfb_timeout_ms,
@@ -466,13 +738,28 @@ impl RoutingSnapshot {
                 prewarm: provider.prewarm,
                 steps: Vec::new(),
             };
-            let mut steps = Vec::with_capacity(provider.models.len());
-            for model in provider.models.iter().filter(|m| !m.hidden) {
-                steps.push(plan_step(index, &plan, model.id.clone()));
+            let visible: Vec<&ModelEntry> = provider.models.iter().filter(|m| !m.hidden).collect();
+            let mut steps = Vec::with_capacity(visible.len());
+            for model in &visible {
+                steps.push(plan_step(
+                    index,
+                    &plan,
+                    model,
+                    config.routing.default_reasoning_level,
+                ));
             }
             plan.steps = steps;
             providers.push(plan);
         }
+
+        // Authored providers by id, so a combo's step can find the model entry the operator
+        // actually wrote (including its `reasoning_wire` and pricing) without a second lookup
+        // structure that could disagree with the one the index was built from.
+        let entries: HashMap<&str, &crate::model::Provider> = config
+            .providers
+            .iter()
+            .map(|p| (p.id.as_str(), p))
+            .collect();
 
         let mut combos: Vec<ComboPlan> = Vec::with_capacity(config.combos.len());
         for combo in &config.combos {
@@ -501,7 +788,24 @@ impl RoutingSnapshot {
                 match provider_index.get(step.provider.as_str()) {
                     Some(&provider) => {
                         let plan = &providers[provider as usize];
-                        steps.push(plan_step(provider, plan, step.model.clone()));
+                        // The entry comes from the authored configuration rather than from the
+                        // compiled plan, so a combo step is built from exactly the same metadata a
+                        // direct `provider/model` request is, with no second derivation to drift.
+                        let entry = entries
+                            .get(step.provider.as_str())
+                            .and_then(|source| {
+                                source
+                                    .models
+                                    .iter()
+                                    .find(|m| m.id.eq_ignore_ascii_case(&step.model))
+                            })
+                            .unwrap_or(&UNKNOWN_MODEL);
+                        steps.push(plan_step(
+                            provider,
+                            plan,
+                            entry,
+                            config.routing.default_reasoning_level,
+                        ));
                         remap[authored_index] = Some((steps.len() - 1) as u16);
                     }
                     None => {
@@ -590,7 +894,10 @@ impl RoutingSnapshot {
                 index_entries.push(IndexEntry {
                     key: combo.id.as_str().to_ascii_lowercase(),
                     rank: RANK_COMBO_ID,
-                    target: IndexTarget::Combo { combo: combo_index },
+                    target: IndexTarget::Combo {
+                        combo: combo_index,
+                        level: None,
+                    },
                     next: None,
                 });
             }
@@ -598,52 +905,116 @@ impl RoutingSnapshot {
                 index_entries.push(IndexEntry {
                     key: combo.name.to_ascii_lowercase(),
                     rank: RANK_COMBO_NAME,
-                    target: IndexTarget::Combo { combo: combo_index },
+                    target: IndexTarget::Combo {
+                        combo: combo_index,
+                        level: None,
+                    },
                     next: None,
                 });
+                // A combo can carry the same `-<level>` suffix a model can, which is how a route
+                // is pinned to a tier without editing it: `coding-high` runs `coding` at `high`.
+                // A suffix that is not a level name produces nothing here, so an ordinary combo
+                // name containing a dash is left exactly as it was.
+                for level in LEVEL_SUFFIXES {
+                    let Some(level) = ReasoningLevel::parse(level) else {
+                        continue;
+                    };
+                    index_entries.push(IndexEntry {
+                        key: format!("{}-{}", combo.name, level.as_str()).to_ascii_lowercase(),
+                        rank: RANK_COMBO_NAME,
+                        target: IndexTarget::Combo {
+                            combo: combo_index,
+                            level: Some(level.rank()),
+                        },
+                        next: None,
+                    });
+                }
             }
         }
-        // Qualified `provider/model` keys, then bare model ids. The bare pass runs second and keeps
-        // only the first provider in configured order that offers the model, which is the documented
-        // tie-break; the qualified pass covers every provider.
+        // Qualified `provider/model` keys, then the level-qualified forms.
+        //
+        // Order is what encodes precedence, and `link_entries` compares rank rather than insertion
+        // order, so these two passes are independent: a model's own id always beats a
+        // `base-level` reading of it.
         for (provider_index, provider) in providers.iter().enumerate() {
             for (step_index, step) in provider.steps.iter().enumerate() {
+                // An exact model id runs at the tier its own name ends in when that tier is one it
+                // offers, and otherwise at its default. The distinction matters for a model called
+                // `gemini-3.8-flash-low`: the trailing `low` is part of the id *and* names the tier
+                // it should run at, and resolving it must not be reported as a substitution.
+                let level = level_suffix(&step.model)
+                    .filter(|level| step.supports_level(*level))
+                    .unwrap_or_else(|| {
+                        ReasoningLevel::from_u8(step.default_level).unwrap_or(ReasoningLevel::None)
+                    });
                 index_entries.push(IndexEntry {
                     key: format!("{}/{}", provider.id.as_str(), step.model).to_ascii_lowercase(),
                     rank: RANK_QUALIFIED,
                     target: IndexTarget::Step {
                         provider: provider_index as u32,
                         step: step_index as u32,
+                        level: level.rank(),
+                        requested: level.rank(),
                     },
                     next: None,
                 });
             }
         }
-        let mut seen_bare: HashSet<String> = HashSet::new();
         for (provider_index, provider) in providers.iter().enumerate() {
             for (step_index, step) in provider.steps.iter().enumerate() {
-                let key = step.model.to_ascii_lowercase();
-                if !seen_bare.insert(key.clone()) {
+                let prefix = format!("{}/", provider.id.as_str());
+                // A real model id that merely *ends* in a level word is not also a `base-level`
+                // name for a shorter model. `antigravity/gemini-3.8-flash-low` is a model; it must
+                // not shadow anything, and the model it would otherwise be read as
+                // (`gemini-3.8-flash`) is a different, real model that has its own entries.
+                if level_suffix(&step.model).is_some() {
                     continue;
                 }
-                index_entries.push(IndexEntry {
-                    key,
-                    rank: RANK_BARE,
-                    target: IndexTarget::Step {
-                        provider: provider_index as u32,
-                        step: step_index as u32,
-                    },
-                    next: None,
-                });
+                for level in LEVEL_SUFFIXES {
+                    let Some(level) = ReasoningLevel::parse(level) else {
+                        continue;
+                    };
+                    let offered = step.supports_level(level);
+                    index_entries.push(IndexEntry {
+                        key: format!("{prefix}{}-{}", step.model, level.as_str())
+                            .to_ascii_lowercase(),
+                        rank: RANK_QUALIFIED_LEVEL,
+                        // An out-of-range level reroutes to the model's highest available one
+                        // rather than failing; the flag the relay reports comes from comparing
+                        // `target.level` with what the name asked for, so nothing extra is stored.
+                        target: IndexTarget::Step {
+                            provider: provider_index as u32,
+                            step: step_index as u32,
+                            level: if offered {
+                                level.rank()
+                            } else {
+                                // Out of range reroutes to the highest available level. A model
+                                // reporting no levels at all reroutes to `none`, which sends no
+                                // reasoning fragment rather than inventing support.
+                                highest_rank(step.levels)
+                            },
+                            requested: level.rank(),
+                        },
+                        next: None,
+                    });
+                }
             }
         }
+        // There is deliberately **no** bare-model pass. Feature 3 removed the bare-id fallback:
+        // a name with no provider prefix resolves only as an alias or a combo, because the old
+        // fallback made two providers offering one model id resolve by configured order — a
+        // routing decision nobody wrote down. The error a miss returns says exactly this.
 
         let mut snapshot = RoutingSnapshot {
             digest,
             built_at,
+            routing_defaults: config.routing.defaults.clone(),
             providers,
             combos,
             aliases,
+            keys,
+            proxies,
+            proxy_strategy: config.proxy_strategy,
             index: HashMap::new(),
             index_entries,
         };
@@ -663,6 +1034,11 @@ impl RoutingSnapshot {
         self.built_at
     }
 
+    /// The fallback model defaults for unsupported request modalities.
+    pub fn routing_defaults(&self) -> &crate::config::RoutingDefaults {
+        &self.routing_defaults
+    }
+
     /// The compiled providers, in configured order.
     pub fn providers(&self) -> &[ProviderPlan] {
         &self.providers
@@ -678,6 +1054,35 @@ impl RoutingSnapshot {
         &self.aliases
     }
 
+    /// The enabled client keys with their rolling quota windows compiled in.
+    ///
+    /// The relay matches a presented key by comparing its hash against these plans, so the order is
+    /// the configured order and nothing here is sorted: key counts are small and a linear scan over
+    /// a handful of constant-time comparisons is cheaper than a second hash index maintained in two
+    /// places.
+    pub fn keys(&self) -> &[KeyPlan] {
+        &self.keys
+    }
+
+    /// The proxies the relay may dial, in configured order.
+    pub fn proxies(&self) -> &[ProxyPlan] {
+        &self.proxies
+    }
+
+    /// How a provider or account with no override picks a proxy.
+    pub fn proxy_strategy(&self) -> ProxyStrategy {
+        self.proxy_strategy
+    }
+
+    /// A proxy by id, for a caller holding a compiled [`ProviderPlan::proxy`] or
+    /// [`AccountPlan::proxy`].
+    ///
+    /// This is a linear scan on purpose: the proxy list is a handful of entries, and an id index
+    /// would be one more thing to keep consistent across encode and decode for no measurable gain.
+    pub fn proxy(&self, id: &str) -> Option<&ProxyPlan> {
+        self.proxies.iter().find(|proxy| proxy.id == id)
+    }
+
     /// Resolve a requested model name to a combo, if one matches.
     ///
     /// This is [`RoutingSnapshot::resolve`] restricted to the combo case, for callers that
@@ -685,48 +1090,120 @@ impl RoutingSnapshot {
     /// to see it.
     pub fn lookup(&self, requested: &str) -> Option<&ComboPlan> {
         match self.resolve(requested) {
-            Resolution::Combo(combo) => Some(combo),
+            Resolution::Combo { plan, .. } => Some(plan),
             _ => None,
         }
     }
 
     /// Resolve a requested model name.
     ///
-    /// The order is fixed and deliberate: alias, then combo id, then combo name, then
-    /// `provider/model`, then bare model id. The alias step is flattened at compile time, so at
-    /// most one extra hop is ever taken here; the loop bound is purely a guard against a snapshot
-    /// built by something that did not flatten.
+    /// The order is fixed and deliberate and lives entirely in the compiled index: a user alias,
+    /// then a combo id, then a combo name (optionally with a `-<level>` suffix), then
+    /// `provider/model` (optionally with a `-<level>` suffix, with the model's own id winning over
+    /// the suffix reading), and finally a bare model id. The alias step is flattened at compile
+    /// time, so at most one extra hop is ever taken here; the loop bound is purely a guard against
+    /// a snapshot built by something that did not flatten.
     ///
     /// Matching is ASCII-case-insensitive. Model ids and provider slugs are ASCII by construction,
-    /// and folding only ASCII keeps this function allocation-free on the hot path.
+    /// and folding only ASCII keeps this allocation-free on the hot path.
+    ///
+    /// A miss carries a reason (see [`Resolution::NotFound`]), because "nothing matched" is not
+    /// actionable when the operator typed a bare model id that used to work.
     pub fn resolve(&self, requested: &str) -> Resolution<'_> {
         let mut key = requested;
         for _ in 0..=MAX_ALIAS_HOPS {
             match self.lookup_target(key) {
                 Some(IndexTarget::Alias { alias }) => match self.aliases.get(*alias as usize) {
                     Some(plan) => key = plan.to.as_str(),
-                    None => return Resolution::NotFound,
+                    None => {
+                        return Resolution::not_found(format!(
+                            "alias {requested:?} points at a target this snapshot does not carry"
+                        ))
+                    }
                 },
-                Some(IndexTarget::Combo { combo }) => {
+                Some(IndexTarget::Combo { combo, level }) => {
                     return match self.combos.get(*combo as usize) {
-                        Some(plan) => Resolution::Combo(plan),
-                        None => Resolution::NotFound,
+                        Some(plan) => Resolution::Combo {
+                            plan,
+                            level: *level,
+                        },
+                        None => Resolution::not_found(format!(
+                            "combo index {combo} is out of range for this snapshot"
+                        )),
                     }
                 }
-                Some(IndexTarget::Step { provider, step }) => {
+                Some(IndexTarget::Step {
+                    provider,
+                    step,
+                    level,
+                    requested: asked,
+                }) => {
                     return match self
                         .providers
                         .get(*provider as usize)
                         .and_then(|p| p.steps.get(*step as usize))
                     {
-                        Some(plan) => Resolution::Direct(plan),
-                        None => Resolution::NotFound,
+                        Some(plan) => Resolution::Direct {
+                            step: plan,
+                            level: *level,
+                            substituted: level != asked,
+                        },
+                        None => Resolution::not_found(format!(
+                            "the model table moved under {requested:?}; reload the snapshot"
+                        )),
                     }
                 }
-                None => return Resolution::NotFound,
+                None => return Resolution::not_found(self.explain_miss(requested)),
             }
         }
-        Resolution::NotFound
+        Resolution::not_found(format!(
+            "alias {requested:?} does not resolve: its chain is longer than the {MAX_ALIAS_HOPS} \
+             hops a compiled snapshot allows"
+        ))
+    }
+
+    /// Why a name matched nothing, phrased for the operator who typed it.
+    ///
+    /// The distinctions matter because the three cases need different fixes: a name with no
+    /// provider prefix is now an error by design (Feature 3 removed the bare-id fallback), an
+    /// unknown provider is a typo in the prefix, and a known provider with an unknown model is a
+    /// typo in the model or a model that was never synced.
+    fn explain_miss(&self, requested: &str) -> String {
+        match requested.split_once('/') {
+            None => format!(
+                "no combo, alias or model matches {requested:?}. A name with no provider prefix \
+                 must be a combo or an alias; a model is addressed as provider/model, optionally \
+                 with a -<level> suffix such as {requested}-high."
+            ),
+            Some((provider, rest)) => {
+                if self.providers.iter().any(|p| p.id.as_str() == provider) {
+                    // Naming a *level* that the model does not offer is not a miss: those keys are
+                    // indexed against the model's highest level. So the only way to get here with a
+                    // known provider is a genuine model miss, and naming the closest candidate
+                    // would be a guess this code deliberately does not make.
+                    format!(
+                        "provider {provider:?} exists but does not offer a model matching {rest:?}"
+                    )
+                } else {
+                    format!(
+                        "unknown provider {provider:?} in {requested:?}; configured providers are {}",
+                        self.provider_ids()
+                    )
+                }
+            }
+        }
+    }
+
+    /// The configured provider ids, comma-separated, for a miss message.
+    fn provider_ids(&self) -> String {
+        if self.providers.is_empty() {
+            return "none (no provider is enabled)".to_string();
+        }
+        self.providers
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Encode to the on-disk frame.
@@ -773,9 +1250,20 @@ impl RoutingSnapshot {
         let mut reader = Reader::new(payload);
         let strings = decode_string_table(&mut reader)?;
         let built_at = Millis::from_millis(reader.i64()?);
+        let routing_defaults = crate::config::RoutingDefaults {
+            image: reader.opt_string(&strings)?,
+            audio: reader.opt_string(&strings)?,
+            video: reader.opt_string(&strings)?,
+            pdf: reader.opt_string(&strings)?,
+            file: reader.opt_string(&strings)?,
+            extra: Default::default(),
+        };
         let providers = decode_providers(&mut reader, &strings)?;
         let combos = decode_combos(&mut reader, &strings, &providers)?;
         let aliases = decode_aliases(&mut reader, &strings)?;
+        let keys = decode_keys(&mut reader, &strings)?;
+        let proxies = decode_proxies(&mut reader, &strings)?;
+        let proxy_strategy = proxy_strategy_from_tag(reader.u8()?)?;
         let index_entries = decode_index_entries(&mut reader, &strings)?;
         if reader.remaining() != 0 {
             return Err(Error::Snapshot(format!(
@@ -787,9 +1275,13 @@ impl RoutingSnapshot {
         let mut snapshot = RoutingSnapshot {
             digest,
             built_at,
+            routing_defaults,
             providers,
             combos,
             aliases,
+            keys,
+            proxies,
+            proxy_strategy,
             index: HashMap::new(),
             index_entries,
         };
@@ -889,7 +1381,7 @@ impl RoutingSnapshot {
         for i in 0..self.index_entries.len() {
             let target = self.index_entries[i].target.clone();
             self.validate_target(&target)?;
-            if self.index_entries[i].rank > RANK_BARE {
+            if self.index_entries[i].rank > RANK_MAX {
                 return Err(Error::Snapshot(format!(
                     "snapshot lookup entry {i} has unknown precedence rank {}",
                     self.index_entries[i].rank
@@ -914,7 +1406,7 @@ impl RoutingSnapshot {
                     )));
                 }
             }
-            IndexTarget::Combo { combo } => {
+            IndexTarget::Combo { combo, .. } => {
                 if *combo as usize >= self.combos.len() {
                     return Err(Error::Snapshot(format!(
                         "snapshot lookup entry points at combo {combo}, but only {} combos exist",
@@ -922,7 +1414,7 @@ impl RoutingSnapshot {
                     )));
                 }
             }
-            IndexTarget::Step { provider, step } => {
+            IndexTarget::Step { provider, step, .. } => {
                 let plan = self.providers.get(*provider as usize).ok_or_else(|| {
                     Error::Snapshot(format!(
                         "snapshot lookup entry points at provider {provider}, but only {} providers \
@@ -949,6 +1441,11 @@ impl RoutingSnapshot {
     fn encode_body(&self) -> (Vec<String>, Vec<u8>) {
         let mut encoder = Encoder::new();
         encoder.put_i64(self.built_at.as_millis());
+        encoder.put_opt_str(self.routing_defaults.image.as_deref());
+        encoder.put_opt_str(self.routing_defaults.audio.as_deref());
+        encoder.put_opt_str(self.routing_defaults.video.as_deref());
+        encoder.put_opt_str(self.routing_defaults.pdf.as_deref());
+        encoder.put_opt_str(self.routing_defaults.file.as_deref());
         encoder.put_u32(self.providers.len() as u32);
         for provider in &self.providers {
             encode_provider(&mut encoder, provider);
@@ -961,6 +1458,15 @@ impl RoutingSnapshot {
         for alias in &self.aliases {
             encode_alias(&mut encoder, alias);
         }
+        encoder.put_u32(self.keys.len() as u32);
+        for key in &self.keys {
+            encode_key(&mut encoder, key);
+        }
+        encoder.put_u32(self.proxies.len() as u32);
+        for proxy in &self.proxies {
+            encode_proxy(&mut encoder, proxy);
+        }
+        encoder.put_u8(proxy_strategy_tag(self.proxy_strategy));
         encoder.put_u32(self.index_entries.len() as u32);
         for entry in &self.index_entries {
             encode_index_entry(&mut encoder, entry);
@@ -1131,7 +1637,7 @@ fn temp_sibling(path: &Path) -> PathBuf {
 /// with no OAuth reference falls back to the conventional [`account_secret_id`] vault path, and an
 /// OAuth account keeps only its metadata reference. The relay opens the vault after resolving its
 /// metadata record; this module only handles ids.
-fn account_plan(provider_id: &str, account: &Account) -> AccountPlan {
+fn account_plan(provider_id: &str, account: &Account, dialable: &HashSet<&str>) -> AccountPlan {
     let secret_ref = match &account.secret_ref {
         Some(explicit) => Some(explicit.clone()),
         None if account.oauth_ref.is_none() => {
@@ -1150,18 +1656,84 @@ fn account_plan(provider_id: &str, account: &Account) -> AccountPlan {
         max_concurrent: account.max_concurrent,
         models_allow: account.models_allow.clone(),
         models_deny: account.models_deny.clone(),
+        proxy: usable_proxy(account.proxy.as_deref(), dialable),
+    }
+}
+
+/// Keep only a proxy override the relay may actually dial.
+///
+/// An explicit id that refers to a missing or disabled proxy is already a config-validation error.
+/// Compiling it to `None` is nevertheless the safe data-plane behaviour: it cannot send traffic via
+/// a disabled endpoint, and means the configured strategy can select from the enabled list.
+fn usable_proxy(proxy: Option<&str>, dialable: &HashSet<&str>) -> Option<String> {
+    proxy.filter(|id| dialable.contains(id)).map(str::to_owned)
+}
+
+/// Build a proxy plan without its disabled configuration metadata.
+fn proxy_plan(proxy: &ProxyConfig) -> ProxyPlan {
+    ProxyPlan {
+        id: proxy.id.clone(),
+        label: proxy.label.clone(),
+        url: proxy.url.clone(),
+        username: proxy.username.clone(),
+        secret_ref: proxy.secret_ref.clone(),
+        priority: proxy.priority,
+    }
+}
+
+/// Build a client-key plan, preserving the three authored optional windows verbatim.
+///
+/// In particular, an explicit all-zero window is retained rather than collapsed to `None`: the
+/// authored config distinguishes an absent window from an explicit window whose dimensions are
+/// uncapped, and a compiled representation should not erase that distinction.
+fn key_plan(key: &ClientKey) -> KeyPlan {
+    KeyPlan {
+        id: key.id.clone(),
+        label: key.label.clone(),
+        key_hash: key.key_hash.clone(),
+        prefix: key.prefix.clone(),
+        allow_models: key.allow_models.clone(),
+        allow_routes: key.allow_routes.clone(),
+        limit_requests: key.limit_requests,
+        limits: key.limits,
     }
 }
 
 /// Build a step from an already-compiled provider.
 ///
-/// Everything except the model and the provider index is copied from the provider, so the encoded
-/// frame carries one copy of each base URL and timeout rather than one per model.
-fn plan_step(index: u32, provider: &ProviderPlan, model: String) -> StepPlan {
+/// Everything except the model's own metadata and the provider index is copied from the provider,
+/// so the encoded frame carries one copy of each base URL and timeout rather than one per model.
+fn plan_step(
+    index: u32,
+    provider: &ProviderPlan,
+    model: &ModelEntry,
+    default_reasoning_level: ReasoningLevel,
+) -> StepPlan {
+    let levels = effective_levels(model, provider);
+    let modalities = effective_modalities(model, provider);
+    // The default has to be a level the model actually offers, or the snapshot would carry a step
+    // whose own default it does not support — and the decoder rejects exactly that, because it
+    // would be a step that emits a fragment the model never agreed to.
+    //
+    // Two cases are worth naming. A model with **no** levels at all gets `none`, which emits no
+    // fragment: a fabricated `high` on a model that never advertised reasoning is the kind of
+    // invented capability this project refuses to show. A model that offers levels but not the
+    // configured default gets its **highest** one, which is the same substitution rule an
+    // out-of-range `-<level>` suffix follows.
+    let default_level = if levels == 0 {
+        ReasoningLevel::None
+    } else {
+        let configured = model.default_level(default_reasoning_level);
+        if levels & (1u32 << configured.rank()) != 0 {
+            configured
+        } else {
+            ReasoningLevel::from_u8(highest_rank(levels)).unwrap_or(ReasoningLevel::None)
+        }
+    };
     StepPlan {
         provider_index: index,
         provider_id: provider.id.clone(),
-        model,
+        model: model.id.clone(),
         dialect: provider.dialect,
         auth: provider.auth.clone(),
         base_url: provider.base_url.clone(),
@@ -1169,6 +1741,208 @@ fn plan_step(index: u32, provider: &ProviderPlan, model: String) -> StepPlan {
         ttfb_timeout_ms: provider.ttfb_timeout_ms,
         idle_timeout_ms: provider.idle_timeout_ms,
         total_timeout_ms: provider.total_timeout_ms,
+        level: default_level.rank(),
+        levels,
+        default_level: default_level.rank(),
+        reasoning_json: reasoning_fragments(provider.dialect, model, levels),
+        input_modalities: modalities,
+        pricing: model.pricing.clone(),
+    }
+}
+
+/// The levels a model offers, as a bitmask.
+///
+/// Three sources, in the order the design fixes: the operator's explicit list wins outright;
+/// otherwise the bundled capability table; otherwise the dialect's own notion of whether this model
+/// reasons at all. The third step is the one that keeps the feature working for a model nobody has
+/// metadata for — a provider that declares the `Reasoning` capability gets a usable level set
+/// rather than silently losing its `-<level>` names.
+fn effective_levels(model: &ModelEntry, provider: &ProviderPlan) -> u32 {
+    let declared = |levels: &[ReasoningLevel]| {
+        levels
+            .iter()
+            .fold(0u32, |mask, level| mask | (1u32 << level.rank()))
+    };
+    if !model.reasoning_levels.is_empty() {
+        return declared(&model.reasoning_levels);
+    }
+    if let Some(meta) = crate::catalog::catalog().model_meta(provider.id.as_str(), &model.id) {
+        if !meta.levels.is_empty() {
+            return declared(meta.levels);
+        }
+    }
+    if model.capabilities.contains(&Capability::Reasoning)
+        || provider.capabilities.contains(&Capability::Reasoning)
+        || dialect_default_levels(provider.dialect)
+    {
+        // The generic set an OpenAI-shaped provider understands. `minimal`, `ultra` and `max` are
+        // deliberately absent: they are provider-specific tiers, and advertising one a provider
+        // rejects turns a working request into a 400.
+        return declared(&DEFAULT_REASONING_LEVELS);
+    }
+    0
+}
+
+/// The levels a dialect assumes a reasoning model supports when nothing more specific is known.
+const DEFAULT_REASONING_LEVELS: [ReasoningLevel; 6] = [
+    ReasoningLevel::None,
+    ReasoningLevel::Low,
+    ReasoningLevel::Medium,
+    ReasoningLevel::High,
+    ReasoningLevel::XHigh,
+    ReasoningLevel::Max,
+];
+
+/// Whether a dialect's models reason by default, so a model with no metadata is still seeded.
+///
+/// Codex and Antigravity only serve reasoning models at all (their `force_stream` dialects are
+/// built around thinking output), so an operator who lists a model there and declares no metadata
+/// still gets level-qualified names. For the OpenAI-compatible dialects this answers `false`: a
+/// plain chat model must not sprout `-high` variants nobody asked for, and the provider's own
+/// `Reasoning` capability is what turns them on.
+fn dialect_default_levels(dialect: Dialect) -> bool {
+    matches!(dialect, Dialect::Codex)
+}
+
+/// The input modalities a model accepts, as a bitmask over `InputModality`'s discriminant.
+///
+/// Text is always accepted: a model that could not take text is not a chat model, and the
+/// rewritten-on-unsupported-input path depends on there being one type that always works.
+fn effective_modalities(model: &ModelEntry, provider: &ProviderPlan) -> u32 {
+    let declared = |modalities: &[InputModality]| {
+        modalities
+            .iter()
+            .fold(1u32 << InputModality::Text.as_u8(), |mask, modality| {
+                mask | (1u32 << modality.as_u8())
+            })
+    };
+    if !model.input_modalities.is_empty() {
+        return declared(&model.input_modalities);
+    }
+    if let Some(meta) = crate::catalog::catalog().model_meta(provider.id.as_str(), &model.id) {
+        if !meta.modalities.is_empty() {
+            return declared(meta.modalities);
+        }
+    }
+    // The provider's own `Vision` capability is the weakest evidence there is, and it is still
+    // better than nothing: it is the operator saying "this provider takes images".
+    if provider.capabilities.contains(&Capability::Vision) {
+        return declared(&[InputModality::Text, InputModality::Image]);
+    }
+    declared(&[InputModality::Text])
+}
+
+/// The per-level reasoning fragment for a step, indexed by level rank.
+///
+/// A per-model `reasoning_wire` entry replaces the dialect default **wholesale** for that level;
+/// this is why the result is a table of encoded JSON strings rather than a merge performed later.
+/// Encoding is fallible in principle (a serialiser can fail on an unrepresentable float) and
+/// infallible for the fragments this module can produce, so a failure is reported by sending
+/// nothing for that level rather than by failing the whole compile — the same "never invent a
+/// capability" rule applies in reverse: never invent a fragment either.
+fn reasoning_fragments(dialect: Dialect, model: &ModelEntry, levels: u32) -> [Option<String>; 8] {
+    let mut out: [Option<String>; 8] = Default::default();
+    for level in ReasoningLevel::ALL {
+        if levels & (1u32 << level.rank()) == 0 {
+            continue;
+        }
+        let fragment = match model
+            .reasoning_wire
+            .as_ref()
+            .and_then(|map| map.get(&level))
+        {
+            // An explicit `null` in `reasoning_wire` is the operator saying "send nothing here",
+            // which is a different statement from "no opinion" and must survive as one.
+            Some(value) if value.is_null() => None,
+            Some(value) => Some(value.clone()),
+            None => dialect_reasoning_fragment(dialect, level),
+        };
+        out[level.rank() as usize] = fragment.and_then(|value| serde_json::to_string(&value).ok());
+    }
+    out
+}
+
+/// The level→fragment table for one dialect.
+///
+/// These are the documented defaults from `plan.md` §4.5. The relay merges the selected fragment
+/// into the upstream body; a dialect with no table (Google and Antigravity, whose thinking config
+/// is a nested `generationConfig` the translator writes) contributes nothing here and is handled
+/// where that body is built.
+fn dialect_reasoning_fragment(
+    dialect: Dialect,
+    level: ReasoningLevel,
+) -> Option<serde_json::Value> {
+    if level == ReasoningLevel::None {
+        // `none` emits no reasoning fragment at all, on every dialect. Sending
+        // `{"reasoning_effort":"none"}` to a provider that does not recognise the value is a 400,
+        // and omitting the field is how every one of them expresses "do not reason".
+        return None;
+    }
+    let effort = effort_spelling(dialect, level);
+    Some(match dialect {
+        Dialect::OpenAi | Dialect::Copilot | Dialect::CommandCodeGo => {
+            serde_json::json!({ "reasoning_effort": effort })
+        }
+        Dialect::Codex => {
+            serde_json::json!({ "reasoning": { "effort": effort, "summary": "auto" } })
+        }
+        Dialect::Anthropic => serde_json::json!({
+            "thinking": { "type": "enabled", "budget_tokens": thinking_budget(level) }
+        }),
+        // Google and Antigravity take thinking inside `generationConfig`. The relay's merge is
+        // recursive, so the fragment is shaped exactly as deep as the field it has to reach.
+        // `thinkingLevel` is a two-value switch in the Gemini API, so everything from `medium` up
+        // is `high` with the corresponding budget.
+        Dialect::Google | Dialect::Antigravity => serde_json::json!({
+            "generationConfig": {
+                "thinkingConfig": {
+                    "thinkingLevel": if level.rank() >= ReasoningLevel::High.rank() { "high" } else { "low" },
+                    "thinkingBudget": thinking_budget(level),
+                }
+            }
+        }),
+    })
+}
+
+/// The `reasoning_effort` string a provider accepts for a level.
+///
+/// The highest value an OpenAI-shaped provider accepts is `xhigh`, so `ultra` and `max` are
+/// normalised down to it — the sanitation rule OmniRoute applies, and the reason `xhigh` support is
+/// described there as opt-out rather than universal. Sending `max` to a provider that has never
+/// heard of it is a 400, and the tier a client asked for is not lost: it is recorded on the step,
+/// and the substitution is what the panel shows.
+fn effort_spelling(dialect: Dialect, level: ReasoningLevel) -> &'static str {
+    match dialect {
+        // `xhigh` is the ceiling for the OpenAI-shaped providers, so the two tiers above it land
+        // there rather than being passed through.
+        Dialect::OpenAi | Dialect::Copilot | Dialect::CommandCodeGo | Dialect::Codex => match level
+        {
+            ReasoningLevel::Minimal => "minimal",
+            ReasoningLevel::Low => "low",
+            ReasoningLevel::Medium => "medium",
+            ReasoningLevel::High => "high",
+            ReasoningLevel::XHigh | ReasoningLevel::Ultra | ReasoningLevel::Max => "xhigh",
+            ReasoningLevel::None => "none",
+        },
+        // Anthropic's `thinking.budget_tokens` is written by the fragment, not by this spelling,
+        // so the canonical name is the honest answer for any dialect this table does not know.
+        _ => level.as_str(),
+    }
+}
+
+/// The thinking-token budget for a level, ported from OmniRoute's `EFFORT_BUDGETS` (MIT).
+///
+/// Claude's `thinking.budget_tokens` has to be a real number, so unlike `reasoning_effort` there is
+/// nothing to omit. The relay clamps this against the request's `max_tokens` when the client set one which is why the constant is deliberately the provider's own maximum rather than a computed guess.
+const fn thinking_budget(level: ReasoningLevel) -> u32 {
+    match level {
+        ReasoningLevel::None => 0,
+        ReasoningLevel::Minimal | ReasoningLevel::Low => 1024,
+        ReasoningLevel::Medium => 10240,
+        ReasoningLevel::High
+        | ReasoningLevel::XHigh
+        | ReasoningLevel::Ultra
+        | ReasoningLevel::Max => 131_072,
     }
 }
 
@@ -1226,6 +2000,13 @@ fn compile_aliases(config: &Config) -> Result<Vec<AliasPlan>> {
     let mut authored: Vec<(String, String, bool)> = Vec::with_capacity(config.aliases.len());
     let mut seen: HashSet<String> = HashSet::new();
     for alias in &config.aliases {
+        if alias.generated {
+            // These aliases were created by a now-retired naming convention. The config loader
+            // removes them with a backup, but filtering here also protects callers that compile an
+            // in-memory Config directly (tests, embedders and future control-plane code) from
+            // quietly reintroducing the old bare-model route.
+            continue;
+        }
         let from = alias.from.trim();
         let to = alias.to.trim();
         if from.is_empty() || to.is_empty() {
@@ -1279,6 +2060,8 @@ fn encode_provider(encoder: &mut Encoder, provider: &ProviderPlan) {
     encoder.put_str(&provider.base_url);
     encode_auth(encoder, &provider.auth);
     encoder.put_u8(provider.key_strategy as u8);
+    let proxy = encoder.opt_str_id(provider.proxy.as_deref());
+    encoder.put_u32(proxy);
     encoder.put_u32(provider.capabilities.len() as u32);
     for capability in &provider.capabilities {
         encoder.put_u8(*capability as u8);
@@ -1315,6 +2098,8 @@ fn encode_account(encoder: &mut Encoder, account: &AccountPlan) {
     encoder.put_u32(account.max_concurrent);
     encode_string_list(encoder, &account.models_allow);
     encode_string_list(encoder, &account.models_deny);
+    let proxy = encoder.opt_str_id(account.proxy.as_deref());
+    encoder.put_u32(proxy);
 }
 
 /// Encode an auth kind.
@@ -1346,13 +2131,139 @@ fn encode_auth(encoder: &mut Encoder, auth: &AuthKind) {
     }
 }
 
-/// Encode a step as `(provider index, model)`.
+/// Encode every field of a step.
 ///
-/// Every other field is the provider's, so it is not repeated per step; `decode` reconstructs the
-/// full [`StepPlan`] from the provider the index names.
+/// The base URL, timeouts and auth are copied from the provider when the step is compiled, and are
+/// deliberately **not** repeated here: the provider each step names is encoded once, and repeating
+/// a base URL per model would multiply the frame by the size of the model list. What *is* per-step
+/// is the reasoning metadata — a level, the set the model offers, the per-level fragments and the
+/// modality mask — because that depends on the model entry, which the frame does not carry
+/// otherwise. `decode` reconstructs the provider-owned fields from the provider the index names.
 fn encode_step(encoder: &mut Encoder, step: &StepPlan) {
     encoder.put_u32(step.provider_index);
     encoder.put_str(&step.model);
+    encoder.put_u8(step.level);
+    encoder.put_u32(step.levels);
+    encoder.put_u8(step.default_level);
+    for fragment in &step.reasoning_json {
+        let id = encoder.opt_str_id(fragment.as_deref());
+        encoder.put_u32(id);
+    }
+    encoder.put_u32(step.input_modalities);
+    encode_pricing(encoder, step.pricing.as_ref());
+}
+
+/// Encode an optional price table.
+///
+/// Rates are `f64` and go out as their IEEE-754 bit patterns: JSON's decimal round-trip is lossy
+/// enough that a price could come back a fraction of a cent different, and a cost estimate that
+/// drifts on every reload is worse than one that is merely stale.
+fn encode_pricing(encoder: &mut Encoder, pricing: Option<&PricingPlan>) {
+    match pricing {
+        None => encoder.put_bool(false),
+        Some(pricing) => {
+            encoder.put_bool(true);
+            for rate in [
+                pricing.input_per_mtok,
+                pricing.output_per_mtok,
+                pricing.cache_read_per_mtok,
+                pricing.cache_write_per_mtok,
+            ] {
+                match rate {
+                    Some(value) => {
+                        encoder.put_bool(true);
+                        encoder.put_u64(value.to_bits());
+                    }
+                    None => encoder.put_bool(false),
+                }
+            }
+            encoder.put_u8(pricing_source_tag(pricing.source));
+        }
+    }
+}
+
+/// Encode a pricing source.
+fn pricing_source_tag(source: PricingSource) -> u8 {
+    match source {
+        PricingSource::Bundled => 0,
+        PricingSource::Synced => 1,
+        PricingSource::Manual => 2,
+    }
+}
+
+/// Decode a pricing source.
+fn pricing_source_from_tag(tag: u8) -> Result<PricingSource> {
+    Ok(match tag {
+        0 => PricingSource::Bundled,
+        1 => PricingSource::Synced,
+        2 => PricingSource::Manual,
+        other => {
+            return Err(Error::Snapshot(format!(
+                "snapshot pricing source tag {other} is not one this binary knows"
+            )))
+        }
+    })
+}
+
+/// Decode an optional price table written by [`encode_pricing`].
+fn decode_pricing(reader: &mut Reader) -> Result<Option<PricingPlan>> {
+    if !reader.bool()? {
+        return Ok(None);
+    }
+    let mut rates = [None; 4];
+    for slot in rates.iter_mut() {
+        if reader.bool()? {
+            *slot = Some(f64::from_bits(reader.u64()?));
+        }
+    }
+    Ok(Some(PricingPlan {
+        input_per_mtok: rates[0],
+        output_per_mtok: rates[1],
+        cache_read_per_mtok: rates[2],
+        cache_write_per_mtok: rates[3],
+        source: pricing_source_from_tag(reader.u8()?)?,
+    }))
+}
+
+/// Decode the per-step reasoning metadata, then fill in the provider-owned fields.
+///
+/// `provider` is the provider this step belongs to; `any_model` stands in for a combo step that
+/// names a model the provider no longer carries, which `Config::validate` reports and the frame
+/// must still encode.
+fn decode_step(
+    reader: &mut Reader,
+    strings: &[String],
+    provider_index: u32,
+    provider: &ProviderPlan,
+) -> Result<StepPlan> {
+    let model = reader.string(strings)?;
+    let level = read_level(reader)?;
+    let levels = reader.u32()?;
+    let default_level = read_level(reader)?;
+    let mut reasoning_json: [Option<String>; 8] = Default::default();
+    for slot in reasoning_json.iter_mut() {
+        *slot = reader.opt_string(strings)?;
+    }
+    let input_modalities = reader.u32()?;
+    let pricing = decode_pricing(reader)?;
+    Ok(StepPlan {
+        provider_index,
+        provider_id: provider.id.clone(),
+        model,
+        dialect: provider.dialect,
+        auth: provider.auth.clone(),
+        base_url: provider.base_url.clone(),
+        connect_timeout_ms: provider.connect_timeout_ms,
+        ttfb_timeout_ms: provider.ttfb_timeout_ms,
+        idle_timeout_ms: provider.idle_timeout_ms,
+        total_timeout_ms: provider.total_timeout_ms,
+        level,
+        levels,
+        default_level,
+        reasoning_json,
+        input_modalities,
+        pricing,
+    })
 }
 
 /// Encode a combo.
@@ -1399,6 +2310,76 @@ fn encode_alias(encoder: &mut Encoder, alias: &AliasPlan) {
     encoder.put_bool(alias.generated);
 }
 
+/// Encode a client key plan, including the three rolling windows.
+///
+/// A window is written as a presence byte followed by its two caps rather than as two u64s where
+/// zero means absent, because `None` (not enforced) and `Some(0)` (enforced, uncapped dimension) are
+/// different answers and the relay must not have to infer which one it was given.
+fn encode_key(encoder: &mut Encoder, key: &KeyPlan) {
+    encoder.put_str(key.id.as_str());
+    encoder.put_str(&key.label);
+    encoder.put_str(&key.key_hash);
+    let prefix = encoder.opt_str_id(key.prefix.as_deref());
+    encoder.put_u32(prefix);
+    encode_string_list(encoder, &key.allow_models);
+    encode_string_list(encoder, &key.allow_routes);
+    encoder.put_u64(key.limit_requests);
+    encode_key_limit(encoder, key.limits.session_5h.as_ref());
+    encode_key_limit(encoder, key.limits.weekly_1w.as_ref());
+    encode_key_limit(encoder, key.limits.monthly_30d.as_ref());
+}
+
+/// Encode one window's caps, or the absence of the window.
+fn encode_key_limit(encoder: &mut Encoder, limit: Option<&KeyLimit>) {
+    match limit {
+        Some(limit) => {
+            encoder.put_bool(true);
+            encoder.put_u64(limit.tokens);
+            encoder.put_u64(limit.requests);
+        }
+        None => encoder.put_bool(false),
+    }
+}
+
+/// Encode one proxy plan.
+fn encode_proxy(encoder: &mut Encoder, proxy: &ProxyPlan) {
+    encoder.put_str(&proxy.id);
+    let label = encoder.opt_str_id(proxy.label.as_deref());
+    encoder.put_u32(label);
+    encoder.put_str(&proxy.url);
+    let username = encoder.opt_str_id(proxy.username.as_deref());
+    encoder.put_u32(username);
+    let secret = encoder.opt_str_id(proxy.secret_ref.as_deref());
+    encoder.put_u32(secret);
+    encoder.put_i32(proxy.priority);
+}
+
+/// The on-disk tag for a proxy strategy.
+///
+/// Written explicitly rather than as the discriminant so that reordering the authored enum cannot
+/// silently change the meaning of an already-written snapshot.
+fn proxy_strategy_tag(strategy: ProxyStrategy) -> u8 {
+    match strategy {
+        ProxyStrategy::Priority => 0,
+        ProxyStrategy::LeastUsed => 1,
+        ProxyStrategy::Random => 2,
+        ProxyStrategy::RoundRobin => 3,
+    }
+}
+
+/// Read a proxy strategy tag, rejecting one this binary does not know.
+fn proxy_strategy_from_tag(tag: u8) -> Result<ProxyStrategy> {
+    match tag {
+        0 => Ok(ProxyStrategy::Priority),
+        1 => Ok(ProxyStrategy::LeastUsed),
+        2 => Ok(ProxyStrategy::Random),
+        3 => Ok(ProxyStrategy::RoundRobin),
+        other => Err(Error::Snapshot(format!(
+            "snapshot names unknown proxy strategy tag {other}"
+        ))),
+    }
+}
+
 /// Encode one lookup entry. The `next` chain is rebuilt on decode rather than persisted.
 fn encode_index_entry(encoder: &mut Encoder, entry: &IndexEntry) {
     encoder.put_str(&entry.key);
@@ -1408,14 +2389,28 @@ fn encode_index_entry(encoder: &mut Encoder, entry: &IndexEntry) {
             encoder.put_u8(0);
             encoder.put_u32(*alias);
         }
-        IndexTarget::Combo { combo } => {
+        IndexTarget::Combo { combo, level } => {
             encoder.put_u8(1);
             encoder.put_u32(*combo);
+            match level {
+                Some(level) => {
+                    encoder.put_bool(true);
+                    encoder.put_u8(*level);
+                }
+                None => encoder.put_bool(false),
+            }
         }
-        IndexTarget::Step { provider, step } => {
+        IndexTarget::Step {
+            provider,
+            step,
+            level,
+            requested,
+        } => {
             encoder.put_u8(2);
             encoder.put_u32(*provider);
             encoder.put_u32(*step);
+            encoder.put_u8(*level);
+            encoder.put_u8(*requested);
         }
     }
 }
@@ -1467,6 +2462,7 @@ fn decode_providers(reader: &mut Reader, strings: &[String]) -> Result<Vec<Provi
         let base_url = reader.string(strings)?;
         let auth = decode_auth(reader, strings)?;
         let key_strategy = key_strategy_from_tag(reader.u8()?)?;
+        let proxy = reader.opt_string(strings)?;
         let capability_count = reader.u32()? as usize;
         let mut capabilities = Vec::with_capacity(capability_count.min(64));
         for _ in 0..capability_count {
@@ -1494,6 +2490,7 @@ fn decode_providers(reader: &mut Reader, strings: &[String]) -> Result<Vec<Provi
             auth,
             key_strategy,
             accounts,
+            proxy,
             capabilities,
             connect_timeout_ms,
             ttfb_timeout_ms,
@@ -1509,15 +2506,32 @@ fn decode_providers(reader: &mut Reader, strings: &[String]) -> Result<Vec<Provi
         let step_count = reader.u32()? as usize;
         let mut steps = Vec::with_capacity(step_count.min(4096));
         for _ in 0..step_count {
-            let provider_index = reader.u32()?;
-            let model = reader.string(strings)?;
-            if provider_index as usize != index {
+            let step_provider = reader.u32()?;
+            if step_provider as usize != index {
                 return Err(Error::Snapshot(format!(
                     "snapshot provider {index} declares a step owned by provider index \
-                     {provider_index}"
+                     {step_provider}"
                 )));
             }
-            steps.push(plan_step(index as u32, &provider, model));
+            let step = decode_step(reader, strings, index as u32, &provider)?;
+            let level = ReasoningLevel::from_u8(step.level).ok_or_else(|| {
+                Error::Snapshot(format!(
+                    "snapshot step {:?} carries reasoning level {}",
+                    step.model, step.level
+                ))
+            })?;
+            // A step with an empty level set has no notion of a tier at all, and stores the
+            // no-reasoning level so it emits no fragment. Any *other* level must be one the step
+            // says it offers, or the frame is internally inconsistent and a request could be
+            // served at a tier the model does not have.
+            if step.levels != 0 && !step.supports_level(level) {
+                return Err(Error::Snapshot(format!(
+                    "snapshot step {:?} is stored at level {}, which its own level set does not \
+                     contain",
+                    step.model, step.level
+                )));
+            }
+            steps.push(step);
         }
         provider.steps = steps;
         providers.push(provider);
@@ -1568,7 +2582,6 @@ fn decode_combos(
         let mut steps = Vec::with_capacity(step_count.min(4096));
         for _ in 0..step_count {
             let provider_index = reader.u32()?;
-            let model = reader.string(strings)?;
             let provider = providers.get(provider_index as usize).ok_or_else(|| {
                 Error::Snapshot(format!(
                     "snapshot combo step references provider index {provider_index}, but only {} \
@@ -1576,7 +2589,7 @@ fn decode_combos(
                     providers.len()
                 ))
             })?;
-            steps.push(plan_step(provider_index, provider, model));
+            steps.push(decode_step(reader, strings, provider_index, provider)?);
         }
 
         for participant in &participants {
@@ -1638,6 +2651,86 @@ fn decode_aliases(reader: &mut Reader, strings: &[String]) -> Result<Vec<AliasPl
     Ok(aliases)
 }
 
+/// Read one window's caps, or `None` when the frame says the window is absent.
+fn decode_key_limit(reader: &mut Reader) -> Result<Option<KeyLimit>> {
+    if !reader.bool()? {
+        return Ok(None);
+    }
+    Ok(Some(KeyLimit {
+        tokens: reader.u64()?,
+        requests: reader.u64()?,
+    }))
+}
+
+/// Read the compiled client keys.
+///
+/// A key whose stored hash is empty is treated as a corrupt frame rather than as an inert key: no
+/// real key has one, and accepting it would let a shifted read masquerade as a valid plan.
+fn decode_keys(reader: &mut Reader, strings: &[String]) -> Result<Vec<KeyPlan>> {
+    let count = reader.u32()? as usize;
+    let mut keys = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        let id = ClientKeyId::from(reader.string(strings)?);
+        let label = reader.string(strings)?;
+        let key_hash = reader.string(strings)?;
+        if key_hash.trim().is_empty() {
+            return Err(Error::Snapshot(format!(
+                "snapshot client key {id} carries an empty key hash"
+            )));
+        }
+        let prefix = reader.opt_string(strings)?;
+        let allow_models = decode_string_list(reader, strings)?;
+        let allow_routes = decode_string_list(reader, strings)?;
+        let limit_requests = reader.u64()?;
+        keys.push(KeyPlan {
+            id,
+            label,
+            key_hash,
+            prefix,
+            allow_models,
+            allow_routes,
+            limit_requests,
+            limits: KeyLimits {
+                session_5h: decode_key_limit(reader)?,
+                weekly_1w: decode_key_limit(reader)?,
+                monthly_30d: decode_key_limit(reader)?,
+            },
+        });
+    }
+    Ok(keys)
+}
+
+/// Read the compiled proxy list.
+fn decode_proxies(reader: &mut Reader, strings: &[String]) -> Result<Vec<ProxyPlan>> {
+    let count = reader.u32()? as usize;
+    let mut proxies = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        proxies.push(ProxyPlan {
+            id: reader.string(strings)?,
+            label: reader.opt_string(strings)?,
+            url: reader.string(strings)?,
+            username: reader.opt_string(strings)?,
+            secret_ref: reader.opt_string(strings)?,
+            priority: reader.i32()?,
+        });
+    }
+    Ok(proxies)
+}
+
+/// Read a level byte, rejecting a value the ladder does not have.
+///
+/// A misread byte here would silently route a request at a tier the operator never asked for, so
+/// this is a hard decode error rather than a clamp.
+fn read_level(reader: &mut Reader) -> Result<u8> {
+    let raw = reader.u8()?;
+    if ReasoningLevel::from_u8(raw).is_none() {
+        return Err(Error::Snapshot(format!(
+            "snapshot carries reasoning level {raw}, which is not on the ladder"
+        )));
+    }
+    Ok(raw)
+}
+
 /// Decode the lookup entries. The `next` chains are rebuilt by `link_entries`.
 fn decode_index_entries(reader: &mut Reader, strings: &[String]) -> Result<Vec<IndexEntry>> {
     let count = reader.u32()? as usize;
@@ -1651,10 +2744,16 @@ fn decode_index_entries(reader: &mut Reader, strings: &[String]) -> Result<Vec<I
             },
             1 => IndexTarget::Combo {
                 combo: reader.u32()?,
+                level: match reader.bool()? {
+                    true => Some(read_level(reader)?),
+                    false => None,
+                },
             },
             2 => IndexTarget::Step {
                 provider: reader.u32()?,
                 step: reader.u32()?,
+                level: read_level(reader)?,
+                requested: read_level(reader)?,
             },
             tag => {
                 return Err(Error::Snapshot(format!(
@@ -1684,6 +2783,7 @@ fn decode_account(reader: &mut Reader, strings: &[String]) -> Result<AccountPlan
         max_concurrent: reader.u32()?,
         models_allow: decode_string_list(reader, strings)?,
         models_deny: decode_string_list(reader, strings)?,
+        proxy: reader.opt_string(strings)?,
     })
 }
 
@@ -1923,6 +3023,12 @@ impl Encoder {
         }
     }
 
+    /// Intern an optional string and append its index to the body.
+    fn put_opt_str(&mut self, value: Option<&str>) {
+        let id = self.opt_str_id(value);
+        self.put_u32(id);
+    }
+
     /// Intern a string and append its index to the body.
     fn put_str(&mut self, value: &str) {
         let id = self.str_id(value);
@@ -2098,8 +3204,13 @@ mod tests {
             context_length: None,
             max_output_tokens: None,
             capabilities: Vec::new(),
+            input_modalities: Vec::new(),
+            reasoning_levels: Vec::new(),
+            default_reasoning_level: None,
+            reasoning_wire: None,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
+            pricing: None,
             synced_at: None,
             hidden: false,
         }
@@ -2157,7 +3268,71 @@ mod tests {
             header: "x-beta-key".into(),
         };
 
+        alpha.proxy = Some("edge".into());
+        alpha.accounts[0].proxy = Some("mobile".into());
         config.providers = vec![alpha, beta];
+        config.proxies = vec![
+            ProxyConfig {
+                id: "edge".into(),
+                label: Some("Edge".into()),
+                url: "http://proxy.example:8080".into(),
+                username: Some("router".into()),
+                secret_ref: Some("proxy/edge".into()),
+                enabled: true,
+                priority: 3,
+                extra: Default::default(),
+            },
+            ProxyConfig {
+                id: "mobile".into(),
+                label: None,
+                url: "socks5://mobile.example:1080".into(),
+                username: None,
+                secret_ref: None,
+                enabled: true,
+                priority: 1,
+                extra: Default::default(),
+            },
+            ProxyConfig {
+                id: "disabled".into(),
+                label: None,
+                url: "http://disabled.example:8080".into(),
+                username: None,
+                secret_ref: None,
+                enabled: false,
+                priority: 0,
+                extra: Default::default(),
+            },
+        ];
+        config.proxy_strategy = ProxyStrategy::RoundRobin;
+        let mut client_key = ClientKey {
+            id: ClientKeyId::from_raw("key-one"),
+            label: "desktop".into(),
+            key_hash: "a".repeat(64),
+            prefix: Some("mr-a".into()),
+            enabled: true,
+            allow_models: vec!["alpha/*".into()],
+            allow_routes: vec!["chat".into()],
+            limit_requests: 999,
+            limits: KeyLimits {
+                session_5h: Some(KeyLimit {
+                    tokens: 5000,
+                    requests: 10,
+                }),
+                weekly_1w: Some(KeyLimit {
+                    tokens: 0,
+                    requests: 20,
+                }),
+                monthly_30d: Some(KeyLimit {
+                    tokens: 0,
+                    requests: 0,
+                }),
+            },
+            note: None,
+        };
+        config.client_keys.push(client_key.clone());
+        client_key.enabled = false;
+        client_key.id = ClientKeyId::from_raw("disabled-key");
+        config.client_keys.push(client_key);
 
         let mut smart = combo(
             "combo-smart",
@@ -2196,7 +3371,7 @@ mod tests {
             Alias {
                 from: "quick".into(),
                 to: "fast".into(),
-                generated: true,
+                generated: false,
             },
         ];
         config
@@ -2204,7 +3379,9 @@ mod tests {
 
     #[test]
     fn a_rich_snapshot_round_trips_through_encode_and_decode() {
-        let config = rich_config();
+        let mut config = rich_config();
+        config.routing.defaults.image = Some("vision/image".into());
+        config.routing.defaults.audio = Some("voice/audio".into());
         let original = RoutingSnapshot::compile(&config).unwrap();
         let bytes = original.encode().unwrap();
         let decoded = RoutingSnapshot::decode(&bytes).unwrap();
@@ -2222,6 +3399,85 @@ mod tests {
             .map(|a| a.label.as_deref().unwrap())
             .collect();
         assert_eq!(labels, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn key_limits_and_proxy_assignments_are_compiled_and_round_trip() {
+        let config = rich_config();
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+        assert_eq!(snapshot.keys().len(), 1);
+        let key = &snapshot.keys()[0];
+        assert_eq!(key.id.as_str(), "key-one");
+        assert_eq!(key.limit_requests, 999);
+        assert_eq!(key.limits.session_5h.unwrap().tokens, 5000);
+        assert_eq!(key.limits.session_5h.unwrap().requests, 10);
+        assert_eq!(key.limits.weekly_1w.unwrap().tokens, 0);
+        assert_eq!(key.limits.weekly_1w.unwrap().requests, 20);
+        assert_eq!(
+            key.limits.monthly_30d,
+            Some(KeyLimit {
+                tokens: 0,
+                requests: 0
+            }),
+            "an explicitly configured uncapped window is preserved"
+        );
+
+        assert_eq!(snapshot.proxy_strategy(), ProxyStrategy::RoundRobin);
+        assert_eq!(
+            snapshot.proxies().len(),
+            2,
+            "disabled proxy is not dialable"
+        );
+        assert_eq!(snapshot.proxy("disabled"), None);
+        let alpha = &snapshot.providers()[0];
+        assert_eq!(alpha.proxy.as_deref(), Some("edge"));
+        assert_eq!(alpha.accounts[0].proxy, None);
+        assert_eq!(alpha.accounts[1].proxy.as_deref(), Some("mobile"));
+        assert_eq!(
+            snapshot.proxy("edge").unwrap().secret_ref.as_deref(),
+            Some("proxy/edge")
+        );
+
+        let decoded = RoutingSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+        assert_eq!(decoded, snapshot);
+        assert_eq!(decoded.keys()[0].limits.session_5h.unwrap().tokens, 5000);
+        assert_eq!(decoded.keys()[0].limits.weekly_1w.unwrap().requests, 20);
+        assert_eq!(
+            decoded.keys()[0].limits.monthly_30d,
+            Some(KeyLimit {
+                tokens: 0,
+                requests: 0
+            })
+        );
+        assert_eq!(
+            decoded.providers()[0].accounts[1].proxy.as_deref(),
+            Some("mobile")
+        );
+    }
+
+    #[test]
+    fn generated_aliases_do_not_enter_a_compiled_snapshot() {
+        let mut config = Config::default();
+        config.providers.push(provider("p"));
+        config.aliases = vec![
+            Alias {
+                from: "manual".into(),
+                to: "p/model".into(),
+                generated: false,
+            },
+            Alias {
+                from: "old-generated".into(),
+                to: "p/model".into(),
+                generated: true,
+            },
+        ];
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+        assert_eq!(snapshot.aliases().len(), 1);
+        assert_eq!(snapshot.aliases()[0].from, "manual");
+        assert!(matches!(
+            snapshot.resolve("old-generated"),
+            Resolution::NotFound { .. }
+        ));
     }
 
     #[test]
@@ -2256,7 +3512,7 @@ mod tests {
             .find(|a| a.from == "quick")
             .unwrap();
         assert_eq!(quick.to, "smart");
-        assert!(quick.generated);
+        assert!(!quick.generated);
         assert!(snapshot.lookup("quick").is_some());
     }
 
@@ -2341,7 +3597,10 @@ mod tests {
         snapshot.index_entries.push(IndexEntry {
             key: "x".into(),
             rank: RANK_COMBO_NAME,
-            target: IndexTarget::Combo { combo: 5 },
+            target: IndexTarget::Combo {
+                combo: 5,
+                level: None,
+            },
             next: None,
         });
         let error = snapshot.link_entries().unwrap_err().to_string();
@@ -2350,10 +3609,12 @@ mod tests {
         let mut snapshot = RoutingSnapshot::default();
         snapshot.index_entries.push(IndexEntry {
             key: "x".into(),
-            rank: RANK_BARE,
+            rank: RANK_QUALIFIED,
             target: IndexTarget::Step {
                 provider: 0,
                 step: 0,
+                level: 0,
+                requested: 0,
             },
             next: None,
         });
@@ -2366,8 +3627,11 @@ mod tests {
         let mut snapshot = RoutingSnapshot::default();
         snapshot.index_entries.push(IndexEntry {
             key: "x".into(),
-            rank: 99,
-            target: IndexTarget::Combo { combo: 0 },
+            rank: RANK_MAX + 1,
+            target: IndexTarget::Combo {
+                combo: 0,
+                level: None,
+            },
             next: None,
         });
         // Give it a real combo so target validation passes first.
@@ -2407,7 +3671,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_precedence_is_alias_then_id_then_name_then_qualified_then_bare() {
+    fn lookup_precedence_is_alias_then_id_then_name_then_qualified_and_bare_ids_do_not_resolve() {
         let mut config = Config::default();
 
         let mut p1 = provider("p1");
@@ -2445,46 +3709,48 @@ mod tests {
         // Alias beats both a combo name ("aa") and a combo id ("bb").
         for requested in ["aa", "bb"] {
             match snapshot.resolve(requested) {
-                Resolution::Combo(combo) => assert_eq!(combo.id.as_str(), "alias-target"),
+                Resolution::Combo { plan: combo, .. } => {
+                    assert_eq!(combo.id.as_str(), "alias-target")
+                }
                 other => panic!("{requested} resolved to {other:?}"),
             }
         }
 
         // A combo id beats another combo's name.
         match snapshot.resolve("cc") {
-            Resolution::Combo(combo) => assert_eq!(combo.name, "x-name"),
+            Resolution::Combo { plan: combo, .. } => assert_eq!(combo.name, "x-name"),
             other => panic!("cc resolved to {other:?}"),
         }
 
         // A combo name beats a qualified provider/model.
         match snapshot.resolve("p1/q1") {
-            Resolution::Combo(combo) => assert_eq!(combo.id.as_str(), "z-id"),
+            Resolution::Combo { plan: combo, .. } => assert_eq!(combo.id.as_str(), "z-id"),
             other => panic!("p1/q1 resolved to {other:?}"),
         }
 
         // A combo name beats a bare model id.
         match snapshot.resolve("bare1") {
-            Resolution::Combo(combo) => assert_eq!(combo.id.as_str(), "w-id"),
+            Resolution::Combo { plan: combo, .. } => assert_eq!(combo.id.as_str(), "w-id"),
             other => panic!("bare1 resolved to {other:?}"),
         }
 
         // A qualified provider/model beats a bare model id with the same characters.
         match snapshot.resolve("p2/qual1") {
-            Resolution::Direct(step) => {
+            Resolution::Direct { step, .. } => {
                 assert_eq!(step.model, "qual1");
                 assert_eq!(step.provider_id.as_str(), "p2");
             }
             other => panic!("p2/qual1 resolved to {other:?}"),
         }
 
-        // With nothing else claiming the name, a bare model id resolves to the first provider.
-        match snapshot.resolve("onlybare") {
-            Resolution::Direct(step) => {
-                assert_eq!(step.model, "onlybare");
-                assert_eq!(step.provider_id.as_str(), "p1");
-            }
-            other => panic!("onlybare resolved to {other:?}"),
-        }
+        // A bare model id no longer resolves at all: Feature 3 removed the fallback, because
+        // "the first provider in configured order that offers this id" was a routing decision
+        // nobody wrote down. The miss has to explain the naming rule.
+        let reason = miss(snapshot.resolve("onlybare"));
+        assert!(
+            reason.contains("provider/model") || reason.contains("provider prefix"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -2494,7 +3760,7 @@ mod tests {
         assert!(snapshot.lookup("Smart").is_some());
         assert!(snapshot.lookup("smart").is_some());
         match snapshot.resolve("ALPHA/M1") {
-            Resolution::Direct(step) => assert_eq!(step.model, "m1"),
+            Resolution::Direct { step, .. } => assert_eq!(step.model, "m1"),
             other => panic!("ALPHA/M1 resolved to {other:?}"),
         }
     }
@@ -2529,14 +3795,17 @@ mod tests {
             key: "impostor".into(),
             // Alias rank: without the string comparison this would outrank the real entry.
             rank: RANK_ALIAS,
-            target: IndexTarget::Combo { combo: other },
+            target: IndexTarget::Combo {
+                combo: other,
+                level: None,
+            },
             next: Some(head),
         });
         snapshot.index.insert(hash, injected);
         assert_eq!(*snapshot.index.get(&hash).unwrap(), injected);
 
         match snapshot.resolve("smart") {
-            Resolution::Combo(combo) => assert_eq!(combo.id.as_str(), "smart-id"),
+            Resolution::Combo { plan: combo, .. } => assert_eq!(combo.id.as_str(), "smart-id"),
             other => panic!("smart resolved to {other:?}"),
         }
     }
@@ -2653,7 +3922,10 @@ mod tests {
 
         let decoded = RoutingSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
         assert_eq!(decoded, snapshot);
-        assert_eq!(decoded.resolve("anything"), Resolution::NotFound);
+        match decoded.resolve("anything") {
+            Resolution::NotFound { reason } => assert!(!reason.is_empty(), "a miss must say why"),
+            other => panic!("an empty snapshot resolved {other:?}"),
+        }
         assert!(decoded.lookup("anything").is_none());
     }
 
@@ -2726,5 +3998,564 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("absent.snapshot");
         assert!(RoutingSnapshot::load_from(&path).is_err());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Feature 3: reasoning levels in model names
+    // -----------------------------------------------------------------------------------------
+
+    /// A provider whose models carry the metadata the level rules read.
+    ///
+    /// The provider id is deliberately a family the bundled catalogue does not carry, so these
+    /// tests exercise what the *operator* declared rather than whatever
+    /// `catalog/model_meta.json` happens to say about a real model.
+    fn level_provider(id: &str, models: Vec<ModelEntry>) -> Provider {
+        let mut p = provider(id);
+        p.models = models;
+        p.accounts = vec![account("a", "a", 0)];
+        p
+    }
+
+    fn with_levels(id: &str, levels: &[ReasoningLevel]) -> ModelEntry {
+        let mut m = model(id);
+        m.reasoning_levels = levels.to_vec();
+        m
+    }
+
+    /// Compile a configuration whose single provider `p1` carries one model with the metadata the
+    /// level rules read.
+    ///
+    /// A builder rather than an inline `Config::default()` mutation in every test: `clippy` rejects
+    /// field assignment after `Default::default()`, and one construction means the tests cannot
+    /// drift from each other in which fields they bother to set.
+    fn compile_one(provider_models: Vec<ModelEntry>, combos: Vec<Combo>) -> RoutingSnapshot {
+        let mut config = Config {
+            providers: vec![level_provider("p1", provider_models)],
+            ..Config::default()
+        };
+        config.combos = combos;
+        RoutingSnapshot::compile(&config).unwrap()
+    }
+
+    /// The `(model, level, substituted)` triple of a direct hit.
+    fn direct(resolution: Resolution<'_>) -> (String, u8, bool) {
+        match resolution {
+            Resolution::Direct {
+                step,
+                level,
+                substituted,
+            } => (step.model.clone(), level, substituted),
+            other => panic!("expected a direct hit, got {other:?}"),
+        }
+    }
+
+    /// The reason a miss carried, so a test can assert the message is actionable.
+    fn miss(resolution: Resolution<'_>) -> String {
+        match resolution {
+            Resolution::NotFound { reason } => reason.into_owned(),
+            other => panic!("expected a miss, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_exact_model_id_ending_in_a_level_word_wins_over_a_stripped_suffix() {
+        // The rank-2-beats-rank-2.5 rule: `gemini-3.8-flash-low` is a model, and its trailing
+        // `low` names the tier it runs at rather than selecting a shorter `gemini-3.8-flash`.
+        let snapshot = compile_one(
+            vec![
+                with_levels(
+                    "gemini-3.8-flash-low",
+                    &[
+                        ReasoningLevel::None,
+                        ReasoningLevel::Low,
+                        ReasoningLevel::High,
+                    ],
+                ),
+                with_levels(
+                    "gemini-3.8-flash",
+                    &[ReasoningLevel::Low, ReasoningLevel::High],
+                ),
+            ],
+            Vec::new(),
+        );
+
+        let (model, level, substituted) = direct(snapshot.resolve("p1/gemini-3.8-flash-low"));
+        assert_eq!(model, "gemini-3.8-flash-low");
+        assert_eq!(level, ReasoningLevel::Low.rank());
+        assert!(
+            !substituted,
+            "the model's own name asked for the tier it runs at, so nothing was substituted"
+        );
+    }
+
+    #[test]
+    fn a_slashed_model_id_resolves_with_a_level_suffix() {
+        let snapshot = compile_one(
+            vec![with_levels(
+                "deepseek/deepseek-v4.1-flash",
+                &[
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                    ReasoningLevel::XHigh,
+                    ReasoningLevel::Max,
+                ],
+            )],
+            Vec::new(),
+        );
+
+        let (model, level, substituted) =
+            direct(snapshot.resolve("p1/deepseek/deepseek-v4.1-flash-max"));
+        assert_eq!(model, "deepseek/deepseek-v4.1-flash");
+        assert_eq!(level, ReasoningLevel::Max.rank());
+        assert!(!substituted);
+    }
+
+    #[test]
+    fn the_configured_default_level_is_high_when_the_model_does_not_override_it() {
+        let snapshot = compile_one(
+            vec![with_levels(
+                "m1",
+                &[
+                    ReasoningLevel::Low,
+                    ReasoningLevel::High,
+                    ReasoningLevel::Max,
+                ],
+            )],
+            Vec::new(),
+        );
+
+        let (_, level, substituted) = direct(snapshot.resolve("p1/m1"));
+        assert_eq!(level, ReasoningLevel::High.rank());
+        assert!(!substituted);
+    }
+
+    #[test]
+    fn a_model_can_override_the_default_level() {
+        let mut declared = with_levels(
+            "m1",
+            &[
+                ReasoningLevel::Low,
+                ReasoningLevel::High,
+                ReasoningLevel::Max,
+            ],
+        );
+        declared.default_reasoning_level = Some(ReasoningLevel::Low);
+        let snapshot = compile_one(vec![declared], Vec::new());
+
+        let (_, level, _) = direct(snapshot.resolve("p1/m1"));
+        assert_eq!(level, ReasoningLevel::Low.rank());
+    }
+
+    #[test]
+    fn a_bare_model_name_is_an_error_that_names_the_problem() {
+        // Feature 3 removed the bare-id fallback deliberately. The message has to say so, because
+        // "no model matches gpt-5" reads as a sync problem when it is really a naming rule.
+        let snapshot = compile_one(vec![with_levels("gpt-5", &[])], Vec::new());
+
+        let reason = miss(snapshot.resolve("gpt-5"));
+        assert!(
+            reason.contains("provider/model") || reason.contains("provider prefix"),
+            "the miss must explain the naming rule: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_provider_is_an_error_that_lists_the_configured_ones() {
+        let snapshot = compile_one(vec![with_levels("m1", &[])], Vec::new());
+
+        let reason = miss(snapshot.resolve("nosuchprovider/model"));
+        assert!(reason.contains("nosuchprovider"), "{reason}");
+        assert!(
+            reason.contains("p1"),
+            "the message must list the providers that do exist: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_known_provider_with_an_unknown_model_says_which_half_was_wrong() {
+        let snapshot = compile_one(vec![with_levels("m1", &[])], Vec::new());
+
+        let reason = miss(snapshot.resolve("p1/nope"));
+        assert!(reason.contains("p1"), "{reason}");
+        assert!(reason.contains("nope"), "{reason}");
+        assert!(
+            !reason.contains("unknown provider"),
+            "the provider is known, so the message must not blame it: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_combo_named_with_a_slash_resolves_and_carries_no_level() {
+        let snapshot = compile_one(
+            vec![with_levels("m1", &[])],
+            vec![combo("c1", "deepseek/deepseek-v4.1-flash", &[("p1", "m1")])],
+        );
+
+        match snapshot.resolve("deepseek/deepseek-v4.1-flash") {
+            Resolution::Combo { plan, level } => {
+                assert_eq!(plan.id.as_str(), "c1");
+                assert_eq!(
+                    level, None,
+                    "the name carried no tier, so no level is forced onto the steps"
+                );
+            }
+            other => panic!("expected the combo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_combo_name_with_a_level_suffix_forces_that_tier() {
+        let snapshot = compile_one(
+            vec![with_levels("m1", &[])],
+            vec![combo("c1", "coding", &[("p1", "m1")])],
+        );
+
+        match snapshot.resolve("coding-low") {
+            Resolution::Combo { plan, level } => {
+                assert_eq!(plan.id.as_str(), "c1");
+                assert_eq!(level, Some(ReasoningLevel::Low.rank()));
+            }
+            other => panic!("expected the combo at a tier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_level_reroutes_to_the_highest_available_one() {
+        // `-max` on a model that tops out at `xhigh` must succeed and reason less, and the
+        // substitution must be visible rather than silent.
+        let snapshot = compile_one(
+            vec![with_levels(
+                "m1",
+                &[
+                    ReasoningLevel::Low,
+                    ReasoningLevel::High,
+                    ReasoningLevel::XHigh,
+                ],
+            )],
+            Vec::new(),
+        );
+
+        let (model, level, substituted) = direct(snapshot.resolve("p1/m1-max"));
+        assert_eq!(model, "m1");
+        assert_eq!(level, ReasoningLevel::XHigh.rank());
+        assert!(
+            substituted,
+            "the substitution must be reported, not absorbed"
+        );
+    }
+
+    #[test]
+    fn every_level_name_is_indexed_even_when_the_model_lacks_it() {
+        // Otherwise a client asking for a tier it cannot have would get a 404 instead of a
+        // downgrade, which is the opposite of the documented rule.
+        let snapshot = compile_one(
+            vec![with_levels(
+                "m1",
+                &[ReasoningLevel::Low, ReasoningLevel::High],
+            )],
+            Vec::new(),
+        );
+
+        for level in ReasoningLevel::ALL {
+            let expected = if level == ReasoningLevel::Low || level == ReasoningLevel::High {
+                level.rank()
+            } else {
+                ReasoningLevel::High.rank()
+            };
+            let (_, actual, substituted) =
+                direct(snapshot.resolve(&format!("p1/m1-{}", level.as_str())));
+            assert_eq!(actual, expected, "at {}", level.as_str());
+            if level != ReasoningLevel::Low && level != ReasoningLevel::High {
+                assert!(substituted, "at {}", level.as_str());
+            }
+        }
+    }
+
+    #[test]
+    fn a_none_level_step_emits_no_reasoning_fragment() {
+        let snapshot = compile_one(
+            vec![with_levels(
+                "m1",
+                &[
+                    ReasoningLevel::None,
+                    ReasoningLevel::Low,
+                    ReasoningLevel::High,
+                ],
+            )],
+            Vec::new(),
+        );
+
+        match snapshot.resolve("p1/m1-none") {
+            Resolution::Direct { step, level, .. } => {
+                assert_eq!(level, ReasoningLevel::None.rank());
+                assert_eq!(
+                    step.reasoning_fragment_for(ReasoningLevel::None),
+                    None,
+                    "`none` must send no reasoning field at all, on every dialect"
+                );
+                // The step's *default* level is a different thing from the level this name asked
+                // for, and it still carries its own fragment.
+                assert!(step.reasoning_fragment().is_some());
+            }
+            other => panic!("expected a direct hit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_model_with_no_levels_gets_no_suffix_and_runs_at_none() {
+        // The honest answer for a model nobody has metadata for and whose provider does not claim
+        // the reasoning capability: no tiers, and no invented `reasoning_effort`.
+        let snapshot = compile_one(vec![with_levels("m1", &[])], Vec::new());
+
+        match snapshot.resolve("p1/m1") {
+            Resolution::Direct { step, level, .. } => {
+                assert_eq!(step.levels, 0);
+                assert!(step.levels().is_empty());
+                assert_eq!(level, ReasoningLevel::None.rank());
+                assert_eq!(step.reasoning_fragment(), None);
+            }
+            other => panic!("expected a direct hit, got {other:?}"),
+        }
+        for level in ReasoningLevel::ALL {
+            assert!(!snapshot
+                .providers()
+                .first()
+                .unwrap()
+                .steps
+                .first()
+                .unwrap()
+                .supports_level(level));
+        }
+    }
+
+    #[test]
+    fn a_provider_declaring_reasoning_seeds_the_generic_level_set() {
+        let mut p = level_provider("p1", vec![with_levels("m1", &[])]);
+        p.capabilities = vec![Capability::Chat, Capability::Reasoning];
+        let mut config = Config {
+            providers: vec![p],
+            ..Config::default()
+        };
+        config.combos = Vec::new();
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+
+        let step = &snapshot.providers()[0].steps[0];
+        assert_eq!(
+            step.levels(),
+            vec![
+                ReasoningLevel::None,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ],
+            "the generic fallback must omit the provider-specific tiers"
+        );
+    }
+
+    #[test]
+    fn resolution_is_case_insensitive_including_the_level() {
+        let snapshot = compile_one(
+            vec![with_levels(
+                "m1",
+                &[ReasoningLevel::Low, ReasoningLevel::High],
+            )],
+            Vec::new(),
+        );
+
+        for requested in ["p1/m1-high", "P1/M1-HIGH", "p1/M1-High"] {
+            let (_, level, substituted) = direct(snapshot.resolve(requested));
+            assert_eq!(level, ReasoningLevel::High.rank(), "{requested}");
+            assert!(!substituted, "{requested}");
+        }
+    }
+
+    #[test]
+    fn a_user_alias_beats_a_level_qualified_model_name() {
+        let config = Config {
+            providers: vec![level_provider(
+                "p1",
+                vec![with_levels(
+                    "m1",
+                    &[ReasoningLevel::Low, ReasoningLevel::High],
+                )],
+            )],
+            aliases: vec![Alias {
+                from: "p1/m1-high".into(),
+                to: "p1/m1-low".into(),
+                generated: false,
+            }],
+            ..Config::default()
+        };
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+
+        let (_, level, _) = direct(snapshot.resolve("p1/m1-high"));
+        assert_eq!(
+            level,
+            ReasoningLevel::Low.rank(),
+            "the alias must win over the derived level name"
+        );
+    }
+
+    #[test]
+    fn level_metadata_survives_the_encode_decode_round_trip() {
+        // The test that catches a codec which forgets a field: a decoded snapshot is what the relay
+        // actually loads, so a level lost in the frame is a level lost in production.
+        let mut declared = with_levels(
+            "deepseek/deepseek-v4.1-flash",
+            &[
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::Max,
+            ],
+        );
+        declared.default_reasoning_level = Some(ReasoningLevel::Medium);
+        declared.input_modalities = vec![InputModality::Text, InputModality::Image];
+        declared.pricing = Some(PricingPlan {
+            input_per_mtok: Some(0.27),
+            output_per_mtok: Some(1.1),
+            cache_read_per_mtok: None,
+            cache_write_per_mtok: Some(0.135),
+            source: PricingSource::Synced,
+        });
+        declared.reasoning_wire = Some(
+            [(
+                ReasoningLevel::Max,
+                serde_json::json!({ "reasoning_effort": "high" }),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let config = Config {
+            providers: vec![level_provider("p1", vec![declared])],
+            // A combo step must carry the same metadata as the direct model it names.
+            combos: vec![combo(
+                "c1",
+                "coding",
+                &[("p1", "deepseek/deepseek-v4.1-flash")],
+            )],
+            ..Config::default()
+        };
+
+        let original = RoutingSnapshot::compile(&config).unwrap();
+        let decoded = RoutingSnapshot::decode(&original.encode().unwrap()).unwrap();
+        assert_eq!(decoded, original);
+
+        let direct_step = &decoded.providers()[0].steps[0];
+        assert_eq!(direct_step.levels, original.providers()[0].steps[0].levels);
+        assert!(direct_step.supports_level(ReasoningLevel::Max));
+        assert!(!direct_step.supports_level(ReasoningLevel::XHigh));
+        assert_eq!(direct_step.default_level, ReasoningLevel::Medium.rank());
+        assert!(direct_step.accepts_modality(InputModality::Image));
+        assert!(!direct_step.accepts_modality(InputModality::Audio));
+        assert_eq!(
+            direct_step.pricing.as_ref().unwrap().input_per_mtok,
+            Some(0.27)
+        );
+        // The step's default level is the model's own `medium`, so the default fragment is the
+        // dialect's `medium` fragment...
+        assert_eq!(
+            direct_step.reasoning_fragment(),
+            Some(r#"{"reasoning_effort":"medium"}"#),
+            "the default fragment comes from the step's default level"
+        );
+        // ...while the operator's override applies at the level it names, replacing the dialect
+        // default there rather than merging with it.
+        assert_eq!(
+            direct_step.reasoning_fragment_for(ReasoningLevel::Max),
+            Some(r#"{"reasoning_effort":"high"}"#),
+            "a per-model override replaces the dialect default wholesale for that level"
+        );
+
+        let combo_step = &decoded.combos()[0].steps[0];
+        assert_eq!(combo_step.levels, direct_step.levels);
+        assert_eq!(combo_step.default_level, direct_step.default_level);
+        assert_eq!(
+            combo_step.reasoning_json, direct_step.reasoning_json,
+            "a combo step and the model it names must compile identically"
+        );
+    }
+
+    #[test]
+    fn each_dialect_maps_a_level_onto_the_field_it_actually_understands() {
+        let fragments = |dialect: Dialect| {
+            let mut config = Config::default();
+            let mut p = level_provider(
+                "p1",
+                vec![with_levels(
+                    "m1",
+                    &[
+                        ReasoningLevel::None,
+                        ReasoningLevel::Low,
+                        ReasoningLevel::High,
+                    ],
+                )],
+            );
+            p.dialect = dialect;
+            config.providers = vec![p];
+            RoutingSnapshot::compile(&config).unwrap().providers()[0].steps[0]
+                .reasoning_json
+                .clone()
+        };
+
+        // `none` is silent everywhere: a provider that does not recognise
+        // `{"reasoning_effort":"none"}` answers 400.
+        assert_eq!(
+            fragments(Dialect::OpenAi)[ReasoningLevel::None.rank() as usize],
+            None
+        );
+        assert_eq!(
+            fragments(Dialect::Anthropic)[ReasoningLevel::None.rank() as usize],
+            None
+        );
+
+        let openai = fragments(Dialect::OpenAi);
+        assert_eq!(
+            openai[ReasoningLevel::Low.rank() as usize].as_deref(),
+            Some(r#"{"reasoning_effort":"low"}"#)
+        );
+
+        let codex = fragments(Dialect::Codex);
+        assert_eq!(
+            codex[ReasoningLevel::High.rank() as usize].as_deref(),
+            Some(r#"{"reasoning":{"effort":"high","summary":"auto"}}"#)
+        );
+
+        let anthropic = fragments(Dialect::Anthropic);
+        assert_eq!(
+            anthropic[ReasoningLevel::High.rank() as usize].as_deref(),
+            Some(r#"{"thinking":{"type":"enabled","budget_tokens":131072}}"#)
+        );
+
+        let google = fragments(Dialect::Google);
+        assert_eq!(
+            google[ReasoningLevel::High.rank() as usize].as_deref(),
+            Some(
+                r#"{"generationConfig":{"thinkingConfig":{"thinkingLevel":"high","thinkingBudget":131072}}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn generated_aliases_are_deleted_while_authored_ones_survive() {
+        let mut document = serde_json::json!({
+            "aliases": [
+                { "from": "generated-one", "to": "coding", "generated": true },
+                { "from": "authored", "to": "coding", "generated": false },
+                { "from": "no-flag", "to": "coding" },
+                "not an object"
+            ]
+        });
+        let removed = crate::config::migrate_generated_aliases(&mut document);
+        assert_eq!(removed, 1);
+        let remaining = document["aliases"].as_array().unwrap();
+        assert_eq!(remaining.len(), 3);
+        assert!(remaining
+            .iter()
+            .all(|alias| alias.get("from").and_then(|v| v.as_str()) != Some("generated-one")));
     }
 }

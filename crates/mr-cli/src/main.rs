@@ -1,6 +1,6 @@
 //! `mr` — the Manarouter control CLI.
 //!
-//! One binary, thirteen subcommands, four exit codes beyond success. The shape of every flag is
+//! One binary, twelve subcommands, four exit codes beyond success. The shape of every flag is
 //! documented in `docs/02-quickstart.md` and the exit-code contract below is part of `--help`;
 //! both are held by tests in this file.
 //!

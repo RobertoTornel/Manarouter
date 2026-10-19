@@ -4,7 +4,8 @@
 //!
 //! It owns everything about talking to a provider over TCP and TLS: connection reuse, the four
 //! timeouts, HTTP/2 negotiation, and the mechanics of getting a response body back without
-//! buffering it.
+//! buffering it. Proxy endpoints are represented on [`UpstreamRequest`] for the server wiring seam,
+//! but this client currently uses its direct pooled connector and does not activate proxy routing.
 //!
 //! It does **not** decide anything. It does not choose a provider, choose an account, attach a
 //! credential, build a route, translate a body, or know what a combo is. Those decisions were all
@@ -49,6 +50,12 @@ pub struct UpstreamRequest {
     /// Built by the caller because attaching a credential depends on `AuthKind`, which is routing
     /// policy, and because a header the caller cannot see is a header the caller cannot log.
     pub headers: HeaderMap,
+    /// A pre-resolved proxy endpoint, when selection and the vault lookup chose one.
+    ///
+    /// `None` means a direct connection. `Some` never means "try direct if the proxy fails": proxy
+    /// failure is returned to the caller, because falling back would leak a request the operator
+    /// explicitly configured to egress through an intermediary.
+    pub proxy: Option<crate::proxy::ProxyEndpoint>,
     /// The request body. Empty for a `GET`.
     pub body: Bytes,
     /// Whether to negotiate HTTP/2.
@@ -493,6 +500,7 @@ impl Upstream {
             method: Method::GET,
             url,
             headers: HeaderMap::new(),
+            proxy: None,
             body: Bytes::new(),
             http2,
             connect_timeout: Duration::from_secs(10),
@@ -533,6 +541,359 @@ fn classify(
     }
 }
 
+// =============================================================================================
+// Input-modality detection and default-model rewriting (Feature 3 / I9)
+// =============================================================================================
+//
+// # Why this lives in a module that otherwise only speaks HTTP
+//
+// The rule it implements is "never drop media, never send it somewhere that cannot read it", and
+// that rule is decided from the *request body* — the one artefact this module already treats as an
+// opaque byte string. Putting the decision here, as a pure function over `serde_json::Value`, keeps
+// it out of `server.rs` (which owns the request path and is edited by another worker) and keeps it
+// testable without a socket: no provider, no TLS, no clock.
+//
+// # The contract the caller must honour
+//
+// The returned id is a *request name*, exactly as written in `routing.defaults.<modality>`: it may
+// be `provider/model`, a bare model id, or a combo. It is **not** necessarily a model id the
+// provider will accept verbatim — `provider/model` is the operator-facing spelling, not the wire
+// id. The relay's `server.rs` must therefore re-resolve the returned name through the routing
+// snapshot and let the usual per-step code write `step.model` upstream; rewriting the body and
+// forwarding the bytes unchanged would send `provider/model` to a provider that knows only `model`.
+//
+// The rewrite is deliberately *not* a "strip the media" operation: the media stays in the body,
+// byte for byte. Only the `model` field moves. A relay that dropped an image to keep a route would
+// be answering a question the client did not ask.
+//
+// # Why the error is precise about a config key
+//
+// The operator is the only one who can fix this, and they fix it by setting one field. An error
+// that says "cannot route media" sends them to the docs; an error that names
+// `routing.defaults.image` sends them to the line to edit.
+
+use mr_core::config::RoutingDefaults;
+use mr_core::dialect::InputModality;
+
+/// The content-part `type` spellings that name media, and the modality each one means.
+///
+/// The spellings are deliberately a closed table rather than a prefix match. Two dialects are in
+/// play: OpenAI chat (`image_url`, `input_audio`), Anthropic messages (`image`, `audio`), and the
+/// relay's own Responses translator emits `input_image`/`input_audio`. A model called something
+/// else — `image_generation`, say — must not be guessed at, and a *text* part (`text`,
+/// `input_text`) must never be mistaken for media.
+const MEDIA_TYPES: [(&str, InputModality); 7] = [
+    ("image_url", InputModality::Image),
+    ("image", InputModality::Image),
+    ("input_image", InputModality::Image),
+    ("input_audio", InputModality::Audio),
+    ("audio", InputModality::Audio),
+    ("video_url", InputModality::Video),
+    ("video", InputModality::Video),
+];
+
+/// Why a request carrying media could not be routed, worded for the operator who has to fix it.
+///
+/// `Clone` and `PartialEq` so a caller can attach the chosen model to a value it also logs, and so
+/// tests compare variants instead of formatting strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModalityError {
+    /// The body carries a modality the chosen model does not accept, and no fallback is configured.
+    NoDefault {
+        /// The modality the model refused.
+        modality: InputModality,
+        /// The model that refused it, when the caller attached one via [`Self::with_model`].
+        model: Option<String>,
+    },
+    /// Several unsupported modalities are present and their defaults name different models.
+    ///
+    /// One chat completion has one `model` field, so a request cannot be split across two upstream
+    /// models; the operator must point both defaults at a single model that accepts both.
+    ConflictingDefaults {
+        /// The first unsupported modality, in canonical order.
+        first: InputModality,
+        /// The model its default names.
+        first_model: String,
+        /// The first later modality whose default disagrees.
+        other: InputModality,
+        /// The model *its* default names.
+        other_model: String,
+    },
+    /// A content part declared a type that looks like media but is not one this build knows.
+    UnsupportedType {
+        /// The `type` string exactly as the body spelled it.
+        wire_type: String,
+    },
+}
+
+impl ModalityError {
+    /// Attach the model id that produced this error, so the message can quote it.
+    ///
+    /// The pure rewrite function does not know the model — it is given only an `accepts` predicate —
+    /// so the caller supplies the id at the point where it surfaces the error. Kept as a builder on
+    /// the error rather than an extra parameter so the rewrite's signature stays the one the routing
+    /// code can use interchangeably with any other step check.
+    pub fn with_model(mut self, model: &str) -> Self {
+        if let Self::NoDefault { model: slot, .. } = &mut self {
+            *slot = Some(model.to_owned());
+        }
+        self
+    }
+
+    /// The config key the operator has to set to make this request routable, when there is one.
+    ///
+    /// Exposed so the caller can log a structured field next to the message instead of making the
+    /// operator read English to find out which setting to change.
+    pub fn setting(&self) -> Option<String> {
+        match self {
+            Self::NoDefault { modality, .. } => {
+                Some(format!("routing.defaults.{}", modality.as_str()))
+            }
+            Self::ConflictingDefaults { first, other, .. } => Some(format!(
+                "routing.defaults.{} and routing.defaults.{}",
+                first.as_str(),
+                other.as_str(),
+            )),
+            Self::UnsupportedType { .. } => Some("routing.defaults".to_owned()),
+        }
+    }
+}
+
+/// The article and the plural the message needs, so it reads as English rather than as a template.
+fn modality_words(modality: InputModality) -> (&'static str, &'static str) {
+    match modality {
+        InputModality::Image => ("an image", "images"),
+        InputModality::Audio => ("audio", "audio"),
+        InputModality::Video => ("video", "video"),
+        InputModality::Pdf => ("a PDF", "PDFs"),
+        InputModality::File => ("a file", "files"),
+        InputModality::Text => ("text", "text"),
+    }
+}
+
+impl std::fmt::Display for ModalityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoDefault { modality, model } => {
+                let (article, plural) = modality_words(*modality);
+                let subject = match model {
+                    Some(model) => format!("model `{model}` does not accept"),
+                    None => "the selected model does not accept".to_owned(),
+                };
+                write!(
+                    f,
+                    "the request contains {article} but {subject} {plural}, and routing.defaults.{} is not set",
+                    modality.as_str(),
+                )
+            }
+            Self::ConflictingDefaults {
+                first,
+                first_model,
+                other,
+                other_model,
+            } => {
+                let (first_article, _) = modality_words(*first);
+                let (other_article, _) = modality_words(*other);
+                write!(
+                    f,
+                    "the request contains {first_article} and {other_article}, but routing.defaults.{} is `{first_model}` and routing.defaults.{} is `{other_model}`; one request has a single model field, so point both defaults at one model that accepts both",
+                    first.as_str(),
+                    other.as_str(),
+                )
+            }
+            Self::UnsupportedType { wire_type } => write!(
+                f,
+                "the request contains a content part of type \"{wire_type}\", which is not an input modality this build recognises, so no routing.defaults entry can be chosen for it (configured keys live under routing.defaults)",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ModalityError {}
+
+/// Which modalities a request body carries, in canonical [`InputModality`] order and deduplicated.
+///
+/// `Err` when a content part claims a media-like type this build cannot classify: such a body
+/// cannot be routed honestly, because the router would have to guess which default applies.
+///
+/// # What is inspected, and what is deliberately not
+///
+/// Only `messages[]` and `input[]` content **arrays** are read, and only parts that are objects with
+/// a string `type`. Everything else is skipped without error:
+///
+/// * `tool` schemas, `tools`, `functions`, `metadata`, `response_format`, `system` and every
+///   provider-specific field — a JSON schema describing an `image_url` property is not an image, and
+///   treating it as one would rewrite the model on a request that carries no media at all.
+/// * A `content` that is a plain string, or absent — the text-only majority, and the shape
+///   Anthropic uses for a single text block.
+/// * A part with no `type`, or a non-string `type` — it makes no modality claim.
+///
+/// Malformed *inner* shapes are skipped rather than rejected: the outer body already parsed as JSON,
+/// so the only way to reach these arms is a body whose field types are not what any dialect sends.
+/// Refusing such a body here would replace the provider's precise 400 with a vaguer one, and the
+/// relay's job is to shuttle bytes it does not understand rather than to police them.
+pub fn detect_input_modalities(
+    body: &serde_json::Value,
+) -> std::result::Result<Vec<InputModality>, ModalityError> {
+    let mut found: Vec<InputModality> = Vec::new();
+    for key in ["messages", "input"] {
+        let Some(items) = body.get(key).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            let Some(parts) = item.get("content").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for part in parts {
+                let Some(wire_type) = part.get("type").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                match classify_part(wire_type) {
+                    PartKind::Modality(modality) => found.push(modality),
+                    PartKind::Unsupported => {
+                        return Err(ModalityError::UnsupportedType {
+                            wire_type: wire_type.to_owned(),
+                        })
+                    }
+                    PartKind::Ignored => {}
+                }
+            }
+        }
+    }
+    // Canonical order (Image, Audio, Video, …) rather than the order the parts appeared in, because
+    // the order decides which default is *named* when several are unsupported. A body-order rule
+    // would make the same request produce different errors depending on how a client happened to
+    // order its parts.
+    found.sort_unstable();
+    found.dedup();
+    Ok(found)
+}
+
+/// How one content-part `type` is classified.
+enum PartKind {
+    /// A modality this build routes.
+    Modality(InputModality),
+    /// A media-looking type this build does not know.
+    Unsupported,
+    /// Not media: text, tool calls, thinking blocks, and everything else.
+    Ignored,
+}
+
+/// Classify one content-part `type`.
+///
+/// Unknown content-block kinds are errors rather than guessed as text: a provider may have added a
+/// new modality, and sending its payload to a model that cannot read it would silently violate the
+/// "always forward media" promise. The small ignore-list covers known text, tool and thinking parts
+/// that are not input modalities; metadata and tool schemas never reach this function because the
+/// detector walks only message/input content arrays.
+fn classify_part(wire_type: &str) -> PartKind {
+    if let Some((_, modality)) = MEDIA_TYPES
+        .iter()
+        .find(|(spelling, _)| *spelling == wire_type)
+    {
+        return PartKind::Modality(*modality);
+    }
+    match wire_type {
+        "text" | "input_text" | "output_text" | "tool_use" | "tool_result" | "tool_calls"
+        | "function_call" | "function" | "thinking" | "thinking_delta" | "redacted_thinking"
+        | "text_delta" | "refusal" => PartKind::Ignored,
+        _ => PartKind::Unsupported,
+    }
+}
+
+/// Whether a body could carry media at all, without parsing it.
+///
+/// A cheap pre-check for the request path: the rewrite needs a full `serde_json` parse, and the
+/// overwhelming majority of requests are text-only. A body with none of the bytes `image`, `audio`
+/// or `video` in it cannot contain any of the spellings in [`MEDIA_TYPES`], so the parse can be
+/// skipped entirely. False positives are harmless — they cost one parse that then finds nothing.
+#[inline]
+pub fn may_carry_media(body: &[u8]) -> bool {
+    [b"image".as_slice(), b"audio", b"video"]
+        .iter()
+        .any(|needle| memchr::memmem::find(body, needle).is_some())
+}
+
+/// Rewrite `model` to the configured default for a modality the chosen model cannot accept.
+///
+/// Returns `Ok(Some(model))` when the body was rewritten, and `Ok(None)` when nothing had to change:
+/// text-only bodies, and bodies whose every modality the chosen model already accepts. `accepts` is
+/// the chosen step's own predicate — `|m| step.accepts_modality(m)` at the call site — so this
+/// function never needs the snapshot, the provider, or the account.
+///
+/// # Multiple modalities
+///
+/// Order matters and is fixed: modalities are considered in canonical [`InputModality`] order
+/// (image, audio, video, pdf, file), so the *first* unsupported one is deterministic for a given
+/// body regardless of part order. Its default supplies the target id, and every other unsupported
+/// modality must agree: either it has the same default, or it has none (which is
+/// [`ModalityError::NoDefault`], naming that key) or a different one (which is
+/// [`ModalityError::ConflictingDefaults`], naming both). One chat completion has one `model` field,
+/// so "send the image here and the audio there" is not expressible, and quietly picking one of the
+/// two would send media to a model whose acceptance the operator never claimed.
+///
+/// # Malformed bodies
+///
+/// A body that is not a JSON object is left untouched (`Ok(None)`): there is no field to rewrite,
+/// and the caller's own validation reports the problem. A body whose inner shapes are unexpected is
+/// handled by [`detect_input_modalities`] the same way — skipped, not rejected.
+pub fn rewrite_model_for_modalities(
+    body: &mut serde_json::Value,
+    accepts: impl Fn(InputModality) -> bool,
+    defaults: &RoutingDefaults,
+) -> std::result::Result<Option<String>, ModalityError> {
+    let carried = detect_input_modalities(body)?;
+    if carried.is_empty() {
+        return Ok(None);
+    }
+    let unsupported: Vec<InputModality> = carried
+        .into_iter()
+        .filter(|modality| !accepts(*modality))
+        .collect();
+    if unsupported.is_empty() {
+        return Ok(None);
+    }
+
+    // The first unsupported modality, in canonical order, decides the target.
+    let first = unsupported[0];
+    let Some(target) = defaults.for_modality(first) else {
+        return Err(ModalityError::NoDefault {
+            modality: first,
+            model: None,
+        });
+    };
+    let target = target.to_owned();
+    for other in &unsupported[1..] {
+        match defaults.for_modality(*other) {
+            None => {
+                return Err(ModalityError::NoDefault {
+                    modality: *other,
+                    model: None,
+                })
+            }
+            Some(id) if id == target => {}
+            Some(id) => {
+                return Err(ModalityError::ConflictingDefaults {
+                    first,
+                    first_model: target,
+                    other: *other,
+                    other_model: id.to_owned(),
+                })
+            }
+        }
+    }
+
+    let serde_json::Value::Object(object) = body else {
+        // Unreachable in practice: media was found inside the object, so the body is one.
+        return Ok(None);
+    };
+    object.insert(
+        "model".to_owned(),
+        serde_json::Value::String(target.clone()),
+    );
+    Ok(Some(target))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +911,159 @@ mod tests {
             Poll::Ready(Some(Ok(frame))) => Some(frame),
             _ => None,
         }
+    }
+
+    fn routing_defaults() -> RoutingDefaults {
+        RoutingDefaults {
+            image: Some("vision/model".into()),
+            audio: Some("audio/model".into()),
+            video: Some("video/model".into()),
+            ..RoutingDefaults::default()
+        }
+    }
+
+    #[test]
+    fn a_text_only_request_does_not_change_its_model() {
+        let mut body = serde_json::json!({
+            "model": "text/model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": {"type": "image"},
+            "tools": [{"type": "function", "function": {"parameters": {"type": "image"}}}]
+        });
+        assert_eq!(
+            rewrite_model_for_modalities(&mut body, |_| false, &routing_defaults()).unwrap(),
+            None
+        );
+        assert_eq!(body["model"], "text/model");
+    }
+
+    #[test]
+    fn an_image_on_a_text_only_model_rewrites_only_the_model() {
+        let mut body = serde_json::json!({
+            "model": "text/model",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": "https://example.invalid/cat.png"}}
+            ]}],
+            "provider_option": {"preserve": true}
+        });
+        let media = body["messages"][0]["content"][1].clone();
+        assert_eq!(
+            rewrite_model_for_modalities(
+                &mut body,
+                |modality| modality == InputModality::Text,
+                &routing_defaults(),
+            )
+            .unwrap()
+            .as_deref(),
+            Some("vision/model")
+        );
+        assert_eq!(body["model"], "vision/model");
+        assert_eq!(body["messages"][0]["content"][1], media);
+        assert_eq!(body["provider_option"]["preserve"], true);
+    }
+
+    #[test]
+    fn an_accepted_image_does_not_rewrite_the_model() {
+        let mut body = serde_json::json!({
+            "model": "vision/model",
+            "messages": [{"role": "user", "content": [{"type": "image", "source": {"data": "AAA"}}]}]
+        });
+        assert_eq!(
+            rewrite_model_for_modalities(
+                &mut body,
+                |modality| modality == InputModality::Image,
+                &routing_defaults(),
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(body["model"], "vision/model");
+    }
+
+    #[test]
+    fn audio_and_video_use_their_matching_defaults() {
+        let defaults = routing_defaults();
+        let mut audio = serde_json::json!({
+            "model": "text/model",
+            "messages": [{"role": "user", "content": [{"type": "input_audio", "input_audio": {}}]}]
+        });
+        let mut video = serde_json::json!({
+            "model": "text/model",
+            "messages": [{"role": "user", "content": [{"type": "video_url", "video_url": {}}]}]
+        });
+        let accepts_text = |modality| modality == InputModality::Text;
+        assert_eq!(
+            rewrite_model_for_modalities(&mut audio, accepts_text, &defaults)
+                .unwrap()
+                .as_deref(),
+            Some("audio/model")
+        );
+        assert_eq!(
+            rewrite_model_for_modalities(&mut video, accepts_text, &defaults)
+                .unwrap()
+                .as_deref(),
+            Some("video/model")
+        );
+    }
+
+    #[test]
+    fn a_missing_modality_default_names_the_setting_and_model() {
+        let mut body = serde_json::json!({
+            "model": "text/model",
+            "messages": [{"role": "user", "content": [{"type": "image"}]}]
+        });
+        let error = rewrite_model_for_modalities(&mut body, |_| false, &RoutingDefaults::default())
+            .unwrap_err()
+            .with_model("commands/default model");
+        let message = error.to_string();
+        assert!(message.contains("commands/default model"), "{message}");
+        assert!(message.contains("routing.defaults.image"), "{message}");
+        assert!(message.contains("does not accept images"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_media_type_names_routing_defaults_and_its_type() {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"type": "video_frame"}]}]
+        });
+        let error = detect_input_modalities(&body).unwrap_err().to_string();
+        assert!(error.contains("routing.defaults"), "{error}");
+        assert!(error.contains("video_frame"), "{error}");
+    }
+
+    #[test]
+    fn multiple_unsupported_modalities_choose_image_first_independent_of_part_order() {
+        let mut body = serde_json::json!({
+            "model": "text/model",
+            "messages": [{"role": "user", "content": [
+                {"type": "video"}, {"type": "audio"}, {"type": "image"}
+            ]}]
+        });
+        let error = rewrite_model_for_modalities(&mut body, |_| false, &RoutingDefaults::default())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ModalityError::NoDefault {
+                modality: InputModality::Image,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn malformed_and_non_content_shapes_are_left_for_the_provider_to_reject() {
+        let mut body = serde_json::json!({
+            "model": "text/model",
+            "messages": "not an array",
+            "input": [{"content": {"type": "image"}}],
+            "metadata": {"type": "video"}
+        });
+        assert_eq!(
+            rewrite_model_for_modalities(&mut body, |_| false, &routing_defaults()).unwrap(),
+            None
+        );
+        assert_eq!(body["model"], "text/model");
     }
 
     #[test]

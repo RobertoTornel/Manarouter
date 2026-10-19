@@ -306,3 +306,102 @@ export function formatWindowLimits(qw) {
   const secs = qw.seconds != null ? ` / ${formatDuration(qw.seconds)}` : '';
   return `${bits.join(' · ')}${secs}${qw.reset_only ? ' (reset only)' : ''}${kind ? ` — ${kind}` : ''}`;
 }
+
+// ---------- quota rendering (Feature 1) ----------
+
+/** The three window families the panel shows, in the order it shows them. */
+export const QUOTA_FAMILIES = ['5h', '1w', '30d'];
+
+/**
+ * How many chunks of `chunks` a remaining fraction paints, and whether the last one is half.
+ *
+ * Rounds HALF UP on the count rather than to the nearest cell: a window with 1% left must still
+ * paint one cell, because a bar that renders completely empty while quota remains reads as
+ * "exhausted" and would stop an operator using the last of it. The half-cell exists so a small
+ * remainder is still distinguishable from a large one.
+ *
+ * Returns `null` — not zero — when no fraction was reported, which is the caller's signal to
+ * render `N/A` instead of an empty bar.
+ */
+export function chunkFill(fraction, chunks) {
+  if (fraction == null || !Number.isFinite(fraction)) return null;
+  const total = Math.max(1, Math.floor(Number(chunks) || 1));
+  const f = Math.min(1, Math.max(0, fraction));
+  if (f <= 0) return { full: 0, half: false };
+  const exact = f * total;
+  const full = Math.floor(exact);
+  const rest = exact - full;
+  if (full === 0) return { full: 0, half: true };
+  // The leftover shows as a half cell once it reaches half a cell. So 40% of 20 (exactly 8) is
+  // eight cells, 42.5% (8.5) is eight and a half, and anything below half a cell rounds down
+  // rather than painting a sliver as a whole cell.
+  return { full, half: rest >= 0.5 };
+}
+
+/** `96.4%` — one decimal, because whole percents hide a 0.4% that matters near exhaustion. */
+export function formatPercent(pct) {
+  if (pct == null || !Number.isFinite(pct)) return 'N/A';
+  return `${pct.toFixed(1)}%`;
+}
+
+/** `in 2 h 15 m`, `in 40 s`, or `reset time unknown`. Never invents a time. */
+export function formatResetIn(resetAtMs, now = Date.now()) {
+  if (resetAtMs == null || !Number.isFinite(resetAtMs)) return 'reset time unknown';
+  const secs = Math.round((resetAtMs - now) / 1000);
+  if (secs <= 0) return 'resets now';
+  return `resets in ${formatDuration(secs)}`;
+}
+
+/**
+ * A cached quota snapshot's age, honestly phrased. `never fetched` is a different state from
+ * `fetched just now`, and a missing timestamp stays unknown rather than being replaced with now.
+ */
+export function formatQuotaAge(fetchedAt, now = Date.now()) {
+  if (fetchedAt === null || fetchedAt === undefined || fetchedAt === '') return 'Never fetched';
+  const age = formatAge(fetchedAt, now);
+  if (age === 'unknown') return 'Fetch time unknown';
+  return `Fetched ${age}`;
+}
+
+/**
+ * Return an honest rendering model for one provider quota window.
+ *
+ * `fraction_reported` is authoritative: its false/missing state means the numeric zeroes are
+ * sentinels, not a confirmed empty quota. The caller can render `N/A` without guessing.
+ */
+export function formatQuotaUsage(quota, { mode = 'chunks', chunks = 20 } = {}) {
+  if (quota?.fraction_reported !== true) return { kind: 'unavailable' };
+  if (quota?.unlimited === true) return { kind: 'unlimited' };
+
+  let percent;
+  if (Number.isFinite(quota.remaining_percentage) && quota.total > 0) {
+    percent = Math.min(100, Math.max(0, quota.remaining_percentage));
+  } else if (Number.isFinite(quota.remaining) && Number.isFinite(quota.total) && quota.total > 0) {
+    percent = Math.min(100, Math.max(0, (quota.remaining / quota.total) * 100));
+  } else {
+    return { kind: 'unavailable' };
+  }
+
+  const remainingFraction = percent / 100;
+  if (mode === 'percentage') {
+    return {
+      kind: 'percentage',
+      label: formatPercent(percent),
+      remainingPercent: percent,
+      usedPercent: 100 - percent,
+    };
+  }
+
+  const total = Math.max(1, Math.floor(Number(chunks) || 1));
+  const fill = chunkFill(remainingFraction, total);
+  const used = Math.max(0, total - fill.full - (fill.half ? 1 : 0));
+  return {
+    kind: 'chunks',
+    total,
+    remaining: fill.full,
+    half: fill.half,
+    used,
+    remainingPercent: percent,
+    usedPercent: 100 - percent,
+  };
+}

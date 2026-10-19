@@ -106,15 +106,16 @@ It is the wrong choice for steps that are *not* equivalent. Rotation means a req
 gotten the better model gets the worse one on purpose, so a round-robin list of a strong model and a
 weak one degrades half the traffic. It also defeats prompt caching: consecutive turns of one
 conversation land on different models, so the upstream cache key changes every turn. If a combo is
-round-robin *and* `affinity` is true, the affinity map wins for the rest of a conversation — the two
-are not contradictory, but the rotation then only happens across conversations, which is usually what
-the operator wanted anyway.
+round-robin *and* `affinity` is true, the intended behaviour is that the affinity map wins for the
+rest of a conversation (§6) — the two are not contradictory, but the rotation then only happens
+across conversations, which is usually what the operator wanted anyway.
 
 ### `reset-aware-priority`
 
 Priority order, with one modification: a step whose accounts are all unavailable is **demoted below
-every healthy step** rather than removed, and restored automatically by a timer when its earliest
-known reset passes.
+every healthy step** rather than removed, and restored automatically once its earliest known reset
+passes. The demotion is recomputed on each selection from the step's reset time — there is no
+background timer.
 
 The rollup is per step but the state is per account: a step is demoted only when *every* account
 backing it is unavailable. If a provider has three keys and one is throttled, the step keeps its
@@ -131,9 +132,12 @@ It depends on reset information existing. With no quota signals and no observed 
 every step looks healthy and the strategy degrades to plain `priority`. It is not a substitute for
 configuring quota tracking.
 
-> **Status.** All three values compile into the snapshot and are covered by tests. The round-robin
-> counter and the reset-aware demotion loop execute in the relay and are in progress; the strategy
-> enum itself is finished. See [overview](00-overview.md) §7 for the live status table.
+> **Status.** All three values compile into the snapshot and are covered by tests. `priority`,
+> `round-robin` and `reset-aware-priority` are executed by the relay: the round-robin cursor is a
+> relaxed atomic in the relay's own `RouteTable`, and reset-aware demotion is computed at selection
+> time from the reset time rather than by a background loop. Concurrent hedging is not yet executed —
+> see [the hedged race](07-hedged-race.md). See [overview](00-overview.md) §7 for the live status
+> table.
 
 ---
 
@@ -217,6 +221,10 @@ Retries and hedging compose. A hedge dispatches several steps at once; the retry
 the attempt that is committed to answering, following the combo's own rules. A losing participant
 that is cancelled before its first byte costs nothing to abandon and does not consume a retry.
 
+> **Status.** `max_retries` and `retry_delay_ms` are compiled into the plan and validated, but the
+> relay's request loop does not yet run the retry pass: a failed step currently falls straight through
+> to the next step. The composition with a hedge is part of the same unwired path.
+
 ---
 
 ## 6. `affinity`
@@ -252,8 +260,12 @@ Turn `affinity` off when stickiness actively hurts:
   conversation boundaries.
 - **Benchmarking.** To measure each step of a combo fairly, every request must re-run the strategy.
 
-> **Status.** `affinity` is in the schema and compiled into the plan; the relay-side LRU is in
-> progress. [The hedged race](07-hedged-race.md) §8 has the full rationale.
+> **Status.** `affinity` is in the schema and compiled into the plan, but the relay does not read it:
+> nothing derives the `x-manarouter-session` key and there is no relay-side LRU, so the per-conversation
+> stickiness described in this section is **not implemented**. What the relay does implement is a
+> different, narrower mechanism — sticky-success — described in
+> [the hedged race](07-hedged-race.md) §8: a combo-wide preference remembered in-process for a
+> `priority` combo, not a session-keyed pin per conversation.
 
 ---
 
@@ -283,6 +295,11 @@ Choose `terminate` when the client is strict about a single, contiguous stream �
 unrecognised SSE event as a protocol error — or when a stitched answer is worse than no answer, as
 with structured output. Otherwise `restart` is the better default: it converts a mid-stream provider
 failure into a completed request.
+
+> **Status.** `midstream_policy` is compiled into the plan and accepted by `mr combo add
+> --midstream-policy`, but nothing in the relay reads it. A step that dies after bytes are on the wire
+> currently ends the client stream as-is: there is no second step, no `manarouter.retry` boundary, and
+> no tool-call guard. The policy above is the design, not live behaviour.
 
 ---
 
@@ -327,13 +344,16 @@ is still callable by either of its identifiers; `hidden` only keeps it out of pa
 ## 9. Changing a combo requires a recompile
 
 Because the relay only ever reads a compiled `ComboPlan`, editing `config.json` does not change what
-the router does until the conductor compiles a new snapshot and swaps it in. This is the direct cost
-of having zero interpretation on the request path, and it is the reason a combo edit is a two-step
-operation: save the config, then let the conductor republish.
+the router does until the configuration is recompiled and the new table swapped in. This is the direct
+cost of having zero interpretation on the request path. Saving through the panel or the CLI is a
+two-step operation — save the config, then republish — but the relay also polls `config.json` itself
+(every two seconds) and recompiles on an external edit, so a hand-edit becomes live without the
+conductor.
 
 The trigger is a change to `Config::routing_digest()`. For a combo it hashes `id` and
 `Combo::signature()`, which covers the name, strategy, hedge enable/window/count/participants,
-`midstream_policy`, `max_retries`, `retry_delay_ms`, and each step's provider, model and enabled flag.
+`sticky_success_window_secs`, `midstream_policy`, `max_retries`, `retry_delay_ms`, and each step's
+provider, model and enabled flag.
 Everything the compiler does not read is deliberately excluded, so a cosmetic edit — a `label`, a
 `note`, a `sort_order` — does not republish the table. See [the routing snapshot](04-routing-snapshot.md)
 §12 for the full list and the reason it is hashed field by field.

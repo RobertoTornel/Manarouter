@@ -917,6 +917,7 @@ mod tests {
                 allow_models: vec!["Brain".into()],
                 allow_routes: vec![],
                 limit_requests: 0,
+                limits: Default::default(),
                 note: None,
             });
             cfg.save_default().unwrap();

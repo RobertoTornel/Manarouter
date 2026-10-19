@@ -30,9 +30,11 @@ pub mod ids;
 pub mod model;
 pub mod oauth;
 pub mod published;
+pub mod quota;
 pub mod secret;
 pub mod snapshot;
 pub mod store;
+pub mod usage;
 
 pub use error::{Error, Result};
 
@@ -84,9 +86,32 @@ pub const SNAPSHOT_MAGIC: [u8; 8] = *b"MROUTES1";
 /// Bumped whenever the compiled layout changes. The relay keeps serving its previous snapshot
 /// rather than loading one it does not understand, so a version skew degrades to stale routing
 /// instead of to a crash.
-pub const SNAPSHOT_VERSION: u32 = 2;
+///
+/// Version 3 added the per-step reasoning-level fields (`levels`, `default_level`,
+/// `reasoning_json`), `input_modalities` and `pricing`, plus the proxy pool and the per-key limit
+/// table. A version-2 snapshot decodes *without* those, so this bump is what stops an old file
+/// being read as though it carried them.
+///
+/// Version 4 completed Feature 3: a step's level metadata is now **encoded**, and every lookup
+/// entry carries the level it resolves to. Version 3 declared the fields but never wrote them, so
+/// a v3 frame would decode with empty level tables.
+///
+/// Version 5 adds compiled client-key limits and proxy assignments/settings to the payload; a v4
+/// frame has neither, and cannot safely stand in for a complete routing plan.
+///
+/// Version 6 adds modality fallback defaults to the compiled routing plan. A v5 frame has no such
+/// defaults, so it must be rejected and rebuilt from authored config.
+pub const SNAPSHOT_VERSION: u32 = 6;
 
 /// Current on-disk database schema version.
 ///
-/// Migrations are numbered and applied in order; see `migrations/` and [`store`].
-pub const SCHEMA_VERSION: u32 = 1;
+/// Migrations are numbered and applied in order, but they live *in code* — the ordered `MIGRATIONS`
+/// table in [`store`], applied through `PRAGMA user_version`. The `migrations/` directory at the
+/// repository root is not used; there are no `.sql` files to apply.
+///
+/// Version 3 added the `usage_tokens` side table (cached tokens, cache-write tokens, and the
+/// generation window that tokens-per-second divides by). The store currently has three migrations;
+/// per-key rolling admission is not yet implemented. Keep this version aligned with `MIGRATIONS`
+/// until the complete, tested admission migration is added. The compile-time assert below enforces
+/// that invariant.
+pub const SCHEMA_VERSION: u32 = 3;

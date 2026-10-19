@@ -15,7 +15,7 @@ of adding a fourth platform is `docs/14-oauth-adding-a-platform.md`.
 
 ## Current implementation scope
 
-The management API and panel currently offer interactive OAuth connection for **OpenAI Codex (browser loopback/PKCE)** and **GitHub Copilot (device code)**. Token sets are stored in the encrypted vault; non-secret credential metadata is in the conductor's SQLite store. The relay opens the same configured SQLite store and vault, resolves the metadata reference to its vault key, and uses the platform refresher before inference. Antigravity, Cline, xAI OAuth, and import-only or cookie/session credentials are not exposed as working login flows. No live login was exercised as part of implementation; run the automated tests before relying on the behavior.
+The management API and panel currently offer interactive OAuth connection for **OpenAI Codex** (browser loopback/PKCE, with an OpenAI device-code fallback), **GitHub Copilot** (device code) and **Google Antigravity** (loopback authorization code; the reverse-engineered T2 IDE client metadata is unverified, and paid-tier onboarding needs an explicit project). Those are exactly the three registered platforms — `openai-codex`, `github-copilot` and `antigravity` in `crates/mr-core/src/oauth/mod.rs`. Token sets are stored in the encrypted vault; non-secret credential metadata is in the conductor's SQLite store. The relay opens the same configured SQLite store and vault, resolves the metadata reference to its vault key, and uses the platform refresher before inference. Cline, xAI OAuth, and import-only or cookie/session credentials are not exposed as working login flows. No live login was exercised as part of implementation; run the automated tests before relying on the behavior.
 
 These OAuth operations live in the **conductor control plane**; they do not add endpoints to the inference relay. The relay only consumes the resulting account credential while serving inference.
 
@@ -75,8 +75,9 @@ loopback redirect.
 
 ### The device flow
 
-Copilot is the exception, and it is worth being precise about why, because "Copilot uses the device
-flow" is otherwise an arbitrary-looking fact.
+Copilot is the platform whose *default* is the device flow — Codex offers the same fallback on request
+(see `docs/11-oauth-codex.md` §2a) — and it is worth being precise about why, because "Copilot uses the
+device flow" is otherwise an arbitrary-looking fact.
 
 The device flow inverts the direction of the redirect. The router calls
 `POST https://github.com/login/device/code` and receives a short `user_code` and a
@@ -105,39 +106,46 @@ The design rule is that adding a platform is **implementing a trait**, not editi
 `match` in the login flow would put one into the panel. Either way, the fourth platform touches code
 that has nothing to do with it.
 
-> **Status.** The `OAuthPlatform` trait is the contract the conductor is written against. The module
-> does not exist in the tree at the time of writing, so the signatures below are the designed
-> interface rather than a quotation from shipped code. They are stated in full because
-> `docs/14-oauth-adding-a-platform.md` implements them, and that document is only usable if this one
-> fixes the shape.
+> **Status.** The `OAuthPlatform` trait is implemented in `crates/mr-core/src/oauth/mod.rs`, with the
+> platform implementations in `codex.rs`, `copilot.rs` and `antigravity.rs` beside it and the static
+> registry in `PLATFORMS`/`platforms()`. The table below names the implemented methods; it is not a
+> design sketch.
 
 Every item below is something a platform knows and the shared machinery does not:
 
 | Item | Responsibility |
 |---|---|
-| `id() -> &'static str` | the stable platform id, matching `oauth_platform` in `catalog/providers.toml` and the `platform` field of `AuthKind::OAuth` in `crates/mr-core/src/dialect.rs` |
-| `flow() -> OAuthFlow` | `AuthorizationCode` or `DeviceCode`; tells the conductor which half of the machinery to drive |
-| `redirect() -> Option<RedirectSpec>` | host, port policy (fixed or ephemeral) and path — the string must match what the provider registered |
-| `authorize_url(&AuthorizeRequest) -> Result<String>` | builds the authorize URL, including PKCE, `state` and platform-specific extra parameters |
-| `device_start` / `device_poll` | the device-flow pair: request a code, then poll it once and interpret `authorization_pending` / `slow_down` |
-| `exchange(&oauth::Http, code, verifier, redirect) -> Result<Credential>` | the code-for-token exchange, including its encoding (form or JSON) |
-| `refresh(&oauth::Http, &Credential) -> Result<Credential>` | the refresh call, which may use a **different encoding and the same URL** as the exchange |
-| `apply(&Credential, Option<&Session>) -> Result<Vec<(HeaderName, HeaderValue)>>` | the header transformation: turn a credential into the exact headers an inference request must carry |
-| `identity(&Credential) -> Result<AccountIdentity>` | extract the stable account identity used to key multi-account storage |
-| `mint(&oauth::Http, &Credential) -> Result<Option<Session>>` | optional second exchange for a short-lived inference token (Copilot); the default returns `None` |
+| `id()`, `label()`, `description()` | the stable platform id, matching `oauth_platform` in `catalog/providers.toml` and the `platform` field of `AuthKind::OAuth` in `crates/mr-core/src/dialect.rs`, plus the panel's label and one-line description |
+| `begins_with_loopback() -> bool` | the **default** flow: `true` for a loopback redirect, `false` for device code |
+| `supports_device_flow() -> bool` | whether the platform can *also* be logged in with a device code; defaults to `!begins_with_loopback()`, and Codex overrides it to `true` |
+| `redirect_ports() -> RedirectPorts` | host, primary/fallback port and path — the string must match what the provider registered |
+| `requires_pkce() -> bool` / `validates_redirect_port() -> bool` | whether the flow binds a PKCE `S256` challenge, and whether the bound port must be one of the registered ports |
+| `authorization_url(state, pkce, port) -> Result<String>` | builds the authorize URL, including PKCE, `state` and platform-specific extra parameters |
+| `device_start()` / `device_poll(&DeviceAuthorization)` | the device-flow pair: request a code, then poll it once and interpret `authorization_pending` / `slow_down` |
+| `exchange_code(code, pkce, port) -> Result<TokenSet>` | the code-for-token exchange, including its encoding (form or JSON) |
+| `refresh(refresh_token)` / `refresh_with_context(refresh_token, previous)` | the refresh call, which may use a **different encoding and the same URL** as the exchange |
+| `complete_login(&mut TokenSet)` / `complete_login_with(&mut TokenSet, http)` | fetch provider-owned post-login metadata before credentials are persisted (the `_with` form is the deterministic test seam) |
+| `apply_credential(&TokenSet) -> Vec<(HeaderName, HeaderValue)>` | the header transformation: turn a credential into the exact headers an inference request must carry |
+| `account_identity(&TokenSet) -> Result<AccountIdentity>` | resolve the credential to the stable account identity used to key multi-account storage |
+| `fingerprint_headers() -> &'static [(&'static str, &'static str)]` | the catalogue-matching fingerprint header list |
+| `refresh_lead() -> Duration` | how early before expiry the credential is refreshed |
 
 Two design points matter more than the individual signatures.
 
-**The trait is object-safe and lives in a registry.** The conductor holds a
-`&'static [&'static dyn OAuthPlatform]` and looks a platform up by id. Nothing in the relay
-references it at all — the relay receives already-resolved headers in the compiled snapshot, so a
-platform implementation is control-plane code and never request-path code.
+**The trait is object-safe and lives in a registry.** `crates/mr-core/src/oauth/mod.rs` exposes
+`PLATFORMS` and looks a platform up by id (`platforms()`/`platform()`). Both processes use it: the
+conductor drives login, and the relay holds a `Refresher` per platform and calls
+`platform(..).apply_credential(&tokens)` before an inference call. The lookup is a linear scan on an
+id that came from the credential's configured platform, so no provider knowledge enters the routing
+decision itself.
 
-**`apply` returns headers, not a mutated request.** The header transformation is where a platform
-asserts its fingerprint: Codex contributes `chatgpt-account-id` and `originator`, Copilot contributes
-`Editor-Version` and `Copilot-Integration-Id`. Returning an owned header list keeps the dialect
-translator free of provider knowledge, and makes the fingerprint a testable value rather than a side
-effect buried in a request builder.
+**`apply_credential` returns headers, not a mutated request.** The header transformation is where a
+platform asserts its fingerprint: Codex contributes `chatgpt-account-id` and `originator`, Copilot
+contributes its static `Copilot-Integration-Id`/`editor-plugin-version`/`user-agent` set plus the
+session-token bearer. `Editor-Version` is deliberately **not** here — its value is the template
+`vscode/${vs_code_version}`, which only the catalogue can fill, so the catalogue owns it. Returning an
+owned header list keeps the dialect translator free of provider knowledge, and makes the fingerprint a
+testable value rather than a side effect buried in a request builder.
 
 ---
 
@@ -197,6 +205,7 @@ A refresh window is how far *before* expiry the credential is refreshed.
 |---|---|---|
 | Codex | 5 minutes (`CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES = 5`) | primary (`openai/codex`) |
 | Copilot | `refresh_in` from the mint response, ~1500 s; the language server sets `expires_at = now + refresh_in + 60` and VS Code refreshes at `expires_at - 300` | primary/T2 |
+| Antigravity | 60 seconds | T2 — the reverse-engineered IDE client refreshes within 60 s of expiry |
 | Claude Code | **4 hours** | **UNCERTAIN** — not in the research dossier; see below |
 
 > **UNCERTAIN.** The 4-hour Claude Code figure is stated in this project's brief but does not appear
@@ -245,7 +254,7 @@ An OAuth credential lives in the **vault**, addressed by id, and nowhere else.
 |---|---|
 | Vault, id `provider/<provider-id>/account/<account-id>` | the credential: access token, refresh token, expiry, granted scopes, account identity |
 | `config.json` | a reference to that id, never a value |
-| `run.db` (`oauth_credential` table, **intended design**) | platform, account label, scopes, expiry — **never** the access or refresh token |
+| `state.sqlite` (`oauth_credential` table) | platform, account label, scopes, expiry — **never** the access or refresh token |
 
 The vault id convention comes from `crates/mr-core/src/secret.rs`
 (`account_secret_id(provider_id, account_id)`), which is the same convention `docs/21-security.md` §3
@@ -258,11 +267,10 @@ is **not** stored is anything derived and cheap to recompute: a Copilot session 
 from the GitHub token on demand and never persisted, because it lives 30 minutes and persisting it
 would only widen the window in which a copy exists.
 
-> **The `oauth_credential` table is not in the tree yet.** `crates/mr-core/src/store.rs` is a stub
-> whose methods return `Error::Store("store not yet implemented")`, and `migrations/` is empty. The
-> table described above is the intended design recorded in `docs/21-security.md` §3. When it is
-> implemented, the constraint to preserve is the one that section states: it holds metadata, and a
-> test reads the raw database bytes and asserts no token appears in them.
+> The table **is** implemented, in `crates/mr-core/src/store.rs` (`MIGRATION_V1` creates
+> `oauth_credential`; the schema is embedded there rather than in a file under `migrations/`). The
+> constraint `docs/21-security.md` §3 states is the one the code enforces: the table holds metadata
+> only, and a test reads the raw database bytes and asserts no token appears in them.
 
 The reason for the split is the threat model, not tidiness. A database file is the artifact most
 likely to end up in a backup and least likely to be encrypted; a credential file is the artifact that
@@ -372,7 +380,7 @@ the order they were added and not a user-chosen label:
 |---|---|---|
 | Codex | `chatgpt_account_id` | the JWT namespace claim `https://api.openai.com/auth` |
 | Copilot | the GitHub account login | the GitHub token, via the `read:user` scope |
-| Antigravity | the Google account identifier | the token's ID claims |
+| Antigravity | the Google account id | `GET https://www.googleapis.com/oauth2/v2/userinfo` (no `openid` scope is requested, so there is no ID token to read) |
 
 Two consequences:
 
@@ -432,12 +440,12 @@ containing it. If you cannot, it is not published, and it does not belong in the
 
 ## See also
 
-- [OpenAI Codex](docs/11-oauth-codex.md) — the login and the ChatGPT inference fingerprint
-- [Google Antigravity](docs/12-oauth-antigravity.md) — the two client tiers and Cloud Code onboarding
-- [GitHub Copilot](docs/13-oauth-copilot.md) — the device flow and its mandatory headers
-- [Adding a platform](docs/14-oauth-adding-a-platform.md) — the trait implemented end to end
-- [Security and credentials](docs/21-security.md) — §5 the subscription ToS posture, §6 the constants
-- [Latency engineering](docs/16-latency-engineering.md) — why none of this is on the request path
-- [published.rs](crates/mr-core/src/published.rs) — the assembled constants and push-protection reasoning
-- [secret.rs](crates/mr-core/src/secret.rs) — the vault and the credential-id convention
-- [dialect.rs](crates/mr-core/src/dialect.rs) — `AuthKind::OAuth { platform }`, `AccountState::AuthFailed`
+- [OpenAI Codex](11-oauth-codex.md) — the login and the ChatGPT inference fingerprint
+- [Google Antigravity](12-oauth-antigravity.md) — the two client tiers and Cloud Code onboarding
+- [GitHub Copilot](13-oauth-copilot.md) — the device flow and its mandatory headers
+- [Adding a platform](14-oauth-adding-a-platform.md) — the trait implemented end to end
+- [Security and credentials](21-security.md) — §5 the subscription ToS posture, §6 the constants
+- [Latency engineering](16-latency-engineering.md) — the latency budget the credential path must fit
+- [published.rs](../crates/mr-core/src/published.rs) — the assembled constants and push-protection reasoning
+- [secret.rs](../crates/mr-core/src/secret.rs) — the vault and the credential-id convention
+- [dialect.rs](../crates/mr-core/src/dialect.rs) — `AuthKind::OAuth { platform }`, `AccountState::AuthFailed`

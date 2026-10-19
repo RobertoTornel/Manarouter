@@ -98,13 +98,232 @@ export function chip(text, cls = 'chip-neutral', title = null) {
   return h('span', { class: `chip ${cls}`, title, text });
 }
 
-/** Labelled form field: <div class=field><label for>..</label><input>…</div>. */
-export function field(labelText, inputEl, { hint = null, id = null } = {}) {
+/* ---------- the help affordance (I2) ---------- */
+
+// The bubble is a CSS ::after on the dot, with position:fixed. Fixed-position descendants escape
+// the overflow boxes (#main, .drawer-body, .dialog-body, .table-wrap) that would clip an absolute
+// popup; app.css has no transformed ancestor that would establish a nearer containing block.
+// JavaScript measures the text in an invisible, style-matched node and sets viewport coordinates
+// on the dot as --tip-top / --tip-left. The pseudo-element owns visibility and content: hover and
+// :focus-visible both reveal attr(data-tip), with no extra event-state styling. Clamping the
+// coordinates and max-width keep the bubble readable at narrow widths and in either direction.
+//
+// The text is duplicated on purpose: `data-tip` feeds the CSS bubble, while a `.sr-only` span is
+// what the control's aria-describedby points at, so a screen reader hears the explanation with the
+// setting and never as a detached "?" button.
+let measureEl = null;
+let tipOwner = null;
+let helpEventsReady = false;
+
+function ensureHelpEvents() {
+  if (helpEventsReady) return;
+  helpEventsReady = true;
+  // Delegated from the document, so a .help-dot built anywhere gets the same behaviour, and a
+  // re-render that throws the dot away leaves nothing to clean up here.
+  const dotFor = (e) => (e.target instanceof Element ? e.target.closest('.help-dot') : null);
+  document.addEventListener('pointerover', (e) => { const d = dotFor(e); if (d) positionTip(d); });
+  document.addEventListener('focusin', (e) => { const d = dotFor(e); if (d) positionTip(d); });
+  document.addEventListener('focusout', (e) => {
+    const d = e.target instanceof Element ? e.target.closest('.help-dot') : null;
+    if (d && !d.matches(':hover')) tipOwner = null;
+  });
+  document.addEventListener('pointerout', (e) => {
+    const d = dotFor(e);
+    // A focused dot keeps its coordinates after the pointer leaves, for keyboard users.
+    if (d && !d.matches(':focus-visible')) tipOwner = null;
+  });
+  // Keep a visible bubble attached to its dot during scroll/resize rather than letting it drift.
+  document.addEventListener('scroll', () => { if (tipOwner) positionTip(tipOwner); }, true);
+  window.addEventListener('resize', () => { if (tipOwner) positionTip(tipOwner); });
+}
+
+function positionTip(dot) {
+  const text = dot.getAttribute('data-tip');
+  if (!text) return;
+  if (!measureEl) {
+    measureEl = h('div', { class: 'tip-measure', 'aria-hidden': 'true' });
+    document.body.append(measureEl);
+  }
+  measureEl.textContent = text;
+  measureEl.style.direction = getComputedStyle(dot).direction;
+  const { width: w, height: hgt } = measureEl.getBoundingClientRect();
+  const r = dot.getBoundingClientRect();
+  const vw = document.documentElement.clientWidth;
+  const vh = document.documentElement.clientHeight;
+  const gap = 6;
+  const margin = 8;
+  // Below the dot unless that would push the bubble out of the viewport, then above it, then
+  // pinned inside the viewport — a dot in the last 40px of a phone screen still shows its text.
+  let top = r.bottom + gap;
+  if (top + hgt > vh - margin) {
+    const above = r.top - gap - hgt;
+    top = above >= margin ? above : Math.max(margin, vh - margin - hgt);
+  }
+  // Grows with the reading direction, from the dot's inline start edge: in RTL the bubble's right
+  // edge lines up with the dot's right edge instead of starting at its left. Clamped either way.
+  const rtl = getComputedStyle(dot).direction === 'rtl';
+  let left = rtl ? r.right - w : r.left;
+  if (left + w > vw - margin) left = vw - margin - w;
+  if (left < margin) left = margin;
+  dot.style.setProperty('--tip-top', `${Math.round(top)}px`);
+  dot.style.setProperty('--tip-left', `${Math.round(left)}px`);
+  dot.dataset.tipSide = top < r.top ? 'above' : 'below';
+  tipOwner = dot;
+  ensureHelpEvents();
+}
+
+/** Merge a description id into the control's aria-describedby, keeping any id already there. */
+function describeInput(input, helpId) {
+  const prev = input.getAttribute('aria-describedby');
+  input.setAttribute('aria-describedby', prev ? `${prev} ${helpId}` : helpId);
+}
+
+/**
+ * The single place the "?" affordance is built — `field()` and `toggle()` both come through here,
+ * so the tooltip, the id wiring and the screen-reader text can never drift apart between them.
+ *
+ * It returns the pieces rather than a finished box because the two callers place the dot
+ * differently (beside a block label, beside a row label); whoever calls `describeInput()` owns
+ * pointing the control at `desc`. Returns null when there is no help text.
+ */
+function helpAffordance(labelText, help) {
+  if (!help) return null;
+  ensureHelpEvents();
+  const id = `help-${++uid}`;
+  const btn = h('button', {
+    class: 'help-dot',
+    type: 'button',
+    'aria-label': `Help: ${labelText}`,
+    'aria-describedby': id,
+    'data-tip': help,
+  }, '?');
+  const desc = h('span', { class: 'sr-only', id }, help);
+  return { btn, desc, id };
+}
+
+/**
+ * Labelled form field: <div class=field><label for>..</label><input>…</div>, plus the optional
+ * "?" help dot (I2) and a hint under the control.
+ *
+ * The dot is a `<button>`, not a `<span title>`: a tooltip that only shows on mouse hover is
+ * unreachable by keyboard, and the whole point of the text is that the setting was not
+ * self-explanatory. It is a sibling of the `<label>` rather than a child: `<button>` is labelable
+ * content, and a `<label>` may not contain labelable descendants other than its own control.
+ */
+export function field(labelText, inputEl, { hint = null, id = null, help = null } = {}) {
   const inputId = id ?? `f-${++uid}`;
   inputEl.id = inputId;
-  const box = h('div', { class: 'field' }, h('label', { for: inputId }, labelText), inputEl);
+  const label = h('label', { for: inputId }, labelText);
+  const aff = helpAffordance(labelText, help);
+  const box = h('div', { class: 'field' }, aff ? h('div', { class: 'label-line' }, label, aff.btn) : label, inputEl);
+  if (aff) {
+    describeInput(inputEl, aff.id);
+    box.append(aff.desc);
+  }
   if (hint) box.append(h('p', { class: 'hint' }, hint));
   return box;
+}
+
+/**
+ * Checkbox row whose visible text is a real `<label for>` — clicking the words ticks the box (I2).
+ *
+ * Returns `{ input, row }`: `input` is what the view reads/writes `.checked` on, `row` is the
+ * element it appends (the row already owns the label, the help dot and the optional hint).
+ * `onChange` is attached here so the caller keeps no second reference to the input just for it.
+ *
+ * The help dot sits beside the label, not inside it, for the same reason as in `field()`: the
+ * label is a click target, and a `<button>` is both labelable content and a tap target of its own.
+ * It keeps the same `data-tip` + `.sr-only` + aria-describedby wiring as `field()`.
+ */
+export function toggle(labelText, {
+  checked = false,
+  id = null,
+  help = null,
+  hint = null,
+  disabled = false,
+  onChange = null,
+} = {}) {
+  const inputId = id ?? `t-${++uid}`;
+  const input = h('input', { type: 'checkbox', id: inputId });
+  input.checked = Boolean(checked);
+  if (disabled) input.disabled = true;
+  if (onChange) input.addEventListener('change', onChange);
+  const aff = helpAffordance(labelText, help);
+  const row = h('div', { class: 'check-row' }, input, h('label', { for: inputId }, labelText));
+  if (aff) row.className += ' has-help';
+  if (aff) {
+    describeInput(input, aff.id);
+    row.append(aff.btn, aff.desc);
+  }
+  if (hint) row.append(h('p', { class: 'hint' }, hint));
+  return { input, row };
+}
+
+/**
+ * Copy `text` to the clipboard and report honestly whether it worked.
+ *
+ * The Clipboard API needs a secure context and can be refused by permission policy; when it is
+ * unavailable the fallback is the old selection trick. Returning a boolean rather than throwing
+ * is deliberate: every caller here is a UI affordance whose only job is to tell the operator
+ * "copied" or "copy it yourself", and neither outcome is an error worth a dialog.
+ */
+export async function copyText(text) {
+  const value = String(text ?? '');
+  if (!value) return false;
+  try {
+    await navigator.clipboard.writeText(value);
+    return true;
+  } catch {
+    // Fallback: a hidden textarea, selected and copied with the legacy command.
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = value;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '-1000px';
+      ta.style.opacity = '0';
+      document.body.append(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/**
+ * A button that copies `text` when pressed, flashing "Copied" on success (I13/Quick Connect).
+ *
+ * `label` is the resting text; the button is `aria-live`-free on purpose — the toast or the
+ * button's own text change is the feedback, and a live region that fires on every copy would be
+ * noise for a screen-reader user.
+ */
+export function copyButton(text, { label = 'Copy', title = null, className = 'btn btn-sm' } = {}) {
+  const btn = h('button', { class: className, type: 'button', title }, label);
+  btn.addEventListener('click', async () => {
+    const ok = await copyText(text);
+    btn.textContent = ok ? 'Copied' : 'Copy failed';
+    btn.classList.toggle('copy-ok', ok);
+    setTimeout(() => {
+      btn.textContent = label;
+      btn.classList.remove('copy-ok');
+    }, 1600);
+  });
+  return btn;
+}
+
+/** Copy a value read at click time, for text that can change while the button is on screen. */
+export function copyFrom(read, { label = 'Copy', title = null, className = 'btn btn-sm' } = {}) {
+  const btn = h('button', { class: className, type: 'button', title }, label);
+  btn.addEventListener('click', async () => {
+    const ok = await copyText(read());
+    btn.textContent = ok ? 'Copied' : 'Copy failed';
+    btn.classList.toggle('copy-ok', ok);
+    setTimeout(() => { btn.textContent = label; btn.classList.remove('copy-ok'); }, 1600);
+  });
+  return btn;
 }
 
 /**

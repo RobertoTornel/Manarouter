@@ -14,7 +14,7 @@
 
 import { api } from './api.js';
 import {
-  h, icon, chip, field, emptyState, errorBlock, applyFieldErrors, clearFieldErrors,
+  h, icon, chip, field, toggle, emptyState, errorBlock, applyFieldErrors, clearFieldErrors,
 } from './dom.js';
 import {
   extractList, stepLabel, moveStep, remapParticipants, remapIndex,
@@ -41,35 +41,42 @@ const FAIL_MODES = [
 
 export async function renderCombos(mount, ctx, selectedId) {
   let combos = [];
+  let providers = [];
 
   const listEl = h('ul', { class: 'combo-list' });
-  const newBtn = h('button', { class: 'btn btn-primary btn-sm', type: 'button' }, 'New combo');
-  const left = h('div', { class: 'card' },
-    h('h2', {}, 'Combos'),
-    listEl,
-    h('div', { style: 'margin-top:10px;' }, newBtn));
+  const newBtn = h('button', { class: 'btn btn-primary', type: 'button' }, 'New combo');
+  const count = h('span', { class: 'count' });
+  const formSlot = h('div');
+  const left = h('div', { class: 'card' }, h('h2', {}, 'Combos'), listEl);
   const right = h('div', { class: 'card' });
-  mount.replaceChildren(h('div', { class: 'combo-layout' }, left, right));
+  mount.replaceChildren(
+    h('div', { class: 'toolbar' }, newBtn, h('span', { class: 'spacer' }), count),
+    formSlot,
+    h('div', { class: 'combo-layout' }, left, right),
+  );
 
-  newBtn.addEventListener('click', () => {
-    // Navigating re-renders the whole view with the editor in "new" mode; the URL stays honest.
-    ctx.navigate('#/combos/_new');
-  });
+  newBtn.addEventListener('click', () => renderEditor(null, formSlot));
 
   try {
+    // list_combos returns { combos: config.combos }; each ComboStep is only provider/model/policy
+    // data. Reasoning capabilities belong to the provider's ModelEntry, so join them below rather
+    // than pretending GET /api/combos contains compiled snapshot levels.
     combos = extractList(await api.get('/api/combos'), 'combos');
   } catch (err) {
     right.replaceChildren(errorBlock(err));
     return;
   }
+  try { providers = await ctx.loadProviders(); } catch { /* combos remain usable without metadata */ }
 
   renderList();
+  count.textContent = `${combos.length} combo${combos.length === 1 ? '' : 's'}`;
 
   if (selectedId === '_new') {
-    renderEditor(null);
+    renderEditor(null, formSlot);
+    right.replaceChildren(emptyState('Create a combo.', 'Add a name and one or more steps to get started.'));
   } else if (selectedId) {
     const found = combos.find((c) => c.id === selectedId);
-    if (found) renderEditor(found);
+    if (found) renderSummary(right, found);
     else right.replaceChildren(emptyState('Combo not found.', 'It may have been deleted.'));
   } else {
     right.replaceChildren(combos.length
@@ -83,11 +90,13 @@ export async function renderCombos(mount, ctx, selectedId) {
   function renderList() {
     listEl.replaceChildren();
     for (const c of combos) {
+      const offeredNames = comboLevels(c.steps ?? [], providers).map((level) => `${c.name || c.id}-${level}`);
       const btn = h('button', { type: 'button', 'aria-current': c.id === selectedId ? 'true' : null },
         h('div', { class: 'cname' }, c.name || c.id),
         h('div', { class: 'cmeta' },
           `${(c.steps ?? []).length} step${(c.steps ?? []).length === 1 ? '' : 's'}`,
           chip(c.strategy ?? 'priority'),
+          ...offeredNames.map((name) => chip(name, 'chip-neutral', 'Level-qualified combo name')),
           c.hedge?.enabled ? chip('hedged', 'chip-pink', 'hedged race enabled') : null,
           c.enabled === false ? chip('off') : null));
       btn.addEventListener('click', () => ctx.navigate(`#/combos/${encodeURIComponent(c.id)}`));
@@ -95,9 +104,72 @@ export async function renderCombos(mount, ctx, selectedId) {
     }
   }
 
+  // ------------------------------------------------------------------ detail drawer and summary
+
+  function closeDrawer() {
+    mount.querySelector('.drawer')?.remove();
+  }
+
+  function drawerShell(title) {
+    closeDrawer();
+    const head = h('div', { class: 'drawer-head' },
+      h('h2', {}, title),
+      h('span', { class: 'spacer' }));
+    const body = h('div', { class: 'drawer-body' });
+    const drawer = h('div', { class: 'drawer', role: 'region', 'aria-label': 'Combo detail' }, head, body);
+    drawer.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
+    mount.append(drawer);
+    return { head, body };
+  }
+
+  function openEditorDrawer(saved) {
+    const { head, body } = drawerShell(saved ? `Edit combo ${saved.name || saved.id}` : 'New combo');
+    head.append(h('button', {
+      class: 'icon-btn', type: 'button', 'aria-label': 'Close combo editor',
+      onclick: closeDrawer,
+    }, icon('x')));
+    renderEditor(saved, body);
+  }
+
+  function renderSummary(target, combo) {
+    const levels = comboLevels(combo.steps ?? [], providers);
+    const editBtn = h('button', { class: 'btn btn-primary', type: 'button' }, 'Edit combo');
+    editBtn.addEventListener('click', () => openEditorDrawer(combo));
+    target.replaceChildren(
+      h('h2', {}, combo.label || combo.name || combo.id),
+      h('p', { class: 'hint mono' }, `id: ${combo.id}`),
+      h('p', { class: 'hint' }, combo.name || combo.id),
+      h('div', { class: 'cmeta' },
+        chip(`strategy: ${combo.strategy ?? 'priority'}`),
+        combo.hedge?.enabled ? chip('hedged', 'chip-pink', 'hedged race enabled') : null,
+        combo.enabled === false ? chip('off') : chip('enabled', 'chip-green')),
+      h('section', {},
+        h('h3', {}, 'Level-qualified names'),
+        levels.length
+          ? h('div', { class: 'cmeta' }, ...levels.map((level) => chip(`${combo.name || combo.id}-${level}`, 'chip-neutral', `Available level suffix: ${level}`)))
+          : h('p', { class: 'hint' }, 'No reasoning_levels are declared on these model entries. Derived runtime levels are not included in the combo config response.')),
+      h('section', {},
+        h('h3', {}, 'Steps — priority order'),
+        h('ol', { class: 'steps' }, ...(combo.steps ?? []).map((step, i) => {
+          const model = stepModel(step, providers);
+          const levelsForStep = Array.isArray(model?.reasoning_levels) ? model.reasoning_levels : [];
+          const defaultLevel = model?.default_reasoning_level;
+          const offersLevel = defaultLevel && levelsForStep.includes(defaultLevel);
+          const canNameComboTier = !endsInLevelName(combo.name || combo.id);
+          return h('li', { class: 'step-row' },
+            h('span', { class: 'step-pos' }, String(i + 1)),
+            h('span', { class: 'step-ref mono' }, stepLabel(step)),
+            ...levelsForStep.map((level) => chip(String(level), 'chip-neutral', 'Reasoning level offered by this model')),
+            defaultLevel && !offersLevel ? chip(`default ${defaultLevel}`, 'chip-pink', 'Model-specific default reasoning level') : null,
+            step.enabled === false ? chip('off') : null);
+        }))),
+      h('div', { class: 'dialog-actions' }, editBtn),
+    );
+  }
+
   // ------------------------------------------------------------------ editor
 
-  function renderEditor(saved) {
+  function renderEditor(saved, target = right) {
     const isNew = saved === null;
     // Draft is a deep copy: edits are local until Save; Revert re-reads from `combos`.
     const draft = isNew ? newDraft() : JSON.parse(JSON.stringify(saved));
@@ -170,8 +242,8 @@ export async function renderCombos(mount, ctx, selectedId) {
     });
 
     // --- hedge ---
-    const hedgeOn = h('input', { type: 'checkbox' });
-    hedgeOn.checked = Boolean(draft.hedge?.enabled);
+    const hedgeToggle = toggle('Enable the hedged race for this combo', { checked: Boolean(draft.hedge?.enabled) });
+    const hedgeOn = hedgeToggle.input;
     const stickyWindowInput = h('input', { class: 'input', type: 'number', min: '0', max: '604800', value: draft.sticky_success_window_secs });
     const stickyWindowBox = field('Sticky success window (seconds)', stickyWindowInput, { hint: 'Priority combos only; enabled with hedge. Default 1800s (30 minutes). Combo-wide across callers; inactivity refreshes after a successful response. Set 0 to disable.' });
     const hedgeCount = h('input', { class: 'input', type: 'number', min: '2', max: '255', 'data-field': 'count', value: draft.hedge?.count ?? 3 });
@@ -189,8 +261,8 @@ export async function renderCombos(mount, ctx, selectedId) {
     const maxRoundsField = field('Max rounds', maxRounds, { hint: 'Bound for re-run excluding.' });
     const stableField = field('Stable step', stableSel, { hint: 'The on-fail model; need not be a race participant.' });
     failSel.addEventListener('change', () => { draft.wf.mode = failSel.value; renderFailExtras(); updateFailHint(); });
-    const cancelLosers = h('input', { type: 'checkbox' });
-    cancelLosers.checked = draft.hedge?.cancel_losers ?? true;
+    const cancelLosersToggle = toggle('Cancel losing requests once the winner is chosen', { checked: draft.hedge?.cancel_losers ?? true });
+    const cancelLosers = cancelLosersToggle.input;
     const loserGrace = h('input', { class: 'input', type: 'number', min: '0', 'data-field': 'loser_grace_ms', value: draft.hedge?.loser_grace_ms ?? 0 });
     const participantSummary = h('p', { class: 'hint' });
 
@@ -213,7 +285,7 @@ export async function renderCombos(mount, ctx, selectedId) {
     const hedgeBox = h('fieldset', { class: 'hedge' },
       h('legend', {}, 'Hedged race and sticky success'),
       stickyWindowBox,
-      h('div', { class: 'check-row' }, hedgeOn, h('label', {}, 'Enable the hedged race for this combo')),
+      hedgeToggle.row,
       h('p', { class: 'hint', style: 'margin-bottom:8px;' },
         'The window is an eligibility gate, not a stopwatch race: the winner is the highest-priority participant that produced a valid reply within the window. A lower-priority model answering faster does not win; if nobody answers in time, nothing is re-spent.'),
       h('div', { class: 'grid-fields' },
@@ -224,7 +296,7 @@ export async function renderCombos(mount, ctx, selectedId) {
       field('On winner fail', failSel),
       failHint,
       h('div', { class: 'grid-fields' }, maxRoundsField, stableField),
-      h('div', { class: 'check-row' }, cancelLosers, h('label', {}, 'Cancel losing requests once the winner is chosen')),
+      cancelLosersToggle.row,
       h('div', { class: 'grid-fields' },
         field('Loser grace (ms)', loserGrace, { hint: '0 = cancel immediately.' })),
       participantSummary,
@@ -240,10 +312,10 @@ export async function renderCombos(mount, ctx, selectedId) {
       h('option', { value: 'terminate', selected: draft.midstream_policy === 'terminate' }, 'terminate'));
     const maxRetries = h('input', { class: 'input', type: 'number', min: '0', 'data-field': 'max_retries', value: draft.max_retries ?? 1 });
     const retryDelay = h('input', { class: 'input', type: 'number', min: '0', 'data-field': 'retry_delay_ms', value: draft.retry_delay_ms ?? 0 });
-    const affinity = h('input', { type: 'checkbox' });
-    affinity.checked = Boolean(draft.affinity);
-    const comboEnabled = h('input', { type: 'checkbox' });
-    comboEnabled.checked = draft.enabled ?? true;
+    const affinityToggle = toggle('Merge identical consecutive messages when translating between dialects', { checked: Boolean(draft.affinity) });
+    const affinity = affinityToggle.input;
+    const comboEnabledToggle = toggle('Combo enabled', { checked: draft.enabled ?? true });
+    const comboEnabled = comboEnabledToggle.input;
 
     // --- actions ---
     const saveBtn = h('button', { class: 'btn btn-primary', type: 'button' }, isNew ? 'Create combo' : 'Save combo');
@@ -252,12 +324,12 @@ export async function renderCombos(mount, ctx, selectedId) {
 
     saveBtn.addEventListener('click', async () => {
       clearFieldErrors(editor);
-      // Client-side pre-checks mirror the backend's combo validation so the obvious mistakes
-      // never make a round trip; server problems still land next to their fields below.
+      // Keep only structural checks here. Model ids are free text on purpose: the server resolves
+      // provider/model names and its field errors explain typos better than stale client metadata.
       const problems = [];
       if (!draft.name?.trim()) problems.push({ field: 'name', message: 'the callable name is required — clients will pass it as the model' });
       if (!draft.steps.length) problems.push({ field: 'steps', message: 'a combo needs at least one step' });
-      if (draft.steps.some((s) => !s.provider || !s.model)) problems.push({ field: 'steps', message: 'every step needs a provider and a model' });
+      if (draft.steps.some((s) => !s.provider || !String(s.model ?? '').trim())) problems.push({ field: 'steps', message: 'every step needs a provider and a model id' });
       if (draft.wf.mode === 'stable-fallback' && !(draft.wf.step >= 0 && draft.wf.step < draft.steps.length)) {
         problems.push({ field: 'step', message: 'the stable step must point at one of this combo\u2019s steps' });
       }
@@ -294,10 +366,12 @@ export async function renderCombos(mount, ctx, selectedId) {
         if (isNew) {
           const created = await api.post('/api/combos', payload);
           ctx.toast.success(`Combo ${created?.id ?? payload.name} created.`);
+          closeDrawer();
           ctx.navigate(`#/combos/${encodeURIComponent(created?.id ?? payload.name)}`);
         } else {
           await api.put(`/api/combos/${encodeURIComponent(saved.id)}`, payload);
           ctx.toast.success(`Combo ${payload.name} saved.`);
+          closeDrawer();
           ctx.navigate('#/combos');
         }
       } catch (err) {
@@ -326,7 +400,7 @@ export async function renderCombos(mount, ctx, selectedId) {
 
     revertBtn.addEventListener('click', () => renderEditor(saved));
 
-    const editor = h('div', {},
+    const editor = h('form', { class: 'combo-editor', onsubmit: (e) => e.preventDefault() },
       title,
       isNew ? null : h('p', { class: 'hint mono', style: 'margin-top:-4px;' }, `id: ${saved.id}`),
       h('div', { class: 'grid-fields' },
@@ -346,8 +420,8 @@ export async function renderCombos(mount, ctx, selectedId) {
         h('div', { class: 'grid-fields' },
           field('Max retries', maxRetries, { hint: 'Retries of a failing step before falling to the next one.' }),
           field('Retry delay (ms)', retryDelay)),
-        h('div', { class: 'check-row' }, affinity, h('label', {}, 'Merge identical consecutive messages when translating between dialects')),
-        h('div', { class: 'check-row' }, comboEnabled, h('label', {}, 'Combo enabled'))),
+        affinityToggle.row,
+        comboEnabledToggle.row),
       h('div', { class: 'dialog-actions' }, revertBtn, delBtn, saveBtn),
     );
 

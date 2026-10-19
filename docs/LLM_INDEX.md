@@ -13,8 +13,8 @@ filename — the file that documents it is listed below.**
 
 **Manarouter** is a small, fast, self-hosted AI router. It presents one OpenAI-compatible and one
 Anthropic-compatible API surface in front of many upstream providers, and it adds named **combos**
-(a combo is a *model name* that fans out across several providers, optionally racing them in
-parallel).
+(a combo is a *model name* that tries configured provider/model steps in order; concurrent hedging is
+not wired into the relay yet).
 
 **Language:** Rust, edition 2021, MSRV 1.82. Workspace of five crates.
 
@@ -22,8 +22,11 @@ parallel).
 
 | Process | Crate | Default port | Responsibility |
 |---|---|---|---|
-| `manarouter-relay` — the **data plane** | `crates/manarouter-relay` | 20900 | Accept a request, look up a compiled route, select an account, shuttle bytes. Evaluates **no policy**. |
-| `manarouter-conductor` — the **control plane** | `crates/manarouter-conductor` | 20901 | Configuration, combo compilation, account selection ordering, quota accounting, OAuth, the web panel. |
+| `manarouter-relay` — the **data plane** | `crates/manarouter-relay` | 20900 | Accept a request, look up a compiled route, select an account, translate/forward. Applies relay auth and reasoning policy; key quota enforcement and configured proxy egress are not wired. |
+| `manarouter-conductor` — the **control plane** | `crates/manarouter-conductor` | 20901 | Configuration, snapshot compilation, quota snapshot refresh APIs, OAuth, and the web panel. Request-usage ledger recording is not wired. |
+
+`mr serve` runs both binaries as supervised child processes for a foreground session; for an
+unattended setup the README documents starting them separately.
 
 The word "compiled" is load-bearing. The conductor compiles combos into a flat binary **routing
 snapshot**; the relay memory-maps it and hot-swaps it through an `arc_swap::ArcSwap`. There is **zero
@@ -33,10 +36,11 @@ IPC on the request path** — no per-request call to the conductor, no lock, no 
 in the conductor. If it can only be known while bytes are moving, it belongs in the relay. Anything
 else is a design bug. Read `docs/01-architecture.md` for the full argument.
 
-**Primary goal:** latency. The relay's own added latency budget is **p50 < 150 µs, p99 < 500 µs**,
-verified in CI against a deterministic mock upstream. For contrast, the measured baseline of an
-existing Javascript router on the development machine — serving a purely local `/v1/models` with no
-upstream work at all — was **5.2 – 9.2 seconds**.
+**Primary goal:** latency. The relay's own added latency budget is **p50 < 150 µs, p99 < 500 µs** — a
+target, not a measurement. The `tools/bench` harness that would assert it in CI does not exist yet,
+and nothing has been measured in the relay (`docs/19-latency-benchmarks.md` §3). For contrast, the
+measured baseline of an existing Javascript router on the development machine — serving a purely local
+`/v1/models` with no upstream work at all — was **5.2 – 9.2 seconds**.
 
 ---
 
@@ -46,22 +50,24 @@ upstream work at all — was **5.2 – 9.2 seconds**.
 |---|---|
 | Understand the whole system | `docs/01-architecture.md` |
 | Change something on the request path | `docs/01-architecture.md`, `docs/16-latency-engineering.md` |
-| Add a provider | `docs/providers/README.md`, `catalog/providers.toml`, `mr-core/src/model.rs` |
-| Add a dialect or translator | `mr-dialects/src/lib.rs`, `docs/18-api-reference.md` |
-| Change combo behaviour | `docs/06-combos.md`, `docs/07-hedged-race.md`, `mr-core/src/model.rs` |
+| Add a provider | `docs/providers/README.md`, `catalog/providers.toml`, `crates/mr-core/src/model.rs` |
+| Add a dialect or translator | `crates/mr-dialects/src/lib.rs`, `docs/18-api-reference.md` |
+| Change combo behaviour | `docs/06-combos.md`, `docs/07-hedged-race.md`, `crates/mr-core/src/model.rs` |
 | Work on the hedged race | `docs/07-hedged-race.md` — read all of it; the semantics are counterintuitive |
-| Change account/key selection | `docs/05-key-selection.md`, `mr-core/src/dialect.rs` (`KeyStrategy`) |
+| Change account/key selection | `docs/05-key-selection.md`, `crates/mr-core/src/dialect.rs` (`KeyStrategy`) |
 | Work on quota | `docs/08-quota-tracking.md`, `docs/09-reset-aware-priority.md` |
 | Add an OAuth platform | `docs/14-oauth-adding-a-platform.md`, `docs/oauth-omniroute-parity.md` |
 | Touch credentials or secrets | `docs/21-security.md` — read before writing any code |
 | Change the configuration schema | `docs/03-configuration.md` §1 first — unknown-key preservation is mandatory |
-| Change the snapshot format | `docs/04-routing-snapshot.md` — a format change requires a version bump |
+| Change the snapshot format | `docs/04-routing-snapshot.md` — a format change requires a version bump; the current version is **4** |
+| Change model naming, reasoning levels, or `/v1/models` | `docs/18-api-reference.md` §"Model addressing", `docs/04-routing-snapshot.md` §5-§7, `crates/mr-core/src/snapshot.rs` (`compile`, `explain_miss`) |
 | Work on the panel | `docs/15-web-panel.md`, `docs/01-architecture.md` §5 |
 | Migrate from OmniRoute | `docs/17-migrating-from-omniroute.md` |
 | Understand latency claims | `docs/16-latency-engineering.md`, `docs/19-latency-benchmarks.md` |
 | Debug something | `docs/20-troubleshooting.md` |
-| Run the tests | `docs/18-api-reference.md`, `.github/workflows/ci.yml` |
+| Run the tests | `docs/23-implementation-status.md`, `.github/workflows/ci.yml` |
 | Touch cross-instance sync | `docs/22-sync-design.md` — v1 implements nothing; do not add a transport |
+| Check what is actually implemented | `docs/23-implementation-status.md` — read before claiming a feature works |
 
 ---
 
@@ -75,6 +81,8 @@ Router/
 ├── catalog/
 │   └── providers.toml             ★ provider seed data, compiled in via include_str!
 ├── docs/                          ★ one file per feature; LLM_INDEX.md is this file
+├── panel/                         ★ the browser UI, served from disk by the conductor (no build step)
+├── tests/                         Python smoke and local-benchmark checks (run by CI)
 ├── scripts/
 │   └── check-secrets.sh           ★ CI guard: fails on a credential-shaped string
 ├── tools/
@@ -92,7 +100,9 @@ Router/
     │       ├── snapshot.rs         ★ the compiled routing table: compile/encode/decode/ArcSwap handle
     │       ├── store.rs            SQLite runtime state: health, quota, usage, oplog
     │       ├── catalog.rs          loads catalog/providers.toml into ProviderTemplates
-    │       └── error.rs            Error enum
+    │       ├── error.rs            Error enum
+    │       ├── published.rs        ★ OAuth public client constants, assembled from fragments
+    │       └── oauth/              ★ per-platform login/token/refresh (codex, copilot, antigravity)
     ├── mr-dialects/                translation; nothing here runs when dialects match
     │   └── src/
     │       ├── lib.rs              ★ the dispatch + TranslateCtx contract
@@ -106,6 +116,12 @@ Router/
     │   └── src/
     │       ├── lib.rs              global allocator (mimalloc) + module map
     │       ├── main.rs             thin binary
+    │       ├── startup.rs          ★ load config, resolve bind, open vault, build state (shared with `mr serve`)
+    │       ├── server.rs           ★ the HTTP route table, request path and accept loop
+    │       ├── select.rs           ★ step/account selection and the hedged-race policy (pure functions)
+    │       ├── upstream.rs         pooled upstream client, the four timeouts, streaming passthrough
+    │       ├── state.rs            snapshot handle, upstream client, client keys
+    │       ├── sticky.rs           bounded process-local successful-step preference
     │       └── model_scan.rs       ★ finds "model" without parsing JSON; the biggest hot-path win
     ├── manarouter-conductor/       the control plane + panel (lib + bin)
     └── mr-cli/                     the `mr` command line
@@ -146,13 +162,21 @@ Dialect translation is reachable per selected step when the client and upstream 
 | POST | `/v1/audio/transcriptions` | `AudioTranscription` | OpenAI (multipart) |
 | POST | `/v1/audio/speech` | `AudioSpeech` | OpenAI |
 | POST | `/v1/images/generations` | `ImagesGenerations` | OpenAI |
-| GET | `/v1/models` | `Models` | OpenAI |
+| GET | `/v1/models` | `Models` | OpenAI; served entirely from the compiled snapshot, so it lists combos, combo `-<level>` names, `provider/model` and the `provider/model-<level>` names each model really offers |
 | POST | `/v1/messages` | `Messages` | **Anthropic** |
 | POST | `/v1/messages/count_tokens` | `CountTokens` | **Anthropic** |
 | GET | `/healthz` | — | liveness only, never routed upstream |
 
 An Anthropic client points `ANTHROPIC_BASE_URL` at the relay; an OpenAI client points
 `OPENAI_BASE_URL` at it. Both work because the path distinguishes them.
+
+`GET /v1/models` contacts **no upstream**. It is served entirely from the compiled snapshot, which is
+what makes it a usable first check: each combo name, each combo name with a level suffix,
+`provider/model` for every visible model, and `provider/model-<level>` for every level that model
+genuinely offers. A model with no reasoning levels is listed exactly once, under its own id, and a
+model whose id already ends in a level word gets no suffixes at all. Each provider entry carries a
+`manarouter` object with `kind`, `dialect`, `default_reasoning_level`, `reasoning_levels` and
+`input_modalities`; a level-qualified entry also carries `reasoning_level`.
 
 ### The conductor (control plane, `/api/…`)
 
@@ -164,8 +188,8 @@ route. Documented in `docs/18-api-reference.md`.
 
 ## 6. Enum vocabularies
 
-Exhaustive lists. These are the exact strings accepted in configuration and returned by the API.
-Anything not listed is a validation error.
+Exhaustive lists. With the one exception noted under `RouteKind`, these are the exact strings
+accepted in configuration and returned by the API. Anything not listed is a validation error.
 
 ### `Dialect` — how a provider speaks
 `open-ai` · `anthropic` · `google` · `codex` · `copilot` · `antigravity` · `command-code`
@@ -173,12 +197,21 @@ Anything not listed is a validation error.
 Passthrough pairs include `open-ai → open-ai`, `anthropic → anthropic`, and OpenAI chat to Copilot's OpenAI-shaped surface. OpenAI chat to Antigravity is **not** a body passthrough: it uses the Google/Antigravity translator and still lacks OAuth/project-context completion.
 
 ### `Capability` — what a provider or model can serve
-`chat` · `responses` · `embeddings` · `audio.transcription` · `audio.speech` · `images.generations` ·
+`chat` · `responses` · `embeddings` · `audio-transcription` · `audio-speech` · `images-generations` ·
 `models` · `messages` · `tool-calling` · `reasoning` · `vision`
+
+These are the `serde` spellings, so a `config.json` or `catalog/providers.toml` entry must use
+`audio-transcription`, **not** `audio.transcription`. The parser behind the `--capability` flag also
+accepts the dotted and short forms (`audio.transcription`, `stt`, `tts`, `images`), and validation
+messages may print them, but the dotted form is rejected by config deserialization.
 
 ### `RouteKind` — a client-facing endpoint
 `chat.completions` · `responses` · `embeddings` · `audio.transcription` · `audio.speech` ·
 `images.generations` · `models` · `messages` · `count.tokens`
+
+These dotted spellings are canonical for a client key's `allow_routes`, where the CLI normalises
+aliases to this form. Where a `RouteKind` itself is serialised — the catalog's `route_overrides`
+table — the `serde` kebab spelling is used instead (`chat-completions`, `count-tokens`).
 
 ### `AuthKind` — how a credential is attached
 `bearer` · `api-key-header` (with `header`) · `header` (with `name`, `prefix`) · `query-param` (with
@@ -224,9 +257,24 @@ Derived by `ProviderHealth::from_counts(total, usable)`. Never stored.
 `rolling` · `fixed` · `provider-declared`
 
 ### `ServiceTier` / reasoning effort
-Where a provider exposes a reasoning effort, it is passed through as the provider's own spelling. The
-relay does not normalise it, because the vocabularies genuinely differ between providers and a lossy
-mapping would change model behaviour.
+This section used to say the relay passes a provider's reasoning effort through untouched. That is no
+longer true, and the change is deliberate: reasoning is now a **routing** concept.
+
+- The canonical ladder, ascending, is `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `ultra`,
+  `max`. `xhigh` also accepts the spellings `x-high`, `extra-high`, `extra_high` and `extrahigh`.
+- A model name may end in a `-<level>` suffix. Which levels a model offers is compiled into the
+  snapshot: the operator's explicit `reasoning_levels` wins, else the bundled table
+  `catalog/model_meta.json` (keyed `provider/model`, falling back to a provider-agnostic `model`
+  key), else the generic set `none, low, medium, high, xhigh, max` when the model or provider
+  declares the `reasoning` capability (or the dialect serves reasoning models only, currently
+  `codex`). A model that reaches none of those has **no** levels and its name gets no suffix.
+- The router rewrites the upstream body per dialect: `reasoning_effort` for OpenAI-shaped dialects,
+  `reasoning.effort` for the Responses dialect, `thinking.budget_tokens` for Anthropic, and
+  `generationConfig.thinkingConfig` for Google/Antigravity. Level `none` emits no reasoning field at
+  all, on every dialect. A per-model `reasoning_wire` map replaces the dialect default **wholesale**
+  for the levels it names, and `null` at a level means "send nothing".
+- **A client's own explicit reasoning field is never overwritten.** `docs/18-api-reference.md`
+  §"Model addressing" has the full table.
 
 ---
 
@@ -244,12 +292,22 @@ test; if you change the behaviour, change the test deliberately and say so.
 | A credential never appears in `config.json` or `state.sqlite` | `config.rs`, `store.rs`, and `scripts/check-secrets.sh` |
 | No nonce is ever reused under AES-GCM | `secret.rs` `each_write_uses_a_fresh_nonce` |
 | A ciphertext cannot be moved between vault entries | `secret.rs` `ciphertexts_cannot_be_swapped_between_entries` |
-| Identical dialects cause no translation work at all | `mr-dialects/src/lib.rs` `identical_dialects_need_no_translation_at_all` |
-| A body that is not JSON is still forwarded | `mr-dialects/src/lib.rs` `passthrough_works_for_a_body_that_is_not_even_json` |
+| Identical dialects cause no translation work at all | `crates/mr-dialects/src/lib.rs` `identical_dialects_need_no_translation_at_all` |
+| A body that is not JSON is still forwarded | `crates/mr-dialects/src/lib.rs` `passthrough_works_for_a_body_that_is_not_even_json` |
 | A `model` inside a string or a nested object is not matched | `model_scan.rs` tests |
 | Step order is never reordered | `config.rs` `providers_are_ordered_as_the_operator_wrote_them` |
 | A whole provider is never marked dead over one bad account | `model.rs` health tests |
 | No provider uses cookie auth | `catalog.rs` test |
+
+**Feature 3 properties that currently rest on code, not on a test.** These are real behaviours of the
+compiler and the relay, but as of this writing no test names them, so a change could break one without
+CI noticing. If you touch naming or levels, add the test alongside the change:
+
+- An exact model id beats a `base-level` reading of it (`snapshot.rs` `compile`, rank 3 versus rank 5).
+- An out-of-range level reroutes to the model's highest instead of failing (`compile`, the
+  `RANK_QUALIFIED_LEVEL` pass).
+- A client's own explicit reasoning field is never overwritten (`server.rs` `merge_reasoning` leaves an
+  existing scalar alone).
 
 ---
 
@@ -302,15 +360,19 @@ wrong, say so explicitly rather than quietly working around it.
 - **Account** — one credential for a provider. A provider with three API keys has three accounts, and
   health, quotas and rotation are tracked **per account**.
 - **Combo** — a named model that resolves to an ordered list of provider/model steps. Clients call it
-  exactly like a model name.
-- **Conductor** — the control-plane process. Owns all policy.
+  exactly like a model name. A combo name may carry a `-<level>` suffix (`coding-high`), which pins
+  every step to that tier; a combo named with no suffix runs each step at that step's own default.
+- **Reasoning level** — one rung of the ladder `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+  `ultra`, `max`, optionally written as a `-<level>` suffix on a model or combo name. Compiled into
+  the snapshot and merged into the upstream body, never parsed per request.
+- **Conductor** — the control-plane process. Owns configuration and compile-time policy; relay applies request-time auth and reasoning behavior.
 - **Dialect** — the wire shape a client or provider speaks. Same word as the `Dialect` enum.
 - **Eligibility gate** — the hedged race's latency window. It decides *priority protection*, not who
   wins outright. See `docs/07-hedged-race.md` §3.
 - **Hedge** — sending one prompt to several models at once. The winner is the highest-priority
   participant that replied inside the window.
 - **Passthrough** — forwarding request or response bytes unchanged because the dialects match.
-- **Relay** — the data-plane process. Evaluates no policy.
+- **Relay** — the data-plane process. Applies client authentication and reasoning-level behavior, but does not yet enforce per-key quotas or route upstream connections through configured proxies.
 - **Snapshot** — the compiled binary routing table the relay reads.
 - **Step** — one provider/model pair inside a combo, at a fixed position in the operator's order.
 - **TTFB** — time to first byte. The metric the hedged race keys on, and a separate timeout from the
@@ -333,7 +395,7 @@ trigger.
     { "path": "docs/01-architecture.md", "purpose": "Why there are two processes, what the compiled snapshot is, and the full request path", "read_when": "changing anything structural" },
     { "path": "docs/02-quickstart.md", "purpose": "A working configuration in five minutes", "read_when": "installing or writing a test harness" },
     { "path": "docs/03-configuration.md", "purpose": "The complete config.json schema, plus why unknown keys are preserved", "read_when": "changing any config field" },
-    { "path": "docs/04-routing-snapshot.md", "purpose": "The compiled binary table: layout, versioning, hot swap", "read_when": "changing the snapshot format or the relay's lookup" },
+    { "path": "docs/04-routing-snapshot.md", "purpose": "The compiled binary table: layout (format version 4), level-aware compilation, index precedence, versioning, hot swap", "read_when": "changing the snapshot format or the relay's lookup" },
     { "path": "docs/05-key-selection.md", "purpose": "priority, round-robin, random and least-used, and how dead accounts are skipped", "read_when": "touching account selection" },
     { "path": "docs/06-combos.md", "purpose": "The combo reference and worked examples", "read_when": "changing combo semantics" },
     { "path": "docs/07-hedged-race.md", "purpose": "The eligibility gate, the four on-failure modes, midstream policy, session affinity", "read_when": "touching the race — read it all" },
@@ -348,14 +410,16 @@ trigger.
     { "path": "docs/15-web-panel.md", "purpose": "The panel: views, API, port editor, design language", "read_when": "touching the UI" },
     { "path": "docs/16-latency-engineering.md", "purpose": "Every latency decision, the rejected ones, and the per-step budget", "read_when": "changing the hot path" },
     { "path": "docs/17-migrating-from-omniroute.md", "purpose": "Importing providers, combos and credentials safely", "read_when": "migrating or touching the importer" },
-    { "path": "docs/18-api-reference.md", "purpose": "Every route on both surfaces, with request and response shapes", "read_when": "adding or calling an endpoint" },
+    { "path": "docs/18-api-reference.md", "purpose": "Every route on both surfaces, with request and response shapes, model addressing with reasoning levels, and the /v1/models listing", "read_when": "adding or calling an endpoint" },
     { "path": "docs/19-latency-benchmarks.md", "purpose": "Measured numbers, mock and real, kept strictly separate", "read_when": "making a performance claim" },
     { "path": "docs/20-troubleshooting.md", "purpose": "Symptom, cause, fix", "read_when": "something is broken" },
     { "path": "docs/21-security.md", "purpose": "Threat model, the vault, cookie prohibition, ToS posture", "read_when": "before writing credential code" },
     { "path": "docs/22-sync-design.md", "purpose": "The intended cross-instance sync design; v1 implements nothing", "read_when": "touching ids, revisions or tombstones" },
+    { "path": "docs/23-implementation-status.md", "purpose": "What actually runs today, with the command that checks each claim", "read_when": "before claiming a feature is implemented" },
     { "path": "docs/combo-cookbook.md", "purpose": "Copy-pasteable combo configurations for common goals", "read_when": "building a combo" },
     { "path": "docs/providers/README.md", "purpose": "How the provider catalogue works and how to add an entry", "read_when": "adding a provider" },
-    { "path": "docs/providers/catalog.md", "purpose": "Generated: every provider, its dialect, auth and base URL", "read_when": "looking up a provider" }
+    { "path": "docs/providers/catalog.md", "purpose": "Generated: every provider, its dialect, auth and base URL", "read_when": "looking up a provider" },
+    { "path": "docs/local-latency-benchmark.md", "purpose": "The report-only local benchmark method and its caveats", "read_when": "running tests/local_latency_bench.py" }
   ],
   "machine_readable_state": {
     "compiled_snapshot": "crates/mr-core/src/snapshot.rs",

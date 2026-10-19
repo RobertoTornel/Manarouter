@@ -50,6 +50,10 @@ hedge participant selection — is genuinely *outside* the router. It is resolve
 relay executes a table-driven procedure with no interpretation, no allocation, and no branch that
 depends on configuration structure.
 
+One part of that table is compiled but not yet executed: hedging is resolved into the snapshot and
+`hedge_decide` is unit-tested, but the relay still walks a combo's steps sequentially, so nothing on
+the request path calls it. See §4 and [`23-implementation-status.md`](23-implementation-status.md).
+
 The tradeoff is honest and worth stating: **the relay is fast at the cost of being dumb.** It cannot
 make a judgement call, because a judgement call would need context it deliberately does not have. If
 a routing decision requires information that only exists at request time, that information must be
@@ -62,19 +66,31 @@ something the relay can read from the snapshot or observe directly from the sock
 ```
 client ──► relay :20900
              │
-             ├─ 1. accept                    pre-bound listener, one per CPU, SO_REUSEPORT
+             ├─ 1. accept                    pre-bound listener, SO_REUSEPORT set (exactly one socket today)
              ├─ 2. authenticate              hash a client key, compare against the snapshot
              ├─ 3. scan for "model"          memchr over the raw body, NO full JSON parse
              ├─ 4. resolve                   one hash lookup in the snapshot's index
              ├─ 5. pick a plan               pre-compiled: ordered steps, account order, hedge plan
+             ├─ 5b. open the credential      AES-GCM open of the chosen account's secret, from the vault
              ├─ 6. open or reuse a socket    pooled keep-alive connection to the upstream
              ├─ 7. forward the bytes         verbatim when the dialects match
              ├─ 8. pipe the response back    verbatim, streaming, never buffered whole
-             └─ 9. emit usage                fire-and-forget batched write, off the critical path
+             └─ 9. record health             in-memory success/failure and cooldown state
 ```
 
+Step 9 is deliberately the only bookkeeping on the path, and it stays in memory. The relay does
+**not** record token usage today, and neither does anything else: the `Store` has a `usage` table
+and the conductor has a read-only `/api/quota` that aggregates it, but no code path in either
+service constructs a `UsageRecord` or feeds the queue, so the table stays empty and `/api/quota`
+reports nothing. The fire-and-forget usage writer the design calls for is still unimplemented; see
+[`23-implementation-status.md`](23-implementation-status.md).
+
 Steps 3 to 6 are the whole latency story, and each of them is deliberately a constant-time
-operation on data that is already resident.
+operation on data that is already resident — with one deliberate exception. The chosen account's
+credential is decrypted from the vault as the request is built (step 5b), once per account attempt,
+rather than held in plaintext for the process lifetime: an AES-GCM open of a short blob is cheap
+enough, and keeping every provider secret resident in a long-lived process is the worse trade. The
+vault file itself is opened once at startup.
 
 ### Step 3: scanning for the model, not parsing the JSON
 
@@ -106,11 +122,14 @@ installs the result behind an `ArcSwap`. Decoding happens on load, not per reque
 claim is *zero parsing per request*, not *zero copies ever*. Stating it precisely matters, because
 the first claim is true and the second would not be.
 
-Swapping is atomic. The conductor writes a new snapshot file, signals the relay, and the relay
-installs it. In-flight requests keep the `Arc` they already hold and finish against the old table;
-the new table serves everything that arrives afterwards. **No request is ever dropped because the
-configuration changed.** That is why `ArcSwap` was chosen over a lock: a reader never blocks, and a
-writer never waits for readers to drain.
+Swapping is atomic. Something writes a new snapshot file — the conductor's API, `mr config`, or any
+operator edit that `mr` accepts — and the relay picks it up on its own: it polls the file's
+`(mtime, length)` on a timer rather than waiting for a signal, which also means a hand-edited
+configuration is adopted without restarting either process. The relay then installs it. In-flight
+requests keep the `Arc` they already hold and finish against the old table; the new table serves
+everything that arrives afterwards. **No request is ever dropped because the configuration
+changed.** That is why `ArcSwap` was chosen over a lock: a reader never blocks, and a writer never
+waits for readers to drain.
 
 ### Step 5: the plan is already computed
 
@@ -118,11 +137,12 @@ A combo is compiled into a `ComboPlan`: an ordered list of steps, each naming a 
 and the account order to try within that provider, plus the resolved hedge plan and the retry
 policy. Nothing about that requires the request. The relay walks the list.
 
-Rotation state is the one thing that must change as requests arrive. Rather than letting the relay
-keep mutable routing state — which would need a lock on the hot path and would diverge between
-processes — the snapshot carries per-step atomic counters. A round-robin step advances an
-`AtomicU64`. It is lock-free, it survives a snapshot swap, and it is the *only* mutable routing
-state in the relay.
+Rotation state is the one thing that must change as requests arrive, and it stays in the relay as a
+relaxed `AtomicU64` per combo (`manarouter-relay/src/state.rs`). The counters live *beside* the
+decoded table inside the same swapped value, not inside the snapshot file: two separate swaps would
+let a request read a new combo list with counters from an older generation. A consequence worth
+knowing is that a snapshot swap starts the counters over — harmless for round-robin fairness, and
+the reason the counter array is rebuilt with the table rather than persisted.
 
 ### Steps 7 and 8: passthrough dominates
 
@@ -149,18 +169,20 @@ frames when it has to rewrite their payloads.
 | Reading the routing table | `manarouter-relay` | `ArcSwap` load; no locks. |
 | Dialect detection and passthrough | `mr-core::dialect` | A `const fn` on two enums. |
 | Dialect translation | `mr-dialects` | Not on the path when dialects match. |
-| Hedged race execution | `manarouter-relay` | Table-driven from the snapshot. |
-| **Combo compilation and strategy** | `manarouter-conductor` | Runs once per config change, not per request. |
-| Provider and account selection | `manarouter-conductor` | Compiled into ordered steps. |
-| Quota accounting | `manarouter-conductor` | The relay only reports observed usage. |
-| OAuth login and token refresh | `manarouter-conductor` | The relay reads a token from memory. |
+| Hedged race execution | **not wired** | `hedge_decide` exists and is unit-tested, but the relay runs the sequential step loop, so nothing on the request path calls it. |
+| Combo and key-strategy compilation | `manarouter-conductor` | Resolved into ordered steps and account orders once per config change, not per request. |
+| Request-time step and account choice | `manarouter-relay` | `select.rs` walks the compiled steps, applies the key strategy and advances the rotation counters. |
+| Quota accounting | `manarouter-conductor` | `/api/quota` reads usage rows from `Store`, but nothing writes them yet; the relay applies transient cooldowns from its own in-memory health state. |
+| OAuth authorization (login) | `manarouter-conductor` | The relay holds a `Refresher` per platform and refreshes an expiring token in front of a request. |
 | The web panel | `manarouter-conductor` | Same process, but a separate task and a separate port. |
-| Credential storage | `mr-core::secret` | Encrypted at rest; the relay decrypts once at startup. |
-| Runtime state (health, usage, cache) | `mr-core::store` | SQLite, WAL. Never read on the hot path. |
+| Credential storage | `mr-core::secret` | Encrypted at rest; the vault is opened once at startup and an account's secret is decrypted when a request tries that account (step 5b). |
+| Usage history, quota aggregates, the oplog | `mr-core::store` | SQLite, WAL. The `usage` and `account_health` tables have no writer yet, so they stay empty. Reads are off the hot path, except the small `oauth_credential` metadata lookup an OAuth account needs before its token is refreshed. |
 
 The rule of thumb: **if it can be decided before a request arrives, it belongs in the conductor. If
 it can only be known while bytes are moving, it belongs in the relay.** Anything that is neither is
-a bug in the design.
+a bug in the design. One qualification is deliberate: the conductor decides the *order* of steps and
+accounts, but the relay makes the final pick from that order at request time, because that pick
+depends on the live health map the relay owns.
 
 ---
 
@@ -192,7 +214,7 @@ The design principle is: **degrade to stale, never to broken.**
 | Conductor crashes | The relay keeps serving the last snapshot indefinitely. Routing is frozen, not broken. The panel is unavailable. |
 | Snapshot file is corrupt | The relay refuses it and keeps the previous one. It logs loudly. It never loads a table it cannot verify. |
 | Snapshot version is newer than the relay understands | Refused, previous table retained. Version skew degrades to stale routing rather than a crash. |
-| Relay crashes | Systemd or the CLI restarts it. Clients see a connection failure for the restart window. |
+| Relay crashes | A supervisor restarts it: the installed systemd units set `Restart=`. `mr serve` deliberately does not — it stops the other service and returns the dead child's exit code, so a crash loop is visible rather than hidden. Clients see a connection failure for the restart window. |
 | An upstream account returns 401 | That *account* is marked failed — never the whole provider. Another account on the same provider is tried. |
 | An upstream returns 429 | The account is parked until its reset hint, or a default cooldown. Other accounts are unaffected. |
 | Every account on a provider is unusable | The provider is reported dead, other providers still serve. |
@@ -224,8 +246,11 @@ For contrast, the measured baseline of an existing Javascript router on this mac
 purely local `/v1/models` with no upstream involved at all, was **5.2–9.2 seconds**. The gap is not
 a matter of tuning the same design; it is a different design.
 
-`tools/bench` measures these numbers against `tools/mock-upstream` so that a regression is a failing
-test rather than a discovery in production. See `docs/16-latency-engineering.md`.
+`tools/bench/` is where the harness that enforces these numbers is meant to live, and it is
+currently an empty directory — no automated check measures them yet, so treat the table as a design
+budget, not a measured guarantee. `tools/mock-upstream` is the deterministic upstream such a harness
+would drive. See `docs/16-latency-engineering.md` and
+[`23-implementation-status.md`](23-implementation-status.md).
 
 ---
 

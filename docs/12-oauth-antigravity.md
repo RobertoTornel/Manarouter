@@ -138,11 +138,12 @@ Two details beyond the PKCE question:
 
 - The redirect is `localhost`, **not** `127.0.0.1`, and the port is fixed at `51121`. The provider
   has that exact string registered; substituting the numeric address is a `redirect_uri_mismatch`.
-- The `state` is not a random nonce here — it is a base64 encoding of `{verifier, projectId}`. The
-  project id travels through the redirect in `state` because the token exchange does not otherwise
-  know which project the login was for. `docs/14-oauth-adding-a-platform.md` treats `state` as opaque
-  and single-use for good reason; this platform is the exception that proves the rule, and carrying
-  application data in `state` is a decision to make consciously rather than by accident.
+- The `state` is an ordinary random, single-use nonce here (`flow::new_state()` — 32 CSPRNG bytes,
+  base64url, unpadded). The project id does **not** travel in `state`: it is discovered after the
+  token exchange by `loadCodeAssist` / `onboardUser` and persisted as `cloudcode_project_id` in the
+  token set's `extra` (`store_cloudcode_context` in `crates/mr-core/src/oauth/antigravity.rs`), which
+  is also what survives a refresh. `docs/14-oauth-adding-a-platform.md` treats `state` as opaque and
+  single-use, and this platform does the same.
 
 The `https://accounts.google.com/o/oauth2/auth` spelling without `/v2` is also valid and is what one
 of the corroborating projects uses; both endpoints work. Google's documentation for the endpoint is
@@ -364,10 +365,10 @@ settled:
 
 ## See also
 
-- [OAuth overview](docs/10-oauth-overview.md) — refresh, storage, the loopback listener
-- [OpenAI Codex](docs/11-oauth-codex.md) — the other authorization-code login, for contrast
-- [GitHub Copilot](docs/13-oauth-copilot.md) — the device-flow platform, no redirect, no secret
-- [Adding a platform](docs/14-oauth-adding-a-platform.md) — the trait this platform implements
-- [Security and credentials](docs/21-security.md) — §5 the ToS posture, §6 the published constants
-- [published.rs](crates/mr-core/src/published.rs) — where the four Google constants are assembled
-- [providers.toml](catalog/providers.toml) — the `antigravity` entry, headers and Cloud Code paths
+- [OAuth overview](10-oauth-overview.md) — refresh, storage, the loopback listener
+- [OpenAI Codex](11-oauth-codex.md) — the other authorization-code login, for contrast
+- [GitHub Copilot](13-oauth-copilot.md) — the device-flow platform, no redirect, no secret
+- [Adding a platform](14-oauth-adding-a-platform.md) — the trait this platform implements
+- [Security and credentials](21-security.md) — §5 the ToS posture, §6 the published constants
+- [published.rs](../crates/mr-core/src/published.rs) — where the four Google constants are assembled
+- [providers.toml](../catalog/providers.toml) — the `antigravity` entry, headers and Cloud Code paths

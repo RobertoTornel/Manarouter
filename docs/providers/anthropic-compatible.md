@@ -92,7 +92,7 @@ dialect, and passes them through when the client is Anthropic-shaped.
 
 **`content_block_delta` for a tool call carries partial JSON**, not an object. It is assembled across
 deltas, which is why the relay refuses to splice a different model's output once a `tool_calls` delta
-has been emitted ([Combos](../06-combos.md#midstream-policy)): a half-assembled tool input from one
+has been emitted ([Combos](../06-combos.md#7-midstream_policy)): a half-assembled tool input from one
 model plus another's is a function call that may be valid and wrong.
 
 ## Count tokens

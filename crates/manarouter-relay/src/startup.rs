@@ -83,12 +83,21 @@ pub fn resolve_addr(options: &RelayOptions, config: &Config) -> Result<SocketAdd
     })
 }
 
-/// Whether a keyless relay may bind this address.
+/// Whether a relay without client keys may bind this address.
 ///
-/// Everything that decides to terminate the process is untestable from outside, and this is exactly
-/// the kind of safety rule that should have a test rather than a comment.
-pub fn keyless_bind_is_allowed(addr: SocketAddr, keys_configured: bool) -> bool {
-    keys_configured || addr.ip().is_loopback()
+/// A deliberate keyless mode is still only remote-accessible when the separate remote override is
+/// enabled. The helper stays pure so startup policy can be tested without binding a socket.
+pub fn keyless_bind_is_allowed(
+    addr: SocketAddr,
+    keys_configured: bool,
+    no_key_required: bool,
+    allow_remote_without_key: bool,
+) -> bool {
+    if no_key_required {
+        addr.ip().is_loopback() || allow_remote_without_key
+    } else {
+        keys_configured || addr.ip().is_loopback()
+    }
 }
 
 /// Load and validate the configuration, reporting every problem rather than the first.
@@ -132,27 +141,25 @@ pub fn build_state(
             .map_err(|e| StartupError::new(format!("could not load the routing table: {e}")))?,
     );
 
-    // With no client keys configured the relay serves **everyone**: `authenticate` answers `Open`,
-    // because a fresh install that rejected all requests would be unusable and the operator would
-    // have no way to reach the panel and create a key.
-    //
-    // That is a reasonable trade on loopback and an unacceptable one anywhere else, so the two
-    // conditions are checked together. Binding a keyless relay to a reachable interface would hand
-    // this machine's provider credentials to anyone who can route to it, and no warning in a log is a
-    // sufficient answer to that.
-    if !relay.keys_are_configured() {
-        if !keyless_bind_is_allowed(addr, false) {
-            return Err(StartupError::new(format!(
-                "refusing to bind {addr} with no client keys configured.\n\
-                 a relay with no keys serves every request to anyone who can reach it,\n\
-                 and it holds this machine's provider credentials.\n\
-                 create a key with `mr key create`, or bind 127.0.0.1."
-            )));
-        }
+    // Missing keys are permitted only by the explicit config flag (or the bootstrap case where
+    // no keys exist at all), and remotely only when the separate escape hatch is also explicit.
+    let keys_configured = relay.keys_are_configured();
+    if !keyless_bind_is_allowed(
+        addr,
+        keys_configured,
+        config.no_key_required,
+        config.allow_remote_without_key,
+    ) {
+        return Err(StartupError::new(format!(
+            "refusing to bind {addr} without client keys: loopback is permitted by default; for remote access set \
+             no_key_required and allow_remote_without_key"
+        )));
+    }
+    if !keys_configured || config.no_key_required {
         tracing::warn!(
             bind = %addr,
-            "no client keys are configured, so every request is accepted on this loopback \
-             address. Create one with `mr key create`."
+            no_key_required = config.no_key_required,
+            "relay permits requests without client keys"
         );
     }
     tracing::info!(
@@ -192,6 +199,7 @@ pub fn build_state(
 
     let state = AppState {
         relay,
+        no_key_required: config.no_key_required,
         health: Arc::new(Health::new()),
         vault,
         oauth_refreshers: Arc::new(oauth_refreshers),
@@ -381,7 +389,7 @@ mod tests {
         let c = Config::default();
         let addr = resolve_addr(&a, &c).unwrap();
         assert!(!addr.ip().is_loopback());
-        assert!(!keyless_bind_is_allowed(addr, false));
+        assert!(!keyless_bind_is_allowed(addr, false, false, false));
     }
 
     #[test]
@@ -415,7 +423,7 @@ mod tests {
         for host in ["127.0.0.1", "[::1]"] {
             let addr: SocketAddr = format!("{host}:20900").parse().unwrap();
             assert!(
-                keyless_bind_is_allowed(addr, false),
+                keyless_bind_is_allowed(addr, false, false, false),
                 "{host} must be allowed without keys"
             );
         }
@@ -428,7 +436,7 @@ mod tests {
         for host in ["0.0.0.0", "10.0.0.7", "192.168.1.10", "[::]"] {
             let addr: SocketAddr = format!("{host}:20900").parse().unwrap();
             assert!(
-                !keyless_bind_is_allowed(addr, false),
+                !keyless_bind_is_allowed(addr, false, false, false),
                 "{host} must be refused without keys"
             );
         }
@@ -436,10 +444,19 @@ mod tests {
 
     #[test]
     fn a_relay_with_keys_may_bind_anywhere() {
-        // Once a key exists the operator has made an explicit choice, and binding a reachable
-        // interface is how the router is used from another machine.
+        // Once a key exists, binding a reachable interface requires authentication.
         let addr: SocketAddr = "0.0.0.0:20900".parse().unwrap();
-        assert!(keyless_bind_is_allowed(addr, true));
+        assert!(keyless_bind_is_allowed(addr, true, false, false));
+    }
+
+    #[test]
+    fn explicit_no_key_mode_is_loopback_only_without_remote_override() {
+        let loopback: SocketAddr = "127.0.0.1:20900".parse().unwrap();
+        let remote: SocketAddr = "0.0.0.0:20900".parse().unwrap();
+        assert!(keyless_bind_is_allowed(loopback, true, true, false));
+        assert!(!keyless_bind_is_allowed(remote, true, true, false));
+        assert!(keyless_bind_is_allowed(remote, true, true, true));
+        assert!(keyless_bind_is_allowed(remote, true, false, true));
     }
 
     // ----- configuration fingerprint ----------------------------------------

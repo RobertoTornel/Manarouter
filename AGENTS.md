@@ -13,8 +13,8 @@ is supplied by a provider; a *combo* is an operator-created route that can combi
 For a default local setup, the OpenAI-compatible API is `http://127.0.0.1:20900/v1` and the web
 panel is `http://127.0.0.1:20901`. The relay and conductor are separate processes with separate
 runtimes; `mr serve` starts both in the foreground, and the README documents launching them
-individually. The panel is for local use and
-must not be exposed to an untrusted network without deliberate authentication and network setup.
+individually. The panel is for local use and must not be exposed to an untrusted network without
+deliberate authentication and network setup.
 
 ## Help a person get started
 

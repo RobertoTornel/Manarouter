@@ -3,7 +3,7 @@
 // the API exposes POST and DELETE only (PUT /api/aliases/{name} does not exist in the contract).
 
 import { api } from './api.js';
-import { h, chip, field, emptyState, errorBlock, applyFieldErrors, clearFieldErrors } from './dom.js';
+import { h, chip, field, toggle, emptyState, errorBlock, applyFieldErrors, clearFieldErrors } from './dom.js';
 import { extractList } from './format.js';
 
 export async function renderAliases(mount, ctx) {
@@ -11,6 +11,11 @@ export async function renderAliases(mount, ctx) {
 
   const tableWrap = h('div', { class: 'table-scroll' });
   const count = h('span', { class: 'count' });
+  const generatedToggle = toggle('Show generated aliases', {
+    checked: false,
+    hint: 'Generated automatically; they disappear on reload and cannot be permanently deleted.',
+    onChange: () => { updateCount(); renderTable(); },
+  });
 
   const fromIn = h('input', { class: 'input mono', type: 'text', required: true, 'data-field': 'from', placeholder: 'alias name' });
   const toIn = h('input', { class: 'input mono', type: 'text', required: true, 'data-field': 'to', placeholder: 'target model or combo' });
@@ -26,6 +31,7 @@ export async function renderAliases(mount, ctx) {
   mount.replaceChildren(
     h('div', { class: 'toolbar' }, h('span', { class: 'spacer' }), count),
     addForm,
+    generatedToggle.row,
     tableWrap,
   );
 
@@ -42,6 +48,7 @@ export async function renderAliases(mount, ctx) {
     } catch (err) {
       applyFieldErrors(addForm, err);
       if (!err.details?.length) ctx.toast.error('Could not add the alias', err);
+    } finally {
       addBtn.disabled = false;
     }
   });
@@ -55,22 +62,32 @@ export async function renderAliases(mount, ctx) {
       tableWrap.replaceChildren(errorBlock(err));
       return;
     }
-    count.textContent = `${aliases.length} alias${aliases.length === 1 ? '' : 'es'}`;
+    updateCount();
     renderTable();
   }
 
+  function updateCount() {
+    const custom = aliases.filter((a) => !a.generated).length;
+    const generated = aliases.length - custom;
+    const shownGenerated = generatedToggle.input.checked;
+    count.textContent = generated
+      ? `${custom} custom · ${generated} generated ${shownGenerated ? 'shown' : 'hidden'}`
+      : `${custom} custom`;
+  }
+
   function renderTable() {
-    if (!aliases.length) {
-      tableWrap.replaceChildren(emptyState('No aliases.', 'Add one above, e.g. fast → Brains.'));
+    const visible = generatedToggle.input.checked ? aliases : aliases.filter((a) => !a.generated);
+    if (!visible.length) {
+      tableWrap.replaceChildren(emptyState('No operator-authored aliases.', 'Add one above, e.g. fast → Brains.'));
       return;
     }
     const tbody = h('tbody');
-    for (const a of aliases) {
-      const del = h('button', {
+    for (const a of visible) {
+      const del = a.generated ? null : h('button', {
         class: 'btn btn-danger btn-sm', type: 'button',
         'aria-label': `Delete alias ${a.from}`,
       }, 'Delete');
-      del.addEventListener('click', async () => {
+      if (del) del.addEventListener('click', async () => {
         const ok = await ctx.confirm({
           title: `Delete alias “${a.from}”?`,
           message: `Requests for ${a.from} will stop resolving to ${a.to}.`,

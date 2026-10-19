@@ -46,6 +46,18 @@ health, never configuration. Putting the snapshot and the database in a separate
 
 `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honoured when set.
 
+### Environment
+
+| Variable | Effect |
+|---|---|
+| `MANAROUTER_CONFIG_DIR` | Configuration and vault directory. Wins over `XDG_CONFIG_HOME`. `mr --config-dir` and `manarouter-relay --config-dir` set the same variable, so a second instance can be pointed elsewhere without touching your real configuration. |
+| `MANAROUTER_STATE_DIR` | Snapshot and database directory. Wins over `XDG_STATE_HOME`. |
+| `XDG_CONFIG_HOME`, `XDG_STATE_HOME` | Standard XDG bases; `manarouter` is appended to each. |
+| `MANAROUTER_CONTROL_PORT` | One-run override of `control.port`. The conductor parses no command-line arguments, so this is the only way to move the panel for a single run; `mr serve --control-port` sets it for the child. An unparseable value is a startup error, never a silent fallback. |
+| `RUST_LOG` | Tracing filter for both services and `mr` (for example `RUST_LOG=manarouter_relay=debug`). On the relay it wins over `--log`; the conductor has no `--log` flag. |
+| `MANAROUTER_FORCE_REFRESH` | Test-only. `=1` makes the opt-in live credential test force a real OAuth rotation instead of accepting a stored token that is not yet due to refresh. Never needed to run the router. |
+| `NO_COLOR` | Disables ANSI colour in `mr` output. Colour is also off whenever stdout is not a terminal. |
+
 ---
 
 ## 3. Top-level schema
@@ -57,8 +69,9 @@ health, never configuration. Putting the snapshot and the database in a separate
   "relay": {
     "host": "127.0.0.1",     // loopback by default: this process holds credentials
     "port": 20900,
-    "reuse_port": true,       // one listener per CPU, kernel-distributed
-    "backlog": 1024
+    "reuse_port": true,       // carried in the schema but read by nothing: one socket is bound,
+                              // with SO_REUSEPORT set unconditionally (see below)
+    "backlog": 1024           // also carried but not applied to the socket today
   },
 
   "control": {
@@ -103,7 +116,8 @@ health, never configuration. Putting the snapshot and the database in a separate
 }
 ```
 
-Everything except `providers` has a sensible default, so a first run works with an empty file.
+Every field has a default, so a first run works with an empty file. `providers` is the one you must
+populate before anything can route.
 
 ### `format_version`
 
@@ -125,6 +139,14 @@ them. There is a Restart button in the panel for when the operator is ready.
 
 `validate()` reports it if the relay and control plane are configured for the same host and port,
 since they cannot both bind.
+
+### `relay.reuse_port` and `relay.backlog`
+
+Both are carried in the schema so an existing file keeps loading, and both are **inert today**.
+`reuse_port` does not change the listener count: the relay binds exactly one socket and sets
+`SO_REUSEPORT` on it unconditionally. That flag is what lets a second *process* share the port; it does
+not fan a single process out across CPUs. `backlog` is never applied to the socket, so you get the
+operating system's default. Neither field is wrong to set, and neither does anything yet.
 
 ---
 
@@ -219,10 +241,11 @@ A combo is a **named model**: clients call it exactly like a model name.
     "count": 2,
     "window_ms": 800,
     "winner_metric": "first-response-byte",
-    "on_winner_fail": "rerun-excluding",
-    "stable_model": null,
-    "max_rounds": 2
+    "on_winner_fail": { "mode": "rerun-excluding", "max_rounds": 2 },
+    "cancel_losers": true,
+    "loser_grace_ms": 0
   },
+  "sticky_success_window_secs": 1800,  // priority + hedge only; 0 disables the preference
   "midstream_policy": "restart",       // restart | terminate
   "max_retries": 1,
   "retry_delay_ms": 2000,
@@ -244,7 +267,11 @@ worst possible moment.
 recompiling a snapshot when nothing that affects routing changed.
 
 The full semantics — including the eligibility gate and the four `on_winner_fail` modes — are in
-`docs/07-hedged-race.md`.
+`docs/07-hedged-race.md`. Note that `on_winner_fail` is internally tagged: the mode name goes in
+`mode`, and `rerun-excluding` carries `max_rounds` while `stable-fallback` carries `step`, an index
+into the combo's own step list. `sticky_success_window_secs` is the separate, already-implemented
+preference for the last successful step; it applies only to `priority` combos with `hedge.enabled`,
+and `0` disables it.
 
 ---
 
@@ -345,9 +372,11 @@ valid. It checks:
 - a zero `hedge_width`, `hedge_max_requests` or `pool_max_idle_per_host`;
 - a `format_version` newer than the binary understands.
 
-`mr config validate` prints them all and exits non-zero if there are any. The conductor refuses to
-compile a snapshot from an invalid configuration and keeps serving the previous one, so a typo
-degrades to stale routing rather than to an outage.
+Any `mr` command that would save an invalid configuration refuses to write it, prints every problem
+and exits non-zero; `mr doctor` reports the same list without saving anything. `mr config validate`
+itself is still a stub, so it cannot be the command you reach for. The conductor refuses to compile
+a snapshot from an invalid configuration and keeps serving the previous one, so a typo degrades to
+stale routing rather than to an outage.
 
 ---
 

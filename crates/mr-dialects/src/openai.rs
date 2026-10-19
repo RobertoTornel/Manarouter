@@ -560,6 +560,19 @@ pub fn reset_stream_state() {
     STREAM_STATE.with(|cell| *cell.borrow_mut() = None);
 }
 
+/// Frame one pivot chunk as Anthropic events against state the caller owns.
+///
+/// [`sse_to_anthropic`] reaches for the per-thread cell above. A dialect whose accumulation is
+/// instead owned per stream (see `commandcode::Translator`) needs the same framing without touching
+/// that cell, or it would reintroduce exactly the sharing it removed. This is that seam.
+pub(crate) fn translate_chunk_for(
+    state: &mut AnthropicStreamState,
+    ctx: &TranslateCtx<'_>,
+    data: &str,
+) -> Result<Vec<String>> {
+    translate_chunk(ctx, data, state)
+}
+
 fn translate_chunk(
     _ctx: &TranslateCtx<'_>,
     data: &str,

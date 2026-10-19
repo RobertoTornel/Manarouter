@@ -30,7 +30,7 @@ time, and the relay does no interpretation per request. See
 
 ## 2. The budget, stated as a budget
 
-The per-stage targets from [Latency engineering §6](16-latency-engineering.md#6-the-budget) are:
+The per-stage targets from [Latency engineering §6](16-latency-engineering.md#6-the-budget-restated) are:
 
 | Stage | p50 target | p99 target |
 |---|---|---|
@@ -42,9 +42,10 @@ The per-stage targets from [Latency engineering §6](16-latency-engineering.md#6
 | Upstream write | 20 µs | 80 µs |
 | **Total added overhead** | **< 150 µs** | **< 500 µs** |
 
-**These are targets.** They were derived by budgeting the loopback floor across the stages, and they
-are enforced (once the data plane is complete) by an assertion in CI, not by hope. A target that
-nothing checks is a wish.
+**These are targets.** They were derived by budgeting the loopback floor across the stages. They are
+**not** enforced anywhere yet: the harness that would assert them (`tools/bench`) does not exist — the
+directory is empty, there is no `mr-bench` package, and CI excludes `bench` from its tool matrix. A
+target that nothing checks is a wish, and this one is currently a wish.
 
 To put the scale in context: at 150 µs of added overhead against a provider whose own TTFB is 400 ms,
 the router is responsible for 0.04% of what the user waits for. That is the correct place for it to
@@ -53,8 +54,9 @@ and being able to race several providers in parallel.
 
 ## 3. What has actually been measured
 
-**Nothing, in the relay.** The data plane is still being built. There is no honest number to publish,
-and this section will stay empty rather than be filled with an estimate.
+**Nothing, in the relay.** The relay itself runs, but no harness in this tree measures it: `tools/bench`
+is empty and there is no `mr-bench` package, so there is no reproducible number to publish. This
+section will stay empty rather than be filled with an estimate.
 
 This is worth being explicit about because it is exactly the kind of gap that gets papered over. A
 plausible-sounding "~40 µs of overhead" invented for a README is worse than a blank, because the
@@ -81,14 +83,20 @@ only version of this measurement that has any effect.
 
 ```bash
 # Terminal 1 — the deterministic upstream, 5 ms of deliberate delay.
-cargo run --release -p mock-upstream -- --port 21900 --delay-ms 5
+# `--delay` is in milliseconds; there is no `--delay-ms`.
+cargo run --release -p mock-upstream -- --port 21900 --delay 5
 
 # Terminal 2 — the relay, pointing at a config whose only provider is the mock.
 cargo run --release -p manarouter-relay -- --config-dir /tmp/mr-bench
 
-# Terminal 3 — the benchmark.
+# Terminal 3 — the benchmark. This command does not exist yet: there is no `mr-bench`
+# package and `tools/bench/` is empty, so the run below is the intent, not a recipe.
 cargo run --release -p mr-bench -- --requests 20000 --concurrency 1 --url http://127.0.0.1:20900
 ```
+
+Until that third binary exists, a local run is what `tests/local_latency_bench.py` provides — it
+drives the relay against `tools/mock-upstream` and writes a percentile report, which is the only
+harness in the tree today.
 
 Rules for the run, each of which exists because ignoring it produces a number that is wrong in a
 direction that flatters the project:
@@ -123,10 +131,10 @@ what time of day, and how many samples, or it is an anecdote with a decimal poin
 
 | Date | Build | Workload | p50 | p99 | Notes |
 |---|---|---|---|---|---|
-| — | — | — | not measured | not measured | The relay's data plane is not complete. |
+| — | — | — | not measured | not measured | No harness exists yet (`tools/bench/` is empty). |
 
-This table is empty on purpose and will be filled only from `mr-bench` output, with the command line
-recorded alongside it.
+This table is empty on purpose and will be filled only from a harness that does not exist yet, with
+the command line recorded alongside it.
 
 ## 6. What will not go in this document
 

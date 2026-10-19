@@ -13,7 +13,11 @@ rounding error.
 
 ## 1. The measured baseline this was built against
 
-These are real numbers taken on the development machine, not estimates.
+These are real numbers taken on the development machine, not estimates. They are also **undated**:
+they were taken while investigating the reference implementation, before this relay existed, and have
+not been re-measured against the code at the current commit. Treat them as the historical motivation,
+not as a current benchmark — [latency benchmarks](19-latency-benchmarks.md) is where reproducible
+numbers belong, and it has none yet.
 
 | Operation | Measured |
 |---|---|
@@ -121,8 +125,9 @@ A TCP connect plus a TLS handshake is one to three round trips and, for a distan
 hundreds of milliseconds. That dwarfs everything the router itself does.
 
 The relay keeps a pool of warm keep-alive connections per upstream authority, with
-`pool_max_idle_per_host` and `pool_idle_secs` configurable per provider. `prewarm` opens a connection
-at startup so the first request does not pay for it.
+`pool_max_idle_per_host` and `pool_idle_secs` set once in the global `latency` block of the
+configuration (they are **not** per-provider; only `prewarm`, `http2` and the four timeouts are).
+`prewarm` opens a connection at startup so the first request does not pay for it.
 
 Care is taken not to confuse *keep-alive* with *connection count*: four idle connections per host is
 the default because a hedge may need three at once, and a fourth concurrent request should not queue
@@ -150,11 +155,13 @@ Enabled by default on both sides. Nagle's algorithm delays a small write while w
 for a request that is a few hundred bytes followed by a wait for the first token, that delay is pure
 added latency. For streamed token-by-token responses the same applies in reverse.
 
-### 3.6 `SO_REUSEPORT` with one listener per worker
+### 3.6 `SO_REUSEPORT`, and a single listener
 
-With `reuse_port` enabled, the relay binds one listening socket per CPU with `SO_REUSEPORT`. The
-kernel distributes incoming connections across them, so there is no single accept queue and no
-thundering herd when several workers wake for one connection.
+The relay sets `SO_REUSEPORT` on its listening socket, so the option is there for a future multi-listener
+setup. Today it binds **exactly one** listener regardless of CPU count: `relay.reuse_port` is read by
+nobody on the request path, and there is no one-listener-per-CPU fan-out. The consequence is that the
+single accept queue and the thundering-herd reasoning below are the design, not the current behaviour.
+The kernel hash distribution becomes real only when the listener is duplicated.
 
 The choice to use `SO_REUSEPORT` rather than a shared listener is deliberate: a shared listener means
 every accept wakes every worker, and the wakeup cost grows with core count. The tradeoff is that
@@ -163,9 +170,9 @@ acceptable here because the relay's work per connection is uniform.
 
 ### 3.7 mimalloc
 
-Declared in `lib.rs` rather than `main.rs`, specifically so that `tools/bench` links the same
-allocator the shipping binary uses. A benchmark that measures a different allocator is measuring the
-wrong program.
+Declared in `lib.rs` rather than `main.rs`, specifically so that any future benchmark binary links the
+same allocator the shipping binary uses. A benchmark that measures a different allocator is measuring
+the wrong program. (There is no such binary yet — `tools/bench` is an empty directory.)
 
 The relay's pattern — many short-lived buffers, allocated and freed on different threads as hyper
 tasks migrate between workers — is where a general-purpose allocator is weakest. mimalloc's
@@ -199,13 +206,16 @@ unoptimised `rustls` or `hyper` makes local profiling meaningless.
 
 ### 3.9 Fire-and-forget usage accounting
 
-Usage data — tokens, latency, which participant won — is recorded, but never synchronously. The relay
-pushes a record onto a bounded channel and the conductor batches writes to SQLite. If the channel is
-full the record is **dropped and counted**, not retried.
+> **Status.** This is the design, not live behaviour. No usage record is written anywhere today: the
+> relay does not mention usage, and the `usage` table's writer has no caller outside `store.rs` tests.
+
+Usage data — tokens, latency, which participant won — is intended to be recorded, but never
+synchronously. The relay would push a record onto a bounded channel and a writer would batch to SQLite.
+If the channel is full the record is **dropped and counted**, not retried.
 
 That is a deliberate choice: an observability feature must never be able to apply backpressure to the
-thing it observes. The panel surfaces the dropped-record count so the loss is visible rather than
-silent.
+thing it observes. The panel is meant to surface the dropped-record count so the loss is visible rather
+than silent.
 
 ---
 
@@ -233,12 +243,12 @@ Two mechanisms, and the distinction between them matters.
 ### `tools/bench` against `tools/mock-upstream`
 
 `tools/mock-upstream` answers with a fixed, tiny payload after a configurable delay, so the time
-measured is the relay's and not the upstream's. The benchmark asserts that p50 added latency is under
-150 µs and p99 under 500 µs, and it runs in CI. A regression therefore fails a test rather than being
-discovered in production.
-
-The mock is deterministic — identical request bytes produce identical response bytes — so a
-comparison between two runs is meaningful and the benchmark does not flake.
+measured is the relay's and not the upstream's. It exists and works. `tools/bench`, the harness that
+would assert p50 under 150 µs and p99 under 500 µs, **does not exist**: the directory is empty, there
+is no `mr-bench` package, and CI excludes `bench` from its tool matrix. So there is no pass/fail
+latency assertion anywhere today, and a regression would not fail a test. The mock's determinism —
+identical request bytes produce identical response bytes — is what would make such a comparison
+meaningful once the harness is written.
 
 ### Opt-in live comparison
 
@@ -266,6 +276,9 @@ would be misleading, so the two are never mixed.
 
 If a proposed change cannot be accounted for within one of these rows, it does not belong on the
 request path.
+
+Every row is a **target**. None of them is currently measured or asserted anywhere in this repository
+— see §5 — so they are the design's budget, not a result.
 
 ---
 

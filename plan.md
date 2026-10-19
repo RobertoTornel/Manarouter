@@ -1,1051 +1,467 @@
-# Plan — a latency-obsessed AI router (Rust data plane + control plane)
+# plan.md — Feature round 2: quota, docs, reasoning levels, tests, and the improvement list
 
-> Status: **awaiting user decisions** on the questions in §15 before implementation begins.
-> Working dir: `/home/mana/Documents/seek/Router`
+> **This file is the operational source of truth for the current work and must survive context
+> compaction.** It replaces the original build plan, preserved verbatim in
+> [`plan-build-history.md`](plan-build-history.md).
+>
+> **On resume after a compaction:** read §1 (constraints), §2 (decisions — do not re-litigate),
+> §4 (feature specs), then §5 (task board) and continue with the **first unchecked task in board
+> order**. Read §7 (progress log) to see what the previous session actually proved. Never restart
+> the project's services.
+
+Working dir: `/home/mana/Documents/seek/Router` — repo `RobertoTornel/Manarouter`, HEAD at plan
+time `9439b937` with ~40 pre-existing modified files in the working tree.
 
 ---
 
-## 1. Objective
+## 1. Hard constraints and safety (never violate)
 
-Build a small, public, open-source AI router that:
+| # | Constraint | Why |
+|---|---|---|
+| C1 | **Never restart Manarouter.** No `mr serve`, no `systemctl restart`, no `kill`, no re-exec of `manarouter-conductor`/`manarouter-relay`. | This agent's own session routes through the live instance. |
+| C2 | **Never write live state**: `/home/mana/.config/manarouter/config.json`, `/home/mana/.local/state/manarouter/*`, `~/.local/bin/manarouter-*`, `~/.dsh/**`. | The running relay re-reads `config.json` on a ~2 s poll; a bad write kills this session. |
+| C3 | All tests and manual runs use an **isolated config/state dir** (`MANAROUTER_CONFIG_DIR`, `MANAROUTER_STATE_DIR` in a temp dir) and **ephemeral ports**. | Keeps the live gateway untouched. |
+| C4 | **Preserve pre-existing uncommitted changes**; never `git checkout`/`reset`/`stash` other people's edits. Stage nothing unless asked. | The tree is dirty on purpose. |
+| C5 | Documentation is written **as each feature completes**, in parallel with building the next one. | Standing rule in the brief. |
+| C6 | Subagents get **file-disjoint ownership**. No two workers touch one file. Live-config or service actions are never delegated. | Avoids race conditions. |
 
-- Speaks **OpenAI-compatible** (Chat Completions, Responses, Embeddings, Audio Transcriptions, Audio Speech, Image Generations, Models) **and Anthropic-compatible** (`/v1/messages`) on the *client* side.
-- Fans out to many upstream providers (OpenAI-compatible + Anthropic-compatible), with **multiple API keys per provider** selected by **priority / round-robin / random / least-used**.
-- Supports **OAuth login** for OpenAI Codex, Google Antigravity, GitHub Copilot — and documents how to add more.
-- Has **custom combos**: user-named models that route to an ordered list of steps with per-combo strategy (priority, round-robin, reset-aware priority) and a **hedged race mode**.
-- Tracks **provider quota** and schedules **reset-aware**.
-- Ships a **small web panel** to add/remove/modify providers, keys, combos, and change the **listen port for next restart**.
-- Ports the provider set from a local **OmniRoute** install (v3.8.51) and integrates the **commandcode-bridge** protocol as a first-class provider.
-- Is **obsessively optimized for latency**: the data plane does nothing but send and receive bytes.
+The live environment, for reference only:
 
-### Hard constraints from the brief
+- relay `http://127.0.0.1:20900` (data plane), control/panel `http://127.0.0.1:20901` (control plane)
+- DSH profile `~/.dsh/profiles/web/cordis.patch.yml` calls the relay with model id
+  `deepseek/deepseek-v4.1-flash` (a *bare* command-code model id that itself contains a slash)
+- providers today: `command-code` (dialect `command-code`, 54 models), `antigravity` (12),
+  `openai-codex` (dialect `codex`, 7); 76 auto-generated aliases; 2 client keys
+- OmniRoute (MIT, © 2026 diegosouzapw) **is installed and running** on `127.0.0.1:20131/20132`;
+  its full TypeScript source is at `/home/mana/.local/lib/node_modules/omniroute` — the reference
+  for Feature 1's ported quota handlers.
 
-| # | Constraint |
+---
+
+## 2. Confirmed decisions (from the planning Q&A — do not re-litigate)
+
+> These are original intended requirements, not a declaration that every feature shipped. Current
+> implementation status is tracked in §5 and the verification log in §7; unresolved scope includes
+> per-key caps (D2), full modality reroute (D3), and runtime proxy egress (D4).
+
+| Area | Decision |
 |---|---|
-| C1 | Priority/routing decisions live on a **separate process** from the router. |
-| C2 | The router is **Rust** and moves everything not related to sending/receiving off the hot path. Combo logic is computed **outside** the router. |
-| C3 | The router must route to **multiple providers concurrently**. |
-| C4 | The panel may be any language but must be **lightweight**. |
-| C5 | The project is **LLM-usage-first**, while remaining fully operable from the panel. |
-| C6 | Every feature gets **its own documentation file**; one **index file** is feedable to an LLM to locate any doc. |
-| C7 | The port is changeable **from the website**, effective on next restart. |
-| C8 | Public GitHub repo, committed. |
+| Safety envelope | Source edits + isolated tests only; user deploys/restarts. |
+| F1 provider coverage | Generic fetcher framework in Rust + the providers this install uses, extensible: codex/chatgpt, copilot/github, antigravity, claude/anthropic, command-code-go, openai-compatible, openrouter, deepseek, glm, kimi, minimax, grok/xai, cursor, qwen-token-plan, moonshot. |
+| F1 chunk direction | **Filled pink = remaining**, light gray = used. |
+| F1 chunk setting | `quota.display { mode: "chunks"\|"percentage", chunks: N }` in `config.json`; one global N. |
+| F1 refresh | Manual buttons (per account + all) **and** an optional refresh-on-panel-load toggle, **default off**. |
+| F2 docs | Vendored **offline Markdown→HTML** renderer (sanitized, no CDN) + **Download** button top-right saving the raw `.md`. |
+| F5 docs | Panel is curated to a **user-facing** document set; those get rewritten. Build/internal docs stay in-repo, out of the panel. |
+| F3 level source | Per-model list in config, auto-seeded from catalog/provider metadata, editable in the panel. |
+| F3 naming | `provider/model` with an **optional** `-level` that **defaults to `high`** (configurable). A missing *provider* is an error, unless the name resolves to a **combo** (combos may be named with slashes). User-authored aliases keep working. |
+| F3 wire mapping | Per-dialect defaults **plus** a per-model override map in config. |
+| F3 existing aliases | Generated aliases (`generated: true`) are **deleted automatically on the next config load**, with a backup. |
+| Bare model ids | **No legacy fallback.** The operator instead creates a combo named after the bare id (e.g. combo `deepseek/deepseek-v4.1-flash` → one step `command-code/deepseek/deepseek-v4.1-flash-high`). |
+| No-key mode | Relay-wide flag, **default off**; refuses to enable when the relay binds non-loopback unless an explicit allow-remote flag is also set. |
+| Per-key quotas | Rolling **5h/1w/30d** windows with **token + request** caps, counters persisted, metered on prompt+completion tokens. |
+| Multimodal defaults | Unsupported input type → **rewrite** to the configured default model for that type; capability flags on `ModelEntry`, auto-seeded and editable. Multiple unsupported types need one model covering all, else a clear error naming the defaults. |
+| Proxies | User brings **http, https, socks4, socks5** proxies; multiple proxies with API-like selection (priority / least-used / random / round-robin), bindable per provider or per account. |
+| Pricing | Bundled offline LiteLLM-derived table + live provider pricing where exposed (OpenRouter-style) + manual override in the panel. |
+| `command-code` rename | **Hard rename to `command-code-go`** plus a one-time config migration (with backup) so the live config keeps working. |
+| Tests (F4) | `git rm --cached` the tracked test files, ignore `tests/`, `panel/test/`, `scripts/test-*.sh`; in-crate `#[cfg(test)]` unit tests stay. |
 
 ---
 
-## 2. Evidence gathered (what the references actually do)
+## 3. File map of the areas this round touches
 
-This is not guesswork — the local OmniRoute install was inspected directly.
-
-### 2.1 OmniRoute (local install, v3.8.51)
-
-> **Corrected.** Earlier revisions of this plan said v16.3.5. That is the **Next.js** version, which a
-> process-title rewrite makes look like OmniRoute's. `package.json` reports **3.8.51**, verified in
-> `.research/omniroute-protocol-layer.md` §1. Every conclusion drawn from the OmniRoute source is
-> unaffected — only the label above the install was wrong.
-
-- Install root: `~/.local/lib/node_modules/omniroute` (~2.5 GB, Node/TypeScript).
-- Live instance: `http://127.0.0.1:20129`, 9500 models across **45 `owned_by` provider ids**.
-- State: `~/.omniroute/storage.sqlite` — **639 MB**, **142 tables**.
-- Relevant tables: `provider_connections` (74 rows), `combos` (7), `provider_quota_state`, `provider_quota_reset_events`, `api_key_quota_counters`, `usage_history`, `model_capabilities`, `key_value` (namespaced settings), `session_account_affinity`, `key_groups`, `plugin`-ish tables.
-- **Providers actually credentialed on this machine: 35** (74 connections), across `apikey` and `oauth` auth types.
-
-`provider_connections` columns that prove the routing model we must match:
-
-```
-provider, auth_type, priority, global_priority, is_active, access_token, refresh_token,
-expires_at, project_id, backoff_level, rate_limited_until, api_key, provider_specific_data,
-consecutive_use_count, rate_limit_protection, max_concurrent, group, quota_visible,
-quota_window_thresholds_json, rate_limit_overrides_json, last_pinged_reset_key, synced_models_at
-```
-
-`consecutive_use_count` ⇒ round-robin / least-used are already tracked per connection.
-`backoff_level` + `rate_limited_until` ⇒ reset-aware scheduling is already a first-class concept.
-
-A real combo row (`combos.data`, redacted of nothing sensitive):
-
-```json
-{
-  "models": [
-    { "id": "nsfw-model-1-deepinfra-sao10k-l3-8b-lunaris-v1-turbo", "kind": "model",
-      "model": "deepinfra/Sao10K/L3-8B-Lunaris-v1-Turbo", "providerId": "deepinfra", "weight": 0 }
-  ],
-  "strategy": "priority",
-  "config": {
-    "maxRetries": 1, "retryDelayMs": 2000, "handoffThreshold": 0.85, "handoffModel": "",
-    "maxMessagesForSummary": 30, "trackMetrics": true,
-    "reasoningTokenBufferEnabled": true, "zeroLatencyOptimizationsEnabled": false
-  },
-  "version": 2, "name": "nsfw", "sortOrder": 2, "isHidden": false
-}
-```
-
-Observed combo strategies in the DB: `priority`, `round-robin`, `fill-first`.
-(Note: the brief's requested **hedged race** mode and **reset-aware priority** are richer than anything OmniRoute exposes in `strategy` today — that is net-new work, see §9.)
-
-Observed quota behaviour (important, and worth beating):
-
-```
-HTTP/1.1 429 Too Many Requests
-retry-after: 300
-{"error":{"message":"[openadapter/DeepSeek-V4.1-Flash] All openadapter accounts have
- exhausted their quota (cached quota state, no upstream attempt; earliest reset reset
- after 5m) (reset after 5m)","retry_after":300,"reset_at":"2026-10-13T19:16:52.762Z"}}
-```
-
-So OmniRoute short-circuits on *cached* quota state without touching the network, and emits a
-machine-readable `reset_at`. We will match that contract — and additionally expose reset state to
-the scheduler so a combo can deprioritise an exhausted step *before* the request is even sent.
-
-Other namespaced settings found in `key_value` that inform our data model:
-`modelAliases`, `customModels`, `syncedAvailableModels`, `fallbackStrategy` (= `priority`),
-`lkgp` (last-known-good-provider, used for session affinity), `compression` / `caveman`
-(token compression), `databaseSettings.semanticCache*`, `promptCache*`.
-
-### 2.2 `commandcode-bridge` (local)
-
-- Path: `/home/mana/Documents/seek/fornai/commandcode-bridge` (Node, zero deps).
-- Purpose: translate OpenAI Chat Completions → Command Code CLI `POST /alpha/generate` envelope,
-  then convert the CLI event stream back to OpenAI JSON or SSE. Targets **Command Code GO-plan**
-  users, who must use `/alpha/generate` rather than `/provider/v1/...`.
-- Upstream: `https://api.commandcode.ai`, header `x-command-code-version` (default `1.79.2`).
-- Env: `CC_API_KEY`, `PROXY_API_KEY`, `PORT`/`HOST` (3050/127.0.0.1), `CC_UPSTREAM_BASE`,
-  `CC_CLI_VERSION`, `MAX_BODY_BYTES` (4 MiB).
-- This will be reimplemented as a native Rust provider adapter (`dialect = commandcode`), so no
-  Node sidecar is needed. Full protocol spec is being extracted (see `docs/providers/commandcode.md`).
-
-### 2.3 9router
-
-Referenced for its multi-provider catalog, client shims (Claude Code / Codex / Cursor / Cline /
-Copilot) and RTK token compression. Research artifact: `.research/9router.md` (in flight).
-
-### 2.4 Latency baseline measured so far
-
-Against the local OmniRoute at `127.0.0.1:20129`:
-
-| Measurement | Value |
+| Area | Files |
 |---|---|
-| Local HTTP accept→first-byte for `/v1/models` (200) | ~0.03–0.17 s |
-| Local loopback connect time | ~0.00014 s |
-| Quota short-circuit 429 (no upstream call) | ~0.024 s TTFB |
-| Real upstream call (`oad/DeepSeek-V4.1-Flash`) | 46 s first warmup, then quota-exhausted |
-| `/v1/models`, a purely local cached-list call | **5.2 – 9.2 s TTFB** |
-| Zero-upstream-work quota 429 short-circuit | 22 – 295 ms |
-
-**Conclusion:** the existing gateway spends **hundreds of milliseconds on pure gateway overhead** —
-a 5–9 s purely local list call, and a 22–295 ms quota rejection that never touches the network — while
-loopback RTT itself is only ~0.14 ms. That gap is the entire opportunity, and it is why no
-per-request control-plane hop is acceptable: hence the ratified **compiled-snapshot** design (§3.1).
-The openadapter model is currently quota-limited, so a full live comparison needs a different probe
-model or a reset window; it is a task, not a blocker.
+| Domain model / config | `crates/mr-core/src/model.rs`, `config.rs`, `dialect.rs`, `catalog.rs`, `published.rs` |
+| Snapshot compiler | `crates/mr-core/src/snapshot.rs` (2.7 kloc — resolution, aliases, levels) |
+| Store | `crates/mr-core/src/store.rs` (3.0 kloc — usage rows, counters) + `migrations/` |
+| Quota (new) | `crates/mr-core/src/quota/*` (new module: types, trait, registry, normalizers, fetchers, MIT-ported) |
+| Dialects | `crates/mr-dialects/src/{lib,openai,anthropic,google,responses,commandcode}.rs` |
+| Relay | `crates/manarouter-relay/src/{server,select,state,upstream,startup,model_scan}.rs` |
+| Control API | `crates/manarouter-conductor/src/{api,state,auth,serve}.rs` |
+| Panel | `panel/{index.html,app.js,app.css,dom.js,view-*.js}`, `panel/test/` |
+| Catalog data | `catalog/providers.toml`, new `catalog/model_meta.json`, new `catalog/pricing.json` |
+| Docs | `docs/*.md`, new `docs/user/*.md`, `docs/LLM_INDEX.md`, `docs/23-implementation-status.md` |
 
 ---
 
-## 3. Architecture
+## 4. Feature specifications and acceptance criteria
 
-Two processes, one cargo workspace, one repo.
+### Feature 1 — real provider quota checks
 
-```
-                       ┌──────────────────────────────────────────────┐
-   Claude Code ─┐      │  DATA PLANE  "manarouter-relay"   (Rust, axum/hyper)   │
-   Codex CLI  ──┼─────▶│                                              │
-   Cursor     ──┤      │  • accept, pull `model` field only           │
-   curl/SDK   ──┘      │  • hashmap lookup → precompiled Plan         │
-                       │  • key pick (branch-free, atomic counters)   │
-                       │  • open/reuse upstream connection            │
-                       │  • stream bytes both ways, no JSON re-encode │
-                       │  • race/hedge when the Plan says so          │
-                       │  • emit async usage/quota deltas (off-path)  │
-                       └───────┬──────────────────────┬───────────────┘
-                               │ mmap  (read, atomic  │ async, off hot path
-                               │ snapshot swap)       │ fire-and-forget
-                       ┌───────▼──────────────────────▼───────────────┐
-                       │  CONTROL PLANE  "conductor"  (Rust, axum)    │
-                       │                                              │
-                       │  • web panel (static HTML+JS, no npm)        │
-                       │  • provider/key/alias/combo CRUD             │
-                       │  • OAuth device+loopback flows, token refresh│
-                       │  • /models discovery + manual model add      │
-                       │  • combo compiler → snapshot                 │
-                       │  • quota tracker, reset windows, backoff     │
-                       │  • usage rollups, health probes              │
-                       │  • SQLite (rusqlite) + JSON config           │
-                       └──────────────────────────────────────────────┘
-```
+**Story.** An operator opens Quota, sees each account's real window usage, can refresh one account
+or everything, and can read it as chunks or percentages.
 
-### 3.1 The key idea: *compile* combos, don't *interpret* them
+**Design.**
 
-The brief says combo logic must live outside the router. Taken literally as "the router asks the
-control plane what to do", that costs an IPC round trip per request — with measured loopback RTT
-at ~0.14 ms and a real RPC + JSON encode/decode on both sides, that is realistically 0.3–2 ms
-added to every single request, forever.
+1. New module `crates/mr-core/src/quota/`:
+   - `types.rs`: `UsageQuota { used, total, remaining, remaining_percentage, reset_at, unlimited,
+     fraction_reported, source, display_name, details }`, `QuotaWindow { family: WindowFamily,
+     used, total, reset_at, ... }`, `WindowFamily { Session5h, Weekly1w, Monthly30d, Other{secs} }`.
+   - `window.rs`: port of `quotaWindowLabel.ts` — duration-aware family inference
+     (≤6 h ⇒ Session, ≤8 d ⇒ Weekly, ≤40 d ⇒ Monthly, else `Other`), label formatting `5h`/`1w`/`30d`.
+   - `http.rs`: `trait QuotaHttp` seam (mirrors `oauth::flow::OAuthHttp`) + real hyper impl.
+   - `registry.rs`: `trait QuotaFetcher { fn id(&self) -> &'static str; fn supports(&self, dialect,
+     provider_id, account) -> bool; async fn fetch(&self, ctx) -> Result<UsageQuota>; }` and a
+     registry mapping provider/dialect → fetcher, with a generic openai-compatible fallback.
+   - One file per provider family: `codex.rs`, `claude.rs`, `antigravity.rs`, `github.rs`
+     (copilot), `commandcode.rs`, `openrouter.rs`, `deepseek.rs`, `glm.rs`, `kimi.rs`, `minimax.rs`,
+     `grok.rs`, `cursor.rs`, `qwen.rs`, `moonshot.rs`, `openai_compat.rs` — **ported from
+     `/home/mana/.local/lib/node_modules/omniroute/open-sse/services/usage/*.ts`**, MIT attribution
+     in the module header and `docs/credits.md`.
+   - Pure parsers must be unit-tested against captured/derived upstream JSON (no network in tests).
+2. Cache: latest snapshot per `(provider, account)` in the store (new table `provider_quota_state`,
+   mirroring OmniRoute) with `fetched_at`, so the panel renders instantly and shows staleness.
+3. API (control plane):
+   - `GET  /api/quota` — extended: observed usage (existing) **+** cached quota windows per account.
+   - `POST /api/quota/refresh` `{provider?, account?}` — refresh one account/all accounts,
+     concurrency-limited; returns per-account result with honest errors.
+   - `GET/PUT /api/quota/display` — `{mode, chunks, reset_on_load}` from `config.quota.display`.
+4. Panel `panel/view-quota.js`: per-account card with one row per window family
+   (`5h`, `1w`, `30d`), showing chunks or percentage; **pink fill = remaining**; a window the
+   provider does not have renders **`N/A`** (never blank); per-account refresh button; a "Refresh
+   all" button; "fetched 12 s ago" staleness text; refresh-on-load only when enabled.
 
-Instead:
+**Acceptance.** `cargo test -p mr-core quota` covers window mapping, every ported parser, and the
+N/A rule; `POST /api/quota/refresh` with a mock upstream returns real numbers and per-account
+errors; the panel renders chunks/percentage/N/A without fabricated values.
 
-1. The conductor holds the full, rich, editable model (combos, weights, races, quota policy).
-2. On every change it **compiles** that into a flat, self-contained **Routing Snapshot**: a
-   `Vec<RouteEntry>` in a layout the data plane can binary-search/hash directly, plus an interned
-   string table for model names, plus `Arc`-shared atomic counters.
-3. It writes the snapshot to a file and pings the data plane.
-4. The data plane `mmap`s it and atomically swaps an `arc_swap::ArcSwap<Snapshot>` pointer.
+### Feature 2 — Documentation tab embeds the docs
 
-Result: **zero IPC per request.** The data plane's routing step is pointer load + hash + a couple
-of atomic ops. Combo *authoring* stays entirely in the control plane, satisfying C1/C2 while not
-paying for it at runtime. Same trick for key counters: the snapshot carries `Arc<AtomicU64>`
-so "least-used" is a local min-scan over an array that is almost always 1–4 entries.
+**Design.** `panel/markdown.js` — a small, dependency-free, offline renderer: escape HTML first,
+then headings, fenced code, tables, lists, blockquotes, hr, links (with `rel="noreferrer noopener"`),
+bold/italic/inline-code. No raw HTML passthrough, no `innerHTML` of unescaped input. `view-docs.js`
+renders through it; a **Download** button sits in the top-right of the content card and saves the raw
+markdown via a Blob. `GET /api/docs` lists the curated set (§F5); `GET /api/docs/{name}` is unchanged.
 
-Anything genuinely dynamic and unavoidable (OAuth token refresh, quota reset transitions) is
-handled as **optimistic + repair**: the data plane assumes the last snapshot is valid, and on a
-401/403/429 it emits a signal to the conductor and (where safe) retries once with the refreshed
-credit.
+**Acceptance.** Panel unit test (`panel/test/markdown.test.mjs`) proves escaping of `<script>`, raw
+HTML, and `javascript:` links; manual render of every curated doc has no broken table/code block.
 
-### 3.2 Why two Rust binaries rather than Rust + Node
+### Feature 3 — provider/model-reasoninglevel naming, no bare aliases
 
-- One toolchain, one build, no `node_modules`, one CI.
-- Panel is a single static `index.html` + `app.js` + `style.css` embedded with `include_str!`
-  → the conductor binary is self-contained and starts in milliseconds.
-- The conductor is *not* on the request path, so it can afford SQLite, background tasks, and a
-  web UI without any latency consequence. (C4 satisfied: total panel payload target < 100 KB.)
+**Design.**
 
-### 3.3 Request lifecycle (hot path), with the cost of each step
+1. `ReasoningLevel` enum `None < Low < Medium < High < XHigh < Ultra < Max` in `model.rs`, reusable
+   in config/snapshot/relay code (snapshot stores a `u8` rank).
+2. `ModelEntry` gains `reasoning_levels: Vec<ReasoningLevel>` (empty ⇒ derive),
+   `default_reasoning_level: Option<ReasoningLevel>`, `reasoning_wire: Option<BTreeMap<ReasoningLevel,
+   serde_json::Value>>` (per-model override of the dialect default fragment), and
+   `input_modalities: Vec<InputModality>`.
+3. Effective levels: entry list if non-empty, else the bundled capability table
+   (`catalog/model_meta.json`, generated from OmniRoute's model metadata), else the dialect default
+   set when the provider advertises reasoning.
+4. Allowed level names in a name: `none|low|medium|high|xhigh|ultra|max`.
+5. Resolution (`snapshot.rs`), in order: user alias → combo id → combo name → **provider-qualified**
+   `provider/rest` → error naming the exact problem. Provider-qualified matching: (a) `rest` is an
+   exact model id ⇒ level = trailing level token of `rest` if it is one of that model's levels, else
+   the model's `default_reasoning_level` else `routing.default_reasoning_level` (default `high`);
+   (b) else strip a trailing level token, and if the remainder is an exact model id ⇒ that level;
+   (c) else error.
+6. Out-of-range level (e.g. `-max` on a model that tops out at `xhigh`) ⇒ **reroute to that model's
+   highest available level** (never fail), and record the substitution so the panel/logs can show it.
+7. Wire application: per-dialect default fragment per level + per-model override, merged into the
+   upstream body by `mr-dialects` (openai/`reasoning_effort`, responses/`reasoning.effort`,
+   anthropic/`thinking`, google+antigravity/`thinkingConfig`, command-code-go/effort field). `none`
+   emits no reasoning fragment.
+8. `generated: true` aliases are dropped on config load (backup written), with a log line; the panel
+   Aliases view shows only user-authored aliases (`view-aliases.js` filters `generated`).
+9. `/v1/models` exposes `provider/model` plus the derived `provider/model-level` entries for the
+   levels that model supports.
 
-| Step | Work | Budget |
+**Acceptance.** Unit tests: exact-model-wins (`antigravity/gemini-3.8-flash-low`), slashed model ids
+(`command-code/deepseek/deepseek-v4.1-flash`), default level `high`, missing provider error,
+combo-with-slash resolution, out-of-range substitution, `none`, alias precedence, generated-alias
+deletion, `/v1/models` listing.
+
+### Feature 4 — tests out of the published repository
+
+**Done (A3).** `git rm --cached tests/smoke_e2e.py tests/local_latency_bench.py
+panel/test/browser.e2e.mjs scripts/test-installer-systemd.sh` (files stay on disk and keep
+working locally), `.gitignore` gained `/tests/`, `/panel/test/`, `/scripts/test-*.sh`,
+`/e2e-evidence/`, `*.spec.mjs`, `*.e2e.mjs`; the two CI steps that referenced the now-untracked
+files were removed from `.github/workflows/ci.yml`. In-crate `#[cfg(test)]` unit tests and
+`crates/*/tests/*.rs` are deliberately **not** ignored: they are source and CI runs them.
+Verified with `git status --short --ignored tests panel/test scripts`.
+
+### §4.5 Design details locked during implementation (read before B2–D6)
+
+**Reasoning levels.** Canonical vocabulary (ascending): `none(0) minimal(1) low(2) medium(3)
+high(4) xhigh(5) ultra(6) max(7)`. `minimal` exists so OmniRoute's tier data maps faithfully; the
+seven names the brief lists are the user-facing ones. Parsing accepts `xhigh`, `x-high`,
+`extra-high`, `extra_high`, `extrahigh`.
+
+**Resolution is compile-time, not runtime string surgery.** `snapshot.rs` already resolves by an
+FNV-keyed index with precedence ranks (alias → combo id → combo name → `provider/model` → bare
+model id). Feature 3 keeps that shape and adds level-qualified entries:
+
+| rank | key compiled | resolves to |
 |---|---|---|
-| 0 | Accept on a `SO_REUSEPORT` listener, one per worker thread | — |
-| 1 | Read headers + body into a pooled `BytesMut` | alloc-once |
-| 2 | Extract `model` via a targeted byte scan of the first ~4 KiB (no full JSON parse) | ~0.5 µs |
-| 3 | `ArcSwap::load()` → `&Snapshot`; hash lookup `model → Plan` | ~50 ns |
-| 4 | Key pick: strategy branch over a tiny array + one relaxed atomic | ~20 ns |
-| 5 | Build the upstream request: clone the *original body bytes verbatim*, rewrite/insert only the auth + routing headers | ~1 µs |
-| 6 | Take a pooled connection (keep-alive, TLS session resumption, pre-warmed) | ~0 ns warm |
-| 7 | Stream response bytes to the client, byte-shuttling, no deserialization | — |
-| 8 | On completion, push one `UsageDelta` into an unbounded MPSC, never await it | ~100 ns |
-
-**Total added overhead target: < 150 µs p50, < 500 µs p99.**
-
-The only cases that pay a translation cost are dialect mismatches, which are explicitly opt-in per
-route (§6.3).
-
----
-
-## 4. Repository layout
-
-```
-Router/
-├── Cargo.toml                  # workspace: manarouter-relay, conductor, core, dialects
-├── rust-toolchain.toml
-├── README.md                   # project README (C6)
-├── LICENSE                     # MIT
-├── plan.md                     # this file
-├── docs/
-│   ├── LLM_INDEX.md            # ★ the single file to feed an LLM: map of every doc (C6)
-│   ├── 00-overview.md
-│   ├── 01-architecture.md
-│   ├── 02-quickstart.md
-│   ├── 03-configuration.md
-│   ├── 04-routing-snapshot.md
-│   ├── 05-key-selection.md
-│   ├── 06-combos.md
-│   ├── 07-hedged-race.md
-│   ├── 08-quota-tracking.md
-│   ├── 09-reset-aware-priority.md
-│   ├── 10-oauth-overview.md
-│   ├── 11-oauth-codex.md
-│   ├── 12-oauth-antigravity.md
-│   ├── 13-oauth-copilot.md
-│   ├── 14-oauth-adding-a-platform.md     # C6: how to add future platforms
-│   ├── 15-web-panel.md
-│   ├── 16-latency-engineering.md
-│   ├── 17-migrating-from-omniroute.md
-│   ├── 18-api-reference.md
-│   ├── 19-latency-benchmarks.md
-│   ├── 20-troubleshooting.md
-│   ├── 21-security.md
-│   ├── 22-sync-design.md        # v1 ships this doc; v1 implements no sync
-│   ├── providers/
-│   │   ├── README.md
-│   │   ├── catalog.md          # generated: every provider, dialect, auth, base URL
-│   │   ├── openai-compatible.md
-│   │   ├── anthropic-compatible.md
-│   │   ├── commandcode.md
-│   │   ├── codex.md
-│   │   ├── copilot.md
-│   │   ├── antigravity.md
-│   │   └── <one file per provider family ported>
-│   └── combo-cookbook.md
-├── crates/
-│   ├── rr-core/                # shared types: Snapshot, Plan, Provider, Key, Combo, Dialect
-│   ├── rr-dialects/            # dialect translation: openai <-> anthropic <-> responses <-> commandcode
-│   ├── rr-relay/               # ← the data plane binary (hot path)
-│   ├── rr-conductor/           # ← the control plane binary + panel + SQLite
-│   └── rr-cli/                 # `mr` CLI: login, add provider, test, bench, migrate
-├── panel/                      # static, embedded into conductor via include_str!
-│   ├── index.html
-│   ├── app.js
-│   └── style.css
-├── migrations/                 # SQLite schema migrations, numbered
-├── tests/
-│   ├── snapshot_compile.rs
-│   ├── key_selection.rs
-│   ├── combo_race.rs
-│   ├── dialect_roundtrip.rs
-│   ├── quota_reset.rs
-│   └── e2e_mock_upstream.rs
-└── tools/
-    └── bench/                  # latency harness, reports p50/p90/p99 + overhead vs direct
-```
-
----
-
-## 5. Core data model
-
-### 5.1 Config (human-editable, JSON, `~/.config/manarouter/`)
-
-```jsonc
-{
-  "listen": { "host": "127.0.0.1", "port": 20900 },        // ← panel-editable (C7)
-  "control": { "host": "127.0.0.1", "port": 20901, "password_hash": "$2b$…" },
-  "client_keys": [ { "key": "rr-…", "label": "claude-code", "allow": ["*"] } ],
-  "providers": [ /* see below */ ],
-  "aliases": { "oad/DeepSeek-V4.1-Flash": "openadapter/DeepSeek-V4.1-Flash" },
-  "combos": [ /* see §9 */ ],
-  "quota": { "track": true, "reset_aware": true, "cooldown_on_429_s": 60 },
-  "latency": {
-    "prewarm_connections": true, "pool_idle_s": 300,
-    "upstream_http2": "auto", "tcp_nodelay": true,
-    "hedge": { "default_max_parallel": 3, "default_window_ms": 800 }
-  }
-}
-```
-
-### 5.2 Provider
-
-```jsonc
-{
-  "id": "openadapter",
-  "label": "OpenAdapter",
-  "dialect": "openai",                 // openai | anthropic | google | commandcode | codex | copilot | antigravity
-  "base_url": "https://…/v1",
-  "auth": { "type": "bearer" },        // bearer | x-api-key | header | query | cookie | oauth
-  "capabilities": ["chat","responses","embeddings","audio.transcription",
-                   "audio.speech","images.generations","models"],
-  "keys": [
-    { "id": "k1", "api_key": "…", "priority": 0, "weight": 1, "enabled": true,
-      "max_concurrent": 4, "models_allow": ["*"] }
-  ],
-  "key_strategy": "priority",          // priority | round-robin | random | least-used
-  "models": { "source": "synced", "synced_at": "…", "manual": ["gpt-x-custom"] },
-  "quota": { "windows": [ { "kind": "rolling", "seconds": 18000, "limit_tokens": 1000000 } ] },
-  "headers": { "extra": {} },
-  "fronted_by": null                    // optional: route via OmniRoute/existing gateway
-}
-```
-
-### 5.3 Compiled snapshot (the only routing structure the data plane sees)
-
-```rust
-#[repr(C)]
-pub struct RouteEntry {
-    model_hash: u64,        // FNV-1a of the requested model id
-    model_off: u32, model_len: u32,   // interned into the snapshot's string table
-    kind: RouteKind,        // Single | Combo
-    plan_off: u32,          // offset into PlanTable
-}
-pub enum RouteKind { Single, Combo }
-
-pub struct SinglePlan {
-    provider_idx: u16,
-    dialect: Dialect,
-    base_url: InternedStr,
-    auth_kind: AuthKind,
-    keys: SmallVec<[KeyRef; 4]>,     // KeyRef holds Arc<AtomicU64> counters + Arc<str> secret
-    key_strategy: KeyStrategy,
-    header_ops: SmallVec<[HeaderOp; 8]>,
-}
-
-pub struct ComboPlan {
-    strategy: ComboStrategy,          // Priority | RoundRobin | ResetAwarePriority
-    hedge: Option<HedgeSpec>,
-    steps: SmallVec<[SinglePlan; 8]>, // pre-resolved, ordered
-    on_fail: Option<u16>,             // index into steps, or a dedicated plan
-    hedge_spec: Option<HedgeSpec>,
-}
-pub struct HedgeSpec {
-    parallel: u8,                     // "first X models"
-    window_ms: u16,                   // "X latency"
-    on_winner_fail: WinnerFail,       // ReRace | UseOnFail | Error
-}
-```
-
-`Dialect` + `SinglePlan` being fully resolved at compile time is what lets the data plane do no
-interpretation. JSON is never touched on the hot path for the matching-dialect case.
-
----
-
-## 6. Provider support
-
-### 6.1 Dialects
-
-| Dialect | Upstream shape | Notes |
-|---|---|---|
-| `openai` | Chat Completions, Responses, Embeddings, Audio, Images, Models | The default. Covers the majority of the 35 ported providers. |
-| `anthropic` | `/v1/messages`, `/v1/messages/count_tokens` | Native, no translation when the client also speaks Anthropic. |
-| `google` | `generateContent` / `streamGenerateContent` | Gemini API-key path. |
-| `antigravity` | `cloudcode-pa.googleapis.com` `v1internal:*` | OAuth; needs the project/tier onboarding envelope. |
-| `codex` | `chatgpt.com/backend-api/codex/responses` | OAuth; Responses-only, `store:false`, `instructions` required. |
-| `copilot` | `api.githubcopilot.com` | OAuth→Copilot bearer; `/chat/completions`, `/v1/messages`. |
-| `commandcode` | `api.commandcode.ai/alpha/generate` | CLI envelope + custom event stream (§2.2). |
-
-### 6.2 Client surfaces (shims)
-
-The brief is LLM-usage-first, so the relay must be droppable into existing agent CLIs:
-
-- `POST /v1/chat/completions` (+ `stream`)
-- `POST /v1/responses`
-- `POST /v1/embeddings`
-- `POST /v1/audio/transcriptions`
-- `POST /v1/audio/speech`
-- `POST /v1/images/generations`
-- `GET  /v1/models`, `GET /v1/models/{id}`
-- `POST /v1/messages` (+ `stream`) — Anthropic, for Claude Code
-- `POST /v1/messages/count_tokens`
-- `POST /v1/complete` — legacy FIM/Codex CLI compatibility
-- `GET  /health`, `GET /metrics`
-
-Point Claude Code at `ANTHROPIC_BASE_URL`, Codex CLI at the Responses URL, Cursor/Cline at the
-OpenAI URL.
-
-### 6.3 Translation policy (latency-relevant)
-
-| Client → Upstream | Behaviour | Cost |
-|---|---|---|
-| openai → openai | **byte passthrough**, headers only | ~0 |
-| anthropic → anthropic | **byte passthrough** | ~0 |
-| openai → anthropic | full translate | serde + SSE rebuild |
-| anthropic → openai | full translate | serde + SSE rebuild |
-| any → codex/responses | translate + enforce `store:false`, `instructions` | serde |
-| any → commandcode | translate to CLI envelope, rebuild event stream | serde |
-| any → google/antigravity | translate | serde |
-
-Translation lives in `mr-dialects`, is pure, and is only invoked when
-`client_dialect != upstream_dialect`. This is the single biggest latency decision in the project
-(Q9).
-
-For Response/SSE streams where dialects match, the relay never materialises a JSON value: it
-finds SSE frame boundaries and forwards `Bytes` slices, only peeking at `usage` frames via a
-cheap memchr for `"usage"` before the terminator.
-
-### 6.4 Model discovery
-
-- **From `/models`**: conductor task per provider, paginated, scheduled (`synced_models_at`),
-  writes into the `models` cache table; diffed and surfaced in the panel with a "sync now" button.
-- **Manually**: panel form (model id, dialect override, context length, capabilities, aliases) and
-  config-file editing. Manual entries win over synced ones (mirrors OmniRoute's
-  `modelMetadataPrecedence`).
-- Aliases: provider-prefixed (`openadapter/X`), short (`oad/X`), bare (`X`), plus user aliases and
-  combo names — mirroring OmniRoute's observed triple-exposure (Q17).
-
-### 6.5 Porting OmniRoute's providers
-
-`mr-cli migrate omniroute --db ~/.omniroute/storage.sqlite` will:
-
-1. Read `provider_connections` and emit one `Provider + keys` block per connection, **preserving
-   `priority`, `global_priority`, `max_concurrent`, `group`** and de-duplicating by provider.
-2. Map `auth_type`: `apikey` → `api_key`; `oauth` → an OAuth credential record (tokens copied from
-   `access_token`/`refresh_token`/`expires_at`/`project_id`/`provider_specific_data`).
-3. Read `combos` and emit combo definitions, mapping `strategy` `priority|round-robin|fill-first`
-   onto ours, and carrying `config.maxRetries`/`retryDelayMs`/`handoffThreshold`/`handoffModel`.
-4. Read `key_value` namespaces `modelAliases`, `customModels`, `syncedAvailableModels`,
-   `fallbackStrategy` into our config.
-5. Report a dry-run diff before writing.
-
-Secrets are **never** written into the repo or the snapshot; they live in `~/.config/manarouter/secrets/`
-mode `0600` (Q14) and are referenced by id.
-
----
-
-## 7. OAuth subsystem
-
-Uniform trait so every platform is the same shape (this is also the answer to C6's
-"how to add more OAuth platforms later"):
-
-```rust
-#[async_trait]
-pub trait OAuthPlatform: Send + Sync {
-    fn id(&self) -> &'static str;                    // "codex" | "copilot" | "antigravity"
-    fn label(&self) -> &'static str;
-    /// Which of the three flows this platform uses.
-    fn flow(&self) -> OAuthFlow;                     // LoopbackPkce | DeviceCode
-    async fn build_authorize(&self, st: &PkceState) -> AuthorizeRequest;
-    async fn exchange(&self, code: &str, st: &PkceState) -> Result<TokenSet>;
-    async fn refresh(&self, rt: &str) -> Result<TokenSet>;
-    /// Turn a live TokenSet into the headers/params the upstream dialect needs.
-    async fn apply(&self, tok: &TokenSet, req: &mut UpstreamRequest) -> Result<()>;
-    /// Optional: exchange a provider token for a narrower one (Copilot).
-    async fn mint_session(&self, tok: &TokenSet) -> Result<Option<TokenSet>>;
-}
-```
-
-Registry `PLATFORMS: &[&dyn OAuthPlatform]`; adding one is a new module + one line, documented
-step-by-step in `docs/14-oauth-adding-a-platform.md`.
-
-Flows implemented:
-
-- **LoopbackPkce** (Codex, Antigravity): bind `127.0.0.1:<ephemeral>`, open the browser, capture
-  `?code=`, exchange, store.
-- **DeviceCode** (GitHub Copilot candidate): print `user_code` + `verification_uri`, poll.
-
-Token lifecycle: background refresh in the conductor at `expiry - 5 min`; the data plane reads the
-current token from the snapshot; on a `401` the relay signals the conductor and retries once with
-a freshly minted token. Refresh is single-flight per credential to avoid stampedes.
-
-Exact endpoints/client-ids/PKCE details are being extracted into
-`docs/11-oauth-codex.md`, `docs/12-oauth-antigravity.md`, `docs/13-oauth-copilot.md`.
-
----
-
-## 8. Web panel
-
-Single static page, embedded in the conductor binary, no build step, no npm.
-
-Views:
-1. **Dashboard** — relay/control status, listen port, request rate, p50/p95/p99 overlay, error rate,
-   active connections, snapshot version + "recompile" indicator.
-2. **Providers** — list with dialect, base URL, key count, health, quota bars, enable/disable,
-   edit, delete, "test", "sync models".
-3. **Keys** — per-provider list: add/remove/reorder (drag), priority, weight, strategy selector
-   (priority / round-robin / random / least-used), per-key limits, masked display (`sk-06fe…`).
-4. **Models** — synced + manual, search across the whole catalog, add-manually form, alias editor.
-5. **Combos** — the centrepiece:
-   - create/rename/delete; custom name is the model id clients call
-   - drag-ordered step list with per-step provider+model picker
-   - strategy dropdown: `priority` / `round-robin` / `reset-aware priority`
-   - **hedge panel**: `parallel` (first X), `window_ms` (X latency), `on_winner_fail`
-     (`re-race` / `use on-fail model` / `error`), plus the on-fail model picker
-   - per-step overrides, weights, enable/disable
-   - "dry run" that shows the compiled plan and simulates which step a request would pick
-6. **OAuth** — one card per platform, "Log in" button → device code or browser redirect, live
-   status, token expiry countdown, multi-account list.
-7. **Quota** — per provider/key windows, used/limit, reset countdown, 429 history, backoff state.
-8. **Settings** — **listen port (C7)**, control port, client API keys, auth password, latency
-   knobs, snapshot path, `restart` button (graceful drain + re-exec) with the explicit note
-   *"applies on next restart"*.
-9. **Logs / Usage** — recent requests (sampled, off hot path), token spend rollups.
-
-Panel auth: localhost-bind by default + password login for non-loopback (Q20).
-
----
-
-## 9. Combo engine — ratified spec
-
-A combo is a **named model**. Clients call it exactly like a model: `{"model": "Brains"}`.
-
-### 9.1 Definition
-
-```jsonc
-{
-  "name": "Brains",                     // the model id clients call
-  "strategy": "priority",               // priority | round-robin | reset-aware-priority
-  "steps": [                            // EXACTLY the user's order; never reordered
-    { "provider": "codex",        "model": "cx/gpt-6-astra", "enabled": true, "weight": 1 },
-    { "provider": "command-code", "model": "cmd/gpt-5.5",    "enabled": true },
-    { "provider": "openadapter",  "model": "oad/DeepSeek-V4.1-Flash" }
-  ],
-  "hedge": {
-    "enabled": true,
-    "participants": [0, 1, 2],               // WHICH steps compete. [] = first `count` in order
-    "count": 2,                              // "first X models", used when participants is empty
-    "window_ms": 800,                        // "X latency" — the eligibility window
-    "winner_metric": "first_response_byte",   // first_response_byte | first_complete_token
-    "on_winner_fail": "rerun-excluding",     // see 9.4
-    "stable_model": null,                    // required by on_winner_fail = "stable-fallback"
-    "max_rounds": 2                          // bound on "rerun-excluding"
-  },
-  "midstream_policy": "restart",         // restart | terminate   (see 9.5)
-  "limits": { "max_retries": 1, "retry_delay_ms": 2000 },
-  "compression": { "enabled": false, "mode": "rtk" }   // off-path transformer, default OFF
-}
-```
-
-### 9.2 Strategies (non-hedged)
-
-- **priority** — always step 1; on failure step 2; and so on. Deterministic and sticky.
-- **round-robin** — start at `n mod len`, then priority-fall forward from there. `n` is a per-combo
-  relaxed atomic, so it costs one `fetch_add`.
-- **reset-aware priority** — priority order, but any step with **no available account** is demoted
-  below all healthy steps rather than removed, and is restored automatically by a timer at its
-  earliest known reset. Within each bucket the user's order is preserved exactly.
-
-### 9.3 The latency window is an eligibility gate, not a race to be fastest
-
-This is the crux of the requested behaviour, and it is deliberately **not** "fastest wins":
-
-> **Winner = the highest-priority participant that produced a valid reply within `window_ms`.**
-
-The consequences are the reason this is the right rule:
-
-- If step 1 replies at 150 ms it wins **immediately**: nothing lower-priority can beat it, so the
-  race resolves at once and the losers are cancelled. **Hedging costs nothing when the preferred
-  model is healthy** — no window wait, no added latency.
-- If step 1 replies at 600 ms and step 2 at 200 ms with `window_ms = 800`, **step 1 still wins**,
-  because both were inside the window and step 1 is higher in the user's order. Hedging here buys
-  insurance against the preferred model failing or stalling — not raw speed.
-- If step 1 fails outright, the winner is the next highest participant that replied inside the
-  window.
-- If nobody replies inside the window the request **does not fail**: the window only expires a
-  participant's *priority protection*. The race keeps waiting and the highest-priority participant
-  that eventually replies wins.
-
-Implementation, therefore: participant `i` is committed as winner as soon as every participant
-**above** it (in the participant list) is resolved — either replied outside the window, or failed.
-Worst-case added latency is bounded by `window_ms`, and it is only ever paid when a
-higher-priority model is slow, which is exactly the case where switching is the point.
-
-`winner_metric` controls what "replied" means, at the user's choice:
-
-| Value | Definition | Cost of a lost hedge |
-|---|---|---|
-| `first_response_byte` | first non-error upstream response **body** byte (TTFB) | ~0 — loser has generated nothing billable |
-| `first_complete_token` | first fully-parsed content delta, or the complete response when non-streaming | one token on every loser |
-
-Ties are always broken by the user's step order.
-
-### 9.4 What happens when the chosen model dies — four user-selectable modes
-
-| Mode | Behaviour |
+| 0 | user alias `from` | alias target (chain followed at compile time) |
+| 1 | combo `id` and `name` | `Resolution::Combo { plan, level: default }` |
+| 1.5 | `comboName-<level>` | `Resolution::Combo { plan, level }` |
+| 2 | `provider/<exact model id>` | `Resolution::Direct { step, level }` (level = trailing level token of the model id when it is one of that model's levels, else the model's default level) |
+| 2.5 | `provider/<base model>-<level>` for each supported level | `Resolution::Direct { step, level }` |
+| 3 | `provider/<exact model id>` for a model whose id does **not** end in a level word | same as rank 2 key — one entry, no duplicate |
+| — | bare model id | **removed** (Feature 3: a name with no provider prefix resolves only as an alias or combo, otherwise it is an error naming the problem) |
+
+Rank 2 beats rank 2.5, which is exactly "an exact model id wins over a stripped suffix"
+(`antigravity/gemini-3.8-flash-low` is a real model id and must not be read as `gemini-3.8-flash`
+plus `low`). Level-qualified keys whose level the model does not offer are **not** indexed; the
+resolution layer instead indexes that key at rank 2.5 pointing at the model's **highest** available
+level, which is how "`-max` on a model that tops out at `xhigh`" reroutes instead of failing.
+`Resolution` therefore becomes `Direct { step: &StepPlan, level: u8 }` /
+`Combo { plan: &ComboPlan, level: u8 }` / `NotFound { reason }`, and `NotFound` carries a reason
+string so the relay can say *why* (`unknown provider`, `model x is not on provider y`,
+`name must be provider/model[-level]`).
+
+**`StepPlan` gains** (snapshot, encode/decode version bump):
+`levels: u32` bitmask (bit = level rank), `default_level: u8`,
+`reasoning_json: [Option<String>; 8]` (per level, the JSON object fragment the relay merges into the
+upstream body; `None` = send nothing), `input_modalities: u32` bitmask,
+`pricing: Option<PricingPlan>` (`{input_per_mtok, output_per_mtok, cache_read_per_mtok,
+cache_write_per_mtok}` as `f64` bits). `ProviderPlan` gains `prewarm: bool` and the proxy choice.
+`RoutingSnapshot` gains the proxy pool and the per-key limit table.
+
+**Dialect reasoning fragments** (defaults; a per-model `reasoning_wire` map replaces them wholesale):
+
+| dialect | fragment |
 |---|---|
-| `rerun-excluding` | Re-run the whole competition over the remaining participants, **excluding every model that has already failed**, up to `max_rounds`. This is the requested "run this again" branch. |
-| `pick-highest-passed` | Do **not** re-dispatch. Take the highest-priority model that already **passed** in the first competition — its result is already in the race's result set or still in flight. Zero added latency. |
-| `pick-highest-passed-different-provider` | As above, restricted to a participant on a **different provider** than the one that died. Protects against a whole-provider outage, including a provider-wide quota reset. |
-| `stable-fallback` | Jump straight to a user-chosen `stable_model` that need not be part of the competition. This is the requested "on fail" model. |
+| OpenAi, Copilot, CommandCodeGo | `{"reasoning_effort":"<level>"}`, `max`/`ultra` normalised to the highest value the provider accepts (OmniRoute's sanitation rule: `xhigh` support is opt-out, `max` → `xhigh` for OpenAI-shape providers) |
+| Codex (Responses) | `{"reasoning":{"effort":"<level>","summary":"auto"}}` |
+| Anthropic | `{"thinking":{"type":"enabled","budget_tokens":N}}` with `N` from the budget table, clamped to the request's `max_tokens` when set |
+| Google, Antigravity | `{"generationConfig":{"thinkingConfig":{"thinkingLevel":"<low\|high>","thinkingBudget":N}}}` |
+| any dialect, level `none` | no fragment at all |
 
-`hedge.participants` additionally lets the user pick **exactly which models enter the competition**,
-independently of the full ordered step list — a model can be in the fallback chain without ever
-being hedged.
+Budget table, ported from OmniRoute `open-sse/services/thinkingBudget.ts` `EFFORT_BUDGETS`
+(MIT): `none 0, minimal 1024, low 1024, medium 10240, high 131072, xhigh 131072, ultra 131072,
+max 131072`, then capped by `capThinkingBudget`-style clamping against the model's output limit.
 
-When the failure happens **before any byte reached the client**, the selected mode runs fully
-transparently.
+**Quota windows.** Fetchers return arbitrary windows; mapping to the three families the panel shows
+is duration-based (port of OmniRoute `quotaWindowLabel.ts`): `≤6 h → 5h`, `≤8 d → 1w`,
+`≤40 d → 30d`, anything else → `other(<secs>)`. A family the provider does not report renders
+**`N/A`**, and an unreported fraction (`fraction_reported == false`) is never shown as `0%`.
 
-### 9.5 When the winner dies mid-stream (ratified: retry per combo rules)
+**Per-key quota windows** reuse the same three families and the same store table shape, keyed by
+client-key id instead of account id; enforcement is a 429 with `x-ratelimit-*`-style headers.
 
-Per the ratified decision, the prompt is **retried with the next best model according to the mode
-and rules inside the combo** — `on_winner_fail` is re-evaluated and the retry follows it. That is
-only safe in two shapes, so `midstream_policy` makes the choice explicit:
+### Feature 5 — documentation for users
 
-- **`restart` (default)** — the retry proceeds. If **no bytes** have reached the client the switch
-  is completely invisible. If bytes have already been flushed, the relay emits an explicit,
-  documented SSE boundary (`event: manarouter.retry` plus the terminated `finish_reason`) and then
-  streams the new model's content, so clients that ignore unknown SSE events still receive a
-  complete, terminated, non-overlapping response.
-  **Hard guard:** if any `tool_calls` delta was already emitted, the relay **refuses to splice** and
-  terminates with an error. A duplicated or half-emitted tool call corrupts the client's state
-  machine, which is strictly worse than a clean failure.
-- **`terminate`** — never retry once bytes are on the wire; close the stream with a proper error and
-  let the client decide.
+New `docs/user/` set, listed by the panel and rendered by Feature 2:
+`00-getting-started.md`, `01-add-a-provider.md`, `02-client-keys.md`, `03-calling-the-api.md`,
+`04-models-and-reasoning-levels.md`, `05-combos.md`, `06-quota.md`, `07-images-audio-video.md`,
+`08-proxies.md`, `09-pricing.md`, `10-troubleshooting.md`, `11-security.md`, `12-cli-reference.md`.
+Written for an operator ("do this, expect that"), no build internals. `docs/LLM_INDEX.md`,
+`docs/23-implementation-status.md`, `HANDOVER.md` are updated at the end with this round's status.
 
-Both are per-combo configurable, so the behaviour is auditable rather than implicit.
+### Improvement details (I1–I18)
 
-### 9.6 Why this is still "outside the router"
-
-The relay evaluates **no policy**. It executes a `ComboPlan` that the conductor already compiled:
-a fixed-length array of fully-resolved `SinglePlan`s, the participant index list, a `u8` count, a
-`u16` window, two enums, and `Arc<AtomicU64>` availability stamps. Running a race is *sending and
-receiving*, which is precisely the relay's remit; deciding order, eligibility, participants and
-fallback is not, and lives in the conductor.
-
-### 9.7 Session affinity (latency + cost win)
-
-Keyed by a hash of the conversation's first system + first user message, or by a client-supplied
-`x-manarouter-session` header. The relay keeps a small sharded LRU `session → chosen step`. Because
-the winner is sticky for the session, hedged races happen **once per conversation**, not once per
-turn, and upstream prompt caches stay warm. This mirrors OmniRoute's observed `lkgp` /
-`session_account_affinity` behaviour but is a lock-free sharded map, so it is free on the hot path.
-
-## 10. Key selection
-
-Per provider, `key_strategy ∈ {priority, round-robin, random, least-used}`:
-
-| Strategy | Data-plane operation | Cost |
+| # | Improvement | Acceptance |
 |---|---|---|
-| priority | first `enabled && !cooling` key in priority order | array scan |
-| round-robin | `idx = counter.fetch_add(1, Relaxed) % n` | 1 atomic |
-| random | one xorshift from a per-thread RNG seeded from the CLOCK_MONOTONIC | ~5 ns |
-| least-used | min over `AtomicU64` counters, cached in a per-provider `AtomicU32` "best" hint refreshed every N picks | ~20 ns |
-
-Plus: skip accounts whose `available_after` (rate-limit reset) is in the future, honour
-`max_concurrent` via a per-account semaphore, and honour per-account `models_allow`. All of it is
-array scanning over ≤8 entries — no locks on the hot path (only the optional `max_concurrent`
-semaphore, which is a fast `try_acquire`).
-
-**Health is per account, never per provider (ratified Q4).** A provider with N accounts is *never*
-declared dead while at least one account is alive. The provider-level status shown in the panel is a
-derived rollup (`healthy` / `degraded 2/6 accounts available` / `dead 0/6`), and it never gates
-routing on its own. Account selection is dynamic on every request and always skips accounts that are
-rate-limited, cooling down, over their window, disabled, or out of quota — so a provider with one
-throttled key and five healthy keys behaves exactly like a five-key provider.
-
----
-
-## 11. Quota tracking
-
-Per `(provider, key, model, window)`:
-
-- Counters in the data plane as `AtomicU64` (requests, input tokens, output tokens) — incremented
-  *after* the response, never awaited.
-- A batched flusher task drains deltas to SQLite in the conductor every ~1 s or every 512 events.
-- Window kinds: `rolling(seconds)`, `fixed(seconds, aligned)`, `daily`, `monthly`, `provider_declared`.
-- Signals folded in: HTTP `429` + `retry-after`, `x-ratelimit-remaining-*`/`-reset-*`,
-  provider-specific quota endpoints (e.g. Copilot entitlement, Codex usage), and the panel's
-  manual "reset at" overrides.
-- On exhaustion the data plane short-circuits with the same machine-readable contract OmniRoute
-  emits (`retry_after`, `reset_at`) — see §2.1 — so existing clients and our own combo scheduler
-  both understand it. (Q4 decides signal priority.)
-
-A `provider_quota_reset_events`-equivalent history is kept so the panel can show reset countdowns
-and the scheduler can be *predictive*: a step whose accounts all reset in 30 s is demoted now and
-restored by a timer, not by trial and error.
-
-**Reset-aware priority operates per account and rolls up per step (ratified Q4).** A combo step is
-only demoted when *every* account backing it is unavailable; when *some* accounts are available the
-step stays in place and the selection layer simply routes around the dead accounts. This is what
-makes a provider with a mixed set of keys — some throttled, some fresh — keep serving traffic at full
-priority instead of being skipped wholesale.
+| I1 | Adding a provider disables prewarm: new `Provider.prewarm` (default **false**), global `latency.prewarm` still honoured, panel shows the toggle. | A newly added provider opens no startup connection. |
+| I2 | Hover descriptions next to setting text; clicking the text toggles on/off settings. | `field()`/`toggle()` in `dom.js` gain `help`; every on/off setting in Settings/Providers is a label-click target. |
+| I3 | Ticked boxes use the pink accent. | `app.css` `accent-color` (+ custom switch styling) shows pink checks. |
+| I4 | Dialect `command-code` → `command-code-go`. | Rename + migration + tests; old value never parses. |
+| I5 | Combos' "New combo" button/layout consistent with the rest. | Same button classes/placement/confirm flow as Providers/Keys. |
+| I6 | Requests hitting the **panel** port get an explicit error naming the relay port. | `POST /v1/chat/completions` (and the other `/v1/*` paths) on the control port → JSON error: "this is the panel port 20901; point the client at the relay port 20900". |
+| I7 | No-key-required mode, default off, with a remote-bind guard. | With the flag on and no key, a request succeeds; enabling it on a non-loopback bind without the allow-remote flag is refused at validation **and** at relay startup. |
+| I8 | Per-key token quotas (5h/1w/30d, tokens + requests), persisted. | Exceeding a window returns 429 with a clear message; counters survive restart; panel shows usage per key. |
+| I9 | Always forward images/audio/video; defaults per input type. | Request with an image and a text-only model → rewritten to `routing.defaults.image`; unknown type → error naming the default. |
+| I10 | Multiple proxies with API-like selection (priority/least-used/random/round-robin). | http/https/socks4/socks5 all connect; strategy observable in tests; per-account override wins. |
+| I11 | Adding a provider pre-fills the base URL when an OAuth/command-code-go endpoint is chosen. | Panel test: choosing `codex`/`antigravity`/`command-code-go` sets the documented base URL. |
+| I12 | "Label"→"Provider Name", "ID"→"Provider ID" in the provider form. | Visible text only; field names unchanged. |
+| I13 | A **Test** button on the models page sending `reply with "yes"`. | `POST /api/providers/{id}/models/{model}/test` returns the upstream reply or a precise error. |
+| I14 | Providers: base URL/auth/note below models; key strategy stays with a mode dropdown next to it; every editable number is editable inline. | Panel screenshot-equivalent check in `panel/test`. |
+| I15 | Providers: bigger Models section. | CSS/row change; list scrolls, doesn't truncate. |
+| I16 | Delete provider asks for confirmation, with "do not warn me again". | Confirm dialog + persisted preference; destructive action only on explicit confirm. |
+| I17 | Pull model pricing from providers where possible. | `POST /api/pricing/sync` fills prices from a provider's `/models` (OpenRouter-style) and from the bundled table; manual override wins. |
+| I18 | Bundled offline price table (LiteLLM-derived) + cost display. | `catalog/pricing.json` generated by `tools/gen-pricing.py`; models page and quota view can show $/1M and estimated cost. |
 
 ---
 
-## 12. Latency engineering checklist
+## 5. Task board
 
-Build:
-- `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = true`.
-- `RUSTFLAGS="-C target-cpu=native"` for local release builds; a portable `x86-64-v2` default build
-  for published artifacts.
-- `mimalloc` (or `jemalloc`) global allocator.
-- `tokio` with `net` + `rt-multi-thread`, one worker thread per core, `SO_REUSEPORT` listeners.
+Legend: `[ ]` todo · `[~]` in progress · `[x]` done with evidence in §7. Each task names its **file
+ownership** so parallel workers never collide. **Order matters** where a task depends on an earlier
+one; do not reorder without recording why in §7.
 
-Network:
-- Connection pool per `(provider, key, resolved-ip)`, keep-alive, `TCP_NODELAY`, `SO_KEEPALIVE`.
-- `rustls` with a shared `ClientConfig` and **session resumption** (tickets) so repeat TLS
-  handshakes are 0-RTT-ish rather than full.
-- Pre-warm: conductor marks a provider "hot" (recently used) → data plane keeps ≥2 idle
-  connections ready. First request after idle pays no handshake in the common case.
-- HTTP/2 to upstreams that support it, with prior-knowledge/ALPN chosen from a cached capability
-  flag; HTTP/1.1 otherwise. No upgrade dance on the hot path.
-- Happy Eyeballs connect with a cached DNS decision; DNS resolved by a background task and cached
-  with TTL, never resolved inline on the hot path.
+### Phase A — scaffolding and evidence
 
-Data handling:
-- `bytes::Bytes`/`BytesMut` with pooling; no `String` allocation for bodies.
-- `memchr` for the `model` field and SSE framing.
-- `serde_json` only on translation paths; `simd-json` behind a feature flag for large bodies.
-- No `format!`, no tracing spans, no histogram updates on the hot path — sampling is off-path.
+- [x] **A1** Record baseline: HEAD `9439b937`, `cargo test --workspace --all-targets` exit 0, 717
+      in-crate `#[test]`s, dirty tree preserved. Evidence §7.
+- [x] **A2** Preserve the original build plan as `plan-build-history.md`.
+- [x] **A3** F4: untrack + ignore tests (`git rm --cached tests/*.py`, extend `.gitignore`).
+      Owns: `.gitignore`, git index. Evidence: `git status --short --ignored tests`.
+- [x] **A4** Generate `catalog/model_meta.json` (reasoning levels + input modalities) from the
+      OmniRoute model metadata, and `catalog/pricing.json` from a LiteLLM-derived public table, via
+      a checked-in generator `tools/gen-model-meta.py` / `tools/gen-pricing.py`.
+      Owns: `tools/`, `catalog/`. Evidence: generator runs, files parse, sizes sane.
 
-Process hygiene:
-- Logging via a bounded ring buffer + a dedicated writer task; if full, drop (never block).
-- `SO_BUSY_POLL`/`io_uring` behind a non-default feature (Q11).
-- Optional: `mlockall` and huge pages for the snapshot mapping.
+### Phase B — core domain (sequential; one writer at a time)
 
-Measurement (must be in CI, not vibes):
-- `tools/bench` reports, for each surface: direct-to-provider vs through-relay, with
-  p50/p90/p99 and a computed **added overhead** column; asserts overhead p50 < 150 µs and
-  p99 < 500 µs against a local mock upstream.
-- A loopback mock upstream removes provider variance so the number is attributable to us.
-- Real-provider comparisons (openadapter `oad/DeepSeek-V4.1-Flash`, command-code) are documented in
-  `docs/19-latency-benchmarks.md`, clearly separated from the controlled mock numbers, because
-  provider latency dominates and varies (already observed: 46 s cold, then quota-exhausted).
+- [x] **B1** Dialect rename + migration. Owns `crates/mr-core/src/dialect.rs`, the migration hook in
+      `config.rs` (coordinates with B3 — do B1 first, then B3). Evidence: tests for `from_str`,
+      serde round-trip, migration of a legacy config with backup.
+- [x] **B2** `ModelEntry`/`Provider`/`ClientKey` fields: `reasoning_levels`,
+      `default_reasoning_level`, `reasoning_wire`, `input_modalities`, `pricing`,
+      `Provider.prewarm`, `ClientKey.limits`. Owns `crates/mr-core/src/model.rs`.
+- [x] **B3** Config: `quota.display`, `routing.defaults` + `routing.default_reasoning_level`,
+      `proxies` + `proxy_strategy`, `no_key_required` + `allow_remote_without_key`,
+      validation rules, migration hook from B1. Owns `crates/mr-core/src/config.rs`.
+- [x] **B4** Store: `provider_quota_state` table, per-key window counters, migrations.
+      Owns `crates/mr-core/src/store.rs`, `migrations/` (single writer).
+- [~] **B5** Snapshot: level-aware resolution, generated-alias deletion, capability/level defaults,
+      proxy assignment + per-key limits compiled in, encode/decode version bump.
+      Owns `crates/mr-core/src/snapshot.rs`, `crates/mr-core/src/published.rs`.
+- [x] **B6** Feature 1 framework: `crates/mr-core/src/quota/{mod,types,window,http,registry}.rs` +
+      `lib.rs` module registration. Owns `crates/mr-core/src/quota/`, `crates/mr-core/src/lib.rs`
+      (coordinate: B6 adds one `pub mod quota;` line; nobody else edits `lib.rs` in this phase).
 
----
+### Phase C — quota fetchers (parallel-safe: one file per fetcher) — after B6
 
-## 13. Documentation deliverables (C6)
+- [~] **C1** `quota/codex.rs` + `quota/github.rs` (copilot) — files written and registered.
+- [~] **C2** `quota/antigravity.rs` + `quota/claude.rs` — written; 3 of the C7 failures are here.
+- [~] **C3** `quota/commandcode.rs` + `quota/openai_compat.rs` (generic fallback) — written; 3 of
+      the C7 failures are commandcode's.
+- [~] **C4** `quota/openrouter.rs` + `quota/deepseek.rs` + `quota/glm.rs` — written, tests green.
+- [x] **C5** `quota/kimi.rs` + `quota/minimax.rs` + `quota/grok.rs` + `quota/moonshot.rs`;
+      Cursor and Qwen fetchers are also present. Evidence: source registration/tests noted below.
+- [x] **C6** Registry wiring + `docs/credits.md` + MIT attribution. `default_registry()` includes
+      Cursor and Qwen alongside the existing provider fetchers and fallback; see
+      `crates/mr-core/src/quota/registry.rs` and `docs/credits.md`.
+- [x] **C7** Fetcher coherence fixes are present. Historical check: `cargo test -p mr-core quota`
+      reported 209 passed in this session before later relay/snapshot edits; rerun the quota suite
+      in final verification. Do not rely on this old count as current final evidence.
 
-- Every feature file listed in §4 is a real, standalone doc: what it is, why, config reference,
-  API/JSON examples, failure modes, how to debug it.
-- `docs/LLM_INDEX.md` is the **single file to feed an LLM**. It must contain: project summary,
-  one-line purpose + scope + key entry points for every doc, a table of "task → read these files",
-  the exact config schema, the full route table, the enum vocabularies (dialects, strategies,
-  flows), and a machine-readable `MANIFEST` block listing every doc path with its purpose so an LLM
-  can pick the right file without a filesystem crawl.
-- `docs/providers/catalog.md` is generated from the ported provider registry so it cannot drift.
-- README.md: what it is, why it exists, architecture diagram, quickstart, feature matrix vs
-  OmniRoute/9router, screenshots of the panel, and pointers into `docs/`.
+### Phase D — relay (file-disjoint tasks; all after B5)
 
----
+- [x] **D1** Reasoning-level resolution and application are implemented: suffix/tier resolution in
+      snapshot and dialect-specific reasoning fragments applied to outgoing bodies. Relay behavior
+      tests and strict Clippy passed in the earlier round verification. Remaining: change unresolved
+      model errors to the spec's preferred 400 only if the API contract is intentionally revised;
+      current docs describe 404 for name misses.
+- [ ] **D2** **Not implemented in relay runtime.** Key UI/snapshot/store structures exist, but the
+      dispatch path neither atomically admits requests against limits nor writes usage rows or taps
+      upstream tokens. Request-only accounting is not a substitute for token + request caps; strict
+      token limits require a reservation/settlement contract. No claim of enforcement is safe.
+- [~] **D3** Detection/rewrite helper is implemented and called. If a configured fallback would
+      apply, the relay now returns HTTP 501 rather than sending the rewritten body through the wrong
+      provider/account. Full reroute to a resolved target step with fresh dialect, credential, URL
+      and headers remains unimplemented; helper coverage is not end-to-end fallback support.
+- [~] **D4** Proxy parser/tunnel and selector utilities exist and have focused tests, but the relay
+      request has `proxy: None` and the upstream client still uses its direct pooled connector. No
+      provider traffic is routed through configured proxies; do not rely on this for egress policy.
+- [x] **D5** No-key auth and startup guard are integrated. Explicit keyless mode allows absent keys;
+      presented invalid keys remain rejected. Remote binding with keyless mode requires the separate
+      `allow_remote_without_key` switch. Focused tests and strict Clippy passed in this verification.
+- [~] **D6** Model import preserves canonical reasoning-tier variants and selection retains steps
+      that share an upstream model but differ in reasoning level. Proxy eligibility is only a seam;
+      proxy selection is not integrated.
 
-## 14. Phases & task breakdown
+### Phase E — control-plane API
 
-Each phase ends with something runnable and verified. No phase is "done" without its doc file.
+- [x] **E1** Quota endpoints + refresh orchestration. `GET /api/quota` returns cached provider/account
+      snapshots; POST refresh supports all or one account, with per-account errors and OAuth unsupported.
+      This is provider quota, distinct from request-usage rows, which the relay does not write. Do not
+      infer live billing completeness from cached provider data.
+- [x] **E2** Model test endpoint + pricing sync. `POST /api/models/test` makes a real provider request
+      (can consume quota/cost; OAuth unsupported for some cases). `POST /api/pricing/sync` applies
+      bundled prices and preserves manual values; it does not fetch live provider pricing.
+- [x] **E3** Panel-port error for `/v1/*` on the control port. Done: `wrong_port` + `is_relay_path`
+      in `crates/manarouter-conductor/src/api.rs`, registered for `/v1` and `/v1/{*rest}` ahead of
+      the catch-all and exempted from the session/origin guard. Evidence §7.
+- [x] **E4** Docs curation endpoints are implemented: `/api/docs` lists curated user documentation and
+      handlers read only canonical in-root paths with validation.
+- [~] **E5** Generic config/provider/account/model/key API routes exist for the new fields. Key updates
+      preserve identity/hash/prefix and ignore supplied plaintext; a full field-by-field audit was not
+      completed, so do not infer every form/runtime behavior is covered.
 
-### Phase 0 — Foundation
-- [ ] 0.1 Verify rust toolchain (done: rustc 1.99.0), pin `rust-toolchain.toml`.
-- [ ] 0.2 `cargo` workspace skeleton: 5 crates, shared `mr-core` types.
-- [ ] 0.3 MIT LICENSE, `.gitignore`, `rustfmt.toml`, CI workflow (build + test + clippy + bench gate).
-- [ ] 0.4 `create_goal` already set in DSH (done).
-- **Exit:** `cargo build --workspace` + `cargo test` green.
+### Phase F — panel (file-disjoint: one view file per task)
 
-### Phase 1 — Core types + dialect engine
-- [ ] 1.1 `mr-core`: `Provider`, `Key`, `Dialect`, `RouteEntry`, `SinglePlan`, `ComboPlan`,
-      `Snapshot`, `RouteKind`, `KeyStrategy`, `ComboStrategy`, `HedgeSpec`, `WinnerFail`.
-- [ ] 1.2 Snapshot binary format + `mmap` reader + `arc_swap` publish/reload (inotify + a
-      control-socket ping).
-- [ ] 1.3 `mr-dialects`: OpenAI Chat Completions ↔ Anthropic Messages (req + resp + SSE, tools,
-      reasoning blocks).
-- [ ] 1.4 `mr-dialects`: OpenAI Chat Completions ↔ Responses API.
-- [ ] 1.5 `mr-dialects`: Command Code envelope encode/decode (from the local bridge spec).
-- [ ] 1.6 Golden round-trip tests for every pair, including awkward payloads
-      (tool-call streams, reasoning blocks, image parts, multi-modal content).
-- **Exit:** dialect round-trip test suite green; docs 01, 04, 18 + `providers/openai-compatible.md`,
-  `providers/anthropic-compatible.md`, `providers/commandcode.md`.
+- [x] **F1** `panel/markdown.js` + `view-docs.js` (Feature 2) + `panel/test/markdown.test.mjs`.
+      Current panel suite: 42 passed, 0 failed in final verification.
+- [x] **F2** Quota view, provider snapshot refresh controls, format/chunk helpers, quota-display settings.
+- [~] **F3** Provider capabilities and fields are surfaced; not every I11–I16 behavior was audited.
+- [x] **F4** Model test, pricing display, reasoning and modality editor are present. Model test can
+      call a live provider; do not use without user consent.
+- [~] **F5** Key limits editor is present, but explicitly warns that relay enforcement is unconfirmed;
+      D2 is not implemented.
+- [~] **F6** Combo level editing/listing is present; derived runtime levels are not all represented.
+- [x] **F7** Settings include no-key mode, proxy config, quota display/reset setting and bundled pricing
+      sync control. Proxy egress remains inactive; pricing sync does not query providers.
+- [x] **F8** Shared accessible help/controls/styles and quota chunks are present.
+- [x] **F9** Generated-alias filtering/toggle and navigation wiring are present.
 
-### Phase 2 — The relay (data plane)
-- [ ] 2.1 axum/hyper server, `SO_REUSEPORT` workers, per-worker runtimes.
-- [ ] 2.2 Fast `model` extraction (memchr scan, no full parse) + unit tests on hostile bodies.
-- [ ] 2.3 Snapshot lookup, key selection (all 4 strategies), `available_after` gating.
-- [ ] 2.4 Upstream client: pooled connections, rustls + resumption, HTTP/2 auto, pre-warm.
-- [ ] 2.5 Pure passthrough streaming for matched dialects; verbatim body forwarding.
-- [ ] 2.6 Translation path wiring for mismatched dialects.
-- [ ] 2.7 Client surfaces: all routes in §6.2, both streaming and not.
-- [ ] 2.8 Usage delta emitter (non-blocking) + SSPL-free metrics endpoint.
-- [ ] 2.9 Quota short-circuit 429 with `retry_after`/`reset_at` contract.
-- **Exit:** mock-upstream e2e tests green for every surface; docs 05, 16, 18.
+### Phase G — user documentation (one file per worker)
 
-### Phase 3 — Combos + hedging
-- [ ] 3.1 Combo compiler: user order → `ComboPlan`; dry-run validator.
-- [ ] 3.2 priority / round-robin / reset-aware-priority execution.
-- [ ] 3.3 Hedged race: parallel dispatch, TTFB winner, tie-break by order, loser abort.
-- [ ] 3.4 `on_winner_fail` × {pre-byte, post-byte} state machine, both `re-race` and `use-on-fail`.
-- [ ] 3.5 Session affinity sticky map (sharded, lock-free) + `x-manarouter-session`.
-- [ ] 3.6 Exhaustive tests: slow-first/fast-second, all-fail, winner-dies-pre-byte,
-      winner-dies-mid-stream, deadline passing, 8-step combos, concurrent sessions.
-- [ ] 3.7 Four `on_winner_fail` modes incl. participants selection and `stable-fallback`.
-- [ ] 3.8 `midstream_policy` (`restart` / `terminate`) with the `tool_calls` no-splice guard.
-- **Exit:** docs 06, 07, `combo-cookbook.md`.
+- [~] **G1–G5** The user-guide set `docs/user/00-getting-started.md` through `12-cli-reference.md` exists;
+      spot-reviewed and updated quota and modality limitations, but a comprehensive editorial/claim audit
+      of every guide was not completed.
+- [~] **G6** This close-out updates `plan.md`, `docs/23-implementation-status.md`, and specific user
+      guides. README, AGENTS, panel README, LLM index and handover remain for a deliberate follow-up audit.
 
-### Phase 4 — Conductor + storage + panel
-- [ ] 4.1 SQLite schema + migrations (providers, accounts, models, combos, quota, usage, oauth,
-      settings, **oplog**) — UUIDv7 ids, `revision`, `deleted_at` tombstones from the first migration (§18).
-- [ ] 4.2 Config load/validate/atomic-save; snapshot compile + publish on every mutation.
-- [ ] 4.3 REST API for all CRUD (documented in 18) + password auth.
-- [ ] 4.4 Panel: single static page, all 9 views, embedded via `include_str!`.
-- [ ] 4.5 Port editor + graceful restart (drain + re-exec) with "applies next restart" semantics (C7).
-- [ ] 4.6 Model discovery scheduler + manual model add + alias editor.
-- [ ] 4.7 Quota tracker: windows, reset timers, prediction, per-account health rollup, panel visualisation.
-- [ ] 4.8 Off-path compression transformer (RTK/caveman), **default OFF**, enableable per combo (Q15).
-- [ ] 4.9 `sync` module: inert oplog writer + panel "pending changes" counter + `docs/22-sync-design.md` (Q15).
-- **Exit:** a human can drive the whole system from the browser; docs 03, 08, 09, 15, 21.
+### Phase H — verification and close-out
 
-### Phase 5 — OAuth
-- [ ] 5.1 `OAuthPlatform` trait + registry + credential store (encrypted, 0600).
-- [ ] 5.2 Codex (loopback PKCE) end-to-end, including the inference envelope.
-- [ ] 5.3 Copilot (device/token mint) end-to-end.
-- [ ] 5.4 Antigravity (loopback PKCE + project onboarding) end-to-end.
-- [ ] 5.5 Single-flight refresh, 401 repair path, multi-account, panel cards.
-- [ ] 5.6 `docs/14-oauth-adding-a-platform.md` with a worked example of adding a *new* platform.
-- **Exit:** all three log in from the panel and serve real traffic; docs 10–14 +
-  `providers/codex.md`, `providers/copilot.md`, `providers/antigravity.md`.
-
-### Phase 6 — Provider port from OmniRoute + Command Code
-- [ ] 6.1 Extract the OmniRoute provider registry → our TOML/JSON catalog (in progress:
-      `.research/omniroute.md`).
-- [ ] 6.2 `mr-cli migrate omniroute`: connections, keys, combos, aliases, settings (dry-run first).
-- [ ] 6.3 Port the 35 credentialed providers as config entries + native adapters for the special
-      dialects; generate `docs/providers/catalog.md`.
-- [ ] 6.4 Command Code GO-plan adapter (native Rust reimplementation of the local bridge).
-- [ ] 6.5 Cookie/web-session provider type (scope per Q6).
-- **Exit:** all ported providers pass a live "hello world" where credentials allow; docs 17 +
-  per-provider files.
-
-### Phase 7 — Latency measurement & tuning
-- [ ] 7.1 `tools/bench` harness + mock upstream; overhead assertions wired into CI.
-- [ ] 7.2 Measure vs direct; profile with `perf`; hunt and remove any allocation, syscall, or
-      lock on the hot path that the profile flags.
-- [ ] 7.3 Real-provider comparison incl. openadapter `oad/DeepSeek-V4.1-Flash` and command-code.
-- [ ] 7.4 Publish numbers in `docs/19-latency-benchmarks.md`.
-- **Exit:** overhead budget met and documented honestly, including where we lose.
-
-### Phase 8 — Documentation, polish, publish
-- [ ] 8.1 Write/complete every doc file in §4 (including `LLM_INDEX.md`).
-- [ ] 8.2 README.md with feature matrix, architecture, quickstart, screenshots.
-- [ ] 8.3 `create` public GitHub repo, push, verify the rendered README + docs links resolve.
-- [ ] 8.4 Tag `v0.1.0`, add a release with prebuilt binaries if the build is portable.
-- **Exit:** repo is public, builds from a clean clone, docs are complete and cross-linked.
+- [x] **H1** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+      `cargo test --workspace --all-targets`, and locked workspace build passed. Full workspace tests
+      reported 34 + 223 + 3 + 96 + 642 + 142 passed; one ignored.
+- [x] **H2** `cargo test -p mr-core --lib quota` → 209 passed; panel suite → 42 passed;
+      `bash scripts/check-secrets.sh` scanned 136 files successfully; `python3 tests/smoke_e2e.py`
+      passed with isolated conductor, relay, and mock upstream.
+- [x] **H3** Feature statuses and evidence are recorded in this plan and
+      `docs/23-implementation-status.md`; D2, D3, proxy egress, and audit gaps remain explicit.
+- [x] **H4** Final report provided without touching live config or restarting. Any deployment is a
+      user-run action; follow the post-deployment checklist below only if needed.
 
 ---
 
-## 15. Ratified decisions
+## 6. Verification commands
 
-All questions raised before implementation were answered. These are binding.
+```bash
+cd /home/mana/Documents/seek/Router
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+cargo test -p mr-core quota            # Feature 1 fetchers/parsers
+bash scripts/check-secrets.sh
+python3 tests/smoke_e2e.py             # isolated conductor+relay+mock upstream
+node --test panel/test/*.test.mjs      # panel unit tests (harness confirmed in A3)
+```
 
-| Q | Topic | Decision |
-|---|---|---|
-| Q1 | Data-plane / control-plane coupling | **Compiled routing snapshot, zero IPC per request.** The relay `mmap`s the snapshot and atomically swaps a pointer; the conductor owns all combo authoring and compilation. |
-| Q2 | Hedge winner & window semantics | **The window is an eligibility gate; the winner is the highest-priority participant that replied inside it.** `winner_metric` is user-selectable: `first_response_byte` or `first_complete_token`. Participants are user-selectable. Four failure modes: `rerun-excluding`, `pick-highest-passed`, `pick-highest-passed-different-provider`, `stable-fallback`. See §9. |
-| Q3 | Winner dies mid-stream | **Retry with the next best model per the combo's mode and rules.** `midstream_policy` = `restart` (default) or `terminate`; the relay refuses to splice once `tool_calls` deltas have been emitted. See §9.5. |
-| Q4 | Reset-aware source of truth | **Live upstream signals first, then user windows override.** Health is tracked **per account**, never per provider: a provider with N accounts is only dead when *all* accounts are dead, and account selection is dynamic and always skips dead accounts. See §11. |
-| Q5 | Provider port scope | **All 35 credentialed providers + a working OmniRoute importer** (dry-run first, reading from a copy of the database). |
-| Q6 | Cookie / web-scraping providers | **Never supported.** No cookie auth and no reverse-engineered web endpoints. `claude-web`, `gemini-web`, `zai-web`, `deepseek-web`, `duckduckgo-web`, `pollinations`, `aihorde`, `veoaifree-web` are explicitly out of scope and documented as such. |
-| Q7 | Control plane language | **Rust (axum)**, living entirely outside the relay, with a minimal host footprint, propagating changes to the relay as fast as possible. The panel follows the greys + single-pink-accent philosophy: greys carry all structure, one pink accent carries emphasis and interaction, and pink is **never** used for destructive or error states — those use green `#4cc38a`, amber `#d9a441`, red `#ef6a6a`. |
-| Q8 | Hot-path body handling | **Targeted `model` scan + verbatim byte passthrough**; translation is invoked only when client and upstream dialects differ. |
-| Q9 | Concurrency model | **Tokio multi-thread + `SO_REUSEPORT`**; an io_uring backend may be added later as a non-default feature. |
-| Q10 | Port change UX | **Persist + a Restart button**, explicitly labelled "applies on next restart", with graceful drain then re-exec. |
-| Q11 | Repository name | **`Manarouter`** — a public GitHub repo under `RobertoTornel`. Crates: `mr-core`, `mr-dialects`, `manarouter-relay`, `manarouter-conductor`, `mr-cli`. Config dir `~/.config/manarouter/`. |
-| Q12 | Secret storage | **`0600` + encrypted at rest**, referenced by id, never committed, with a pre-commit check and a CI grep that fails the build on key-shaped strings. |
-| Q13 | OmniRoute migration | **Import credentials too**, read from a *copy* of `storage.sqlite`, dry-run first, original never modified. |
-| Q14 | Testing depth | **CI mock-based tests + an opt-in live smoke harness** using the real credentials on this machine. Every latency number is published honestly. |
-| Q15 | Optional capabilities | Session affinity: **in**. Anthropic `/v1/messages` + Responses shims: **in**. Token compression (RTK/caveman): **built as an off-path, default-OFF transformer** — it exists and is enableable per combo, but never runs on the default hot path, which satisfies both the "leave the groundwork" and "make it available" intent. **Plus: v2 groundwork for cross-instance sync** (§18). |
-
-### 15.1 Explicit non-goals for v1
-
-- Cookie and web-scraping providers (Q6).
-- Any in-band content transformation on the default request path, including token compression.
-- Multi-tenant hosting, billing, or per-user isolation: this is a single-operator, local-first tool.
-- A hosted service, SaaS control plane, or remote database.
-
-### 15.2 Recorded answers, verbatim intent
-
-- **Q2:** "First complete token or first non error response body user chooses. Highest model up that replies in the latency window means the model highest in the priority list that fits the latency window chosen by the user." Four failure modes and user-selected participants, as implemented in §9.4.
-- **Q3:** "The prompt should be retried with the next best model depending on the mode and rules inside of the combo."
-- **Q4:** "Live upstream signals first, then user windows override. Don't class a whole provider as dead if there's multiple api keys/oauth providers if at least one of them is dead. Choosing accounts should be dynamic depending on user choice and should skip dead accounts."
-- **Q7:** "Up to your judgement. Must live outside of the router itself and should both communicate changes as fast as possible and take as little resources as possible on the host machine."
-- **Q15:** "Make the groundwork for v2 so credentials, combos and settings can be synced between 2 instances in different machines."
+Never: `mr serve`, `systemctl`, `kill <manarouter pid>`, writes under
+`/home/mana/.config/manarouter` or `~/.local/state/manarouter`.
 
 ---
 
-## 16. Verification plan
+## 7. Progress log (append-only; newest last)
 
-- `cargo test --workspace` — unit + integration, no network.
-- `tests/e2e_mock_upstream.rs` — spin a mock upstream, drive every surface (chat, responses,
-  embeddings, audio×2, images, models, messages, count_tokens), streaming and not, asserting
-  byte-level output shape and that passthrough really is passthrough.
-- `tests/combo_race.rs` — deterministic races using a mock upstream with scripted per-step delays
-  (test 2 releases deadlock/split issues, which is the whole point of the observer patch).
-- Snapshot tests: compile N combos, reload, assert the data plane sees the new plan within X ms and
-  that zero requests fail during the swap.
-- Latency gate in CI: mock upstream, assert added overhead p50 < 150 µs, p99 < 500 µs.
-- Live smoke (opt-in, env-gated): openadapter `oad/DeepSeek-V4.1-Flash`, command-code, codex,
-  copilot, antigravity — one round trip each, recorded in `docs/19-latency-benchmarks.md`.
-- Migration test: point `mr-cli migrate omniroute` at a *copy* of `~/.omniroute/storage.sqlite` and
-  assert it extracts 35 providers / 74 connections / 7 combos without touching the original.
+| When | Task | What was done | Evidence |
+|---|---|---|---|
+| 2026-10-16 final | Close-out | Reconciled stale plan statuses; updated quota/modality/pricing docs and implementation status; pricing Settings now exposes bundled sync; modality fallback returns explicit 501 instead of sending a rewritten model to the wrong provider. | Fresh: workspace tests all passed (34 + 223 + 3 + 96 + 642 + 142; one ignored), strict Clippy, formatting, secrets scan (136 files), panel tests 42/42, isolated smoke passed. D2 and proxy egress remain incomplete; D3 partial; broader guide and E5 audits remain partial.
+| 2026-10-19 19:4x | Round 2 close-out | **Schema repaired.** A half-applied edit had set `SCHEMA_VERSION = 4` with no fourth migration, which failed the compile-time assert in `store.rs` and broke the whole build; the constant is back at 3 and the store is green again. The v2/v3 migrations (`key_usage` + `provider_quota_state`, `usage_tokens`) and the APIs behind them (`record_key_usage`, `key_window_usage`, `key_window_usage_many`, `prune_key_usage`, the quota-cache CRUD, `record_usage_tokens`/`usage_tokens`) are restored and covered by 7 new store tests, including the v1→v3 upgrade path and the rolling-window maths. **CI restored and widened.** The workflow runs fmt, strict Clippy (workspace *and* `tools/mock-upstream`), the secret scan, build, workspace tests, release tests, the isolated installer test, the isolated mock-upstream smoke and the panel Node tests; three strict-Clippy lints in `tools/mock-upstream` are fixed. **Test tracking reversed.** The staged deletions of `tests/smoke_e2e.py`, `tests/local_latency_bench.py`, `panel/test/browser.e2e.mjs` and `scripts/test-installer-systemd.sh` were reverted and the matching `.gitignore` rules dropped: CI now *runs* those files, so untracking them would have removed the checks rather than protected them. **Docs reconciled.** `docs/user/08-proxies.md` keeps saying proxying is not on the request path (with a fixed relative link), `HANDOVER.md` gained a "what this revision changed" section and the three D-item gaps, and `docs/23-implementation-status.md` was re-stated against the code. | Fresh: `cargo test --workspace --all-targets` → 1 139 passed / 0 failed / 1 ignored; `cargo test --workspace --release` → passed; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --all -- --check` clean; `tools/mock-upstream` clippy clean and 22 tests; `bash scripts/check-secrets.sh` → OK (140 files); `python3 tests/smoke_e2e.py` → PASS; `bash scripts/test-installer-systemd.sh` → passed; `node --test panel/test/*.test.mjs` → 42/42. **Still not done, and documented as such:** D2 enforcement (the ledger is stored; the relay neither writes to it nor enforces a cap), D3 fallback (fail-closed HTTP 501), D4 proxy egress (the transport is direct-only). |
+| 2026-10-16 00:4x | A1 | Recon + baseline. Read plan/architecture docs, panel views, quota/store/snapshot/relay-relevant code; confirmed live topology (relay 20900, panel 20901, DSH profile calls the relay with bare id `deepseek/deepseek-v4.1-flash`); found the OmniRoute MIT source at `/home/mana/.local/lib/node_modules/omniroute`. Baseline tests green. | `cargo test --workspace --all-targets` exit 0; HEAD `9439b937`; 717 `#[test]`s |
+| 2026-10-16 00:4x | A2 | Original build plan copied to `plan-build-history.md`; this file written. | `ls plan*.md` shows all three |
+| 2026-10-16 01:05 | A3 | Verified the F4 untracking already on disk and completed it: the four tracked test files are `git rm --cached` (still present on disk), `.gitignore` carries `/tests/`, `/panel/test/`, `/scripts/test-*.sh`, `/e2e-evidence/`, `*.spec.mjs`, `*.e2e.mjs`; the two CI steps that referenced them are already gone from `.github/workflows/ci.yml`. The seeded Node harness `panel/test/markdown.test.mjs` runs. | `git status --short --ignored tests panel/test scripts` → four `D ` (staged, on disk) + `!! tests/` and `!! panel/test/`; `node --test panel/test/*.test.mjs` → 35 pass / 0 fail (node v24.20.0) |
+| 2026-10-16 01:05 | A4 | Verified both checked-in generators produce the committed catalog files. `gen-model-meta.py` reads the local `.research/omniroute_models.json` (no network): 9500 source entries → 6276 `by_model`, 4761 `by_provider_model`; regeneration into a temp dir is byte-identical to the committed `catalog/model_meta.json` (1763.1 KiB), so it is deterministic. `gen-pricing.py` fetched the LiteLLM table and wrote a 539.1 KiB table with 3379 models, matching the committed `catalog/pricing.json` byte size. Both outputs `json.load` cleanly. | `python3 tools/gen-model-meta.py --out $TMP` → diff vs `catalog/model_meta.json` identical; `python3 tools/gen-pricing.py --out $TMP` exit 0, `models: 3379`; `json.load` on both catalog files → dict with 6 top-level keys |
+| 2026-10-16 01:4x | B1 | Dialect rename completed. The `dialect.rs` half was already on disk (`CommandCodeGo = 6`, `as_str() = "command-code-go"`, `parse` accepting only `command-code-go`/`cmdgo`, serde + parse tests) and `catalog/providers.toml` already carried the new spelling — verified, not rewritten. **Added the missing migration hook in `config.rs`**, which is what B1 still owed: `Config::load` now rewrites pre-rename dialect spellings in the **raw JSON document** before deserialising (the old spelling has no `Dialect` variant left, so it cannot be migrated after parse), keeps the operator's original bytes as `config.json.pre-command-code-go.bak` (never clobbering an existing backup), and then writes the migrated file through the same atomic tmp+fsync+rename path as `Config::save` (extracted to `write_config_atomically`). A config too new to save (`format_version > MAX_KNOWN_FORMAT_VERSION`) is migrated **in memory only**, so a downgrade still starts. Also fixed a real regression the rename had left behind: `panel/view-providers.js` still offered `command-code` in its dialect dropdown, which the backend now rejects at save time. | `cargo test -p mr-core --lib` → **349 passed, 0 failed** (B1 added 6 config tests — migration+backup, one-time (no second backup), `from_json` fails on the old spelling, too-new-is-memory-only, every legacy spelling incl. case, no-providers no-op — plus 1 cross-language test pinning the panel dropdown to the serde spellings); `cargo clippy -p mr-core --all-targets -- -D warnings` clean; `cargo fmt -p mr-core -- --check` clean; `Dialect::parse("command-code"/"commandcode"/"cmd")` all `None` |
+| 2026-10-16 02:1x | B2 | `ModelEntry` gained `input_modalities`, `reasoning_levels`, `default_reasoning_level`, `reasoning_wire`, `pricing: Option<PricingPlan>`; `Provider.prewarm` was already re-defaulted to **false**; `ClientKey.limits: KeyLimits` added. New `PricingPlan { input_per_mtok, output_per_mtok, cache_read_per_mtok, cache_write_per_mtok, source: PricingSource }` with `has_any_rate()`, and `PricingSource { Bundled < Synced < Manual }` deriving `Ord` so "which source wins" is a `max` rather than a hand-written match. `KeyLimits { session_5h, weekly_1w, monthly_30d }` with `is_empty`, `KeyLimit { tokens, requests }` with `is_inert`. Helpers `ModelEntry::default_level(config_default)` and `highest_level(&levels)` added — both had **no caller** until B5. Deliberately **not** derived: `Default` for `ModelEntry` (an empty `id` is not a valid model), while `PricingPlan` does derive it because "nothing known" is meaningful. Fallout: `Provider.proxy` and `Account.proxy` added here too (the I10 per-account-overrides-provider binding B3's config validates), plus 8 explicit-field patches across `config.rs`, `oauth/migrate.rs`, `snapshot.rs`, `conductor/api.rs`, `relay/state.rs`, `mr-cli/{key,combo,models}.rs`. | `cargo test -p mr-core --lib` → 417 passed / 0 failed; `cargo clippy -p mr-core --all-targets -- -D warnings` clean; `cargo check --workspace --all-targets` clean |
+| 2026-10-16 02:55 | B3 | Config surface for the round, and the second config-file migration. Added `quota.display { mode: Chunks\|Percentage, chunks, reset_on_load }` with `DEFAULT_QUOTA_CHUNKS = 20` (divides by 4 and 5, so the common fractional allowances land on whole cells) and `MAX_QUOTA_CHUNKS = 200` (the value becomes DOM nodes); `routing { default_reasoning_level: high, defaults { image, audio, video, pdf, file } }` with `for_modality`/`configured`; `proxies: Vec<ProxyConfig>` (scheme-validated: `http`/`https`/`socks4`/`socks5`, must carry a host and a port, password only as a `secret_ref`) + `proxy_strategy { priority, least-used, random, round-robin }`; `no_key_required` + `allow_remote_without_key`, both **false**; `Config::{proxy, enabled_proxies, effective_proxy, serves_keyless}` and free `is_loopback`/`is_remote_exposed`. Validation added for all of it, including **I7 at the validation layer** (a keyless non-loopback bind is refused, and setting the allowance without the flag it guards is reported as inert). Generalised B1's migration hook to a list of additive, idempotent steps and added the second: `migrate_generated_aliases` deletes only `generated: true` aliases (F3), with the backup suffix renamed `.pre-command-code-go.bak` → `.pre-migration.bak` now that it names a step rather than one migration. | `cargo test -p mr-core --lib config::` → **64 passed / 0 failed** (24 new: round-trip, old-file-with-defaults, unknown-key preservation in the new sections, `is_loopback` spellings, keyless refusal at loopback/remote/with-flag/with-keys, inert-allowance, unknown proxy ref, duplicate proxy id, 4 bad-URL shapes + all 4 good schemes, account-overrides-provider, disabled-proxy→direct, routing default naming nothing, chunk bounds, 5 generated-alias tests); `cargo fmt --all -- --check` clean |
+| 2026-10-16 03:05 | B4 | Store schema v2. Two new tables rather than an `ALTER` on `usage`: **`ALTER TABLE ... ADD COLUMN` is not idempotent in SQLite**, and the migration runner's invariant is that a re-run must never fail, so `key_usage(id, client_key_id, prompt_tokens, completion_tokens, occurred_at, created_at)` + `key_usage_by_key_time(client_key_id, occurred_at)` and `provider_quota_state(provider_id, account_id, fetched_at, source, payload, created_at, updated_at, PK(provider,account))`, all `CREATE ... IF NOT EXISTS`. `key_usage` is an immutable **ledger**, not a stored counter, so 5h/1w/30d are genuinely *rolling* — a counter plus `window_started_at` is a *tumbling* window that resets mid-traffic and would silently hand back quota the operator had already spent. `SCHEMA_VERSION` 1 → 2. API: `record_key_usage`, `key_window_usage(key, since)`, `key_window_usage_many(since, keys)` (dense map, one grouped query per window, so the panel never does N+1), `prune_key_usage(before)`, `put_provider_quota_state`, `provider_quota_state`, `all_provider_quota_state`, `delete_provider_quota_state`. Window math takes `since: Millis`, so no new window type was invented. | `cargo test -p mr-core --lib store` → **50 passed / 0 failed** (9 new, incl. `v1_database_upgrades_to_v2_and_keeps_its_rows` asserting `user_version == 2` with the legacy row still readable, and re-apply idempotence) |
+| 2026-10-16 03:10 | B6 | Feature 1 framework: `quota/{types,window,http,registry}.rs`, 2658 lines, 32 tests. `UsageQuota` keeps OmniRoute's shape **including the two fields that stop the panel lying**: `fraction_reported` (so an unreported `0` is distinguishable from a real 0%) and `source`. `WindowFamily::from_seconds` ports `quotaWindowLabel.ts` with the plan's boundaries (≤6h/≤8d/≤40d, inclusive); `parse_reset_time` ports the `<1e12`-is-seconds rule exactly, since getting it wrong silently mis-places every reset by 1000×. `QuotaHttp` is the object-safe seam (a test injects a fake; only `HyperQuotaHttp` can reach a socket), and `QuotaRegistry` resolves exact provider id → dialect → generic fallback. Three deliberate decisions: counts are `f64` (USD balances survive); `reset_at` is epoch **millis**; `is_exhausted()`/`reported_percentage()` require `total > 0` so a "no limit" `0/0` can never read as exhausted. `GenericOpenAiCompat` is a registered placeholder with a documented seam for C3's fuller `openai_compat.rs`. | `cargo test -p mr-core --lib quota` → 36 passed / 0 failed; no test opens a socket |
 
-## 17. Risks
 
-| Risk | Mitigation |
+---
+
+## 8. Risks, unknowns, and how to handle them
+
+| Risk | Handling |
 |---|---|
-| Single-stream release build; 46 s cold upstream observed | Pre-warm + fast paths + releasable blame-free latency harness; never bench against a cold provider |
-| Streaming the body 1:1 causes unnecessary deadlock/split issues when 2+ combo steps race | Explicitly tested in `tests/combo_race.rs` before the combo engine is considered done |
-| Hedging burns quota | Abort losers at first byte; never hedge a non-streaming embeddings/images call |
-| OAuth client-ids may be unpublished/undocumented | Research marked uncertain values explicitly; each OAuth platform is independently testable and documentedly replaceable via `OAuthPlatform` |
-| 35 providers is a lot to port faithfully | Config-driven generic adapters + generated catalog; only 8 special dialects need native code |
-| Panel scope creep | 9 fixed views, no framework, no npm, < 100 KB total |
-| Secrets leaking into git | Secrets only under `~/.config/manarouter/secrets/`, `.gitignore`d, and a pre-commit check + CI grep for key-shaped strings |
-| Public repo exposing this machine's credentials during migration | Migration writes only to the local config dir; the repo ships templates with placeholders; CI asserts no `sk-`/`ghp_`/`gho_`/JWT-shaped string is ever committed |
-
----
-
-## 18. v2 groundwork: cross-instance sync (ratified Q15)
-
-The user asked for the groundwork so that **credentials, combos and settings can be synced between
-two instances on different machines** in v2. v1 does not ship networking, but it must not make v2
-impossible. Therefore v1 commits to these invariants from the very first migration:
-
-1. **Every record has a stable, device-independent id** (UUIDv7), never an autoincrement integer, so
-   two instances can merge without collisions. `created_at` and `updated_at` are monotonic UTC.
-2. **Every mutable record carries a `revision`** (a monotonic counter) and a `deleted_at` tombstone
-   instead of a hard delete, so a merge can tell "changed" from "removed" — a plain delete is
-   indistinguishable from "the other side never had it".
-3. **Secrets are addressed by id, never inline in the config**, so the sync layer can choose to send
-   ciphertext, a wrapped key, or nothing at all without touching any other table.
-4. **All writes go through one repository layer** (`mr-core::store`), so a future replication log has
-   exactly one choke point to hook.
-5. **A `sync` module exists but is inert**: an `oplog` table records `(entity, id, revision, op,
-   updated_at, payload_hash)` for every write from day one. v1 never reads it beyond a panel
-   "pending changes" counter; v2 replays it. Writing the oplog from day one is what avoids a
-   painful backfill later.
-6. **The config format is explicitly versioned** (`"format_version": 1`) and forward-compatible:
-   unknown keys are preserved on round-trip rather than dropped, so an older instance never destroys
-   a newer instance's fields.
-7. **Conflicts are last-writer-wins per field for settings, and per record for credentials/combos**,
-   with the losing value retained in the oplog so nothing is silently lost. Documented in
-   `docs/22-sync-design.md`, which v1 writes even though it implements nothing.
-
-This is cheap in v1 — a UUID, a revision column, tombstones, and one append-only table — and it is
-the difference between a v2 sync feature that is a week of work and one that is a rewrite.
-
----
-
-## 19. Reconciliation: where the plan met reality (added during implementation)
-
-This plan was written from a research dossier before any code existed. Some of it turned out to be
-wrong, and the corrections are recorded here rather than quietly applied, because a plan that has
-been silently edited to match the outcome is no longer evidence of anything.
-
-### 19.1 The provider count: 28 ship, not 35
-
-**§6 Q5 said "port all 35 credentialed providers". That number cannot be reconstructed, and 28 of
-the 45 connected providers in the reference database ship instead.**
-
-Why the original number does not survive contact with the source:
-
-1. The dossier's §6.3 provider list is **truncated** — it ends mid-sentence ("singletons including"),
-   so the tail of the list was never captured. Any count derived from it is a lower bound presented
-   as a total.
-2. The reference count **includes the web-session providers**, which Q6 forbids outright. Six are in
-   that group (`claude-web`, `deepseek-web`, `gemini-web`, `zai-web`, `duckduckgo-web`,
-   `veoaifree-web`). They are not "not yet done"; they are permanently out of scope by decision.
-3. Several remaining entries are not expressible as an HTTP provider at all:
-   - `kiro` speaks AWS CodeWhisperer's event-stream protocol, which is not any `Dialect`.
-   - `fishaudio` is a bespoke TTS surface with no shared shape.
-   - `auggie`, `zcode`, `codex-app-server` and `devin-cli-agentic` are not HTTP services.
-   - `cloudflare-playground` is a WebSocket.
-   - `combo` is not a provider, `uno` has no registry row, `wawawa` is a user-supplied node.
-4. Two more (`aihorde`, `pollinations`) are no-session community proxies that Q6's logic excludes.
-
-The shipped catalogue is **`catalog/providers.toml`, 55 entries**: 4 OAuth platforms, Command Code,
-19 major key-based providers, 3 loopback locals (Ollama, llama.cpp, vLLM), 27 providers matched to
-the reference database, and 11 additional sources.
-
-**The honest status is therefore 28 of 45 reachable providers implemented, 17 excluded for stated
-reasons, and the original "35" unsupportable.** Anything a reader was told based on "35" should be
-corrected.
-
-### 19.2 Two providers that migration cannot reach
-
-`kiro` and `fishaudio` are credentialed in the reference database and **cannot be imported**, because
-no `Dialect` can express their wire format. The importer must report them as skipped with the reason,
-not silently omit them — an operator migrating wants to know what did not come across and why. This
-is a documented gap, not a bug.
-
-### 19.3 A real bug the plan did not anticipate: `o-auth`
-
-`AuthKind` derives `#[serde(rename_all = "kebab-case")]`, which renders `AuthKind::OAuth` as
-`o-auth`. The catalogue was written against the documented name, `oauth`, and nine tests failed.
-
-The kebab-case rule is right for `Dialect` (`open-ai`), `Capability` (`images.generations`) and the
-rest, but it is wrong for an acronym: `o-auth` is not a word anyone would guess, and it reads as a
-typo in a hand-edited configuration. The fix is a variant-level `#[serde(rename = "oauth")]`, which
-pins the wire name and states it explicitly rather than leaving it an emergent property of a rename
-rule. §5's data model should be read with that pin in place.
-
-**The lesson worth keeping:** a derived wire name is an API. It was only caught because the catalogue
-and the config schema were written independently and disagreed.
-
-### 19.4 Corrections to specific claims
-
-| Plan said | Reality |
-|---|---|
-| §12 "compiled snapshot, zero-copy" | Decode builds owned `String`s and `Vec`s once at load. The honest claim is **zero interpretation on the request path**, not literal zero-copy. The snapshot module states this plainly. |
-| §4 crates, 5 members | Correct, and `tools/mock-upstream` is a **detached** crate with its own `[workspace]`, so it cannot break `cargo check --workspace`. |
-| §13 document list | `docs/01`, `03`, `07`, `16`, `21` and `LLM_INDEX.md` are written. The rest follow. |
-| §12 "budget p50 < 150 µs" | Unchanged as the target; not yet measured, because the data plane is still being built. No number will be published before it is measured. |
-
-### 19.5 Process
-
-Work was parallelised across subagents, one file each, with frozen interfaces, which is why the
-compile errors were concentrated in integration rather than in the middle of anyone's task. Two
-observations worth recording for anyone extending this:
-
-- **Concurrent agents in one crate see each other's in-flight breakage.** Three agents editing
-  `mr-core` at once each briefly saw a crate that did not compile. Telling each of them "only your
-  file is yours, report other breakage rather than fixing it" was what kept that from becoming
-  mutual interference.
-- **Agents that died without writing produced no partial file**, so the failure was detectable by
-  checking for the file's existence rather than by reading it. Two of nine died this way and were
-  restarted.
+| Full per-key quota enforcement is not wired despite editor/store/snapshot structures. | Treat limits as inactive. Implement atomic admission plus request usage finalization and token reservation/settlement before relying on them. |
+| Configured proxy selection is not on the relay upstream request path. | Do not treat proxy settings as an egress control until connector injection is integrated and tested end to end. |
+| Modality fallback helper cannot safely reroute the whole step yet. | Relay returns HTTP 501 rather than misrouting the fallback model through the selected provider. |
+| Any tool/agent accidentally touching the live config would kill this session. | C2; all runs use `MANAROUTER_CONFIG_DIR` temp dirs; the live path is never edited; the final combo is handed to the user to apply. |
+| `snapshot.rs` is 2.7 kloc and the single riskiest file; its encode/decode is versioned. | B5 is a single-writer task with an explicit format version bump and round-trip tests; nobody else edits it. |
+| Ported quota fetchers target endpoints that may have changed since OmniRoute v16.3.5. | Fetch-from-source, keep parsers tolerant, mark unverifiable fetchers honestly in docs and return a precise "not verified" error rather than numbers. |
+| Model ids that already end in a level word (`antigravity/gemini-3.8-flash-low`) could be mis-split. | Exact-model-id-first rule (B5/D1) with a dedicated test. |
+| Adding crates (`tokio-socks`) needs network; crates.io reachable at plan time. | Verify with `cargo fetch` before writing code that depends on it; if unavailable, implement SOCKS4/5 handshakes by hand (they are small). |
+| Deleting generated aliases rewrites the live config on the next restart. | User-approved; backup written before rewrite; only `generated: true` entries are touched; the bare-id combo is the replacement path. |
+| Reasoning-level wire formats differ per provider and some are guessed. | Per-dialect defaults + per-model override, documented as "verify against the provider"; `none` always safe. |

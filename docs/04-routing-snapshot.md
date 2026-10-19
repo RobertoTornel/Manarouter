@@ -94,7 +94,7 @@ magic[8] | version u32 | digest u64 | payload_len u32 | checksum u64 | payload[.
 | Field | Offset | Type | Protects against |
 |---|---|---|---|
 | `magic` | 0 | 8 bytes | Being handed an unrelated file. The constant is `SNAPSHOT_MAGIC = *b"MROUTES1"` in `mr-core/src/lib.rs`. A mismatch is reported as *"this is not a compiled routing snapshot"*, before any structure is built. |
-| `version` | 8 | `u32` LE | Loading a layout this binary cannot interpret. `SNAPSHOT_VERSION = 1`. A mismatch is refused, not guessed at. |
+| `version` | 8 | `u32` LE | Loading a layout this binary cannot interpret. `SNAPSHOT_VERSION = 4`. A mismatch is refused, not guessed at. |
 | `digest` | 12 | `u64` LE | Being unable to tell "the file changed" from "the bytes changed" without comparing whole snapshots. Copied from `Config::routing_digest()`. |
 | `payload_len` | 20 | `u32` LE | A truncated or padded file. Checked against the actual byte count in both directions: fewer bytes is a precise "truncated" error, more bytes is a "trailing bytes" error. |
 | `checksum` | 24 | `u64` LE | A single flipped byte anywhere meaningful. |
@@ -178,6 +178,41 @@ compiler downgrades it rather than executing race bookkeeping for a single reque
 `on_winner_fail` names a stable fallback step that is no longer routable, the mode is replaced with
 its default rather than left dangling at an index into a shrunken step list.
 
+### Level-aware compilation
+
+Reasoning levels are compiled, not parsed per request, in the same way everything else here is.
+`plan_step` turns a `ModelEntry` plus its `ProviderPlan` into a `StepPlan`, and the level fields it
+fills in are what the relay merges into the upstream body:
+
+| `StepPlan` field | Type | What it carries |
+|---|---|---|
+| `model` | `String` | The model id **as the upstream expects it**, and therefore **never** carrying a `-<level>` suffix. The suffix selected `level`; forwarding it would name a model the upstream does not have. |
+| `level` | `u8` | The level a direct request to this step runs at, compiled as the same value as `default_level`. |
+| `levels` | `u32` | Bitmask of the levels this model genuinely offers, bit `n` = `ReasoningLevel::rank() == n`. Zero is a real answer: the model advertises no levels. |
+| `default_level` | `u8` | The level a request gets when it names this model with no suffix. Recorded as `none` whenever the model's level set does **not** contain `none` — which is always true of a model with no levels at all — because such a model has no default reasoning tier to send. |
+| `reasoning_json` | `[Option<String>; 8]` | Per level, the encoded JSON object fragment the relay merges into the upstream body. `None` means "send nothing for this level" — the correct answer for `none`, for a dialect with nothing to say, and for a level the model does not offer. |
+| `input_modalities` | `u32` | Bitmask of accepted input kinds, over `InputModality`'s discriminant. |
+| `pricing` | `Option<PricingPlan>` | Input/output and cache rates per million tokens, plus where the numbers came from. Copied in so a cost estimate never has to look the model up again. |
+
+`StepPlan::supports_level`, `StepPlan::levels`, `StepPlan::accepts_modality` and
+`StepPlan::reasoning_fragment` are the accessors; `levels()` materialises the bitmask in ascending
+order, which is what the listing and the panel read.
+
+**Why the level lives in the step rather than in the request name.** The name the client sent is not
+available to the merge step as a parsed value — the relay deliberately never fully parses a body it
+can pass through — and a level has to be decided even when the name carried no suffix. Compiling the
+default into the step is what makes "no suffix" and "an explicit suffix that matches the default"
+the same code path.
+
+**Which levels a model offers is derived here, in a fixed order:** the operator's explicit
+`reasoning_levels` on the model entry wins outright; otherwise the bundled table
+`catalog/model_meta.json`, keyed `provider/model` and falling back to a provider-agnostic `model`
+key; otherwise, when the model or its provider declares the `reasoning` capability — or the dialect
+serves only reasoning models, currently `codex` — the generic set `none, low, medium, high, xhigh,
+max`. A model that reaches none of the three has `levels == 0` and its name gets no `-<level>`
+suffix. The generic set deliberately omits `minimal`, `ultra` and `max`: they are provider-specific
+tiers, and advertising one a provider rejects turns a working request into a 400.
+
 ---
 
 ## 6. The index, and precedence
@@ -187,16 +222,47 @@ name, and a bare model id all at the same time. The index resolves that with a f
 is also exactly the order in which the panel and `mr` will warn about shadowing.
 
 ```text
-RANK_ALIAS      = 0   the alias `from` value
-RANK_COMBO_ID   = 1   ComboId
-RANK_COMBO_NAME = 2   the callable model name
-RANK_QUALIFIED  = 3   provider/model
-RANK_BARE       = 4   a bare model id
+RANK_ALIAS            = 0   the alias `from` value
+RANK_COMBO_ID         = 1   ComboId
+RANK_COMBO_NAME       = 2   the callable combo name, optionally with a -<level> suffix
+RANK_QUALIFIED        = 3   provider/<exact model id>
+RANK_BARE             = 4   a bare model id
+RANK_QUALIFIED_LEVEL  = 5   provider/<base model>-<level>
 ```
 
 Lower rank wins. So an alias always beats a combo name, and a combo name always beats the bare model
 id it shadows — which is what makes "name a combo after the model the client already uses" a
-non-breaking change.
+non-breaking change. `RANK_MAX` is `RANK_QUALIFIED_LEVEL`, and `link_entries` rejects any entry
+carrying a higher rank rather than letting an unknown precedence into the table.
+
+**Level-qualified keys, and why `provider/<exact model id>` outranks them.** Feature 3 added two
+kinds of derived key, and the rank order between them is the whole point:
+
+- `comboName-<level>`, compiled at `RANK_COMBO_NAME` — the same rank as the combo name itself. It
+  resolves to the same combo with an explicit level, which is how a route is pinned to a tier
+  without editing it: `coding-high` runs `coding` at `high`. A combo name that merely contains a dash
+  is untouched, because a suffix that is not a level name compiles no key at all.
+- `provider/<base model>-<level>` for each level, at `RANK_QUALIFIED_LEVEL` = 5, the *lowest*
+  precedence there is. An exact model id at rank 3 therefore always beats a `base-level` reading of
+  itself. `antigravity/gemini-3.8-flash-low` is a real model id; it is not read as
+  `gemini-3.8-flash` plus the level `low`, and the entry for the shorter model is only consulted when
+  no model by the longer name exists.
+
+**A `base-level` key is indexed even for a level the model does not offer.** That is not an
+inconsistency: it is how an out-of-range level succeeds instead of failing. The entry's `level` is
+the model's **highest available** level, while its `requested` field records what the name actually
+asked for. `Resolution::Direct::substituted` is then `level != requested` — a field read rather than
+a re-parse of the name. So `-max` on a model that tops out at `xhigh` reroutes to `xhigh`; a model
+reporting no levels at all reroutes to `none`, which emits no fragment rather than inventing
+support. A model whose own id ends in a level word gets **no** `base-level` keys at all, because
+those names would resolve to nothing: the exact-model-id rule wins.
+
+**A miss is explained, not just reported.** `NotFound` carries a `reason` string produced by
+`explain_miss`, and the three cases need different fixes. A name with no provider prefix says that
+it must be a combo or an alias, and that a model is addressed as `provider/model`, optionally with a
+`-<level>` suffix. A name whose prefix is not a configured provider names the typo and lists the
+configured providers. A known provider with an unmatched model says so — it does not guess at a
+closest candidate.
 
 The index is a `HashMap<u64, u32>` from a hash of the folded key to the head of a chain in
 `index_entries`. Each `IndexEntry` stores:
@@ -231,20 +297,28 @@ care about combos. `resolve` is the general one.
 
 ```rust
 pub enum Resolution<'a> {
-    Combo(&'a ComboPlan),
-    Direct(&'a StepPlan),
-    NotFound,
+    Combo { plan: &'a ComboPlan, level: Option<u8> },
+    Direct { step: &'a StepPlan, level: u8, substituted: bool },
+    NotFound { reason: std::borrow::Cow<'a, str> },
 }
 ```
 
 - **`Combo`** — the name matched a combo. The relay walks `plan.steps` in the operator's order under
   the plan's `strategy`, applies the plan's `hedge` if enabled, and selects an account using the
   target provider's `key_strategy`. Everything it needs — step order, remapped participants, timeouts
-  — is already in the plan.
+  — is already in the plan. `level` is `Some` only when the client named a tier (`combo-name-high`);
+  `None` means the name carried no suffix, and **each step then runs at its own model's default
+  level**. That distinction is deliberate: forcing the configuration default onto every step would
+  override a per-model `default_reasoning_level` the operator set on purpose. A combo named *with* a
+  suffix forces that tier onto every step, and a step whose model does not offer it falls back to
+  that model's highest — the same substitution rule as a direct name.
 - **`Direct`** — the name matched a concrete provider/model step. The relay calls that provider with
-  that model. A `provider/model` request and a bare-model request both land here; the difference is
-  only which index rank matched.
-- **`NotFound`** — nothing matched. The relay answers with a routing error, and the client gets a
+  that model, at `level`. `substituted` is `true` when the level asked for was not one the model
+  offers and its highest available level was used instead; the relay logs it and the panel shows it.
+  Nothing else about the resolution changes — the request still succeeds. A `provider/model` request
+  and a bare-model request both land here; the difference is only which index rank matched.
+- **`NotFound`** — nothing matched, and `reason` says why (see §6). The relay answers with a routing
+  error — a 404 carrying `model_not_found` and that reason as the message — and the client gets a
   distinct, actionable failure rather than a generic upstream 503. The relay does not attempt an
   upstream call and does not guess.
 
@@ -266,11 +340,12 @@ the snapshot**: a counter in the table would make a routing decision a write, wo
 disagree about which account is "next", and would make a hot swap lose or double-count the rotation
 position.
 
-The only mutable state on the request path is the `ArcSwap` inside `SnapshotHandle`, and the
-per-request selection state that a mutable strategy needs. Round-robin position, least-used counts
-and account health belong to the conductor's runtime state (the state database), which is observed
-rather than authored; the relay consumes the *order* the conductor published and the strategy the
-plan names.
+The only mutable state on the request path is the `ArcSwap` inside `SnapshotHandle` and the
+relay-local state a mutable strategy needs. Round-robin cursors live in the relay's own `RouteTable`
+(relaxed `AtomicU64` counters beside the `ArcSwap`, `manarouter-relay/src/state.rs`), and live account
+health — cooldowns, `available_after`, failure counts — lives in the relay process's in-memory `Health`
+map, not in the snapshot and not in the state database. The relay consumes the *order* the conductor
+published and the strategy the plan names.
 
 This is a deliberate split with a cost, and the cost is worth stating: because the snapshot is
 immutable, `KeyStrategy::RoundRobin` cannot be a counter embedded in the table. Its exact placement
@@ -298,6 +373,10 @@ pub struct SnapshotHandle { inner: Arc<ArcSwap<RoutingSnapshot>> }
 - `install(next)` publishes a newly compiled snapshot, visible to every worker immediately.
 - `reload_from(path)` decodes a file, installs it, and returns its digest.
 
+The conductor is the usual publisher, but not the only one: the relay also polls `config.json` (every
+two seconds, keyed on mtime and length) and recompiles and installs a fresh table itself when the file
+changed, so a hand-edit is picked up without waiting for the conductor.
+
 **Readers never block.** `arc_swap::ArcSwap` stores a pointer; a reader loads it and increments a
 refcount. There is no writer lock on the read side, so a hot swap cannot introduce a stall in a
 request that is already running.
@@ -308,10 +387,9 @@ table and drops its reference afterwards. Nothing is ever observed half-replaced
 
 **Memory behaviour is refcount-driven.** The old snapshot is freed when the last `Arc` to it is
 dropped — normally just after the last in-flight request that started before the swap completes.
-There is no copying of the routing table on swap, and no grace-period timer. The only bound that
-exists is the conductor's, not the relay's: `latency.snapshot_swap_budget_ms` (default 50) is how
-long a relay may keep serving a snapshot the conductor has replaced, which is a policy knob rather
-than an allocator behaviour.
+There is no copying of the routing table on swap, and no grace-period timer. An intended bound is
+named in the configuration — `latency.snapshot_swap_budget_ms` (default 50) — but nothing in the relay
+or the conductor currently reads it, so today the bound is only the refcount.
 
 **A failed reload changes nothing.** `reload_from` returns `Err` and does not install, so a corrupt
 file leaves the relay serving the previous table. This is the same degradation rule as a failed
@@ -326,7 +404,16 @@ yet, not a routing decision — a `Default` snapshot resolves everything to `Not
 
 ## 10. Version and compatibility
 
-`SNAPSHOT_MAGIC` is `*b"MROUTES1"` and `SNAPSHOT_VERSION` is `1`, both in `crates/mr-core/src/lib.rs`.
+`SNAPSHOT_MAGIC` is `*b"MROUTES1"` and `SNAPSHOT_VERSION` is `4`, both in
+`crates/mr-core/src/lib.rs`.
+
+The version history is worth recording, because Feature 3 spent two of it. Version 3 added the
+per-step reasoning-level fields (`levels`, `default_level`, `reasoning_json`), `input_modalities` and
+`pricing`, plus the proxy pool and the per-key limit table — but it declared the fields without
+writing them, so a version-3 frame would decode with empty level tables. Version 4 completed the
+feature: a step's level metadata is now actually encoded, and every lookup entry carries the level it
+resolves to (`level` plus the `requested` it is compared against). A version-2 or version-3 snapshot
+is therefore refused rather than read as though it carried levels it does not.
 
 The rule is absolute: **a change to the compiled layout requires a `SNAPSHOT_VERSION` bump.** The
 version is not a semver hint; the decoder has no compatibility paths, and a table written under a
@@ -347,10 +434,10 @@ temporary: the conductor is the only writer, it recompiles on demand, and the wo
 routing for the interval until it does. The magic check rejects a plain non-snapshot file for the same
 reason — a `config.json` or a database should never be interpretable as routing data.
 
-`SNAPSHOT_MAGIC` and `SNAPSHOT_VERSION` are separate from `CONFIG_FORMAT_VERSION` (also 1) and
-`SCHEMA_VERSION` (also 1). They version three different things — the authored file, the compiled
+`SNAPSHOT_MAGIC` and `SNAPSHOT_VERSION` are separate from `CONFIG_FORMAT_VERSION` (still 1) and
+`SCHEMA_VERSION` (now 2). They version three different things — the authored file, the compiled
 table, and the database — and conflating them would force an unnecessary migration in two of the
-three whenever the third changed.
+three whenever the third changed. The three are free to move independently, and now do.
 
 ---
 
@@ -396,8 +483,8 @@ everything the compiler reads, and deliberately nothing else:
 | Provider `id`, `enabled`, `key_strategy` | They change what exists and how an account is picked. |
 | Account **array position**, `id`, `priority`, `weight`, `enabled` | They change the selection order the relay reads directly. |
 | Account `models_allow`, `models_deny` | They change which account may serve a model. |
-| Model `id`, `hidden` | Hidden models are dropped from the direct-lookup index. |
-| Combo `id` and `signature()` | `signature()` folds name, strategy, hedge fields, `midstream_policy`, retry counts and step/provider/model/enabled/weight. |
+| Model `id`, `hidden` | The id is the lookup key, and a hidden model is dropped from the direct-lookup index. **The model's level metadata is not hashed** — see the note below. |
+| Combo `id` and `signature()` | `signature()` folds name, strategy, the hedge fields, `sticky_success_window_secs`, `midstream_policy`, retry counts and each step's provider/model/enabled. (`weight` is not folded, matching the strategies that ignore it.) |
 | Alias `from`, `to` | Alias resolution is compile-time. |
 | Client key `id`, `enabled`, `allow_models`, `allow_routes` | They change authentication and authorization at the edge of routing. |
 | `quota.enabled`, `quota.live_signals_win`, `quota.failures_before_dead` | They change when an account becomes unusable. |
@@ -408,15 +495,26 @@ a flattened `extra` map for unknown-key preservation and a map cannot be hashed.
 also the correctness win: only fields that change a routing decision are included, so a cosmetic edit
 — a label, a note, a `sort_order` — does not republish the table.
 
+**A gap Feature 3 left open, recorded here because it is load-bearing.** The per-model level metadata
+that `compile` now reads — `reasoning_levels`, `default_reasoning_level`, `reasoning_wire`,
+`input_modalities`, `pricing` — is **not** in the digest, and neither is
+`routing.default_reasoning_level`. Editing any of them changes the compiled step (`levels`,
+`default_level`, `reasoning_json`, `input_modalities`, `pricing`) without changing
+`Config::routing_digest()`, so a conductor that skips a recompile on an unchanged digest will keep
+serving the previous table until something else routing-relevant moves. The fields are compiled
+correctly; they are simply not yet part of the trigger. Anyone touching this area should add them to
+`routing_digest` rather than assume the table refreshed.
+
 When the digest is unchanged, the conductor has nothing to do: the compiled table is identical, so
 swapping the relay's pointer would cost a cache line and buy nothing. This is what the comment in
 `routing_digest` means by "matters because a recompile swaps the relay's tables and briefly costs a
 cache line".
 
 What is deliberately *outside* the digest: account health, quota counters and usage totals. Those are
-observed, they live in the state database, and they change continuously — folding them into the digest
-would mean recompiling the routing table whenever a request was counted. They change routing
-*decisions* without changing the routing *table*, which is exactly the split this design rests on.
+observed at request time — the relay keeps account health in memory and does not persist it, and no
+usage writer exists yet — and they change continuously. Folding them into the digest would mean
+recompiling the routing table whenever a request was counted. They change routing *decisions* without
+changing the routing *table*, which is exactly the split this design rests on.
 
 ---
 
@@ -467,7 +565,7 @@ strings         ["openai", "https://api.openai.com/v1", "a1", "gpt-5.5",
                  "claude-sonnet-4-5", "Good", "gpt-5", ...]
                  (the reference variant of ids::fnv1a64, plus each id's secret-ref path)
 
-providers[0]    id=openai dialect=open-ai key_strategy=priority
+providers[0]    id=openai dialect=openai key_strategy=priority
                 accounts = [ a1(priority 0) ]          ← a2 dropped: disabled
                 steps    = [ gpt-5.5 ]                 ← gpt-5.5-mini dropped: hidden
 providers[1]    id=anthropic dialect=anthropic key_strategy=round-robin
@@ -494,11 +592,11 @@ Resolving the three interesting request names:
 
 | Client sends | Lookup | `Resolution` | Relay does |
 |---|---|---|---|
-| `"Good"` | combo name, rank 2 | `Combo(&combos[0])` | walks steps in order, starting at `openai/gpt-5.5` |
-| `"gpt-5"` | alias, rank 0 | `Combo(&combos[0])` after one hop to `"Good"` | same as above |
-| `"openai/gpt-5.5"` | qualified, rank 3 | `Direct(&providers[0].steps[0])` | calls OpenAI directly, bypassing the combo |
-| `"gpt-5.5"` | bare, rank 4 | `Direct(&providers[0].steps[0])` | same, because no combo shadows the name |
-| `"gpt-4o"` | miss | `NotFound` | routing error; no upstream call |
+| `"Good"` | combo name, rank 2 | `Combo { plan: &combos[0], level: None }` | walks steps in order, starting at `openai/gpt-5.5`, each step at its own default level |
+| `"gpt-5"` | alias, rank 0 | `Combo` after one hop to `"Good"` | same as above |
+| `"openai/gpt-5.5"` | qualified, rank 3 | `Direct { step, level, substituted: false }` | calls OpenAI directly, bypassing the combo |
+| `"gpt-5.5"` | bare, rank 4 | `Direct { step, .. }` | same, because no combo shadows the name |
+| `"gpt-4o"` | miss | `NotFound { reason }` | 404 `model_not_found` carrying the reason; no upstream call |
 
 Two things this example is meant to make concrete. First, the **account** `a2` is already gone from
 the compiled table — the relay never evaluates `enabled` on the request path. Second, the **bare
@@ -508,12 +606,18 @@ rank-2 entry beats the rank-4 one, so the same request now goes through the comb
 shadowing mechanism from §6, and it is the cheapest way to add a fallback to a client you cannot
 reconfigure.
 
+The index in this example contains two further entries only when the models advertise levels: a
+`gpt-5.5-high` key at rank 2 for a combo named `gpt-5.5`, and `openai/gpt-5.5-<level>` keys at rank 5
+for each level OpenAI's `gpt-5.5` entry offers. Neither appears for the other model, which offers
+none.
+
 ---
 
 ## See also
 
 - [Architecture](01-architecture.md) — the two processes and the request path
 - [Configuration](03-configuration.md) — the authored form the compiler reads
+- [API reference](18-api-reference.md) — model addressing, reasoning levels and `/v1/models`
 - [Key selection](05-key-selection.md) — what the relay does with an `AccountPlan`
 - [Combos](06-combos.md) — what `ComboPlan` means to an operator
 - [The hedged race](07-hedged-race.md) — the remapped participants and the eligibility gate

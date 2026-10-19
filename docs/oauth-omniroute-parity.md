@@ -4,7 +4,7 @@ This is a provider-flow inventory, not a promise that every OmniRoute integratio
 
 ## Current Manarouter adapters
 
-- OpenAI Codex — loopback authorization code with PKCE.
+- OpenAI Codex — loopback authorization code with PKCE by default, plus an OpenAI device-code fallback.
 - GitHub Copilot — device authorization.
 - Google Antigravity — loopback OAuth and Cloud Code account onboarding; experimental T2 client metadata remains unverified and paid-tier onboarding requires a project.
 

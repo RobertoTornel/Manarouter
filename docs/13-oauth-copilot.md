@@ -233,6 +233,11 @@ One host, one bearer credential, several wire dialects. **The path selects the d
 the list and the request is still refused; the endpoint set is the authority, not the model's
 existence.
 
+These are the **upstream** paths on `api.githubcopilot.com`, not the router's routes. The relay
+exposes `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/messages`,
+`/v1/messages/count_tokens` and `/v1/models` (`crates/manarouter-relay/src/server.rs`); it does not
+currently call `/models/session` or read `supported_endpoints` to validate a route before sending.
+
 **The native Anthropic surface is a latency win worth stating plainly.** An Anthropic-shaped client
 can be pointed at `/v1/messages` and the router can pass the request and the response through without
 translating to the OpenAI shape and back. Translation is where the latency budget is spent and where
@@ -258,9 +263,13 @@ accounting gets more information here than through a translated route.
 | `x-vscode-user-agent-library-version` | `electron-fetch` | fingerprint fidelity |
 | `Copilot-Vision-Request` | `true` only when an `image_url` part is present | conditional |
 
-`catalog/providers.toml` records this set for `github-copilot`, and the `headers` test in
+`catalog/providers.toml` records the static subset it can fill — `Editor-Version`,
+`Copilot-Integration-Id`, `editor-plugin-version`, `user-agent`, `openai-intent`,
+`x-github-api-version` and `x-vscode-user-agent-library-version` — and the `headers` test in
 `crates/mr-core/src/catalog.rs` asserts that `Editor-Version` and `Copilot-Integration-Id` are
-present.
+present. Two rows above are **not** catalogue entries and are **not** implemented here: the router
+sends no `x-request-id`, and it does not set `Copilot-Vision-Request` for image parts. Treat those as
+part of the reference client's fingerprint, not as headers this build injects.
 
 ### `Editor-Version` is mandatory
 
@@ -347,11 +356,11 @@ long-lived GitHub token. Consequences:
 
 ## See also
 
-- [OAuth overview](docs/10-oauth-overview.md) — the device flow, single-flight, storage
-- [OpenAI Codex](docs/11-oauth-codex.md) — the other short-lived-token platform
-- [Google Antigravity](docs/12-oauth-antigravity.md) — the two-tier Google login
-- [Adding a platform](docs/14-oauth-adding-a-platform.md) — the trait, including `mint`
-- [Latency engineering](docs/16-latency-engineering.md) — the native Anthropic passthrough
-- [Security and credentials](docs/21-security.md) — §5 the ToS posture and the fingerprint rule
-- [providers.toml](catalog/providers.toml) — the `github-copilot` entry and its recorded headers
-- [catalog.rs](crates/mr-core/src/catalog.rs) — the test asserting `Editor-Version` is present
+- [OAuth overview](10-oauth-overview.md) — the device flow, single-flight, storage
+- [OpenAI Codex](11-oauth-codex.md) — the other short-lived-token platform
+- [Google Antigravity](12-oauth-antigravity.md) — the two-tier Google login
+- [Adding a platform](14-oauth-adding-a-platform.md) — the trait, including the device-flow pair
+- [Latency engineering](16-latency-engineering.md) — the native Anthropic passthrough
+- [Security and credentials](21-security.md) — §5 the ToS posture and the fingerprint rule
+- [providers.toml](../catalog/providers.toml) — the `github-copilot` entry and its recorded headers
+- [catalog.rs](../crates/mr-core/src/catalog.rs) — the test asserting `Editor-Version` is present

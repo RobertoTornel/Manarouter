@@ -6,10 +6,11 @@ is published in the compiled snapshot as a `KeyStrategy` on the `ProviderPlan`, 
 it reads is the order the compiler already resolved.
 
 > **Status.** The strategy vocabulary, the `AccountPlan` fields, the `AccountState` set and the
-> `ProviderHealth` rollup are implemented in `mr-core` and tested. The relay's selection loop is not
-> yet written — `manarouter-relay` does not bind a listener in this tree. The algorithms below are the
-> intended behaviour of the strategies as their own doc comments define them, and this document says
-> where a rule is not enforceable from code yet.
+> `ProviderHealth` rollup are implemented in `mr-core` and tested. All four `KeyStrategy` values are
+> also executed by the relay (`manarouter-relay/src/select.rs`), which binds its listener and serves
+> `/v1`; the account selection described below is live behaviour. What is not yet wired is account
+> *health as persisted state*: the relay's live view is in memory and nothing writes the
+> `account_health` table.
 
 ---
 
@@ -322,11 +323,14 @@ upstream, because there is nothing to contact. It must not be a generic 503 for 
 - **It is not an upstream failure.** The upstream was never called. Reporting a provider error for a
   local routing decision misattributes the fault and sends the operator to the wrong logs.
 
-*The exact status code and body shape of this error are not fixed in code yet: the relay's router does
-not exist in this tree. The design requirement is that the cause is distinguishable programmatically
-— different codes or a machine-readable cause field — so a client can back off intelligently instead
-of parsing prose. The generic error text is defined by `Error::NotFound` in `mr-core/src/error.rs`;
-the HTTP mapping is the part still to be built.*
+*The relay does distinguish the broad cases programmatically today: a name that resolves to no usable
+step gets a `model_not_found` error, and steps that exist with every account unavailable get the
+relay's own 429 with the code `no_usable_accounts` and a `Retry-After` derived from the earliest known
+reset. What is still the design rather than the code is the finer distinction — separate signals for
+"no accounts", "all disabled", "all cooling down" and "none permitted" — so a client can back off
+intelligently from the right cause rather than from prose. `Error::NotFound` in
+`mr-core/src/error.rs` defines the generic text; the finer HTTP mapping is the part still being
+refined.*
 
 ---
 
@@ -338,9 +342,9 @@ the chain needs.
 
 **Unavailable steps are demoted, never removed.** A step with no usable account moves below every
 healthy step and stays in the plan. When its earliest known reset (`available_after` on the account,
-or the next quota-window reset) passes, it is **restored to its authored position**. Nothing about the
-operator's declared order is destroyed, so restoring is a matter of letting a timer expire rather than
-re-saving the configuration.
+or the next quota-window reset) passes, it is **restored to its authored position** — the demotion is
+recomputed on each selection from the reset time, so there is no timer to wait on and no configuration
+to re-save.
 
 Removal would be simpler and wrong for three reasons:
 
@@ -378,8 +382,14 @@ Account state is **observed, not authored**, and it is stored accordingly:
 | Data | Location | Written by |
 |---|---|---|
 | `enabled`, `priority`, `weight`, `models_allow`, `models_deny` | `config.json`, per account | the operator, the panel, or `mr` |
-| Live `AccountState`, `available_after`, failure counts | the state database (`state.sqlite`), keyed by account id | the conductor, from traffic observations |
-| Round-robin cursor, least-used counters | runtime state, not the snapshot | the conductor |
+| Live account health (cooldown, reset time, failure count) | the relay process's memory (`manarouter-relay/src/select.rs`), keyed by account id | the relay, from the `429`/`401` it observes |
+| Round-robin cursor, least-used counters | the relay's own `RouteTable` runtime state, not the snapshot | the relay, per request |
+
+The schema has four tables — `account_health`, `usage`, `oauth_credential` and `oplog` — and the
+`usage` table exists with `usage_by_account()` reading it while `account_health` has its own read path,
+but **nothing writes either one from traffic**: the relay's live view never leaves the process and no
+code calls an account-health write path either. So `/api/quota`, which aggregates `usage`, returns
+empty in a real deployment, while cooldowns themselves work.
 
 The rule stated in [configuration](03-configuration.md) §11 is unconditional: **never in
 `config.json`.** Health is a moving observation; putting it in the authored file would mean the panel
@@ -390,12 +400,14 @@ panel authored.
 
 Observe it in two places:
 
-- **The panel**, which shows the rollup per provider and the state per account. The rollup is
-  `ProviderHealth::from_counts`, so what the panel shows and what selection computed are the same
-  function.
-- **Deleting `state.sqlite`**, which is always safe and is the supported way to clear a stuck state.
-  Every account returns to `Ready` on next observation; nothing authored is lost. That is the test that
-  the split was made correctly.
+- **The panel's provider/account view**, which is intended to render the rollup per provider and the
+  state per account via `ProviderHealth::from_counts`. Because no health row is written, what it can
+  actually show today is the authored account list, not live cooldowns; the relay-local view is not
+  exposed over HTTP.
+- **Restarting the relay**, which is the only supported way to clear a stuck cooldown today: the
+  in-memory map is rebuilt empty and every account is eligible again. Deleting `state.sqlite` is still
+  always safe and loses nothing authored, but it does *not* clear cooldowns — they were never in the
+  file.
 
 ---
 

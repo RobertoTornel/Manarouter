@@ -35,7 +35,13 @@ pub enum Dialect {
     Antigravity = 5,
     /// Command Code's CLI envelope at `api.commandcode.ai/alpha/generate`, which returns its
     /// own event stream rather than OpenAI SSE.
-    CommandCode = 6,
+    ///
+    /// The `-go` suffix names the Go bridge this dialect targets. The pre-rename spellings
+    /// (`commandcode`, `command-code`, `cmd`) are deliberately **not** accepted by
+    /// [`Dialect::parse`]: a configuration file that still contains one is old data, and the
+    /// migration that rewrites such files is a separate, explicit step. Failing loudly here is
+    /// what keeps a stale file from silently selecting this dialect.
+    CommandCodeGo = 6,
 }
 
 impl Dialect {
@@ -55,12 +61,20 @@ impl Dialect {
             3 => Self::Codex,
             4 => Self::Copilot,
             5 => Self::Antigravity,
-            6 => Self::CommandCode,
+            6 => Self::CommandCodeGo,
             _ => return None,
         })
     }
 
-    /// The stable identifier used in config files, the panel and documentation.
+    /// The canonical, *normalised* identifier: what [`Dialect::parse`] returns for, and what a
+    /// diagnostic or CLI table should print.
+    ///
+    /// This is **not** the config-file spelling. Config files and the panel go through `serde`,
+    /// whose `kebab-case` rename produces `open-ai` where this returns `openai`. The two differ
+    /// exactly once, for [`Dialect::OpenAi`], and the divergence is deliberate: `parse` is the
+    /// permissive human-facing parser, serde is the strict wire form. A cross-language test
+    /// (`the_panel_offers_only_dialects_this_binary_deserialises`) pins the panel's list to the
+    /// serde form so the stricter of the two cannot be forgotten.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenAi => "openai",
@@ -69,12 +83,17 @@ impl Dialect {
             Self::Codex => "codex",
             Self::Copilot => "copilot",
             Self::Antigravity => "antigravity",
-            Self::CommandCode => "commandcode",
+            Self::CommandCodeGo => "command-code-go",
         }
     }
 
     /// Parse the config identifier. Case-insensitive, and accepts common aliases so that both
     /// hand-written config and migrated OmniRoute data load.
+    ///
+    /// [`Dialect::CommandCodeGo`] is the deliberate exception: it accepts exactly
+    /// `command-code-go` and the short alias `cmdgo`, and nothing else. The pre-rename spellings
+    /// are not aliases — accepting them here would defeat the rename and hide stale config, so a
+    /// file that still uses one fails loudly and the config migration rewrites it.
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim().to_ascii_lowercase();
         Some(match s.as_str() {
@@ -86,7 +105,7 @@ impl Dialect {
             "codex" | "chatgpt" | "chatgpt-codex" => Self::Codex,
             "copilot" | "github-copilot" | "githubcopilot" => Self::Copilot,
             "antigravity" | "agy" | "gemini-code-assist" | "cloudcode" => Self::Antigravity,
-            "commandcode" | "command-code" | "cmd" => Self::CommandCode,
+            "command-code-go" | "cmdgo" => Self::CommandCodeGo,
             _ => return None,
         })
     }
@@ -122,7 +141,7 @@ impl Dialect {
         Self::Codex,
         Self::Copilot,
         Self::Antigravity,
-        Self::CommandCode,
+        Self::CommandCodeGo,
     ];
 }
 
@@ -157,7 +176,13 @@ pub enum Capability {
 }
 
 impl Capability {
-    /// The stable identifier used in config and the panel.
+    /// A spelling for operator-facing diagnostics.
+    ///
+    /// This is **not** the configuration or panel wire form. Those go through `serde`, whose
+    /// `kebab-case` rename produces `audio-transcription`, `audio-speech` and
+    /// `images-generations`. The dotted spellings returned here are accepted on input by
+    /// [`Capability::parse`] and appear in validation messages, but are deliberately not what
+    /// gets written to `config.json`.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Chat => "chat",
@@ -801,6 +826,202 @@ impl ProviderHealth {
     }
 }
 
+/// How much reasoning a client asked a model to spend, on one closed ladder.
+///
+/// The rule this type exists for: a client asks for `provider/model-level`, and a level the model
+/// does not offer must **never** fail the request. The caller reroutes to the model's highest
+/// available level instead. That rerouting lives with the router, not in this file; what lives here
+/// is the ordered ladder that makes "highest available" a single comparison on
+/// [`ReasoningLevel::rank`] rather than a per-vendor string table, and one spelling per level so a
+/// request, a config file and a snapshot byte all agree.
+///
+/// The canonical spellings are lowercase and match what appears on the wire. `xhigh` is canonical
+/// because that is what OmniRoute writes; the `x-high`/`extra-high` spellings are accepted aliases
+/// in [`ReasoningLevel::parse`] because that is what a human writing a config by hand types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub enum ReasoningLevel {
+    /// No reasoning at all: the model answers directly.
+    None = 0,
+    /// As little reasoning as the provider can express.
+    Minimal = 1,
+    /// A small, cheap reasoning budget.
+    Low = 2,
+    /// The provider's default for most models.
+    Medium = 3,
+    /// More reasoning than the default, for models that can spend it.
+    High = 4,
+    /// The tier above `high` on the models that offer one.
+    ///
+    /// Pinned with an explicit `rename`: the container's `kebab-case` would derive `x-high`, but
+    /// the value that appears on the wire and in migrated OmniRoute data is `xhigh`.
+    #[serde(rename = "xhigh")]
+    XHigh = 5,
+    /// The provider's top tier below a hard maximum (`max`).
+    Ultra = 6,
+    /// The model's absolute maximum.
+    Max = 7,
+}
+
+impl ReasoningLevel {
+    /// Every level, in ascending order, for the panel and exhaustive tests.
+    pub const ALL: [ReasoningLevel; 8] = [
+        Self::None,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Ultra,
+        Self::Max,
+    ];
+
+    /// Where the level sits on the ladder, so "highest available" is a comparison.
+    ///
+    /// This is deliberately the discriminant: the declaration order *is* the ladder, so ranking and
+    /// the snapshot value cannot drift apart.
+    #[inline]
+    pub const fn rank(self) -> u8 {
+        self as u8
+    }
+
+    /// The stable identifier used in config, the request and the panel.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Ultra => "ultra",
+            Self::Max => "max",
+        }
+    }
+
+    /// Parse a level. Case-insensitive, and accepts the human spellings of `xhigh`.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+        Some(match s.as_str() {
+            "none" => Self::None,
+            "minimal" => Self::Minimal,
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            // OmniRoute writes `xhigh`; a hand-written config is more likely to write the others.
+            "xhigh" | "x-high" | "extra-high" | "extrahigh" => Self::XHigh,
+            "ultra" => Self::Ultra,
+            "max" => Self::Max,
+            _ => return None,
+        })
+    }
+
+    /// The `u8` stored in the snapshot.
+    #[inline]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Recover a level from its snapshot `u8`, rejecting unknown values rather than guessing.
+    #[inline]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => Self::None,
+            1 => Self::Minimal,
+            2 => Self::Low,
+            3 => Self::Medium,
+            4 => Self::High,
+            5 => Self::XHigh,
+            6 => Self::Ultra,
+            7 => Self::Max,
+            _ => return None,
+        })
+    }
+}
+
+/// An input a model accepts, as a closed vocabulary.
+///
+/// Routing cares about the *kind* of content, not the MIME type: a request carrying an image or a
+/// PDF may need a different model than one carrying only text, and the panel needs a fixed set to
+/// render. `Pdf` is separate from `File` because providers that accept documents usually treat an
+/// inline PDF specially, while `File` is the catch-all for every other attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub enum InputModality {
+    /// Plain text, including markdown and code. Every chat model accepts this.
+    Text = 0,
+    /// Image input (vision).
+    Image = 1,
+    /// Audio input, such as a recorded prompt or a transcription.
+    Audio = 2,
+    /// Video input.
+    Video = 3,
+    /// A PDF document, usually inline base64 or a provider-side file id.
+    Pdf = 4,
+    /// Any other attachment the provider accepts.
+    File = 5,
+}
+
+impl InputModality {
+    /// Every modality, for the panel and exhaustive tests.
+    pub const ALL: [InputModality; 6] = [
+        Self::Text,
+        Self::Image,
+        Self::Audio,
+        Self::Video,
+        Self::Pdf,
+        Self::File,
+    ];
+
+    /// The stable identifier used in config, the panel and on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Video => "video",
+            Self::Pdf => "pdf",
+            Self::File => "file",
+        }
+    }
+
+    /// Parse a modality. Case-insensitive.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim().to_ascii_lowercase();
+        Some(match s.as_str() {
+            "text" => Self::Text,
+            "image" => Self::Image,
+            "audio" => Self::Audio,
+            "video" => Self::Video,
+            "pdf" => Self::Pdf,
+            "file" => Self::File,
+            _ => return None,
+        })
+    }
+
+    /// The `u8` stored in the snapshot.
+    #[inline]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Recover a modality from its snapshot `u8`, rejecting unknown values rather than guessing.
+    #[inline]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => Self::Text,
+            1 => Self::Image,
+            2 => Self::Audio,
+            3 => Self::Video,
+            4 => Self::Pdf,
+            5 => Self::File,
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +1049,36 @@ mod tests {
                 assert_eq!(a.is_passthrough_to(b), expected, "{a:?} -> {b:?}");
             }
         }
+    }
+
+    #[test]
+    fn on_winner_fail_uses_the_internally_tagged_wire_form() {
+        // The config file format for `on_winner_fail` is internally tagged on `mode`. This test
+        // pins it because `panel/format.js` still builds and parses the *externally* tagged form
+        // (`{"rerun-excluding": {...}}`), which this type refuses to deserialize. Whoever fixes the
+        // panel should make it emit/accept exactly what is asserted here.
+        let rerun = WinnerFailMode::RerunExcluding { max_rounds: 3 };
+        let json = serde_json::to_value(&rerun).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({ "mode": "rerun-excluding", "max_rounds": 3 })
+        );
+        assert_eq!(
+            serde_json::from_value::<WinnerFailMode>(json).expect("deserialize"),
+            rerun
+        );
+
+        let stable = WinnerFailMode::StableFallback { step: 2 };
+        assert_eq!(
+            serde_json::to_value(stable).expect("serialize"),
+            serde_json::json!({ "mode": "stable-fallback", "step": 2 })
+        );
+
+        // The externally tagged shape the panel currently emits is not accepted.
+        assert!(serde_json::from_value::<WinnerFailMode>(
+            serde_json::json!({ "rerun-excluding": { "max_rounds": 3 } })
+        )
+        .is_err());
     }
 
     #[test]
@@ -931,5 +1182,180 @@ mod tests {
             assert!(!s.is_usable(), "{s:?} must not be usable");
         }
         assert!(AccountState::Ready.is_usable());
+    }
+
+    #[test]
+    fn command_code_go_serde_uses_the_renamed_identifier() {
+        // The `kebab-case` rename must be verified, not assumed: an acronym-heavy variant is
+        // exactly where the derived spelling and the intended one diverge.
+        let json = serde_json::to_string(&Dialect::CommandCodeGo).unwrap();
+        assert_eq!(json, "\"command-code-go\"");
+        let back: Dialect = serde_json::from_str("\"command-code-go\"").unwrap();
+        assert_eq!(back, Dialect::CommandCodeGo);
+        // The pre-rename spellings are not accepted on input either, so a stale config fails
+        // rather than silently selecting this dialect.
+        assert!(serde_json::from_str::<Dialect>("\"commandcode\"").is_err());
+        assert!(serde_json::from_str::<Dialect>("\"command-code\"").is_err());
+        assert!(serde_json::from_str::<Dialect>("\"cmd\"").is_err());
+    }
+
+    #[test]
+    fn command_code_go_parses_only_the_new_identifier() {
+        assert_eq!(
+            Dialect::parse("command-code-go"),
+            Some(Dialect::CommandCodeGo)
+        );
+        assert_eq!(Dialect::parse("cmdgo"), Some(Dialect::CommandCodeGo));
+        // Case-insensitive like every other dialect identifier.
+        assert_eq!(
+            Dialect::parse("Command-Code-Go"),
+            Some(Dialect::CommandCodeGo)
+        );
+        assert_eq!(Dialect::parse("command-code"), None);
+        assert_eq!(Dialect::parse("commandcode"), None);
+        assert_eq!(Dialect::parse("cmd"), None);
+    }
+
+    #[test]
+    fn every_dialect_has_its_own_stable_identifier() {
+        let expected = [
+            (Dialect::OpenAi, "openai"),
+            (Dialect::Anthropic, "anthropic"),
+            (Dialect::Google, "google"),
+            (Dialect::Codex, "codex"),
+            (Dialect::Copilot, "copilot"),
+            (Dialect::Antigravity, "antigravity"),
+            (Dialect::CommandCodeGo, "command-code-go"),
+        ];
+        assert_eq!(expected.len(), Dialect::ALL.len());
+        for (dialect, id) in expected {
+            assert_eq!(dialect.as_str(), id, "{dialect:?}");
+            assert_eq!(Dialect::parse(id), Some(dialect), "{id}");
+        }
+    }
+
+    #[test]
+    fn the_panel_offers_only_dialects_this_binary_deserialises() {
+        // Cross-language guard. The panel writes the *serde* spelling, which is not always
+        // `as_str()`: `OpenAi` is `open-ai` in a config file and `openai` to `parse`. A dropdown
+        // entry the backend rejects turns "Add provider" into a save-time error, which is exactly
+        // how the pre-rename `command-code` entry was caught.
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../panel/view-providers.js");
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            return; // the panel is not part of a published crate checkout; nothing to pin
+        };
+        let line = source
+            .lines()
+            .find(|line| line.trim_start().starts_with("const DIALECTS ="))
+            .expect("panel/view-providers.js declares `const DIALECTS`");
+        let list = line.split_once('[').expect("DIALECTS is an array").1;
+        let list = list.split_once(']').expect("DIALECTS is closed").0;
+        let offered: Vec<&str> = list
+            .split(',')
+            .map(|entry| entry.trim().trim_matches('\''))
+            .filter(|entry| !entry.is_empty())
+            .collect();
+
+        // Every offered spelling must deserialise, and to a dialect that exists.
+        for spelling in &offered {
+            let quoted = format!("\"{spelling}\"");
+            let parsed: Dialect = serde_json::from_str(&quoted).unwrap_or_else(|e| {
+                panic!("the panel offers `{spelling}`, which the config cannot deserialise: {e}")
+            });
+            assert!(Dialect::ALL.contains(&parsed), "{spelling} -> {parsed:?}");
+        }
+        // And every dialect must be reachable from the panel.
+        for dialect in Dialect::ALL {
+            let spelling = serde_json::to_value(dialect).unwrap();
+            let spelling = spelling.as_str().unwrap().to_string();
+            assert!(
+                offered.contains(&spelling.as_str()),
+                "{dialect:?} ({spelling}) is missing from the panel's DIALECTS"
+            );
+        }
+        assert_eq!(
+            offered.len(),
+            Dialect::ALL.len(),
+            "DIALECTS has a duplicate: {line}"
+        );
+    }
+
+    #[test]
+    fn reasoning_levels_are_ordered_from_none_to_max() {
+        // The real ladder. Getting the top three out of order would silently reroute a request to
+        // a weaker level, so the order is asserted directly rather than only through `rank`.
+        assert!(ReasoningLevel::None < ReasoningLevel::Minimal);
+        assert!(ReasoningLevel::Minimal < ReasoningLevel::Low);
+        assert!(ReasoningLevel::Low < ReasoningLevel::Medium);
+        assert!(ReasoningLevel::Medium < ReasoningLevel::High);
+        assert!(ReasoningLevel::High < ReasoningLevel::XHigh);
+        assert!(ReasoningLevel::XHigh < ReasoningLevel::Ultra);
+        assert!(ReasoningLevel::Ultra < ReasoningLevel::Max);
+        for (i, level) in ReasoningLevel::ALL.into_iter().enumerate() {
+            assert_eq!(level.rank(), i as u8, "{level:?}");
+            assert_eq!(level.as_u8(), level.rank(), "{level:?}");
+            assert_eq!(ReasoningLevel::from_u8(level.as_u8()), Some(level));
+        }
+        assert_eq!(ReasoningLevel::from_u8(8), None);
+        assert_eq!(ReasoningLevel::from_u8(255), None);
+    }
+
+    #[test]
+    fn reasoning_level_aliases_and_roundtrips() {
+        for level in ReasoningLevel::ALL {
+            assert_eq!(ReasoningLevel::parse(level.as_str()), Some(level));
+            assert_eq!(
+                ReasoningLevel::parse(&level.as_str().to_ascii_uppercase()),
+                Some(level)
+            );
+            assert_eq!(
+                serde_json::from_str::<ReasoningLevel>(&format!("\"{}\"", level.as_str())).unwrap(),
+                level
+            );
+            assert_eq!(
+                serde_json::to_string(&level).unwrap(),
+                format!("\"{}\"", level.as_str())
+            );
+        }
+        // `xhigh` is canonical; humans write the other spellings.
+        for alias in [
+            "xhigh",
+            "x-high",
+            "extra-high",
+            "extra_high",
+            "extrahigh",
+            "XHigh",
+        ] {
+            assert_eq!(
+                ReasoningLevel::parse(alias),
+                Some(ReasoningLevel::XHigh),
+                "{alias}"
+            );
+        }
+        assert_eq!(ReasoningLevel::parse("nope"), None);
+        assert_eq!(ReasoningLevel::parse(""), None);
+    }
+
+    #[test]
+    fn input_modalities_roundtrip() {
+        for m in InputModality::ALL {
+            assert_eq!(InputModality::parse(m.as_str()), Some(m), "{m:?}");
+            assert_eq!(
+                InputModality::parse(&m.as_str().to_ascii_uppercase()),
+                Some(m)
+            );
+            assert_eq!(InputModality::from_u8(m.as_u8()), Some(m), "{m:?}");
+            assert_eq!(
+                serde_json::from_str::<InputModality>(&format!("\"{}\"", m.as_str())).unwrap(),
+                m
+            );
+            assert_eq!(
+                serde_json::to_string(&m).unwrap(),
+                format!("\"{}\"", m.as_str())
+            );
+        }
+        assert_eq!(InputModality::from_u8(6), None);
+        assert_eq!(InputModality::parse("hologram"), None);
     }
 }

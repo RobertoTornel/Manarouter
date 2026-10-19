@@ -49,18 +49,33 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Standalone mock-upstream checks
+        working-directory: tools/mock-upstream
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
       - name: No committed credentials
         run: scripts/check-secrets.sh
 
       - name: Installer systemd behavior
         run: bash scripts/test-installer-systemd.sh
 
+      - name: Isolated mock-upstream smoke
+        run: python3 tests/smoke_e2e.py
+
+      - name: Panel Node tests
+        run: node --test panel/test/*.test.mjs
+
       - name: Build
         run: cargo build --workspace --all-targets
 
       - name: Test
         # Every test must pass with no network and no credentials. Anything needing a real upstream
-        # belongs behind an ignored test that a human runs deliberately (see docs/18-testing.md).
+        # belongs behind an ignored test that a human runs deliberately — see the opt-in live smoke
+        # test in docs/14-oauth-adding-a-platform.md and the gate table in
+        # docs/23-implementation-status.md.
         run: cargo test --workspace --all-targets
 
       - name: Test release profile
@@ -108,9 +123,6 @@ jobs:
       - name: Test
         working-directory: tools/${{ matrix.tool }}
         run: cargo test
-
-      - name: End-to-end local smoke test
-        run: python3 tests/smoke_e2e.py
 
   docs:
     name: docs build

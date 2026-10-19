@@ -5,8 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>Manarouter — panel</title>
-<!-- data: URI favicon avoids a stray /favicon.ico request on an offline install -->
-<link rel="icon" href="data:,">
+<!-- Install-local SVG favicon: no CDN, and no request that can leave the loopback interface.
+     A browser that cannot render an SVG icon shows no icon, which is what the old `data:,`
+     stub did as well. -->
+<link rel="icon" type="image/svg+xml" href="./logo.svg">
 <link rel="stylesheet" href="./app.css">
 </head>
 <body>
@@ -15,7 +17,10 @@
 <div id="app-root">
   <div id="shell" hidden>
     <aside class="sidebar">
-      <div class="brand">Manarouter</div>
+      <div class="brand">
+        <img class="brand-mark" src="./logo.svg" alt="" width="22" height="22">
+        <span class="brand-name">Manarouter</span>
+      </div>
       <nav aria-label="Primary">
         <ul id="nav-list">
           <li><a href="#/overview"  data-route="overview">Overview</a></li>
@@ -29,9 +34,12 @@
           <li><a href="#/docs"      data-route="docs">Documentation</a></li>
         </ul>
       </nav>
+      <!-- No log-out button by design: the panel is a local, single-operator console, and a
+           log-out control invited the idea that closing the tab or signing out locked it. The
+           session still expires server-side and the 401 handler still returns to the sign-in
+           screen; see panel/README.md. -->
       <div class="sidebar-foot">
         <div id="sidebar-meta" class="sidebar-meta"></div>
-        <button id="logout-btn" class="btn btn-ghost btn-sm" type="button">Log out</button>
       </div>
     </aside>
 

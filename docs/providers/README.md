@@ -95,7 +95,7 @@ broken or the endpoint moved. Recording it in the data means the panel can show 
 
 **A provider that requires cookie or browser-session authentication.** Not `claude-web`, not
 `gemini-web`, not `deepseek-web`, not any other. This is settled
-([Security §6](../21-security.md#6-cookie-authentication-is-never-supported)) and the six known
+([Security §4](../21-security.md#4-authentication-methods-that-are-refused)) and the six known
 web-session providers are deliberately absent from the file.
 
 **A real credential.** Client ids and secrets that a vendor publishes in its own client are recorded,

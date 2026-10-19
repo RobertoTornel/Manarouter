@@ -58,8 +58,8 @@ configuration parsing are not on the request path at all.
 
 | Process | Crate | Default port | Responsibility |
 |---|---|---|---|
-| `manarouter-relay` — the **data plane** | `crates/manarouter-relay` | 20900 | Accept, look up a compiled route, select an account, shuttle bytes. Evaluates **no policy**. |
-| `manarouter-conductor` — the **control plane** | `crates/manarouter-conductor` | 20901 | Configuration, combo compilation, account ordering, quota accounting, OAuth, the web panel. |
+| `manarouter-relay` — the **data plane** | `crates/manarouter-relay` | 20900 | Accept, look up a compiled route, select an account, apply client auth/reasoning and forward. Key-quota enforcement and configured proxy egress are not wired. |
+| `manarouter-conductor` — the **control plane** | `crates/manarouter-conductor` | 20901 | Configuration, snapshot compilation, cached provider-quota refresh APIs, OAuth, the web panel. Request-usage ledger recording is not wired. |
 
 The conductor compiles the authored `config.json` into the routing snapshot and publishes it; the
 relay holds a `SnapshotHandle` over an `ArcSwap` and hot-swaps it without dropping a request. There
@@ -101,22 +101,23 @@ The full request path, step by step, is in [architecture](01-architecture.md).
 | Authored config load/save/validate, unknown-key preservation | implemented | [configuration](03-configuration.md) |
 | Compiled routing snapshot: compile, encode, decode, verify, atomic write | implemented | [routing snapshot](04-routing-snapshot.md) |
 | Hot swap through `ArcSwap` | implemented | [routing snapshot](04-routing-snapshot.md) §8 |
-| Per-account health states and provider rollup | implemented (types and rollup) | [key selection](05-key-selection.md) §6 |
-| Key strategies: `priority`, `round-robin`, `random`, `least-used` | implemented (enum and plans); relay selection in progress | [key selection](05-key-selection.md) |
-| Combos and the three combo strategies | implemented (schema, compile) | [combos](06-combos.md) |
-| Hedged race with four winner-fail modes | implemented (plan); execution in progress | [the hedged race](07-hedged-race.md) |
-| Reset-aware priority | implemented (strategy enum); demotion loop in progress | [combos](06-combos.md) §3 |
-| Session affinity for a combo winner | in progress | [the hedged race](07-hedged-race.md) |
-| Quota windows, live signals, cooldowns | in progress | [configuration](03-configuration.md) §3 |
-| OAuth login flows (Codex, Copilot, Antigravity, Cline) | in progress | [security](21-security.md) §5 |
-| Web panel | in progress | [architecture](01-architecture.md) §6 |
-| `mr` CLI | in progress (skeleton) | [quickstart](02-quickstart.md) |
-| Relay request loop and listener | in progress | [latency engineering](16-latency-engineering.md) |
+| Per-account health states and provider rollup | implemented | [key selection](05-key-selection.md) §6 |
+| Key strategies: `priority`, `round-robin`, `random`, `least-used` | implemented (config, compile and relay selection) | [key selection](05-key-selection.md) |
+| Combos and the three combo strategies | implemented (schema, compile and relay execution) | [combos](06-combos.md) |
+| Hedged race with four winner-fail modes | plan implemented and unit-tested; the relay still runs the sequential step loop, so `hedge_decide` is never called | [the hedged race](07-hedged-race.md) |
+| Reset-aware priority | implemented (the selector demotes an exhausted step and restores it once its reset passes) | [combos](06-combos.md) §3 |
+| Session affinity for a combo winner | implemented (combo-wide, process-local, default 1800 s window) | [the hedged race](07-hedged-race.md) |
+| Quota windows, live signals, cooldowns | cooldowns and live signals implemented in the relay; `/api/quota` reads a `usage` table that nothing writes yet, so it reports nothing | [configuration](03-configuration.md) §3 |
+| OAuth login flows | implemented for Codex, Copilot and Antigravity; the `cline` catalogue entry is a migration refusal, not a working login | [security](21-security.md) §5 |
+| Web panel | implemented (served by the conductor on 20901) | [architecture](01-architecture.md) §6 |
+| `mr` CLI | implemented except `mr vault` and `mr config`, whose bodies still return "not implemented yet" | [quickstart](02-quickstart.md) |
+| Relay request loop and listener | implemented | [latency engineering](16-latency-engineering.md) |
 | Cross-instance sync | not implemented; design only | [LLM_INDEX](LLM_INDEX.md) §9 |
 
-Status here means "present in this tree", not "shipped". The data plane, control plane and panel are
-being wired up; the schema, the snapshot format, both dialect layers and the provider catalogue are
-in place and tested.
+Status here means "present in this tree", not "shipped". The schema, the snapshot format, both dialect
+layers, the provider catalogue, the data plane, the control plane and the panel are in place and
+tested. The exceptions are named in the table above — hedged execution, and the two stubbed CLI
+bodies. [`23-implementation-status.md`](23-implementation-status.md) holds the audited list.
 
 ---
 

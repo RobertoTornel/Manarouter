@@ -29,15 +29,15 @@ The two processes share state through files, not through IPC: the conductor writ
 
 | View | Shows | Can change |
 |---|---|---|
-| **Overview** | Relay and conductor status, request counts, error rate, which providers are usable, pending-restart state | Nothing |
-| **Providers** | Every provider, its dialect, base URL, capabilities, account count, and health | Add, edit, enable/disable, remove; add, edit, disable and re-key accounts |
-| **Models** | Discovered and hand-entered models per provider | Sync from a provider, hide/show a model, edit metadata |
+| **Overview** | Relay and conductor status, uptime, snapshot digest and age, configuration counts, whether a panel password is set, pending-restart state | Nothing |
+| **Providers** | Every provider, its dialect, base URL, auth, key strategy, account count, and health | Add, edit, enable/disable, remove; add, enable/disable and remove accounts |
+| **Models** | Discovered and hand-entered models per provider | Hide/show and delete a model; sync and hand-entry live in the Providers drawer |
 | **Combos** | Every combo with its steps **in priority order** | Create, edit, reorder steps, enable/disable, remove |
-| **Keys** | Client keys by label and prefix | Create (plaintext shown once), revoke, enable/disable |
+| **Keys** | Client keys by label and prefix | Create (plaintext shown once), edit the policy, rotate the secret in place (new plaintext shown once, old secret invalidated after commit), enable/disable, delete |
 | **Aliases** | Alias to target mappings | Add, remove |
-| **Quota** | Per-account windows, cooldowns, reset instants, and usage over time | Declare a window, clear a cooldown |
-| **Settings** | Ports, timeouts, quota policy, sync settings | Edit; **ports apply on next restart** |
-| **Docs** | The files in `docs/`, rendered | Nothing |
+| **Quota** | Per-account windows, cooldowns, reset instants, and usage over time | Nothing (windows are declared in the configuration) |
+| **Settings** | Ports, the relay connection pool (including a low-resource profile), the panel password, and the raw configuration | Edit; **ports apply on next restart** |
+| **Documentation** | The top-level files in `docs/`, shown as markdown source | Nothing |
 
 The **Models** view distinguishes discovered from hand-entered metadata explicitly, because a sync
 must never overwrite what a human typed. If the two ever disagreed and the panel did not say which
@@ -91,9 +91,9 @@ The panel can change the relay and conductor ports, and a port change is **persi
 applied**. It is labelled "next restart", an amber banner appears, and the banner stays until the
 restart happens.
 
-The banner is not dismissible into oblivion. It is dismissible for the session, and it returns on
-the next load, because the cost of forgetting that a change is pending is a confusing failure later
-("I set the port, why is it still on the old one?").
+The banner is not dismissible at all. It stays until the restart happens, because the cost of
+forgetting that a change is pending is a confusing failure later ("I set the port, why is it still on
+the old one?").
 
 A **Restart** button applies it. The restart is never automatic, because rebinding a listening socket
 means the old one closes, and everything connected to it — including an in-flight completion —
@@ -104,8 +104,10 @@ request that is mid-answer. Making the restart explicit turns a surprise into a 
 
 - Bound to `127.0.0.1` by default, which requires no password.
 - A non-loopback bind **without a password is refused at startup**, with a message saying how to set
-  one. It does not warn and continue: a panel that silently exposes provider credentials and client
-  keys to the network because the operator did not read a log line is not a defensible default.
+  one. It does not warn and continue (the one way past it is the explicit
+  `control.allow_remote_without_password` opt-out): a panel that silently exposes provider credentials
+  and client keys to the network because the operator did not read a log line is not a defensible
+  default.
 - Passwords are stored as **Argon2id** hashes. Session lookup is constant-time, so a timing
   difference cannot be used to probe a token.
 - Every mutating request must carry an acceptable `Origin`, which is checked before the handler runs.
@@ -147,8 +149,9 @@ Each of those is a choice with a cost:
   running a local router. A panel that fails to load its own stylesheet because the network is down
   would be an obvious own goal.
 
-Everything is served from the conductor's own binary, so the panel has no installation step, no
-`node_modules`, and no version skew against the API it talks to.
+The panel is served from the `panel/` directory on disk, located once at startup beside the working
+directory or the executable, so there is no build step, no `node_modules`, and no version skew against
+the API it talks to. A missing `panel/` directory degrades to a placeholder page rather than a crash.
 
 ## See also
 

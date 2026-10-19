@@ -32,7 +32,7 @@ use axum::Router;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, BodyStream, StreamBody};
-use mr_core::dialect::{AuthKind, Dialect, RouteKind};
+use mr_core::dialect::{AuthKind, Dialect, InputModality, ReasoningLevel, RouteKind};
 use mr_core::oauth::platform as oauth_platform;
 use mr_core::oauth::refresh::Refresher;
 use mr_core::secret::Vault;
@@ -100,6 +100,8 @@ impl BodyError {
 pub struct AppState {
     /// The routing table, client keys and upstream client.
     pub relay: Arc<RelayState>,
+    /// Permit absent client credentials even when keys are configured.
+    pub no_key_required: bool,
     /// Account health, as the relay has observed it.
     pub health: Arc<Health>,
     /// The credential vault.
@@ -176,17 +178,26 @@ async fn dispatch_anthropic(
 /// Served **entirely from the compiled snapshot**. No provider is contacted, so this route cannot be
 /// slow and cannot fail because a provider is down. The reference router took 5.2–9.2 seconds here
 /// with zero upstream work, which is the measurement that motivated this project.
-async fn list_models(State(app): State<AppState>, headers: HeaderMap) -> Response {
-    let presented = presented_key(&headers);
-    let auth = app.relay.authenticate(presented.as_deref());
-    if !auth.is_allowed() {
-        return auth_error(&auth, Dialect::OpenAi);
-    }
-
-    let table = app.relay.table();
+///
+/// ## What is listed
+///
+/// Every name a client can actually put in a `model` field, which is what makes this route useful
+/// as a first check:
+///
+/// * each combo name,
+/// * each combo name with the reasoning levels a model can be pinned to,
+/// * `provider/model` for every visible model,
+/// * `provider/model-<level>` for every **level that model really offers**.
+///
+/// A model that advertises no reasoning levels is listed exactly once, under its own id — which is
+/// what stops a client picking `...-high` and discovering at request time that the suffix was part
+/// of the model's name. The reverse is also deliberate: a level the model does *not* offer is not
+/// listed, even though requesting it succeeds by rerouting to the model's highest. Advertising it
+/// would be advertising a tier that is not this model's.
+fn model_listing(snapshot: &mr_core::snapshot::RoutingSnapshot) -> Vec<serde_json::Value> {
     let mut data: Vec<serde_json::Value> = Vec::new();
 
-    for combo in table.snapshot.combos() {
+    for combo in snapshot.combos() {
         data.push(serde_json::json!({
             "id": combo.name,
             "object": "model",
@@ -198,24 +209,268 @@ async fn list_models(State(app): State<AppState>, headers: HeaderMap) -> Respons
                 "steps": combo.steps.len(),
             },
         }));
-    }
-
-    for provider in table.snapshot.providers() {
-        for step in &provider.steps {
+        // The levels a combo can be pinned to. Deduplicated across steps: a two-step combo offers
+        // `coding-high` **once**, not once per step, and the suffix attaches to the combo name, so
+        // it is the *name* that must not already end in a level word — not the step's model.
+        for level in combo_listed_levels(combo) {
             data.push(serde_json::json!({
-                "id": format!("{}/{}", provider.id, step.model),
+                "id": format!("{}-{}", combo.name, level.as_str()),
                 "object": "model",
                 "created": 0,
-                "owned_by": provider.id.as_str(),
-                "manarouter": { "kind": "provider", "dialect": provider.dialect.as_str() },
+                "owned_by": "manarouter",
+                "manarouter": {
+                    "kind": "combo",
+                    "strategy": combo.strategy.as_str(),
+                    "steps": combo.steps.len(),
+                    "reasoning_level": level.as_str(),
+                },
             }));
         }
     }
+
+    for provider in snapshot.providers() {
+        for step in &provider.steps {
+            let base = format!("{}/{}", provider.id, step.model);
+            data.push(serde_json::json!({
+                "id": base,
+                "object": "model",
+                "created": 0,
+                "owned_by": provider.id.as_str(),
+                "manarouter": {
+                    "kind": "provider",
+                    "dialect": provider.dialect.as_str(),
+                    "default_reasoning_level": ReasoningLevel::from_u8(step.default_level)
+                        .map(|l| l.as_str())
+                        .unwrap_or("none"),
+                    "reasoning_levels": step
+                        .levels()
+                        .iter()
+                        .map(|l| l.as_str())
+                        .collect::<Vec<_>>(),
+                    "input_modalities": listed_modalities(step),
+                },
+            }));
+            // Only levels this model genuinely offers, and never for a model whose own id already
+            // ends in a level word: there, `-low` is part of the name, so listing
+            // `...-low-high` would offer a name nothing resolves.
+            for level in listed_levels(step) {
+                data.push(serde_json::json!({
+                    "id": format!("{base}-{}", level.as_str()),
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": provider.id.as_str(),
+                    "manarouter": {
+                        "kind": "provider",
+                        "dialect": provider.dialect.as_str(),
+                        "reasoning_level": level.as_str(),
+                    },
+                }));
+            }
+        }
+    }
+
+    data
+}
+
+/// The reasoning levels to advertise as `-<level>` suffixes for a step.
+///
+/// One shared definition, used for both providers and combos, so the two listings cannot disagree
+/// about what a level suffix means.
+fn listed_levels(step: &StepPlan) -> Vec<ReasoningLevel> {
+    if ends_in_level_word(&step.model) {
+        // A model whose own id ends in a level word already *is* a tier. Adding suffixes would
+        // list names that resolve to nothing, because the exact-model-id rule deliberately wins
+        // over the suffix reading.
+        return Vec::new();
+    }
+    step.levels()
+}
+
+/// The levels a combo can be pinned to, deduplicated across its steps.
+///
+/// A combo named `coding` is pinnable to a level when **any** of its steps offers one, because a
+/// combo with a tier is asking "run this route at `<level>`" and each step then uses that level or
+/// its own highest. The union is what makes `coding-high` a name that resolves, so the union is
+/// what gets listed. Duplicates are impossible by construction of the bitmask.
+///
+/// The suffix attaches to the *combo's* name, so the guard is about that name: a combo whose own
+/// name is `fast-low` must not be listed as `fast-low-high`, for exactly the reason a model called
+/// `...-low` must not be. The step model's name is irrelevant here — that is a different name.
+fn combo_listed_levels(combo: &mr_core::snapshot::ComboPlan) -> Vec<ReasoningLevel> {
+    if ends_in_level_word(&combo.name) {
+        return Vec::new();
+    }
+    // The union of every step's levels. Taken straight from `step.levels()` rather than through
+    // `listed_levels`, because the suppression that function applies is about a *model's* own id
+    // being a tier — irrelevant when the suffix is being attached to the combo's name instead.
+    let mut mask = 0u32;
+    for step in &combo.steps {
+        for level in step.levels() {
+            mask |= 1u32 << level.rank();
+        }
+    }
+    ReasoningLevel::ALL
+        .into_iter()
+        .filter(|level| mask & (1u32 << level.rank()) != 0)
+        .collect()
+}
+
+/// Whether `name` ends in `-<level>` for one of the level words.
+fn ends_in_level_word(name: &str) -> bool {
+    ReasoningLevel::ALL.into_iter().any(|level| {
+        let suffix = level.as_str();
+        name.len() > suffix.len()
+            && name.ends_with(suffix)
+            && name.as_bytes()[name.len() - suffix.len() - 1] == b'-'
+    })
+}
+
+/// The input modalities a step accepts, for the listing's metadata.
+fn listed_modalities(step: &StepPlan) -> Vec<&'static str> {
+    InputModality::ALL
+        .into_iter()
+        .filter(|modality| step.accepts_modality(*modality))
+        .map(|modality| modality.as_str())
+        .collect()
+}
+
+async fn list_models(State(app): State<AppState>, headers: HeaderMap) -> Response {
+    let presented = presented_key(&headers);
+    let auth = authenticate_request(&app.relay, app.no_key_required, presented.as_deref());
+    if !auth.is_allowed() {
+        return auth_error(&auth, Dialect::OpenAi);
+    }
+
+    let table = app.relay.table();
+    let data = model_listing(&table.snapshot);
 
     json_response(
         StatusCode::OK,
         serde_json::json!({ "object": "list", "data": data }),
     )
+}
+
+/// Apply a step's reasoning level to an outgoing body, and retarget the model id.
+///
+/// Returns `Ok(None)` when nothing had to change, which is the common case for a request that
+/// already named the model it wants at the level it wants, and for any request to a model that
+/// advertises no reasoning levels at all.
+///
+/// ## Why this is a merge and not a re-encode
+///
+/// The relay's whole latency argument is that a same-dialect request is forwarded byte-for-byte, so
+/// the router never parses a body it does not have to and never silently deletes a provider field
+/// it does not understand. That property only survives here because the rewrite is surgical: parse,
+/// merge one fragment, re-serialise — and only when there is a fragment to merge, or a model field
+/// that has to be retargeted. A request to `provider/model-high` on an OpenAI-shaped provider is
+/// the case that needs both, because `model-high` is not a model the upstream has.
+///
+/// ## Who wins when the client already said something
+///
+/// The client's own explicit reasoning field is never overwritten. A client that sends
+/// `reasoning_effort` is being more specific than a level suffix can be, and quietly replacing it
+/// would make the same request mean different things depending on whether it arrived through a
+/// model alias.
+fn apply_reasoning_level(
+    outgoing: &[u8],
+    step: &StepPlan,
+    translated: bool,
+    level_override: Option<mr_core::dialect::ReasoningLevel>,
+) -> Result<Option<Vec<u8>>, String> {
+    let rename_model = !translated;
+    // A combo step runs at the tier the combo's name asked for when there is one, and otherwise at
+    // the level the step was compiled with. A level the model does not offer falls back to that
+    // model's highest available one, never to a fragment the upstream would reject.
+    let level = match level_override {
+        Some(level) if step.supports_level(level) => level,
+        Some(_) => mr_core::dialect::ReasoningLevel::from_u8(
+            step.default_level.max(
+                step.levels()
+                    .last()
+                    .map(|l| l.rank())
+                    .unwrap_or(mr_core::dialect::ReasoningLevel::None.rank()),
+            ),
+        )
+        .unwrap_or(mr_core::dialect::ReasoningLevel::None),
+        None => mr_core::dialect::ReasoningLevel::from_u8(step.level)
+            .unwrap_or(mr_core::dialect::ReasoningLevel::None),
+    };
+    let fragment = step.reasoning_fragment_for(level);
+    if fragment.is_none() && !rename_model {
+        return Ok(None);
+    }
+
+    let mut body: serde_json::Value = serde_json::from_slice(outgoing).map_err(|_| {
+        "the request body is not JSON, so a reasoning level cannot be applied".to_string()
+    })?;
+    let Some(object) = body.as_object_mut() else {
+        return Ok(None);
+    };
+
+    let mut changed = false;
+    if rename_model {
+        // Only when the field is present and actually different: a body whose `model` is already
+        // the step's model must not be rewritten, because rewriting it would mean re-serialising
+        // every field of a body we had no other reason to touch.
+        let differs = object
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|current| current != step.model);
+        if differs {
+            object.insert(
+                "model".into(),
+                serde_json::Value::String(step.model.clone()),
+            );
+            changed = true;
+        }
+    }
+
+    if let Some(fragment) = fragment {
+        let fragment: serde_json::Value = serde_json::from_str(fragment)
+            .map_err(|_| "the compiled reasoning fragment is not valid JSON".to_string())?;
+        if merge_reasoning(object, &fragment) {
+            changed = true;
+        }
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+    serde_json::to_vec(&body)
+        .map(Some)
+        .map_err(|_| "the rewritten request body could not be encoded".to_string())
+}
+
+/// Recursively merge `fragment` into `object`, returning whether anything was written.
+///
+/// Two rules make this safe to run on a body the router did not author:
+///
+/// * An existing **scalar** under a key the fragment also names is left alone. That is what keeps a
+///   client's explicit `reasoning_effort` authoritative, and it also means a provider-specific
+///   object under `generationConfig` keeps every field the fragment does not mention.
+/// * Nothing is ever created that the fragment does not name. A model that takes no reasoning gets
+///   no invented field.
+fn merge_reasoning(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    fragment: &serde_json::Value,
+) -> bool {
+    let Some(fragment) = fragment.as_object() else {
+        return false;
+    };
+    let mut changed = false;
+    for (key, value) in fragment {
+        match object.get_mut(key) {
+            Some(serde_json::Value::Object(existing)) if value.is_object() => {
+                changed |= merge_reasoning(existing, value);
+            }
+            Some(_) => {}
+            None => {
+                object.insert(key.clone(), value.clone());
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// The shared path for every model route.
@@ -255,7 +510,7 @@ async fn dispatch(
 
     // --- Authentication, before anything reads the body. ---
     let presented = presented_key(&headers);
-    let auth = app.relay.authenticate(presented.as_deref());
+    let auth = authenticate_request(&app.relay, app.no_key_required, presented.as_deref());
     if !auth.is_allowed() {
         return auth_error(&auth, client_dialect);
     }
@@ -289,21 +544,47 @@ async fn dispatch(
     let resolution = table.snapshot.resolve(model_name);
     let lookup_done = started.elapsed();
 
-    let (combo, direct) = match resolution {
-        Resolution::Combo(c) => (Some(c), None),
-        Resolution::Direct(s) => (None, Some(s)),
-        Resolution::NotFound => {
+    // The level is part of the resolution, not a side channel: `-high` on a model that offers it
+    // selects that tier, and `-max` on a model that tops out at `xhigh` is *rerouted* to `xhigh`
+    // rather than failing, with the substitution reported so the logs show what actually ran.
+    //
+    // `level_override` is set only for a combo named *with* a tier (`coding-high`). Each step then
+    // runs at that tier rather than at its own model's default, and a step whose model does not
+    // offer it falls back to that model's highest — the same substitution rule as a direct name.
+    let mut combo = None;
+    let mut direct = None;
+    let mut level_override: Option<mr_core::dialect::ReasoningLevel> = None;
+    match resolution {
+        Resolution::Combo { plan, level } => {
+            combo = Some(plan);
+            level_override = level.and_then(mr_core::dialect::ReasoningLevel::from_u8);
+        }
+        Resolution::Direct {
+            step,
+            level,
+            substituted,
+        } => {
+            if substituted {
+                tracing::debug!(
+                    model = model_name,
+                    provider = %step.provider_id,
+                    level = mr_core::dialect::ReasoningLevel::from_u8(level)
+                        .map(|l| l.as_str())
+                        .unwrap_or("unknown"),
+                    "the requested reasoning level is not one this model offers; using its highest"
+                );
+            }
+            direct = Some(step);
+        }
+        Resolution::NotFound { reason } => {
             return error_response(
                 StatusCode::NOT_FOUND,
                 client_dialect,
                 "model_not_found",
-                &format!(
-                    "no combo, alias or model matches \"{model_name}\". Resolution order is alias, \
-                     combo id, combo name, provider/model, then bare model id."
-                ),
+                &reason,
             );
         }
-    };
+    }
 
     let health = app.health.view();
     let now_ms = mr_core::ids::now_millis().max(0) as u64;
@@ -521,6 +802,68 @@ async fn dispatch(
             }
         }
 
+        // --- The reasoning level, applied to the bytes that actually go upstream. ---
+        //
+        // This runs *after* translation so it lands on the upstream's own shape: an OpenAI client
+        // routed to Gemini gets `generationConfig.thinkingConfig`, not a field Gemini never reads.
+        // It also runs on the passthrough path, where `outgoing` is still the client's own bytes —
+        // which is exactly why the rewrite is a merge rather than a re-encode, and why it retargets
+        // the `model` field in the same pass.
+        match apply_reasoning_level(&outgoing, step, translated_body, level_override) {
+            Ok(Some(body)) => outgoing = body.into(),
+            Ok(None) => {}
+            Err(message) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    client_dialect,
+                    "invalid_request_error",
+                    &message,
+                )
+            }
+        }
+
+        // Modality detection runs on the translated upstream shape, so the same helper can inspect
+        // both passthrough and cross-dialect requests. Only a differing configured default changes
+        // the model field; the request content is never dropped or rewritten.
+        let mut modality_body: serde_json::Value = match serde_json::from_slice(&outgoing) {
+            Ok(body) => body,
+            Err(_) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    client_dialect,
+                    "invalid_request_error",
+                    "the request body must be valid JSON to inspect its modalities",
+                )
+            }
+        };
+        match crate::upstream::rewrite_model_for_modalities(
+            &mut modality_body,
+            |modality| step.accepts_modality(modality),
+            table.snapshot.routing_defaults(),
+        ) {
+            Ok(Some(_target)) => {
+                // Do not dispatch a body for a fallback model through the originally selected
+                // provider/account. Correct fallback needs full snapshot resolution and a new step
+                // selection (including credentials, URL, dialect and headers), not just a model
+                // string rewrite. Keep the helper available for that complete reroute path.
+                return error_response(
+                    StatusCode::NOT_IMPLEMENTED,
+                    client_dialect,
+                    "modality_fallback_unavailable",
+                    "the selected route does not support this input modality and automatic fallback routing is not available yet",
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    client_dialect,
+                    "invalid_request_error",
+                    &error.with_model(&step.model).to_string(),
+                )
+            }
+        }
+
         // A path the translator named wins over the provider's route override. The translator knows
         // which dialect it just wrote the body for; a route override is keyed by the *client's*
         // route, and says nothing about an upstream that does not follow OpenAI's path convention.
@@ -559,6 +902,7 @@ async fn dispatch(
                 dialect_content_type,
                 &oauth_headers,
             ),
+            proxy: None,
             body: outgoing,
             http2: provider.http2,
             connect_timeout: Duration::from_millis(step.connect_timeout_ms),
@@ -720,6 +1064,25 @@ fn presented_key(headers: &HeaderMap) -> Option<String> {
     }
 }
 
+/// Authenticate through the relay, allowing only genuinely absent credentials through open mode.
+/// Any presented credential — including an invalid one — is always checked and rejected normally.
+fn authenticate_request(
+    relay: &RelayState,
+    no_key_required: bool,
+    presented: Option<&str>,
+) -> AuthOutcome {
+    if presented.is_none() && no_key_required {
+        return AuthOutcome::Open;
+    }
+    match relay.authenticate(presented) {
+        // In the bootstrap/no-key configuration the relay's legacy state treats every credential as
+        // open. A presented key cannot be validated when no keys exist, so reject it rather than
+        // silently treating it as an accepted credential.
+        AuthOutcome::Open if presented.is_some() => AuthOutcome::Rejected,
+        outcome => outcome,
+    }
+}
+
 /// Map an authentication outcome onto a response.
 fn auth_error(outcome: &AuthOutcome, dialect: Dialect) -> Response {
     let message = match outcome {
@@ -803,7 +1166,7 @@ fn default_path(dialect: Dialect) -> &'static str {
         Dialect::Antigravity => "/v1internal:generateContent",
         Dialect::Codex => "/responses",
         Dialect::Copilot => "/chat/completions",
-        Dialect::CommandCode => "/alpha/generate",
+        Dialect::CommandCodeGo => "/alpha/generate",
     }
 }
 
@@ -861,7 +1224,7 @@ fn upstream_headers(
 
     // Command Code will not answer without these two: they are how its CLI identifies itself, and
     // the constants live next to the translator that writes the body so the two cannot drift apart.
-    if step.dialect == Dialect::CommandCode {
+    if step.dialect == Dialect::CommandCodeGo {
         map.insert(
             "x-command-code-version",
             HeaderValue::from_static(mr_dialects::commandcode::COMMAND_CODE_VERSION),
@@ -922,9 +1285,10 @@ fn apply_auth(headers: &mut HeaderMap, auth: &AuthKind, credential: Option<&str>
             return;
         }
         AuthKind::OAuth { .. } => {
-            // The control plane performs the token exchange and refresh and writes the access token
-            // to the vault; the relay only presents it. A refresh in front of a completion is exactly
-            // the work this architecture keeps off the request path.
+            // The token exchange happens in the control plane, but the relay refreshes an expiring
+            // token itself just before use (`Refresher::ensure_fresh`, called in the step loop above)
+            // so a long-lived relay does not need a restart to pick up a new access token. By the
+            // time this runs, `secret` is already the current access token.
             ("authorization".to_owned(), format!("Bearer {secret}"))
         }
     };
@@ -981,7 +1345,24 @@ async fn build_client_response(
         // The buffer is carried across frames because a `data:` line has no obligation to arrive in
         // one piece; translating a half-line would corrupt the stream in a way that looks like an
         // upstream fault. `scan` is what makes the carry-over expressible without a mutex.
-        let stream = frames.scan(String::new(), move |pending, frame| {
+        //
+        // `started` is what makes the *stream* boundary real for the dialects that still accumulate
+        // in per-thread state. A stream that ended without translating a terminal frame — upstream
+        // died, client hung up, this attempt was abandoned — leaves partial state behind, and the
+        // next stream translated on this thread would inherit it. Clearing on the first frame of
+        // every stream is what stops that; it cannot be done once around the whole stream, because
+        // the body is polled on whichever worker the task happens to be scheduled on.
+        //
+        // Command Code does **not** rely on this, and must not: a reset keyed on a worker thread
+        // cannot separate two answers in flight on that thread — it wipes the *other* live stream's
+        // state instead, which is the same corruption seen from the other side. Its state is
+        // `commandcode` below, owned per stream and dropped with the body.
+        let mut commandcode = mr_dialects::commandcode::Translator::new();
+        let stream = frames.scan((String::new(), false), move |(pending, started), frame| {
+            if !*started {
+                *started = true;
+                mr_dialects::reset_stream_state();
+            }
             let ctx = TranslateCtx {
                 route,
                 client_dialect,
@@ -994,7 +1375,7 @@ async fn build_client_response(
                 Ok(frame) => frame
                     .into_data()
                     .ok()
-                    .map(|chunk| translate_stream_chunk(&ctx, pending, &chunk)),
+                    .map(|chunk| translate_stream_chunk(&ctx, &mut commandcode, pending, &chunk)),
                 Err(e) => Some(vec![Err(e)]),
             };
             async move { Some(out) }
@@ -1029,13 +1410,13 @@ async fn build_client_response(
     for (name, value) in headers.iter() {
         let lower = name.as_str().to_ascii_lowercase();
         if HOP_BY_HOP.contains(&lower.as_str())
-            || (ctx.upstream_dialect == Dialect::CommandCode && lower == "content-type")
+            || (ctx.upstream_dialect == Dialect::CommandCodeGo && lower == "content-type")
         {
             continue;
         }
         response.headers_mut().append(name.clone(), value.clone());
     }
-    if ctx.upstream_dialect == Dialect::CommandCode {
+    if ctx.upstream_dialect == Dialect::CommandCodeGo {
         let content_type = if ctx.client_streaming {
             "text/event-stream; charset=utf-8"
         } else {
@@ -1055,6 +1436,7 @@ async fn build_client_response(
 /// of a `data:` line is normal rather than exceptional.
 fn translate_stream_chunk(
     ctx: &TranslateCtx<'_>,
+    commandcode: &mut mr_dialects::commandcode::Translator,
     pending: &mut String,
     chunk: &Bytes,
 ) -> Vec<Result<Bytes, hyper::Error>> {
@@ -1079,11 +1461,15 @@ fn translate_stream_chunk(
             // The live Command Code endpoint emits newline-delimited JSON event objects rather than
             // standard SSE `data:` records. Treat each JSON line as one event; metadata events are
             // ignored by the dialect translator, while text/tool/finish events become OpenAI SSE.
-            (ctx.upstream_dialect == Dialect::CommandCode && trimmed.starts_with('{'))
+            (ctx.upstream_dialect == Dialect::CommandCodeGo && trimmed.starts_with('{'))
                 .then_some(trimmed)
         });
         match data {
-            Some(data) => match mr_dialects::translate_sse_data(ctx, data) {
+            Some(data) => match if ctx.upstream_dialect == Dialect::CommandCodeGo {
+                mr_dialects::commandcode::translate(commandcode, ctx, data)
+            } else {
+                mr_dialects::translate_sse_data(ctx, data)
+            } {
                 Ok(lines) => {
                     for line in lines {
                         if line.is_empty() {
@@ -1098,7 +1484,7 @@ fn translate_stream_chunk(
             },
             // Comments (`: ping`), `event:` and `id:` lines carry no payload to translate and are
             // forwarded as they are. Command Code metadata JSON is intentionally suppressed.
-            None if ctx.upstream_dialect == Dialect::CommandCode => {}
+            None if ctx.upstream_dialect == Dialect::CommandCodeGo => {}
             None => out.push(Ok(Bytes::from(format!("{trimmed}\n")))),
         }
     }
@@ -1262,6 +1648,25 @@ mod tests {
         assert!(inject_antigravity_project(b"not-json", Some(&tokens)).is_err());
     }
 
+    #[test]
+    fn no_key_required_permits_missing_credentials_but_still_checks_presented_keys() {
+        let config = mr_core::config::Config::default();
+        let relay = RelayState::new(
+            &config,
+            mr_core::snapshot::RoutingSnapshot::default(),
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        );
+        assert!(authenticate_request(&relay, true, None).is_allowed());
+        assert!(matches!(
+            authenticate_request(&relay, false, None),
+            AuthOutcome::Open
+        ));
+        assert!(matches!(
+            authenticate_request(&relay, true, Some("invalid")),
+            AuthOutcome::Rejected
+        ));
+    }
+
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
         for (k, v) in pairs {
@@ -1285,7 +1690,21 @@ mod tests {
             ttfb_timeout_ms: 1,
             idle_timeout_ms: 1,
             total_timeout_ms: 1,
+            level: mr_core::dialect::ReasoningLevel::High.rank(),
+            // A model that advertises reasoning, so the helper's steps look like the ones the
+            // compiler produces for a real provider.
+            levels: level_mask(&mr_core::dialect::ReasoningLevel::ALL),
+            default_level: mr_core::dialect::ReasoningLevel::High.rank(),
+            reasoning_json: Default::default(),
+            input_modalities: 1,
+            pricing: None,
         }
+    }
+
+    fn level_mask(levels: &[mr_core::dialect::ReasoningLevel]) -> u32 {
+        levels
+            .iter()
+            .fold(0, |mask, level| mask | (1u32 << level.rank()))
     }
 
     /// A minimal provider plan: no headers, no accounts, no route overrides.
@@ -1297,6 +1716,7 @@ mod tests {
             base_url: "https://example.com".into(),
             auth: AuthKind::Bearer,
             key_strategy: Default::default(),
+            proxy: None,
             accounts: Vec::new(),
             capabilities: Vec::new(),
             connect_timeout_ms: 1,
@@ -1309,6 +1729,335 @@ mod tests {
             prewarm: false,
             steps: Vec::new(),
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // `GET /v1/models` and the reasoning level a name selects
+    // -----------------------------------------------------------------------------------------
+
+    /// A snapshot with one provider whose single model carries explicit metadata.
+    fn snapshot_with(
+        dialect: Dialect,
+        model_id: &str,
+        levels: &[ReasoningLevel],
+        modalities: &[InputModality],
+        combos: &[(&str, &str)],
+    ) -> mr_core::snapshot::RoutingSnapshot {
+        use mr_core::model::{ModelEntry, ModelSource};
+
+        let mut config = mr_core::config::Config::default();
+        let mut provider = mr_core::model::Provider::new("p1", dialect, "https://p1.example/v1");
+        provider.models = vec![ModelEntry {
+            id: model_id.into(),
+            source: ModelSource::Manual,
+            label: None,
+            context_length: None,
+            max_output_tokens: None,
+            capabilities: Vec::new(),
+            input_modalities: modalities.to_vec(),
+            reasoning_levels: levels.to_vec(),
+            default_reasoning_level: None,
+            reasoning_wire: None,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            pricing: None,
+            synced_at: None,
+            hidden: false,
+        }];
+        provider.accounts = vec![mr_core::model::Account::new("a")];
+        config.providers = vec![provider];
+        config.combos = combos
+            .iter()
+            .map(|(id, name)| {
+                let mut combo = mr_core::model::Combo::new(
+                    *name,
+                    mr_core::model::ComboStep::new("p1", model_id),
+                );
+                combo.id = mr_core::ids::ComboId::from_raw(*id);
+                combo
+            })
+            .collect();
+        mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap()
+    }
+
+    /// An otherwise-empty [`ModelEntry`], so a test can name exactly the fields it cares about.
+    ///
+    /// Every other field is a `Default`, which is the honest starting point: a test that sets only
+    /// `reasoning_levels` is asserting what happens when nothing else is declared.
+    fn dm() -> mr_core::model::ModelEntry {
+        mr_core::model::ModelEntry {
+            id: String::new(),
+            source: mr_core::model::ModelSource::Manual,
+            label: None,
+            context_length: None,
+            max_output_tokens: None,
+            capabilities: Vec::new(),
+            input_modalities: Vec::new(),
+            reasoning_levels: Vec::new(),
+            default_reasoning_level: None,
+            reasoning_wire: None,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            pricing: None,
+            synced_at: None,
+            hidden: false,
+        }
+    }
+
+    fn listed_ids(snapshot: &mr_core::snapshot::RoutingSnapshot) -> Vec<String> {
+        model_listing(snapshot)
+            .into_iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_model_listing_advertises_only_the_levels_a_model_really_offers() {
+        // The listing is a client's contract: a name it finds here must work verbatim, and a
+        // `-<level>` it does NOT find must be recognisable as unsupported rather than a typo.
+        let snapshot = snapshot_with(
+            Dialect::OpenAi,
+            "m1",
+            &[ReasoningLevel::Low, ReasoningLevel::High],
+            &[InputModality::Text],
+            &[],
+        );
+        let ids = listed_ids(&snapshot);
+
+        assert!(ids.contains(&"p1/m1".to_string()));
+        assert!(ids.contains(&"p1/m1-low".to_string()));
+        assert!(ids.contains(&"p1/m1-high".to_string()));
+        // Offered by the ladder but not by this model.
+        for absent in ["p1/m1-minimal", "p1/m1-medium", "p1/m1-max", "p1/m1-ultra"] {
+            assert!(!ids.contains(&absent.to_string()), "{absent} was listed");
+        }
+    }
+
+    #[test]
+    fn the_model_listing_gives_a_modelless_name_exactly_one_entry() {
+        // No levels means the suffix is not part of this model's vocabulary, so advertising
+        // `p1/m1-high` would offer a name that resolves to nothing.
+        let snapshot = snapshot_with(Dialect::OpenAi, "m1", &[], &[InputModality::Text], &[]);
+        let ids = listed_ids(&snapshot);
+        assert_eq!(ids, vec!["p1/m1".to_string()]);
+    }
+
+    #[test]
+    fn the_model_listing_does_not_qualify_a_model_whose_id_ends_in_a_level_word() {
+        // `gemini-3.8-flash-low` already is a tier; `...-low-high` would name nothing because the
+        // exact-id rule wins. Listing it would be listing a name that cannot resolve.
+        let snapshot = snapshot_with(
+            Dialect::OpenAi,
+            "gemini-3.8-flash-low",
+            &[ReasoningLevel::Low, ReasoningLevel::High],
+            &[InputModality::Text],
+            &[],
+        );
+        let ids = listed_ids(&snapshot);
+        assert_eq!(ids, vec!["p1/gemini-3.8-flash-low".to_string()]);
+    }
+
+    #[test]
+    fn a_listed_name_is_a_name_the_snapshot_actually_resolves() {
+        // The property that makes the listing worth trusting: every id it publishes resolves, and
+        // resolves at the level the entry claims.
+        let snapshot = snapshot_with(
+            Dialect::OpenAi,
+            "m1",
+            &[
+                ReasoningLevel::Low,
+                ReasoningLevel::High,
+                ReasoningLevel::Max,
+            ],
+            &[InputModality::Text, InputModality::Image],
+            &[("c1", "coding")],
+        );
+        for entry in model_listing(&snapshot) {
+            let id = entry["id"].as_str().unwrap();
+            match snapshot.resolve(id) {
+                Resolution::Direct { step, level, .. } => {
+                    if let Some(named) = entry["manarouter"]["reasoning_level"].as_str() {
+                        let expected =
+                            ReasoningLevel::parse(named).expect("a canonical level spelling");
+                        assert_eq!(level, expected.rank(), "{id} resolved at the wrong level");
+                    }
+                    let suffix = suffix_of(&entry);
+                    if !suffix.is_empty() {
+                        assert!(!step.model.ends_with(&suffix), "{id}");
+                    }
+                }
+                Resolution::Combo { .. } => {
+                    assert_eq!(entry["manarouter"]["kind"], "combo", "{id}");
+                }
+                Resolution::NotFound { reason } => {
+                    panic!("the listing published {id}, which does not resolve: {reason}")
+                }
+            }
+        }
+    }
+
+    /// The `-<level>` suffix an entry was listed under, or the empty string for a base name.
+    fn suffix_of(entry: &serde_json::Value) -> String {
+        entry["manarouter"]["reasoning_level"]
+            .as_str()
+            .map(|level| format!("-{level}"))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_model_listing_reports_each_models_levels_and_modalities() {
+        let snapshot = snapshot_with(
+            Dialect::OpenAi,
+            "m1",
+            &[ReasoningLevel::Low, ReasoningLevel::High],
+            &[
+                InputModality::Text,
+                InputModality::Image,
+                InputModality::Pdf,
+            ],
+            &[],
+        );
+        let entry = model_listing(&snapshot)
+            .into_iter()
+            .find(|entry| entry["id"] == "p1/m1")
+            .expect("the base name is listed");
+
+        assert_eq!(entry["object"], "model");
+        assert_eq!(entry["owned_by"], "p1");
+        assert_eq!(entry["manarouter"]["kind"], "provider");
+        assert_eq!(entry["manarouter"]["dialect"], Dialect::OpenAi.as_str());
+        assert_eq!(
+            entry["manarouter"]["reasoning_levels"],
+            serde_json::json!(["low", "high"])
+        );
+        assert_eq!(
+            entry["manarouter"]["input_modalities"],
+            serde_json::json!(["text", "image", "pdf"])
+        );
+    }
+
+    #[test]
+    fn the_model_listing_lists_a_combo_plain_and_per_level() {
+        let snapshot = snapshot_with(
+            Dialect::OpenAi,
+            "m1",
+            &[ReasoningLevel::Low, ReasoningLevel::High],
+            &[InputModality::Text],
+            &[("c1", "coding")],
+        );
+        let ids = listed_ids(&snapshot);
+        assert!(ids.contains(&"coding".to_string()));
+        assert!(ids.contains(&"coding-low".to_string()));
+        assert!(ids.contains(&"coding-high".to_string()));
+
+        let entry = model_listing(&snapshot)
+            .into_iter()
+            .find(|entry| entry["id"] == "coding-high")
+            .unwrap();
+        assert_eq!(entry["manarouter"]["kind"], "combo");
+        assert_eq!(entry["manarouter"]["reasoning_level"], "high");
+    }
+
+    #[test]
+    fn a_multi_step_combo_lists_each_level_once() {
+        // Two steps offering overlapping levels must not produce `coding-high` twice. A duplicate
+        // is not merely untidy: a client that builds a picker from this list shows the same name
+        // twice, and one that keys on id sees the list contradict itself.
+        let mut config = mr_core::config::Config::default();
+        let mut provider = mr_core::model::Provider::new("p1", Dialect::OpenAi, "https://p1/v1");
+        provider.models = vec![
+            {
+                let mut m = mr_core::model::ModelEntry {
+                    id: "m1".into(),
+                    ..dm()
+                };
+                m.reasoning_levels = vec![ReasoningLevel::Low, ReasoningLevel::High];
+                m
+            },
+            {
+                let mut m = mr_core::model::ModelEntry {
+                    id: "m2".into(),
+                    ..dm()
+                };
+                m.reasoning_levels = vec![ReasoningLevel::Low, ReasoningLevel::Max];
+                m
+            },
+        ];
+        provider.accounts = vec![mr_core::model::Account::new("a")];
+        config.providers = vec![provider];
+        let mut combo =
+            mr_core::model::Combo::new("coding", mr_core::model::ComboStep::new("p1", "m1"));
+        combo.steps.push(mr_core::model::ComboStep::new("p1", "m2"));
+        combo.id = mr_core::ids::ComboId::from_raw("c1");
+        config.combos = vec![combo];
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let ids = listed_ids(&snapshot);
+        let mut sorted = ids.clone();
+        sorted.sort();
+        let mut deduped = sorted.clone();
+        deduped.dedup();
+        assert_eq!(
+            sorted, deduped,
+            "the listing contains a duplicate id: {ids:?}"
+        );
+        // The union of both steps, which is what a combo pinned to that tier can actually run.
+        assert!(ids.contains(&"coding-low".to_string()));
+        assert!(ids.contains(&"coding-high".to_string()));
+        assert!(ids.contains(&"coding-max".to_string()));
+        assert!(!ids.contains(&"coding-medium".to_string()));
+    }
+
+    #[test]
+    fn a_combos_levels_are_its_own_not_its_step_models() {
+        // A combo whose step model id ends in a level word still supports pinning the *combo* to a
+        // tier: the suffix attaches to `coding`, not to `gemini-3.8-flash-low`. Reading the step's
+        // name here suppressed the combo's whole level list.
+        let snapshot = snapshot_with(
+            Dialect::OpenAi,
+            "gemini-3.8-flash-low",
+            &[
+                ReasoningLevel::None,
+                ReasoningLevel::Low,
+                ReasoningLevel::High,
+            ],
+            &[InputModality::Text],
+            &[("c1", "coding")],
+        );
+        let ids = listed_ids(&snapshot);
+        assert!(
+            ids.contains(&"coding-low".to_string()),
+            "the combo is pinnable even though its step model is a tier: {ids:?}"
+        );
+        assert!(ids.contains(&"coding-high".to_string()));
+        // The *model* is still listed once, because its own id is already a tier.
+        assert!(ids.contains(&"p1/gemini-3.8-flash-low".to_string()));
+        assert!(!ids.contains(&"p1/gemini-3.8-flash-low-high".to_string()));
+    }
+
+    #[test]
+    fn a_combo_whose_own_name_ends_in_a_level_word_lists_no_variants() {
+        let snapshot = snapshot_with(
+            Dialect::OpenAi,
+            "m1",
+            &[ReasoningLevel::Low, ReasoningLevel::High],
+            &[InputModality::Text],
+            &[("c1", "fast-low")],
+        );
+        let ids = listed_ids(&snapshot);
+        assert!(ids.contains(&"fast-low".to_string()));
+        assert!(
+            !ids.contains(&"fast-low-high".to_string()),
+            "the combo's own name would swallow the suffix: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_model_with_no_levels_compiles_with_an_empty_level_mask() {
+        let snapshot = snapshot_with(Dialect::OpenAi, "m1", &[], &[InputModality::Text], &[]);
+        let step = &snapshot.providers()[0].steps[0];
+        assert_eq!(step.levels, 0);
+        assert!(!step.supports_level(ReasoningLevel::High));
     }
 
     #[test]
@@ -1381,7 +2130,7 @@ mod tests {
             Dialect::Codex,
             Dialect::Copilot,
             Dialect::Antigravity,
-            Dialect::CommandCode,
+            Dialect::CommandCodeGo,
         ] {
             let p = default_path(d);
             assert!(p.starts_with('/'), "{d:?} must have an absolute path");
@@ -1394,17 +2143,17 @@ mod tests {
         let ctx = TranslateCtx {
             route: RouteKind::ChatCompletions,
             client_dialect: Dialect::OpenAi,
-            upstream_dialect: Dialect::CommandCode,
+            upstream_dialect: Dialect::CommandCodeGo,
             upstream_model: "deepseek/deepseek-v4-flash",
             client_streaming: true,
             session_id: None,
         };
-        mr_dialects::commandcode::reset_stream_state();
+        let mut commandcode = mr_dialects::commandcode::Translator::new();
         let mut pending = String::new();
         let metadata = Bytes::from_static(b"{\"type\":\"start\"}\n");
-        assert!(translate_stream_chunk(&ctx, &mut pending, &metadata).is_empty());
+        assert!(translate_stream_chunk(&ctx, &mut commandcode, &mut pending, &metadata).is_empty());
         let token = Bytes::from_static(b"{\"type\":\"text-delta\",\"text\":\"OK\"}\n");
-        let output = translate_stream_chunk(&ctx, &mut pending, &token);
+        let output = translate_stream_chunk(&ctx, &mut commandcode, &mut pending, &token);
         let output = output.into_iter().map(Result::unwrap).collect::<Vec<_>>();
         assert_eq!(output.len(), 1);
         let text = std::str::from_utf8(&output[0]).unwrap();
@@ -1414,7 +2163,7 @@ mod tests {
         let finish = Bytes::from_static(
             b"{\"type\":\"finish\",\"finishReason\":\"stop\",\"totalUsage\":{\"inputTokens\":2,\"outputTokens\":1}}\n",
         );
-        let output = translate_stream_chunk(&ctx, &mut pending, &finish);
+        let output = translate_stream_chunk(&ctx, &mut commandcode, &mut pending, &finish);
         let text = output
             .into_iter()
             .map(Result::unwrap)
@@ -1422,7 +2171,6 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("finish_reason"), "{text:?}");
         assert!(text.contains("[DONE]"), "{text:?}");
-        mr_dialects::commandcode::reset_stream_state();
     }
 
     #[test]
@@ -1447,7 +2195,7 @@ mod tests {
         // of this test wrote `"/alpha/generate"` with a leading slash while the constant is
         // `"alpha/generate"` without one, so the test asserted a URL the code never built and the
         // real one — `https://api.commandcode.aialpha/generate` — went unnoticed.
-        let s = step(Dialect::CommandCode, "https://api.commandcode.ai");
+        let s = step(Dialect::CommandCodeGo, "https://api.commandcode.ai");
         let over = mr_dialects::commandcode::GENERATE_PATH.to_string();
         assert_eq!(
             build_url(&s, Some(&over)).as_deref(),
@@ -1484,7 +2232,7 @@ mod tests {
         let ctx = TranslateCtx {
             route: RouteKind::ChatCompletions,
             client_dialect: Dialect::OpenAi,
-            upstream_dialect: Dialect::CommandCode,
+            upstream_dialect: Dialect::CommandCodeGo,
             upstream_model: "claude-sonnet-4-5",
             client_streaming: false,
             session_id: None,
@@ -1494,7 +2242,7 @@ mod tests {
             .expect("the dialects differ, so a body must be produced");
         assert!(translated.force_stream, "Command Code always streams");
         let path = translated.path_override.expect("a path is declared");
-        let s = step(Dialect::CommandCode, "https://api.commandcode.ai");
+        let s = step(Dialect::CommandCodeGo, "https://api.commandcode.ai");
         assert_eq!(
             build_url(&s, Some(&path)).as_deref(),
             Some("https://api.commandcode.ai/alpha/generate")
@@ -1510,7 +2258,7 @@ mod tests {
         assert!(!head.wants_stream());
         let out = upstream_headers(
             &p,
-            &step(Dialect::CommandCode, "https://example.com"),
+            &step(Dialect::CommandCodeGo, "https://example.com"),
             None,
             &HeaderMap::new(),
             &head,
@@ -1527,7 +2275,7 @@ mod tests {
         let head = scan_request_head(br#"{"model":"m"}"#);
         let out = upstream_headers(
             &p,
-            &step(Dialect::CommandCode, "https://example.com"),
+            &step(Dialect::CommandCodeGo, "https://example.com"),
             None,
             &HeaderMap::new(),
             &head,
@@ -1574,7 +2322,7 @@ mod tests {
         );
         let out = upstream_headers(
             &p,
-            &step(Dialect::CommandCode, "https://example.com"),
+            &step(Dialect::CommandCodeGo, "https://example.com"),
             None,
             &client,
             &head,
@@ -1692,7 +2440,7 @@ mod tests {
 
     #[test]
     fn an_oauth_credential_is_sent_as_a_bearer_token() {
-        // The control plane refreshes; the relay only presents.
+        // Whoever refreshed it, the token is presented as a bearer header.
         let mut h = HeaderMap::new();
         apply_auth(
             &mut h,

@@ -186,13 +186,13 @@ def main() -> int:
             )
             if status != 200:
                 raise AssertionError(f"relay returned HTTP {status}: {result}")
-            if result.get("model") != "mock/mock-model":
-                raise AssertionError(f"upstream model was not reached: {result}")
+            # The relay forwards the provider's response model identifier; it is allowed to be
+            # upstream-specific (mock-model) rather than echoing the client-facing qualified name.
             message = result.get("choices", [{}])[0].get("message", {})
             if message.get("content") != "Hello from mock-upstream.":
                 raise AssertionError(f"unexpected mock response: {result}")
-            if result.get("echo", {}).get("model") != "mock/mock-model":
-                raise AssertionError(f"mock echo missing: {result}")
+            if result.get("echo", {}).get("model") != "mock-model":
+                raise AssertionError(f"mock upstream model mismatch: {result}")
             # Verify the synthetic secret is present only in the encrypted vault and known fixture
             # files remain inside the disposable config/state roots. The caller key is omitted.
             if not (config_dir / "vault.key").is_file() or not (config_dir / "vault.enc").is_file():

@@ -1,7 +1,7 @@
 # Manarouter provider catalogue — SEED DATA, not runtime configuration.
 # This file is compiled into `mr-core` with include_str! and read through
 # `mr_core::catalog::catalog()`. It is the list of upstream providers this build knows how to talk
-# to, and it exists so that `mr providers add <id>` (and the panel's "add provider" screen) can
+# to, and it exists so that `mr provider add <id>` (and the panel's "add provider" screen) can
 # create a correctly-configured provider in one step. Nothing here is read on the request path, and
 # nothing here is ever written by the panel. The operator-owned file is
 # `~/.config/manarouter/config.json`; once a template is instantiated it becomes an ordinary
@@ -131,7 +131,7 @@ note = "OAuth-only upstream (authModes=[oauth]). This build does not implement t
 [[providers]]
 id = "command-code"
 label = "Command Code"
-dialect = "command-code"
+dialect = "command-code-go"
 base_url = "https://api.commandcode.ai"
 auth = { type = "bearer" }
 capabilities = ["chat", "models", "tool-calling", "reasoning"]

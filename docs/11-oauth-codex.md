@@ -20,18 +20,17 @@ The shared machinery — single-flight refresh, the 401 repair path, the loopbac
 | Authorize | `https://auth.openai.com/oauth/authorize` |
 | Token | `https://auth.openai.com/oauth/token` |
 | Refresh | `https://auth.openai.com/oauth/token` — the same URL, **different encoding** (§3) |
-| Revoke | `https://auth.openai.com/oauth/revoke` |
+| Revoke | `https://auth.openai.com/oauth/revoke` — a first-party-client fact recorded for completeness; **no code path in this build calls it** |
 | Issuer | `https://auth.openai.com` (`DEFAULT_ISSUER`) |
 
 Do not use the second literal that appears in the Codex binary, `app_69a1d78e929881919bba0dbda1f6436d`.
 It is for **agent identity / workload-identity registration**, not the interactive login flow, and
 presenting it at the authorize endpoint will not produce a ChatGPT credential.
 
-Three environment overrides exist in the first-party client and are honoured here for the same reason
-they exist there — testing against a staging issuer without recompiling:
-`CODEX_APP_SERVER_LOGIN_CLIENT_ID`, `CODEX_REFRESH_TOKEN_URL_OVERRIDE` and
-`CODEX_REVOKE_TOKEN_URL_OVERRIDE`. They are development affordances, not configuration to document
-for operators.
+Three environment overrides exist in the first-party client, for testing against a staging issuer
+without recompiling: `CODEX_APP_SERVER_LOGIN_CLIENT_ID`, `CODEX_REFRESH_TOKEN_URL_OVERRIDE` and
+`CODEX_REVOKE_TOKEN_URL_OVERRIDE`. **This build does not read any of them** — `codex.rs` uses the
+fixed constants in `crates/mr-core/src/published.rs`, so there is no staging affordance here.
 
 ---
 
@@ -406,11 +405,11 @@ is the error that third-party harnesses hit. The disagreement is *where* they go
 
 ## See also
 
-- [OAuth overview](docs/10-oauth-overview.md) — single-flight refresh, the 401 path, storage
-- [GitHub Copilot](docs/13-oauth-copilot.md) — the other short-lived-token platform
-- [Adding a platform](docs/14-oauth-adding-a-platform.md) — the trait this platform implements
-- [Security and credentials](docs/21-security.md) — §5 why the fingerprint is sent exactly
-- [The hedged race](docs/07-hedged-race.md) — how a combo spends a subscription account's quota
-- [providers.toml](catalog/providers.toml) — the `openai-codex` entry and its recorded headers
-- [catalog.rs](crates/mr-core/src/catalog.rs) — the test that asserts the fingerprint headers
-- [mr-dialects lib.rs](crates/mr-dialects/src/lib.rs) — `upstream_forces_stream()` and the shim
+- [OAuth overview](10-oauth-overview.md) — single-flight refresh, the 401 path, storage
+- [GitHub Copilot](13-oauth-copilot.md) — the other short-lived-token platform
+- [Adding a platform](14-oauth-adding-a-platform.md) — the trait this platform implements
+- [Security and credentials](21-security.md) — §5 why the fingerprint is sent exactly
+- [The hedged race](07-hedged-race.md) — how a combo spends a subscription account's quota
+- [providers.toml](../catalog/providers.toml) — the `openai-codex` entry and its recorded headers
+- [catalog.rs](../crates/mr-core/src/catalog.rs) — the test that asserts the fingerprint headers
+- [mr-dialects lib.rs](../crates/mr-dialects/src/lib.rs) — `upstream_forces_stream()` and the shim

@@ -32,8 +32,9 @@ Combos, account ordering, health, quota, fallback rules — all compiled ahead o
 binary table the relay reads with a single atomic load. Adding a provider or editing a combo does not
 touch the request path.
 
-**The relay's total added latency target is under 150 µs at p50 and 500 µs at p99**, verified in CI
-against a deterministic mock upstream. See [`docs/16-latency-engineering.md`](docs/16-latency-engineering.md).
+**The relay's total added latency target is under 150 µs at p50 and 500 µs at p99.** The `tools/bench`
+harness that would assert it in CI against a deterministic mock upstream is not written yet. See
+[`docs/16-latency-engineering.md`](docs/16-latency-engineering.md).
 
 ---
 
@@ -47,7 +48,7 @@ For an isolated, report-only comparison of direct loopback mock requests versus 
 |---|---|
 | **APIs** | OpenAI Chat Completions, Responses, Embeddings, Audio (transcription and speech), Images, Models — and Anthropic Messages with `count_tokens` |
 | **Providers** | Any OpenAI-compatible endpoint, any Anthropic-compatible endpoint, plus first-class adapters for OpenAI Codex, GitHub Copilot, Google Antigravity and Command Code |
-| **Combos** | A combo *is a model name*. Order it yourself; race it or don't |
+| **Combos** | A combo *is a model name*. Order it yourself; the concurrent race is designed but not wired yet |
 | **Key selection** | `priority`, `round-robin`, `random`, `least-used` — always skipping dead accounts |
 | **Health** | Per **account**, never per provider. One revoked key does not take a provider down |
 | **Quota** | Live upstream signals first, your declared windows as an override |
@@ -69,6 +70,12 @@ passed, take the best that passed *on a different provider*, or fall back to a m
 
 This surprises people, so it is documented in full, with worked timelines:
 [`docs/07-hedged-race.md`](docs/07-hedged-race.md).
+
+**Not wired yet:** the race is compiled and unit-tested, but the relay still walks a combo's steps
+sequentially, so nothing on the request path runs it concurrently. Treat the paragraph above as the
+designed behaviour, not the current one; [`docs/23-implementation-status.md`](docs/23-implementation-status.md)
+is the authoritative list. Priority combos *do* remember the last successful step for a configurable
+window (`sticky_success_window_secs`, default 1800 s).
 
 ---
 
@@ -139,8 +146,9 @@ local Manarouter. Create one and keep it somewhere private:
 mr key create --label my-computer --print
 ```
 
-The one-time key is printed to your terminal. Copy it; Manarouter stores only its hash. Start the
-control panel/conductor and relay in **two terminals**:
+The one-time key is printed to your terminal. Copy it; Manarouter stores only its hash. For a
+foreground session, `mr serve` starts the control panel/conductor and the relay together. To run them
+as separate processes, start each in its own terminal:
 
 ```bash
 manarouter-conductor
@@ -171,8 +179,9 @@ curl http://127.0.0.1:20900/v1/chat/completions \
 ```
 
 The client key above is a placeholder: use the one-time value printed by `mr key create`. Each
-request may incur charges from your configured provider. To stop Manarouter, press **Ctrl-C** in
-each terminal. Configuration and encrypted credentials are kept under `~/.config/manarouter`; see
+request may incur charges from your configured provider. To stop Manarouter, press **Ctrl-C** —
+once under `mr serve`, or in each terminal when the two processes run separately. Configuration and
+encrypted credentials are kept under `~/.config/manarouter`; see
 [`docs/02-quickstart.md`](docs/02-quickstart.md) for configuration, model aliases, combos, API
 clients and troubleshooting.
 
@@ -213,7 +222,10 @@ For humans:
 | [Troubleshooting](docs/20-troubleshooting.md) | Symptom, cause, fix |
 | [Security](docs/21-security.md) | Threat model, the vault, and the things it does not protect |
 | [Sync design](docs/22-sync-design.md) | Planned, not implemented |
+| [Implementation status](docs/23-implementation-status.md) | What runs today, and the evidence for it |
 | [Combo cookbook](docs/combo-cookbook.md) | Copy-pasteable configurations |
+| [LLM task map](docs/LLM_INDEX.md) | Which file describes which task, for an agent |
+| [Local latency benchmark](docs/local-latency-benchmark.md) | Report-only loopback comparison |
 
 ---
 
@@ -221,8 +233,9 @@ For humans:
 
 - Credentials are encrypted at rest with AES-256-GCM, each ciphertext bound to its own id so it
   cannot be moved between entries. Only non-reversible fingerprints are ever displayed.
-- **Cookie and web-session authentication is not supported at all.** No provider uses it. This is a
-  hard constraint, enforced by a test.
+- **No provider authenticates by cookie or web session.** This is a hard constraint, enforced by a
+  test. The browser panel itself uses a local session cookie for its own login, which is unrelated to
+  how upstream providers are authenticated.
 - The panel binds to loopback by default and requires a password to be reachable from anywhere else.
 - `scripts/check-secrets.sh` fails the build on a credential-shaped string, and is run in CI.
 
@@ -235,9 +248,11 @@ a proxy is not a use the provider has licensed. Both are explained in
 
 ## Status
 
-Under active construction. The schema, the compiled snapshot format, both dialect layers and the
-provider catalogue are in place and tested; the data plane, control plane and panel are being wired
-up.
+Working and tested: the schema, the compiled snapshot format, both dialect layers, the provider
+catalogue, the data plane (relay), the control plane (conductor) and the panel. The known gaps are
+the concurrent hedged race, the fire-and-forget usage writer, and the `mr config` / `mr vault`
+bodies. [`docs/23-implementation-status.md`](docs/23-implementation-status.md) is the audited list,
+with the command that checks each row.
 
 The design decisions in this repository are recorded, not folklore. [`docs/LLM_INDEX.md`](docs/LLM_INDEX.md)
 §9 lists them, and `docs/LLM_INDEX.md` §8 lists the changes that will be rejected and why.

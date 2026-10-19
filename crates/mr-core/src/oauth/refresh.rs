@@ -258,10 +258,10 @@ pub fn is_due(tokens: &TokenSet, now: Millis, lead: Duration) -> bool {
 
 /// Durable storage for OAuth credentials.
 ///
-/// `crate::store` is a stub in spirit for this data — the `oauth_credential` table described in
-/// the docs is "intended design" — so the vault is the durable home: encryption at rest, 0600
-/// key, atomic flush. Implementations must make `save` atomic from the caller's view: either
-/// the new tokens are durable or the old ones are still there, never a torn state.
+/// The token material is durable in the vault — encryption at rest, a 0600 key, atomic flush — while
+/// the non-secret metadata lives in the `oauth_credential` table of [`crate::store`]. Implementations
+/// must make `save` atomic from the caller's view: either the new tokens are durable or the old ones
+/// are still there, never a torn state.
 pub trait CredentialStore: Send + Sync {
     /// Load the credential under `key`, if one exists.
     fn load(&self, key: &str) -> Result<Option<TokenSet>>;

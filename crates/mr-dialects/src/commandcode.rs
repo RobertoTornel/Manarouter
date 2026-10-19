@@ -31,7 +31,7 @@ use bytes::Bytes;
 use mr_core::Dialect;
 use serde_json::{json, Map, Value};
 
-use crate::openai::{pivot_response_to_anthropic, sse_to_anthropic, AnthropicStreamState};
+use crate::openai::{pivot_response_to_anthropic, AnthropicStreamState};
 use crate::sse;
 use crate::{Result, TranslateCtx, TranslateError, TranslatedRequest, SSE_DONE};
 
@@ -345,8 +345,13 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 // ---------------------------------------------------------------------------------------------
 
 /// One accumulated tool call.
+///
+/// Both `id` and `name` are always non-empty. That is an invariant of this struct, not a hope:
+/// a call the client cannot name cannot be dispatched, and a call with no id cannot be matched to
+/// its result, so neither is ever constructed with an empty string — the upstream event that would
+/// have produced one is dropped instead (see [`classify`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ToolCall {
+pub(crate) struct ToolCall {
     id: String,
     name: String,
     arguments: String,
@@ -358,7 +363,7 @@ struct ToolCall {
 /// `sentRole` / `finishReason` / `usage` locals, and it is deliberately per-stream: sharing it
 /// between concurrent conversations is exactly how two answers get spliced together.
 #[derive(Debug, Clone)]
-struct StreamState {
+pub(crate) struct StreamState {
     id: String,
     model: String,
     content: String,
@@ -369,6 +374,13 @@ struct StreamState {
     finish_reason: String,
     prompt_tokens: u64,
     completion_tokens: u64,
+    /// Prompt tokens served from the provider's cache, and prompt tokens written *into* it.
+    ///
+    /// The live endpoint reports these under `totalUsage.inputTokenDetails.cacheReadTokens` and
+    /// `.cacheWriteTokens`. They were previously dropped, which is why a cache hit showed as zero
+    /// and the cost of every cached turn was overstated.
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
     usage_seen: bool,
     /// `role: "assistant"` rides the first delta of any kind, and is never repeated.
     sent_role: bool,
@@ -387,6 +399,8 @@ impl StreamState {
             finish_reason: "stop".to_string(),
             prompt_tokens: 0,
             completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             usage_seen: false,
             sent_role: false,
             done: false,
@@ -408,6 +422,11 @@ enum Step {
         arguments: String,
     },
     /// A fragment appended to an open tool call.
+    ///
+    /// `arguments` alone is all a fragment legitimately carries: the call it belongs to was opened
+    /// and named by a preceding event, and the client keys the block by the index that event
+    /// established. Nothing here can create a block — [`open_tool_call`] is the only constructor —
+    /// which is what keeps an id-less, nameless tool call from ever being emitted.
     ToolArgs { index: usize, arguments: String },
     /// The upstream said it was done.
     Finish,
@@ -415,6 +434,17 @@ enum Step {
     Error(Value),
     /// Nothing the client can use: a keep-alive, an unknown event, or an empty delta.
     Ignored,
+}
+
+/// A non-empty string field of an upstream event, or `None`.
+///
+/// `Value::as_str` answers `Some("")` for a present-but-empty string, so a bare
+/// `and_then(Value::as_str).unwrap_or_else(…)` fallback never runs for `"toolCallId": ""`. That is
+/// how an empty upstream tool-call id used to reach the client verbatim as `id: ""`, which the
+/// client then recorded as a tool call it could neither execute nor match — and which made the
+/// session log fail its own format validation on the next read.
+fn nonempty_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
 }
 
 /// Fold one upstream event into `state` and report what the client should see.
@@ -439,9 +469,7 @@ fn classify(state: &mut StreamState, v: &Value) -> Step {
 
         // Atomic: one event carries id, name and the complete argument string.
         "tool-call" => {
-            let id = v
-                .get("toolCallId")
-                .and_then(Value::as_str)
+            let id = nonempty_str(v, "toolCallId")
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("call_{}", mr_core::ids::new_id()));
             // `input` is an object upstream; stringify it because a Chat Completions client reads
@@ -455,6 +483,22 @@ fn classify(state: &mut StreamState, v: &Value) -> Step {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            // A tool call the client cannot name is not a tool call: naming it `""` hands the
+            // client a function it cannot dispatch. Drop the event and let the turn end as text,
+            // which is the honest outcome for a malformed upstream frame.
+            if name.is_empty() {
+                return Step::Ignored;
+            }
+            // A repeat of a call already opened under this id is the *same* tool call, not a second
+            // one. The incremental arm has always ignored the repeat; this arm did not, and
+            // `open_tool_call` repoints `tool_index` at the new entry. That is how a single upstream
+            // call reached the client as two blocks: the first holding the real argument string, the
+            // second carrying the *same* id with `{}`, because the repeat event has no `input`. A
+            // client can dispatch neither a duplicate id nor an empty argument object, and the
+            // first entry is the one that holds the answer.
+            if state.tool_index.contains_key(&id) {
+                return Step::Ignored;
+            }
             let index = open_tool_call(state, id.clone(), name.clone(), arguments.clone());
             state.finish_reason = "tool_calls".to_string();
             Step::ToolOpen {
@@ -467,10 +511,10 @@ fn classify(state: &mut StreamState, v: &Value) -> Step {
 
         // Incremental: open with empty arguments, then append fragments.
         "tool-use" | "tool-input-start" => {
-            let id = v
-                .get("toolCallId")
-                .or_else(|| v.get("id"))
-                .and_then(Value::as_str)
+            // Both spellings must be non-empty: a present-but-empty id would otherwise be recorded
+            // under `""` and could never be matched by a later fragment.
+            let id = nonempty_str(v, "toolCallId")
+                .or_else(|| nonempty_str(v, "id"))
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("call_{}", mr_core::ids::new_id()));
             if state.tool_index.contains_key(&id) {
@@ -481,6 +525,10 @@ fn classify(state: &mut StreamState, v: &Value) -> Step {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            // A nameless incremental open cannot be dispatched either; see the atomic arm above.
+            if name.is_empty() {
+                return Step::Ignored;
+            }
             let index = open_tool_call(state, id.clone(), name.clone(), String::new());
             state.finish_reason = "tool_calls".to_string();
             Step::ToolOpen {
@@ -492,10 +540,9 @@ fn classify(state: &mut StreamState, v: &Value) -> Step {
         }
 
         "tool-delta" | "tool-input-delta" => {
-            let id = v
-                .get("toolCallId")
-                .or_else(|| v.get("id"))
-                .and_then(Value::as_str)
+            // An empty id is "no id", which falls through to the most-recently-opened call.
+            let id = nonempty_str(v, "toolCallId")
+                .or_else(|| nonempty_str(v, "id"))
                 .unwrap_or("");
             let index = state
                 .tool_index
@@ -515,9 +562,10 @@ fn classify(state: &mut StreamState, v: &Value) -> Step {
             if arguments.is_empty() {
                 return Step::Ignored;
             }
-            if let Some(call) = state.tool_calls.get_mut(index) {
-                call.arguments.push_str(arguments);
-            }
+            let Some(call) = state.tool_calls.get_mut(index) else {
+                return Step::Ignored;
+            };
+            call.arguments.push_str(arguments);
             state.finish_reason = "tool_calls".to_string();
             Step::ToolArgs {
                 index,
@@ -539,6 +587,17 @@ fn classify(state: &mut StreamState, v: &Value) -> Step {
                     .unwrap_or(0);
                 state.completion_tokens = usage
                     .get("outputTokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                // Cache accounting lives one level down, under `inputTokenDetails`. The vendor CLI
+                // reads exactly these two paths; anything else silently reports a cache miss.
+                let details = usage.get("inputTokenDetails");
+                state.cache_read_tokens = details
+                    .and_then(|d| d.get("cacheReadTokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                state.cache_write_tokens = details
+                    .and_then(|d| d.get("cacheWriteTokens"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
                 state.usage_seen = true;
@@ -655,7 +714,7 @@ fn error_to_client(ctx: &TranslateCtx<'_>, error: &Value) -> Value {
 /// the failure path, where the buffered body is an error envelope rather than a stream at all.
 pub fn to_pivot_response(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Bytes> {
     let text = std::str::from_utf8(body).map_err(|e| TranslateError::MalformedResponse {
-        dialect: "commandcode",
+        dialect: "command-code-go",
         detail: e.to_string(),
     })?;
 
@@ -761,6 +820,13 @@ fn completion_object(state: &StreamState) -> Value {
             "prompt_tokens": state.prompt_tokens,
             "completion_tokens": state.completion_tokens,
             "total_tokens": state.prompt_tokens + state.completion_tokens,
+            // OpenAI's own spellings, so an OpenAI-shaped client (and this gateway's own usage tap)
+            // sees the cache split without having to know Command Code's nesting.
+            "prompt_tokens_details": {
+                "cached_tokens": state.cache_read_tokens,
+            },
+            "cache_read_input_tokens": state.cache_read_tokens,
+            "cache_write_input_tokens": state.cache_write_tokens,
         },
     })
 }
@@ -770,35 +836,101 @@ fn to_bytes(value: Value) -> Result<Bytes> {
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|e| TranslateError::MalformedResponse {
-            dialect: "commandcode",
+            dialect: "command-code-go",
             detail: e.to_string(),
         })
 }
 
-thread_local! {
-    /// Stream state for whichever Command Code stream is in flight on this thread.
+/// Per-stream translation state for the Command Code dialect.
+///
+/// ## Why this is an owned value and not a thread-local
+///
+/// A Command Code answer arrives as a private event stream, so the translator has to remember what
+/// it has already seen: the accumulated text, every tool call opened so far, whether the opening
+/// role has been sent, the finish reason, and the usage the `finish` event reports. That state
+/// belongs to **one stream**.
+///
+/// It used to live in a `thread_local!`, cleared between streams by [`reset_stream_state`]. A
+/// thread-local is keyed by the *worker thread*, and a thread is not a stream: the relay polls a
+/// response body on whichever runtime worker is free, and two answers are routinely in flight on
+/// the same worker at once. Both wrote into the same cell, and the damage was specific and
+/// reproducible — one stream's `tool-delta` argument fragments were appended to the *other*
+/// stream's tool call, because the fragment arm falls back to "the most recently opened call" when
+/// its id is not found in the state it is holding.
+///
+/// The client then saw a second tool call with no id and no name. `deepseek-harness` can neither
+/// execute nor match such a call, so the turn died and the session log failed validation with
+/// `format v4 tool/result at seq N requires toolCallId matching its tool source`. Clearing the cell
+/// on a stream's first frame made that worse rather than better: it wiped the *other* live stream's
+/// state, which is the same defect seen from the other side.
+///
+/// Owning the state removes the whole class of bug: there is no shared cell, so there is nothing to
+/// reset and nothing to splice.
+///
+/// ## Why it also holds the Anthropic half
+///
+/// For an Anthropic client, every pivot chunk this dialect produces is framed by the inverse
+/// translator, which keeps its own accumulation (the open content block, tool-block indices,
+/// `message_start` bookkeeping). That state is *also* per stream, so it rides here; otherwise the
+/// Anthropic half of a stream would splice while the Chat Completions half did not.
+#[derive(Debug)]
+pub struct Translator {
+    /// The Command Code event accumulation, absent until the first frame arrives.
+    state: Option<StreamState>,
+    /// The pivot→Anthropic framing state, used only when the client speaks Anthropic.
+    anthropic: AnthropicStreamState,
+}
+
+impl Default for Translator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Translator {
+    /// A translator with nothing accumulated.
     ///
-    /// Translation is called frame by frame with no per-stream handle, so the accumulation has to
-    /// live somewhere. A thread-local keeps concurrent conversations from sharing it; the state
-    /// also resets itself once a terminal frame has gone out, so a pooled worker that never calls
-    /// [`reset_stream_state`] still cannot splice two answers together.
+    /// Create exactly one per upstream stream and drop it when the stream ends. Sharing one between
+    /// two streams reintroduces the splice documented on this type.
+    pub fn new() -> Self {
+        Self {
+            state: None,
+            anthropic: AnthropicStreamState::default(),
+        }
+    }
+
+    /// Whether a terminal frame has been translated, so the next event starts a fresh answer.
+    pub fn is_finished(&self) -> bool {
+        self.state.as_ref().map(|s| s.done).unwrap_or(false)
+    }
+}
+
+thread_local! {
+    /// **Retained only for the legacy entry point.** [`translate`] does not read this; its state is
+    /// the [`Translator`] the caller owns. Kept so [`reset_stream_state`] still means something to a
+    /// caller that has not moved to the per-stream API.
+    #[allow(dead_code)]
     static COMMAND_CODE_STREAM_STATE: RefCell<Option<StreamState>> = const { RefCell::new(None) };
 }
 
-/// Forget the in-flight stream state.
+/// Forget the legacy per-thread Command Code state.
 ///
-/// Call between streams on a reused worker thread. The state self-heals after a terminal frame, but
-/// a stream that dies without one leaves partial state behind.
+/// **This is not how correctness is achieved any more.** A thread is not a stream, so this cannot
+/// separate two concurrent answers; [`Translator`] is what does that. Retained for callers still on
+/// the old entry point.
 pub fn reset_stream_state() {
     COMMAND_CODE_STREAM_STATE.with(|cell| *cell.borrow_mut() = None);
 }
 
-/// Translate one Command Code event into client-dialect frames.
+/// Translate one Command Code event into client-dialect frames, against caller-owned state.
 ///
-/// A `finish` event is the only end-of-answer signal this upstream sends — there is no `[DONE]` on
-/// the wire — so the terminal `delta:{}` + `finish_reason` frame (and the client's own terminator)
-/// is emitted here rather than left to the relay.
-pub fn sse_to_pivot(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<String>> {
+/// This is the entry point the relay uses. `translator` must be the same value for every frame of
+/// one stream and a fresh value for every other stream; see [`Translator`] for why.
+pub fn translate(
+    translator: &mut Translator,
+    ctx: &TranslateCtx<'_>,
+    data: &str,
+) -> Result<Vec<String>> {
     let trimmed = data.trim();
     // The relay strips the `data:` prefix before calling this, but a raw NDJSON line would not
     // have one, and tolerating both costs nothing.
@@ -812,101 +944,129 @@ pub fn sse_to_pivot(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<String>> {
         return Ok(Vec::new());
     };
 
+    // Disjoint borrows of the two fields, so the Anthropic framing below can run while `state` is
+    // still borrowed for the chunk building above.
+    let Translator { state, anthropic } = translator;
+    let state = state.get_or_insert_with(|| StreamState::new(ctx));
+    let step = classify(state, &v);
+    let mut out: Vec<String> = Vec::new();
+    let mut chunks: Vec<Value> = Vec::new();
+    let mut terminate = false;
+
+    match &step {
+        Step::Text(text) => {
+            let delta = with_role(state, json!({"content": text}));
+            chunks.push(chunk(state, delta));
+        }
+
+        Step::ToolOpen {
+            index,
+            id,
+            name,
+            arguments,
+        } => {
+            let delta = with_role(
+                state,
+                json!({"tool_calls": [{
+                    "index": index,
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }]}),
+            );
+            chunks.push(chunk(state, delta));
+        }
+
+        Step::ToolArgs { index, arguments } => {
+            let delta = with_role(
+                state,
+                json!({"tool_calls": [{
+                    "index": index,
+                    "function": {"arguments": arguments},
+                }]}),
+            );
+            chunks.push(chunk(state, delta));
+        }
+
+        Step::Finish => {
+            // An answer that produced no delta at all still gets a role chunk, so an Anthropic
+            // client has a `message_start` to hang its `message_stop` on.
+            if !state.sent_role {
+                let delta = with_role(state, json!({}));
+                chunks.push(chunk(state, delta));
+            }
+            state.done = true;
+            chunks.push(final_chunk(state));
+            terminate = true;
+        }
+
+        Step::Error(err) => {
+            // The reference bridge swallows this event and reports a normal `stop`. That turns
+            // a real failure into an empty answer, so the error is forwarded instead — in the
+            // client's own error shape, and followed by that dialect's terminator.
+            state.done = true;
+            let body = error_to_client(ctx, err);
+            match ctx.client_dialect {
+                Dialect::Anthropic => out.push(sse::named_frame("error", &body.to_string())),
+                _ => {
+                    out.push(sse::data_frame(&body.to_string()));
+                    out.push(sse::data_frame(SSE_DONE));
+                }
+            }
+        }
+
+        Step::Ignored => {}
+    }
+
+    // Every chunk is a Chat Completions chunk at this point; who is listening decides the
+    // framing. An Anthropic client's stream is rebuilt by the inverse translator rather than
+    // handed OpenAI frames it would reject.
+    for c in &chunks {
+        let body = c.to_string();
+        match ctx.client_dialect {
+            Dialect::Anthropic => {
+                out.extend(crate::openai::translate_chunk_for(anthropic, ctx, &body)?)
+            }
+            _ => out.push(sse::data_frame(&body)),
+        }
+    }
+
+    if terminate {
+        match ctx.client_dialect {
+            Dialect::Anthropic => out.extend(crate::openai::translate_chunk_for(
+                anthropic, ctx, SSE_DONE,
+            )?),
+            _ => out.push(sse::data_frame(SSE_DONE)),
+        }
+    }
+
+    Ok(out)
+}
+
+/// Translate one Command Code event into client-dialect frames.
+///
+/// A `finish` event is the only end-of-answer signal this upstream sends — there is no `[DONE]` on
+/// the wire — so the terminal `delta:{}` + `finish_reason` frame (and the client's own terminator)
+/// is emitted here rather than left to the relay.
+///
+/// **Prefer [`translate`].** This entry point accumulates into a per-thread cell, and a thread is
+/// not a stream, so two concurrent Command Code streams on one worker contaminate each other — see
+/// [`Translator`]. It is retained for callers that drive a single stream on a thread of their own,
+/// and as the Command Code arm of [`crate::translate_sse_data`].
+pub fn sse_to_pivot(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<String>> {
     COMMAND_CODE_STREAM_STATE.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.as_ref().map(|s| s.done).unwrap_or(false) {
             *slot = None;
         }
-        let state = slot.get_or_insert_with(|| StreamState::new(ctx));
-        let step = classify(state, &v);
-        let mut out: Vec<String> = Vec::new();
-        let mut chunks: Vec<Value> = Vec::new();
-        let mut terminate = false;
-
-        match step {
-            Step::Text(text) => {
-                let delta = with_role(state, json!({"content": text}));
-                chunks.push(chunk(state, delta));
-            }
-
-            Step::ToolOpen {
-                index,
-                id,
-                name,
-                arguments,
-            } => {
-                let delta = with_role(
-                    state,
-                    json!({"tool_calls": [{
-                        "index": index,
-                        "id": id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": arguments},
-                    }]}),
-                );
-                chunks.push(chunk(state, delta));
-            }
-
-            Step::ToolArgs { index, arguments } => {
-                let delta = with_role(
-                    state,
-                    json!({"tool_calls": [{
-                        "index": index,
-                        "function": {"arguments": arguments},
-                    }]}),
-                );
-                chunks.push(chunk(state, delta));
-            }
-
-            Step::Finish => {
-                // An answer that produced no delta at all still gets a role chunk, so an Anthropic
-                // client has a `message_start` to hang its `message_stop` on.
-                if !state.sent_role {
-                    let delta = with_role(state, json!({}));
-                    chunks.push(chunk(state, delta));
-                }
-                state.done = true;
-                chunks.push(final_chunk(state));
-                terminate = true;
-            }
-
-            Step::Error(err) => {
-                // The reference bridge swallows this event and reports a normal `stop`. That turns
-                // a real failure into an empty answer, so the error is forwarded instead — in the
-                // client's own error shape, and followed by that dialect's terminator.
-                state.done = true;
-                let body = error_to_client(ctx, &err);
-                match ctx.client_dialect {
-                    Dialect::Anthropic => out.push(sse::named_frame("error", &body.to_string())),
-                    _ => {
-                        out.push(sse::data_frame(&body.to_string()));
-                        out.push(sse::data_frame(SSE_DONE));
-                    }
-                }
-            }
-
-            Step::Ignored => {}
-        }
-
-        // Every chunk is a Chat Completions chunk at this point; who is listening decides the
-        // framing. An Anthropic client's stream is rebuilt by the inverse translator rather than
-        // handed OpenAI frames it would reject.
-        for c in &chunks {
-            let body = c.to_string();
-            match ctx.client_dialect {
-                Dialect::Anthropic => out.extend(sse_to_anthropic(ctx, &body)?),
-                _ => out.push(sse::data_frame(&body)),
-            }
-        }
-
-        if terminate {
-            match ctx.client_dialect {
-                Dialect::Anthropic => out.extend(sse_to_anthropic(ctx, SSE_DONE)?),
-                _ => out.push(sse::data_frame(SSE_DONE)),
-            }
-        }
-
-        Ok(out)
+        let mut translator = Translator {
+            state: slot.take(),
+            anthropic: AnthropicStreamState::default(),
+        };
+        let out = translate(&mut translator, ctx, data);
+        // A finished stream leaves nothing behind; an unfinished one is parked for its next frame.
+        *slot = translator.state.filter(|s| !s.done);
+        out
     })
 }
 
@@ -954,7 +1114,7 @@ mod tests {
     fn ctx() -> TranslateCtx<'static> {
         TranslateCtx::new(
             RouteKind::ChatCompletions,
-            Dialect::CommandCode,
+            Dialect::CommandCodeGo,
             "cmd-model",
         )
     }
@@ -967,8 +1127,38 @@ mod tests {
 
     /// Reset every thread-local a translation touches, so one test cannot see another's stream.
     fn reset_all() {
-        reset_stream_state();
-        crate::openai::reset_stream_state();
+        crate::reset_stream_state();
+    }
+
+    /// Every tool-call delta in a set of frames, as `(index, id, name)`.
+    ///
+    /// Ids and names are `Option` so a test can tell "absent" from "present but empty" — the
+    /// distinction the whole regression turns on.
+    fn tool_deltas(frames: &[String]) -> Vec<(u64, Option<String>, Option<String>)> {
+        let mut out = Vec::new();
+        for frame in frames {
+            let parsed = sse::parse_frame(frame);
+            if parsed.data == "[DONE]" {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(&parsed.data) else {
+                continue;
+            };
+            let Some(calls) = v["choices"][0]["delta"].get("tool_calls") else {
+                continue;
+            };
+            for call in calls.as_array().unwrap() {
+                out.push((
+                    call["index"].as_u64().unwrap_or(0),
+                    call.get("id").and_then(Value::as_str).map(str::to_string),
+                    call["function"]
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                ));
+            }
+        }
+        out
     }
 
     fn build(v: Value) -> Value {
@@ -1033,7 +1223,7 @@ mod tests {
         let out = build_envelope(
             &TranslateCtx::new(
                 RouteKind::ChatCompletions,
-                Dialect::CommandCode,
+                Dialect::CommandCodeGo,
                 "deepseek/deepseek-v4-flash",
             ),
             json!({"model": "deepseek/deepseek-v4-flash", "messages": []})
@@ -1252,6 +1442,212 @@ mod tests {
         assert_eq!(call["function"]["arguments"], "{\"a\":1}");
     }
 
+    /// A present-but-empty `toolCallId` must mint a real id, never `id: ""`.
+    ///
+    /// `Value::as_str` answers `Some("")`, so the `unwrap_or_else` id fallback never used to run.
+    /// `""` reached the client, which advertised an unexecutable tool call under it and wrote a
+    /// session log that failed v4 validation as `tool call id requires a nonempty string`.
+    #[test]
+    fn an_empty_tool_call_id_is_replaced_rather_than_forwarded() {
+        reset_all();
+        let frames = sse_to_pivot(
+            &ctx(),
+            r#"{"type":"tool-call","toolCallId":"","toolName":"f","input":{"a":1}}"#,
+        )
+        .unwrap();
+        let call = &data_json(&frames[0])["choices"][0]["delta"]["tool_calls"][0];
+        let id = call["id"].as_str().unwrap();
+        assert!(!id.is_empty(), "an empty upstream id must be replaced");
+        assert!(
+            id.starts_with("call_"),
+            "the minted id keeps the call_ shape"
+        );
+        assert_eq!(call["function"]["name"], "f");
+    }
+
+    #[test]
+    fn an_empty_incremental_tool_call_id_is_replaced_rather_than_forwarded() {
+        reset_all();
+        let frames = sse_to_pivot(
+            &ctx(),
+            r#"{"type":"tool-input-start","toolCallId":"","toolName":"search"}"#,
+        )
+        .unwrap();
+        let call = &data_json(&frames[0])["choices"][0]["delta"]["tool_calls"][0];
+        let id = call["id"].as_str().unwrap();
+        assert!(!id.is_empty(), "an empty upstream id must be replaced");
+        assert!(id.starts_with("call_"));
+    }
+
+    /// A tool call the client cannot name is dropped, never emitted as `name: ""`.
+    #[test]
+    fn a_nameless_tool_call_is_ignored_in_both_paths() {
+        reset_all();
+        let frames = sse_to_pivot(
+            &ctx(),
+            r#"{"type":"tool-call","toolCallId":"c1","toolName":"","input":{}}"#,
+        )
+        .unwrap();
+        assert!(
+            frames.is_empty(),
+            "a nameless atomic tool call must not reach the client"
+        );
+
+        reset_all();
+        let frames = sse_to_pivot(
+            &ctx(),
+            r#"{"type":"tool-input-start","toolCallId":"c2","toolName":""}"#,
+        )
+        .unwrap();
+        assert!(
+            frames.is_empty(),
+            "a nameless incremental tool call must not reach the client"
+        );
+    }
+
+    /// A repeated atomic `tool-call` under the same id is the same call, not a second one.
+    ///
+    /// This is the defect that reached a real client as *two* content blocks for one upstream call:
+    /// the first holding the whole argument string and the second the **same id** with `{}`, because
+    /// the repeat event carries no `input`. `open_tool_call` also repointed `tool_index` at the new,
+    /// empty entry, so every later fragment for that id appended to the wrong call. The incremental
+    /// arm has always ignored a duplicate id; the atomic arm has to as well.
+    #[test]
+    fn a_repeated_atomic_tool_call_does_not_open_a_second_call() {
+        reset_all();
+        let event = |raw: &str| serde_json::from_str::<Value>(raw).unwrap();
+
+        let first = sse_to_pivot(
+            &ctx(),
+            r#"{"type":"tool-call","toolCallId":"call_same","toolName":"write","input":{"content":"hello"}}"#,
+        )
+        .unwrap();
+        let second = sse_to_pivot(
+            &ctx(),
+            r#"{"type":"tool-call","toolCallId":"call_same","toolName":"write"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            tool_deltas(&first).len(),
+            1,
+            "the first event opens the call"
+        );
+        assert!(
+            second.is_empty(),
+            "a repeat of an already-open call must emit nothing, got {second:?}"
+        );
+
+        // And the accumulated call is still the first one, still holding the real arguments.
+        let mut state = StreamState::new(&ctx());
+        classify(
+            &mut state,
+            &event(
+                r#"{"type":"tool-call","toolCallId":"call_same","toolName":"write","input":{"content":"hello"}}"#,
+            ),
+        );
+        classify(
+            &mut state,
+            &event(r#"{"type":"tool-call","toolCallId":"call_same","toolName":"write"}"#),
+        );
+        let folded = completion_object(&state);
+        let calls = folded["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "one upstream call must fold to one tool call"
+        );
+        assert_eq!(calls[0]["id"], "call_same");
+        assert_eq!(
+            calls[0]["function"]["arguments"], "{\"content\":\"hello\"}",
+            "the surviving call keeps the arguments the first event carried"
+        );
+    }
+
+    /// A later fragment must not reach into a call an abandoned stream left behind.
+    ///
+    /// Adapters accumulate into a thread-local, so a stream that ends without a terminal frame —
+    /// the upstream died, the client disconnected — leaves its calls behind for the next stream on
+    /// that worker. `reset_stream_state` is what the relay calls at each stream boundary; this is
+    /// the leak it closes, and the reason a stale index can no longer be chosen.
+    #[test]
+    fn an_abandoned_stream_cannot_donate_a_tool_call_to_the_next_one() {
+        reset_all();
+        // A stream that opens a call and then simply stops, with no `finish`.
+        let opened = sse_to_pivot(
+            &ctx(),
+            r#"{"type":"tool-call","toolCallId":"abandoned","toolName":"write","input":{"a":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(tool_deltas(&opened).len(), 1);
+
+        // The relay's stream boundary.
+        crate::reset_stream_state();
+
+        // A fresh stream whose first event is an id-less fragment. Without the reset this would
+        // append to `abandoned` and be reported under a call this client never saw opened.
+        let frames = sse_to_pivot(
+            &ctx(),
+            r#"{"type":"tool-input-delta","delta":"{\"stolen\":true}"}"#,
+        )
+        .unwrap();
+        assert!(
+            frames.is_empty(),
+            "an id-less fragment with no open call must be dropped, got {frames:?}"
+        );
+
+        // And the new stream's own completion must not mention the dead call.
+        let mut state = StreamState::new(&ctx());
+        classify(
+            &mut state,
+            &serde_json::from_str(r#"{"type":"finish","finishReason":"stop"}"#).unwrap(),
+        );
+        let folded = completion_object(&state);
+        assert!(
+            folded["choices"][0]["message"].get("tool_calls").is_none(),
+            "the abandoned call must not appear in the next stream: {folded}"
+        );
+    }
+
+    /// The regression in full: a stream whose malformed frames used to emit `id: ""` must now
+    /// emit no empty id at all, while the well-formed call in the same stream is untouched.
+    #[test]
+    fn no_emitted_delta_ever_carries_an_empty_tool_call_id_or_name() {
+        reset_all();
+        let events = [
+            r#"{"type":"tool-call","toolCallId":"good_1","toolName":"bash","input":{"command":"ls"}}"#,
+            r#"{"type":"tool-call","toolCallId":"","toolName":"","input":{}}"#,
+            r#"{"type":"tool-input-start","toolCallId":"","toolName":""}"#,
+            r#"{"type":"tool-input-delta","toolCallId":"","delta":"{\"a\":1}"}"#,
+            r#"{"type":"finish","finishReason":"tool_calls"}"#,
+        ];
+        let mut seen = 0;
+        for event in events {
+            for frame in sse_to_pivot(&ctx(), event).unwrap() {
+                let frame = sse::parse_frame(&frame);
+                if frame.data == "[DONE]" {
+                    continue;
+                }
+                let v: Value = serde_json::from_str(&frame.data).unwrap();
+                let Some(calls) = v["choices"][0]["delta"].get("tool_calls") else {
+                    continue;
+                };
+                for call in calls.as_array().unwrap() {
+                    seen += 1;
+                    if let Some(id) = call.get("id") {
+                        assert!(!id.as_str().unwrap().is_empty(), "id must not be empty");
+                    }
+                    if let Some(name) = call["function"].get("name") {
+                        assert!(!name.as_str().unwrap().is_empty(), "name must not be empty");
+                    }
+                }
+            }
+        }
+        assert_eq!(seen, 2, "the one good open plus its argument fragment");
+    }
+
     #[test]
     fn finish_emits_the_terminal_frame_and_then_the_done_sentinel() {
         reset_all();
@@ -1399,7 +1795,14 @@ mod tests {
         assert_eq!(out["choices"][0]["finish_reason"], "stop");
         assert_eq!(
             out["usage"],
-            json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})
+            json!({
+                "prompt_tokens": 2,
+                "completion_tokens": 1,
+                "total_tokens": 3,
+                "prompt_tokens_details": {"cached_tokens": 0},
+                "cache_read_input_tokens": 0,
+                "cache_write_input_tokens": 0,
+            })
         );
     }
 
@@ -1461,6 +1864,218 @@ mod tests {
         let v = data_json(&second[0]);
         assert_eq!(v["choices"][0]["delta"]["role"], "assistant");
         assert_eq!(v["choices"][0]["delta"]["content"], "next");
+    }
+
+    /// The regression, at the entry point the relay uses.
+    ///
+    /// Two streams are in flight **concurrently on one worker thread** — which is the normal case,
+    /// because a response body is polled on whichever runtime worker is free. Each opens its own
+    /// tool call and then sends its own argument fragment. Before the per-stream `Translator`, both
+    /// accumulated into one `thread_local`, so a fragment whose id was not in the shared map was
+    /// appended to "the most recently opened call" — the *other* stream's. The client saw a second
+    /// tool call with an empty id and an empty name, which cannot be executed or matched, and the
+    /// session log then failed validation with
+    /// `format v4 tool/result at seq N requires toolCallId matching its tool source`.
+    ///
+    /// The assertion is on the frames each stream *sees*, because that is what the client gets: no
+    /// stream may ever emit a tool call that is missing its id or its name, and no fragment may be
+    /// attributed to a call the stream did not open.
+    #[test]
+    fn two_concurrent_streams_do_not_contaminate_each_others_tool_calls() {
+        // Deliberately NOT reset_all(): the point is that two live streams coexist.
+        let mut a = Translator::new();
+        let mut b = Translator::new();
+
+        // Interleave the two streams frame by frame, as a shared worker does.
+        let a_open = translate(
+            &mut a,
+            &ctx(),
+            r#"{"type":"tool-use","toolCallId":"call_A","toolName":"alpha"}"#,
+        )
+        .unwrap();
+        let b_open = translate(
+            &mut b,
+            &ctx(),
+            r#"{"type":"tool-use","toolCallId":"call_B","toolName":"beta"}"#,
+        )
+        .unwrap();
+        let a_args = translate(
+            &mut a,
+            &ctx(),
+            r#"{"type":"tool-delta","toolCallId":"call_A","delta":"A-ARGS"}"#,
+        )
+        .unwrap();
+        let b_args = translate(
+            &mut b,
+            &ctx(),
+            r#"{"type":"tool-delta","toolCallId":"call_B","delta":"B-ARGS"}"#,
+        )
+        .unwrap();
+
+        // Every open carries the id and name of the call its own stream opened.
+        for (label, frames, id, name) in [
+            ("A open", &a_open, "call_A", "alpha"),
+            ("B open", &b_open, "call_B", "beta"),
+        ] {
+            let calls = tool_deltas(frames);
+            assert_eq!(calls.len(), 1, "{label} opens exactly one call");
+            assert_eq!(
+                calls[0].1.as_deref(),
+                Some(id),
+                "{label} carries its own id"
+            );
+            assert_eq!(
+                calls[0].2.as_deref(),
+                Some(name),
+                "{label} carries its own name"
+            );
+        }
+
+        // And each stream's fragments fold into its own accumulated call, unmixed.
+        assert_eq!(
+            tool_deltas(&a_args)[0].0,
+            0,
+            "A's fragment lands on A's call index"
+        );
+        assert_eq!(
+            tool_deltas(&b_args)[0].0,
+            0,
+            "B's fragment lands on B's call"
+        );
+
+        // The decisive check: each stream's own accumulation holds only its own fragment.
+        let a_done = translate(
+            &mut a,
+            &ctx(),
+            r#"{"type":"finish","finishReason":"tool_calls"}"#,
+        )
+        .unwrap();
+        let b_done = translate(
+            &mut b,
+            &ctx(),
+            r#"{"type":"finish","finishReason":"tool_calls"}"#,
+        )
+        .unwrap();
+        assert!(!a_done.is_empty() && !b_done.is_empty());
+
+        // No frame of either stream may carry an empty id or an empty name anywhere.
+        for (label, frames) in [
+            ("A", a_open.iter().chain(&a_args).chain(&a_done)),
+            ("B", b_open.iter().chain(&b_args).chain(&b_done)),
+        ] {
+            for frame in frames {
+                let parsed = sse::parse_frame(frame);
+                if parsed.data == SSE_DONE {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<Value>(&parsed.data) else {
+                    continue;
+                };
+                let Some(calls) = v["choices"][0]["delta"].get("tool_calls") else {
+                    continue;
+                };
+                for call in calls.as_array().unwrap() {
+                    if let Some(id) = call.get("id") {
+                        assert!(
+                            !id.as_str().unwrap().is_empty(),
+                            "{label}: empty id emitted"
+                        );
+                    }
+                    if let Some(name) = call["function"].get("name") {
+                        assert!(
+                            !name.as_str().unwrap().is_empty(),
+                            "{label}: empty name emitted"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// PROOF that the legacy per-thread path is what produced the phantom call.
+    ///
+    /// This drives two logical streams through [`sse_to_pivot`] — the pre-fix entry point — with no
+    /// reset between them, exactly as the relay did when two answers shared a worker. Stream A's
+    /// fragment is attributed to stream B's call, which is the corruption reduced to one thread.
+    #[test]
+    fn proof_the_legacy_thread_local_path_misattributes_a_fragment() {
+        reset_all();
+        sse_to_pivot(
+            &ctx(),
+            r#"{"type":"tool-use","toolCallId":"A","toolName":"alpha"}"#,
+        )
+        .unwrap();
+        // The relay's per-stream reset fires for B on this worker...
+        reset_all();
+        sse_to_pivot(
+            &ctx(),
+            r#"{"type":"tool-use","toolCallId":"B","toolName":"beta"}"#,
+        )
+        .unwrap();
+        sse_to_pivot(
+            &ctx(),
+            r#"{"type":"tool-delta","toolCallId":"B","delta":"B-ARGS"}"#,
+        )
+        .unwrap();
+        // ...then A's own fragment arrives, whose id this worker no longer holds.
+        sse_to_pivot(
+            &ctx(),
+            r#"{"type":"tool-delta","toolCallId":"A","delta":"A-ARGS"}"#,
+        )
+        .unwrap();
+
+        COMMAND_CODE_STREAM_STATE.with(|cell| {
+            let slot = cell.borrow();
+            let state = slot.as_ref().expect("B's parked state");
+            let b = state
+                .tool_calls
+                .iter()
+                .find(|c| c.id == "B")
+                .expect("B's call");
+            // B opened with "B-ARGS"; A's "A-ARGS" was appended to it as well.
+            assert_eq!(
+                b.arguments, "B-ARGSA-ARGS",
+                "documents the legacy leak: A's fragment was folded into B's call"
+            );
+        });
+    }
+
+    /// A stream driven through the owned translator accumulates exactly one call per open, with the
+    /// arguments its own fragments supplied — the fold the client actually dispatches.
+    #[test]
+    fn an_owned_translator_folds_its_own_fragments_into_its_own_call() {
+        let mut t = Translator::new();
+        translate(
+            &mut t,
+            &ctx(),
+            r#"{"type":"tool-use","toolCallId":"t1","toolName":"search"}"#,
+        )
+        .unwrap();
+        translate(
+            &mut t,
+            &ctx(),
+            r#"{"type":"tool-delta","toolCallId":"t1","delta":"{\"q\":"}"#,
+        )
+        .unwrap();
+        translate(
+            &mut t,
+            &ctx(),
+            r#"{"type":"tool-delta","toolCallId":"t1","delta":"\"x\"}"}"#,
+        )
+        .unwrap();
+        translate(
+            &mut t,
+            &ctx(),
+            r#"{"type":"finish","finishReason":"tool_calls"}"#,
+        )
+        .unwrap();
+
+        assert!(t.is_finished(), "the finish was seen by this translator");
+        let state = t.state.as_ref().expect("state");
+        assert_eq!(state.tool_calls.len(), 1);
+        assert_eq!(state.tool_calls[0].id, "t1");
+        assert_eq!(state.tool_calls[0].name, "search");
+        assert_eq!(state.tool_calls[0].arguments, "{\"q\":\"x\"}");
     }
 
     #[test]

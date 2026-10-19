@@ -14,8 +14,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::dialect::{
-    AccountState, AuthKind, Capability, ComboStrategy, Dialect, KeyStrategy, MidstreamPolicy,
-    ProviderHealth, RouteKind, WindowKind, WinnerFailMode, WinnerMetric,
+    AccountState, AuthKind, Capability, ComboStrategy, Dialect, InputModality, KeyStrategy,
+    MidstreamPolicy, ProviderHealth, ReasoningLevel, RouteKind, WindowKind, WinnerFailMode,
+    WinnerMetric,
 };
 use crate::ids::{fnv1a64, AccountId, ComboId, Millis, OAuthCredentialId, ProviderId};
 
@@ -44,18 +45,81 @@ pub struct ModelEntry {
     /// Routes this specific model can serve, when narrower than the provider's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<Capability>,
+    /// Input types this model accepts, when the operator has declared them.
+    ///
+    /// Empty is the normal case and means *derive*: the compiler seeds it from the bundled
+    /// capability table (`catalog/model_meta.json`) and falls back to text-only. An explicit list
+    /// is how an operator corrects the seed, and hand-entered metadata always wins over discovered
+    /// metadata — the same rule [`ModelEntry::source`] documents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_modalities: Vec<InputModality>,
+    /// Reasoning tiers this model offers, when the operator has declared them.
+    ///
+    /// Empty means *derive*, in the same way and from the same table as [`Self::input_modalities`]:
+    /// the bundled table first, then the dialect's default set when the provider advertises
+    /// reasoning. Ascending order is not required — it is normalised when compiled.
+    ///
+    /// The canonical vocabulary lives in [`crate::dialect::ReasoningLevel`], including the
+    /// deliberate `minimal` tier, so migrated OmniRoute tier data maps faithfully.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_levels: Vec<ReasoningLevel>,
+    /// The tier used when a request names the model without a `-<level>` suffix.
+    ///
+    /// `None` falls through to `routing.default_reasoning_level` in the configuration, which
+    /// itself defaults to `high`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_level: Option<ReasoningLevel>,
+    /// Per-model override of the dialect's reasoning fragment, keyed by level.
+    ///
+    /// This is a **wholesale replacement**, not a merge: a dialect's default fragment has to be
+    /// internally consistent (`{"thinking":{"type":"enabled","budget_tokens":N}}` cannot be merged
+    /// field-by-field with an operator's), so when a level is present here its value is what the
+    /// relay puts in the upstream body, and when a level is absent the dialect default is used.
+    /// `None` at a level means "send nothing for this level".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_wire: Option<BTreeMap<ReasoningLevel, serde_json::Value>>,
     /// Model-specific input price per million tokens, for the panel's cost column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_price_per_mtok: Option<f64>,
     /// Model-specific output price per million tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_price_per_mtok: Option<f64>,
+    /// The full price picture, when known: both directions plus cache rates and where the numbers
+    /// came from.
+    ///
+    /// [`Self::input_price_per_mtok`] and [`Self::output_price_per_mtok`] predate this field and
+    /// are kept because they are what the panel's simpler cost column reads. When both are set they
+    /// must agree; [`PricingPlan`] is the authoritative record, because it also carries the cache
+    /// rates a cost estimate needs and the provenance that decides which source wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<PricingPlan>,
     /// When this entry was last reconciled with the provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synced_at: Option<Millis>,
     /// Whether the operator has hidden it from pickers without deleting it.
     #[serde(default)]
     pub hidden: bool,
+}
+
+impl ModelEntry {
+    /// The level a request gets when it names this model without a `-<level>` suffix.
+    ///
+    /// Falls through to the configuration's `routing.default_reasoning_level`, which the caller
+    /// passes in, so this stays a pure function with no configuration dependency.
+    #[inline]
+    pub fn default_level(&self, config_default: ReasoningLevel) -> ReasoningLevel {
+        self.default_reasoning_level.unwrap_or(config_default)
+    }
+}
+
+/// The highest level in `levels`, or `None` when the list is empty.
+///
+/// This is the one substitution the design allows instead of failing a request: asking for a level
+/// a model does not offer (`-max` on a model that tops out at `xhigh`) reroutes to that model's
+/// highest available tier. Ranking through [`ReasoningLevel::rank`] rather than relying on enum
+/// comparison keeps it identical to the `u8` the snapshot stores.
+pub fn highest_level(levels: &[ReasoningLevel]) -> Option<ReasoningLevel> {
+    levels.iter().copied().max_by_key(|level| level.rank())
 }
 
 /// Where a [`ModelEntry`] came from.
@@ -80,6 +144,67 @@ impl ModelSource {
     pub const fn is_overwritable_by_sync(self) -> bool {
         matches!(self, Self::Synced | Self::Inferred)
     }
+}
+
+/// What a model costs, and where the numbers came from.
+///
+/// Rates are US dollars per million tokens. Every rate is optional because providers publish
+/// different subsets: a model that bills no cache reads has *no* cache-read rate, which is not the
+/// same as a rate of zero, and the panel must be able to tell those apart.
+///
+/// `Default` is the honest "nothing is known" price, which is what makes it usable as the base a
+/// merge starts from; it is deliberately *not* an all-zero price.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PricingPlan {
+    /// Prompt tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_per_mtok: Option<f64>,
+    /// Completion tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_per_mtok: Option<f64>,
+    /// Tokens served from a provider-side prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_per_mtok: Option<f64>,
+    /// Tokens written to a provider-side prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_mtok: Option<f64>,
+    /// Which source these numbers came from.
+    #[serde(default)]
+    pub source: PricingSource,
+}
+
+impl PricingPlan {
+    /// Whether any rate at all is known.
+    ///
+    /// A plan with no rates renders as `N/A`, never as free: an unknown price is not a zero price,
+    /// and a cost estimate that silently reads $0.00 for an unknown model is worse than no estimate.
+    #[inline]
+    pub const fn has_any_rate(&self) -> bool {
+        self.input_per_mtok.is_some()
+            || self.output_per_mtok.is_some()
+            || self.cache_read_per_mtok.is_some()
+            || self.cache_write_per_mtok.is_some()
+    }
+}
+
+/// Where a [`PricingPlan`]'s numbers came from, least authoritative first.
+///
+/// The precedence matters because the three sources genuinely disagree: the bundled LiteLLM table
+/// lags a provider's price change, a provider's live response reflects it first, and an operator
+/// who has typed a number has the final word. Deriving `Ord` in this declaration order makes
+/// "which source wins" a `max` rather than a hand-written match that can drift from this comment.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum PricingSource {
+    /// The bundled offline table generated by `tools/gen-pricing.py`.
+    #[default]
+    Bundled,
+    /// Live provider pricing, where the provider exposes it (OpenRouter-style).
+    Synced,
+    /// Typed into the panel by the operator.
+    Manual,
 }
 
 /// One credential belonging to a provider: a single API key, or a single OAuth account.
@@ -123,6 +248,13 @@ pub struct Account {
     /// Per-account quota windows, when they differ from the provider's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quota: Vec<QuotaWindow>,
+    /// Which configured proxy this account's traffic goes through, by [`ProxyConfig::id`].
+    ///
+    /// `None` falls back to the provider's [`Provider::proxy`], which falls back to a direct
+    /// connection. The account level exists because one account can be the one that is rate-limited
+    /// or region-locked, and moving *just it* behind a proxy must not move the whole provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
     /// Free-form provider-specific fields, for example a Copilot session or a Codex workspace id.
     ///
     /// Kept as an open map so a new provider needs no schema change, and preserved on round-trip
@@ -151,6 +283,7 @@ impl Account {
             models_allow: Vec::new(),
             models_deny: Vec::new(),
             quota: Vec::new(),
+            proxy: None,
             extra: BTreeMap::new(),
         }
     }
@@ -329,11 +462,28 @@ pub struct Provider {
     #[serde(default)]
     pub total_timeout_ms: u64,
     /// Whether to keep idle connections warm to this provider.
-    #[serde(default = "default_true")]
+    ///
+    /// Defaults to **false**, making prewarm a per-provider opt-in: adding a provider opens no
+    /// connection until it is used, so a provider that is misconfigured, rate-limited or simply
+    /// unwanted costs nothing on start.
+    ///
+    /// The global `latency.prewarm` is *also* required, and acts as the master switch
+    /// (`effective = latency.prewarm && provider.prewarm`). It is an `&&`, not an `||`, because the
+    /// alternative is self-defeating: `latency.prewarm` defaults to true, so an `||` would re-enable
+    /// every provider the moment the file was loaded and "adding a provider opens no connection"
+    /// would be unobservable.
+    #[serde(default)]
     pub prewarm: bool,
     /// Whether this provider prefers HTTP/2 when the host supports it.
     #[serde(default = "default_http2")]
     pub http2: Http2Preference,
+    /// Which configured proxy this provider's traffic goes through, by [`ProxyConfig::id`].
+    ///
+    /// `None` dials the upstream directly. An account may override this, which is the case the
+    /// feature exists for: several accounts on one provider where only one needs to egress
+    /// elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
     /// Operator note, shown in the panel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -394,8 +544,9 @@ impl Provider {
             ttfb_timeout_ms: default_ttfb_timeout_ms(),
             idle_timeout_ms: default_idle_timeout_ms(),
             total_timeout_ms: 0,
-            prewarm: true,
+            prewarm: false,
             http2: Http2Preference::Auto,
+            proxy: None,
             note: None,
             extra: BTreeMap::new(),
         }
@@ -568,7 +719,7 @@ impl Provider {
                     }
                 }
             }
-            Dialect::CommandCode if wants(Capability::Embeddings) => {
+            Dialect::CommandCodeGo if wants(Capability::Embeddings) => {
                 out.push("the Command Code dialect has no embeddings endpoint".to_string());
             }
             _ => {}
@@ -1029,9 +1180,62 @@ pub struct ClientKey {
     /// Per-key request budget. Zero means unlimited.
     #[serde(default)]
     pub limit_requests: u64,
+    /// Rolling token and request caps per window, enforced by the relay.
+    ///
+    /// Separate from [`Self::limit_requests`], which is a flat, non-rolling budget kept for
+    /// compatibility. The two are both enforced when both are set.
+    #[serde(default, skip_serializing_if = "KeyLimits::is_empty")]
+    pub limits: KeyLimits,
     /// Descriptive note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+/// A client key's rolling caps, one per window family the quota panel already shows.
+///
+/// The three windows are named explicitly rather than stored as a list of durations because they
+/// are the three the operator is actually offered, and because an explicit field cannot be
+/// silently mistyped into a fourth window nothing enforces. Each is independently optional, and
+/// `None` means *not enforced* rather than *zero allowed*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct KeyLimits {
+    /// Caps over a rolling five hours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_5h: Option<KeyLimit>,
+    /// Caps over a rolling seven days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_1w: Option<KeyLimit>,
+    /// Caps over a rolling thirty days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly_30d: Option<KeyLimit>,
+}
+
+impl KeyLimits {
+    /// Whether nothing at all is capped, which is the overwhelmingly common case and is why the
+    /// field is skipped on serialisation.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.session_5h.is_none() && self.weekly_1w.is_none() && self.monthly_30d.is_none()
+    }
+}
+
+/// One window's caps for a client key. Zero in either field means that dimension is uncapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct KeyLimit {
+    /// Prompt + completion tokens allowed in the window. Zero means uncapped.
+    #[serde(default)]
+    pub tokens: u64,
+    /// Requests allowed in the window. Zero means uncapped.
+    #[serde(default)]
+    pub requests: u64,
+}
+
+impl KeyLimit {
+    /// Whether this window caps nothing, in which case it is inert and the relay skips it.
+    #[inline]
+    pub const fn is_inert(&self) -> bool {
+        self.tokens == 0 && self.requests == 0
+    }
 }
 
 impl ClientKey {
@@ -1335,6 +1539,7 @@ mod tests {
             allow_models: vec!["claude-*".into()],
             allow_routes: vec!["messages".into()],
             limit_requests: 0,
+            limits: KeyLimits::default(),
             note: None,
         };
         assert!(k.permits("claude-opus-4-7", RouteKind::Messages));
@@ -1363,5 +1568,230 @@ mod tests {
             Some(&serde_json::json!({ "nested": [1, 2, 3] })),
             "unknown top-level keys must be preserved"
         );
+    }
+
+    // ---------------------------------------------------------------- B2: new model metadata
+
+    #[test]
+    fn a_config_written_before_the_new_fields_still_loads_and_does_not_gain_keys() {
+        // Every field B2 added is `#[serde(default)]` + `skip_serializing_if`, so an old file must
+        // load unchanged *and* a round trip must not invent keys the operator never wrote. A
+        // migration that silently rewrites every model entry would be a diff on every save.
+        let json = serde_json::json!({
+            "id": "gpt-6",
+            "source": "manual",
+            "dialect": "open-ai",
+            "base_url": "https://example.test/v1",
+            "models": [{ "id": "gpt-6-luna" }]
+        });
+        let p: Provider = serde_json::from_value(json).unwrap();
+        let m = &p.models[0];
+        assert!(
+            m.reasoning_levels.is_empty(),
+            "absent levels must default empty"
+        );
+        assert_eq!(m.default_reasoning_level, None);
+        assert!(m.reasoning_wire.is_none());
+        assert!(m.input_modalities.is_empty());
+        assert!(m.pricing.is_none());
+
+        let out = serde_json::to_value(&p).unwrap();
+        let model = &out["models"][0];
+        for absent in [
+            "reasoning_levels",
+            "default_reasoning_level",
+            "reasoning_wire",
+            "input_modalities",
+            "pricing",
+        ] {
+            assert!(
+                model.get(absent).is_none(),
+                "round trip invented the key `{absent}`: {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_new_model_metadata_round_trips_through_serde() {
+        let m: ModelEntry = serde_json::from_value(serde_json::json!({
+            "id": "gemini-3.8-flash",
+            "reasoning_levels": ["low", "high", "xhigh", "max"],
+            "default_reasoning_level": "high",
+            "reasoning_wire": {
+                "high": { "thinking": { "type": "enabled", "budget_tokens": 131072 } }
+            },
+            "input_modalities": ["text", "image", "video"],
+            "pricing": {
+                "input_per_mtok": 0.15,
+                "output_per_mtok": 0.6,
+                "cache_read_per_mtok": 0.0375,
+                "source": "synced"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(m.reasoning_levels.len(), 4);
+        assert_eq!(m.default_reasoning_level, Some(ReasoningLevel::High));
+        assert_eq!(
+            m.reasoning_wire.as_ref().unwrap()[&ReasoningLevel::High]["thinking"]["budget_tokens"],
+            131072
+        );
+        assert_eq!(
+            m.input_modalities,
+            vec![
+                InputModality::Text,
+                InputModality::Image,
+                InputModality::Video
+            ]
+        );
+        let pricing = m.pricing.as_ref().unwrap();
+        assert_eq!(pricing.input_per_mtok, Some(0.15));
+        assert_eq!(pricing.cache_read_per_mtok, Some(0.0375));
+        assert_eq!(pricing.cache_write_per_mtok, None);
+        assert_eq!(pricing.source, PricingSource::Synced);
+
+        let back: ModelEntry = serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn reasoning_wire_keys_use_the_canonical_level_spelling() {
+        // `xhigh` not `x-high`: the map is written by the panel and read by the relay, and a key
+        // that does not match `ReasoningLevel`'s serde form would silently never apply.
+        let m: ModelEntry = serde_json::from_value(serde_json::json!({
+            "id": "m",
+            "reasoning_wire": { "xhigh": { "reasoning_effort": "high" } }
+        }))
+        .unwrap();
+        assert!(m
+            .reasoning_wire
+            .as_ref()
+            .unwrap()
+            .contains_key(&ReasoningLevel::XHigh));
+        let out = serde_json::to_value(&m).unwrap();
+        assert!(out["reasoning_wire"].get("xhigh").is_some(), "{out}");
+    }
+
+    #[test]
+    fn highest_level_substitutes_by_rank_not_declaration_order() {
+        // The substitution the design allows instead of failing: `-max` on a model that tops out at
+        // `xhigh` reroutes there. The list is deliberately out of order, because an operator's list
+        // need not be sorted and `xhigh` sorts below `max` numerically but above `ultra` by rank.
+        let levels = [
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Low,
+            ReasoningLevel::None,
+            ReasoningLevel::Ultra,
+        ];
+        assert_eq!(highest_level(&levels), Some(ReasoningLevel::Ultra));
+        assert_eq!(
+            highest_level(&[ReasoningLevel::Minimal]),
+            Some(ReasoningLevel::Minimal)
+        );
+        assert_eq!(highest_level(&[]), None);
+    }
+
+    #[test]
+    fn default_level_falls_through_to_the_configured_default() {
+        let mut m: ModelEntry = serde_json::from_value(serde_json::json!({ "id": "m" })).unwrap();
+        assert_eq!(m.default_level(ReasoningLevel::High), ReasoningLevel::High);
+        m.default_reasoning_level = Some(ReasoningLevel::Low);
+        assert_eq!(m.default_level(ReasoningLevel::High), ReasoningLevel::Low);
+    }
+
+    #[test]
+    fn prewarm_is_off_for_a_new_provider_and_on_only_when_asked() {
+        // I1: adding a provider must open no startup connection.
+        let p = Provider::new("p", Dialect::OpenAi, "https://example.test/v1");
+        assert!(!p.prewarm, "a new provider must not prewarm");
+
+        let parsed: Provider = serde_json::from_value(serde_json::json!({
+            "id": "p", "dialect": "open-ai", "base_url": "https://example.test/v1"
+        }))
+        .unwrap();
+        assert!(!parsed.prewarm, "an absent `prewarm` must mean false");
+
+        let asked: Provider = serde_json::from_value(serde_json::json!({
+            "id": "p", "dialect": "open-ai", "base_url": "https://example.test/v1",
+            "prewarm": true
+        }))
+        .unwrap();
+        assert!(asked.prewarm, "an explicit `true` must be honoured");
+    }
+
+    #[test]
+    fn client_key_limits_are_skipped_when_nothing_is_capped() {
+        // The common case is no limits at all, and it must not add a key to every saved config.
+        let key = ClientKey {
+            id: crate::ids::ClientKeyId::from_raw("k1"),
+            label: "k".into(),
+            key_hash: "h".into(),
+            prefix: None,
+            enabled: true,
+            allow_models: Vec::new(),
+            allow_routes: Vec::new(),
+            limit_requests: 0,
+            limits: KeyLimits::default(),
+            note: None,
+        };
+        assert!(key.limits.is_empty());
+        let out = serde_json::to_value(&key).unwrap();
+        assert!(out.get("limits").is_none(), "{out}");
+
+        let capped = ClientKey {
+            limits: KeyLimits {
+                session_5h: Some(KeyLimit {
+                    tokens: 100_000,
+                    requests: 0,
+                }),
+                ..KeyLimits::default()
+            },
+            ..key
+        };
+        assert!(!capped.limits.is_empty());
+        let out = serde_json::to_value(&capped).unwrap();
+        assert_eq!(out["limits"]["session_5h"]["tokens"], 100_000);
+        assert_eq!(out["limits"]["session_5h"]["requests"], 0);
+        assert!(out["limits"].get("weekly_1w").is_none(), "{out}");
+
+        let back: ClientKey = serde_json::from_value(out).unwrap();
+        assert_eq!(back, capped);
+    }
+
+    #[test]
+    fn an_inert_limit_is_recognised_and_an_unknown_price_is_not_free() {
+        assert!(KeyLimit::default().is_inert());
+        assert!(!KeyLimit {
+            tokens: 1,
+            requests: 0
+        }
+        .is_inert());
+
+        // `None` rates must never read as $0.00.
+        assert!(!PricingPlan::default().has_any_rate());
+        assert!(
+            PricingPlan {
+                output_per_mtok: Some(0.0),
+                ..PricingPlan::default()
+            }
+            .has_any_rate(),
+            "a genuine zero rate is still a known rate"
+        );
+    }
+
+    #[test]
+    fn pricing_sources_rank_so_a_manual_price_beats_a_synced_one_which_beats_the_bundle() {
+        // "Manual override wins" (I18) is the whole reason the source is stored.
+        assert!(PricingSource::Bundled < PricingSource::Synced);
+        assert!(PricingSource::Synced < PricingSource::Manual);
+        assert_eq!(PricingSource::default(), PricingSource::Bundled);
+        let winner = [
+            PricingSource::Synced,
+            PricingSource::Manual,
+            PricingSource::Bundled,
+        ]
+        .into_iter()
+        .max();
+        assert_eq!(winner, Some(PricingSource::Manual));
     }
 }

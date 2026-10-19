@@ -2,16 +2,17 @@
 //!
 //! # What is here, and what is deliberately not
 //!
-//! There is exactly **one** piece of mutable state on the request path: a relaxed `AtomicU64` per
-//! combo, used by the `round-robin` strategy. Everything else — the routing table, the providers,
-//! the accounts — is loaded once, behind an `ArcSwap`, and read without a lock.
+//! Mutable request-path state is limited to relaxed atomics: a `AtomicU64` per combo for the
+//! `round-robin` strategy, plus a global counter and per-proxy in-flight counts for proxy choice.
+//! Everything else — the routing table, the providers, the accounts — is loaded once, behind an
+//! `ArcSwap`, and read without a lock.
 //!
 //! That is not an optimisation for its own sake. A mutex on this path is a queue, and a queue is
 //! latency that grows with load precisely when latency matters most. The compiled snapshot exists so
 //! that a request needs no coordination at all: it loads an `Arc`, walks a slice, and sends bytes.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -22,6 +23,82 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::upstream::Upstream;
+
+/// Mutable proxy-selection counters, separate from the hot-swapped routing table.
+///
+/// The vector index matches `Config::proxies` order. Keeping counters indexed (rather than keyed by
+/// proxy id) makes the hot path a pair of relaxed atomic loads, and this state must be rebuilt when
+/// the config's proxy list changes so that indexes cannot silently refer to a different proxy.
+/// Selection itself remains independent of `RelayState`; the caller can hold this beside the config
+/// generation and pass it to `proxy::choose`.
+pub struct ProxySelectionState {
+    round_robin: AtomicU64,
+    inflight: Vec<AtomicUsize>,
+}
+
+impl ProxySelectionState {
+    /// Construct counters for a config's proxy list.
+    pub fn new(proxies: &[mr_core::config::ProxyConfig]) -> Self {
+        Self::with_proxy_count(proxies.len())
+    }
+
+    /// Construct counters for `proxy_count` entries.
+    ///
+    /// This is useful in tests and for a caller that has already reduced a config into its own
+    /// immutable generation. Indexes must still be the indexes into that same config's proxy slice.
+    pub fn with_proxy_count(proxy_count: usize) -> Self {
+        Self {
+            round_robin: AtomicU64::new(0),
+            inflight: (0..proxy_count).map(|_| AtomicUsize::new(0)).collect(),
+        }
+    }
+
+    /// Increment the shared round-robin ticket and return the previous value.
+    pub fn next_round_robin(&self) -> u64 {
+        self.round_robin.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Current number of leases for the proxy at `index`.
+    ///
+    /// An out-of-range index is a programming error: silently returning zero would make a stale
+    /// state generation look like an idle proxy, so this method deliberately panics with the index.
+    pub fn inflight(&self, index: usize) -> usize {
+        self.inflight
+            .get(index)
+            .unwrap_or_else(|| panic!("proxy index {index} is outside selection state"))
+            .load(Ordering::Relaxed)
+    }
+
+    /// Mark `index` in flight until the returned lease is dropped.
+    ///
+    /// The call site should create the lease immediately after selection, then keep it alive until
+    /// the upstream request ends (including TLS setup and response streaming). If connect fails, the
+    /// same drop releases the count; no hand-written decrement path can be forgotten.
+    pub fn lease(&self, index: usize) -> ProxyLease<'_> {
+        let counter = self
+            .inflight
+            .get(index)
+            .unwrap_or_else(|| panic!("proxy index {index} is outside selection state"));
+        counter.fetch_add(1, Ordering::Relaxed);
+        ProxyLease { counter }
+    }
+}
+
+/// An RAII count of one request using a proxy.
+///
+/// The counter is atomic and relaxed because it chooses a tie-breaker, not a synchronization
+/// boundary. A stale count can only change which equally eligible proxy the next request uses; it
+/// cannot affect the request currently holding this lease.
+pub struct ProxyLease<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl Drop for ProxyLease<'_> {
+    fn drop(&mut self) {
+        let previous = self.counter.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "proxy lease counter underflowed");
+    }
+}
 
 /// The routing table, with the one piece of mutable routing state attached.
 ///
@@ -385,6 +462,7 @@ mod tests {
             allow_models: Vec::new(),
             allow_routes: Vec::new(),
             limit_requests: 0,
+            limits: Default::default(),
             note: None,
         }
     }

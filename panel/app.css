@@ -96,11 +96,25 @@ body {
 }
 
 .brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-weight: 650;
   letter-spacing: 0.02em;
   padding: 4px 16px 12px;
   color: var(--tx1);
 }
+
+/* The mark is decorative here: the name is right next to it, so the alt text is empty. */
+.brand-mark {
+  display: block;
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  flex: none;
+}
+
+.brand-name { letter-spacing: 0.02em; }
 
 .sidebar nav ul {
   list-style: none;
@@ -383,6 +397,101 @@ textarea.input { resize: vertical; min-height: 60px; font-family: var(--mono); f
 .hint { color: var(--tx3); font-size: 11.5px; margin: 3px 0 0; }
 .hint .mono { color: var(--tx2); }
 
+/* ---------- help affordance (I2) ---------- */
+
+/* A tiny "?" beside a setting's label. Deliberately quiet: it must be findable when wanted and
+ * invisible when not. Hover and keyboard focus reveal the same text — a hover-only tooltip is
+ * unusable without a mouse, which is the whole reason this is a button and not a `title`. */
+.help-dot {
+  appearance: none;
+  background: var(--bg2);
+  border: 1px solid var(--line2);
+  color: var(--tx3);
+  border-radius: 50%;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  font: 600 10px/1 var(--sans);
+  cursor: help;
+  vertical-align: middle;
+  position: relative;
+  flex: none;          /* never squeezed by a long label in the same flex row */
+  line-height: 1;
+}
+.help-dot:hover, .help-dot:focus-visible { color: var(--tx1); border-color: var(--pink); }
+
+/* Fixed-position pseudo-element escapes the overflow boxes (#main, drawer, dialog and tables),
+ * unlike an absolute ::after, and stays next to its dot during scrolling. dom.js measures the
+ * wrapped bubble once, then sets viewport coordinates in these custom properties. `data-tip`
+ * supplies the content, with the same rule for hover and keyboard focus. */
+.help-dot:hover::after, .help-dot:focus-visible::after {
+  content: attr(data-tip);
+  position: fixed;
+  top: var(--tip-top, 50vh);
+  left: var(--tip-left, 50vw);
+  z-index: 90;                       /* above the drawer (40), dialogs (60) and toasts (80) */
+  width: max-content;
+  max-width: min(320px, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);    /* a full paragraph stays inside the viewport too */
+  overflow-y: auto;
+  white-space: normal;
+  overflow-wrap: anywhere;           /* a 60-character unbroken provider id still wraps */
+  text-align: start;                 /* follows the document direction, not a hard-coded left */
+  background: var(--bg3);
+  color: var(--tx1);
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  font: 11.5px/1.45 var(--sans);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  pointer-events: none;              /* cannot swallow the hover that opened it */
+}
+/* Off-screen, visually hidden twin used only to measure exact wrapped dimensions before showing
+ * the pseudo-element. It lives on <body>; it is not an aria-description (the sr-only span is). */
+.tip-measure {
+  position: fixed;
+  top: 0;
+  left: -10000px;
+  z-index: -1;
+  width: max-content;
+  max-width: min(320px, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: start;
+  background: var(--bg3);
+  color: var(--tx1);
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  font: 11.5px/1.45 var(--sans);
+}
+
+/* The label line, used only when a field has help text: the label and the dot share one line
+ * without nesting the button inside the label (a label may not contain labelable elements). */
+.label-line { display: flex; align-items: center; gap: 5px; margin-bottom: 3px; min-width: 0; }
+.label-line > label {
+  font-size: 12px;
+  color: var(--tx2);
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 .field-error {
   color: var(--red);
   font-size: 11.5px;
@@ -428,10 +537,106 @@ fieldset.hedge legend, fieldset.plain legend {
 }
 fieldset.plain { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; margin: 0 0 12px; }
 
-.check-row { display: flex; align-items: center; gap: 7px; margin-bottom: 8px; }
-.check-row label { color: var(--tx2); cursor: pointer; }
+/* One on/off row: box, its label, optional "?" dot, optional hint. Wraps rather than overflowing,
+ * so a long label at 360px drops to a second line instead of pushing the box off-screen. */
+.check-row { display: flex; align-items: center; gap: 3px 7px; margin-bottom: 8px; flex-wrap: wrap; }
+.check-row label { color: var(--tx2); cursor: pointer; min-width: 0; overflow-wrap: anywhere; }
+/* The hint takes a line of its own inside the flex row; the sr-only description stays absolute. */
+.check-row .hint { flex: 1 0 100%; margin: 0; }
+/* Existing hand-built check rows have the label as the final node; let it fill spare room so the
+ * help dot remains visibly beside its text in both directions, and can wrap at narrow widths. */
+.check-row.has-help label { flex: 1 1 auto; }
+
+/* ---------- checkboxes and switches use the pink accent (I3) ---------- */
+
+/* accent-color paints the native control, so a ticked box is pink in every browser that supports
+ * it (all current ones) without a hand-built control to keep accessible. A checkbox with no
+ * label of its own gets a pointer cursor from its wrapping label; standalone ones are set here. */
+input[type="checkbox"], input[type="radio"] {
+  accent-color: var(--pink);
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+  flex: none;
+}
+/* The global :focus-visible ring applies here too, but a 14px box needs a little air around it or
+ * the ring reads as part of the border. Explicit so it survives any per-view outline resets. */
+input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
+  outline: 2px solid var(--pink);
+  outline-offset: 2px;
+}
+
+/* Custom switch, for settings that read better as on/off than as ticked/unticked. The real
+ * checkbox stays in the DOM and keeps focus, keyboard and screen-reader behaviour; only its
+ * painted box is replaced. */
+.switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch .track {
+  width: 30px;
+  height: 17px;
+  border-radius: 9px;
+  background: var(--bg3);
+  border: 1px solid var(--line2);
+  position: relative;
+  transition: background 120ms linear, border-color 120ms linear;
+  flex: none;
+}
+.switch .track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  inset-inline-start: 2px;      /* logical, so the knob starts on the reading-direction side */
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--tx3);
+  transition: transform 120ms ease-out, background 120ms linear;
+}
+.switch input:checked + .track { background: var(--pink-dim); border-color: var(--pink); }
+.switch input:checked + .track::after { transform: translateX(13px); background: var(--pink); }
+/* The same 13px slide, mirrored: translateX is physical even when inset-inline-start is not. */
+.switch:dir(rtl) input:checked + .track::after { transform: translateX(-13px); }
+.switch input:focus-visible + .track { outline: 2px solid var(--pink); outline-offset: 2px; }
+.switch .switch-label { color: var(--tx2); }
 
 .grid-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0 12px; }
+
+/* ---------- quota chunks (Feature 1) ---------- */
+
+/* Filled pink = REMAINING. That inversion is the point of the widget: an operator reads a full
+ * bar as "plenty left", which is true here and false in the usual used-meter. The view states it
+ * in words as well — colour alone must never be the only explanation. */
+.chunks {
+  display: inline-flex;
+  gap: 2px;
+  align-items: center;
+  vertical-align: middle;
+}
+.chunk {
+  width: 9px;
+  height: 14px;
+  border-radius: 2px;
+  background: var(--bg3);
+  border: 1px solid var(--line2);
+  display: inline-block;
+}
+.chunk.on { background: var(--pink); border-color: var(--pink); }
+.chunk.half {
+  background: linear-gradient(to right, var(--pink) 50%, var(--bg3) 50%);
+  border-color: var(--pink);
+}
+.chunks-na { color: var(--tx3); font-family: var(--mono); font-size: 12px; }
+.quota-pct { font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+.quota-legend { color: var(--tx3); font-size: 11.5px; margin: 6px 0 0; }
+.quota-legend .swatch {
+  display: inline-block;
+  width: 9px;
+  height: 11px;
+  border-radius: 2px;
+  background: var(--pink);
+  vertical-align: -1px;
+  margin: 0 3px 0 0;
+}
 
 /* ---------- banners, callouts ---------- */
 
@@ -621,6 +826,51 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 .dialog .dialog-msg { color: var(--tx2); margin: 0 0 6px; overflow-wrap: anywhere; }
 .dialog .dialog-warn { color: var(--amber); font-size: 12.5px; margin: 0 0 6px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+
+/* A content dialog's title row: heading on the left, close on the right. */
+.dialog-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.dialog-head .dialog-title { margin: 0; font-size: 14px; }
+.dialog-body { max-height: 60vh; overflow-y: auto; }
+
+/* ---------- copy affordances ---------- */
+
+/* Green is the panel's "this worked" colour (chips, health). A copy button flashing green for
+ * 1.6 s is the same statement, so it borrows the same token rather than inventing a new one. */
+.copy-ok { color: var(--green) !important; border-color: var(--green) !important; }
+
+/* A value that is itself the copy target: monospace, and it says so on hover. */
+.copy-target {
+  cursor: pointer;
+  border-bottom: 1px dashed var(--line2);
+}
+.copy-target:hover { color: var(--tx1); border-bottom-color: var(--pink); }
+
+.copy-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.copy-row .copy-value { overflow-wrap: anywhere; }
+
+/* ---------- Quick Connect (Overview) ---------- */
+
+.qc-grid { display: grid; gap: 10px; }
+.qc-endpoint {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg2);
+  padding: 8px 10px;
+}
+.qc-endpoint .qc-url {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--tx1);
+  overflow-wrap: anywhere;
+}
+.qc-endpoint .qc-note { color: var(--tx3); font-size: 11.5px; margin-top: 2px; }
+.qc-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
 .key-reveal {
   display: flex;

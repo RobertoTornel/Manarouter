@@ -209,7 +209,8 @@ pub fn translate_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Option<T
             google::from_pivot_request(ctx, body).map(Some)
         }
 
-        (Dialect::OpenAi, Dialect::CommandCode) | (Dialect::Anthropic, Dialect::CommandCode) => {
+        (Dialect::OpenAi, Dialect::CommandCodeGo)
+        | (Dialect::Anthropic, Dialect::CommandCodeGo) => {
             commandcode::from_pivot_request(ctx, body).map(Some)
         }
 
@@ -246,9 +247,8 @@ pub fn translate_response_body(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<By
         | (Dialect::Anthropic, Dialect::Google)
         | (Dialect::OpenAi, Dialect::Antigravity)
         | (Dialect::Anthropic, Dialect::Antigravity) => google::to_pivot_response(ctx, body),
-        (Dialect::OpenAi, Dialect::CommandCode) | (Dialect::Anthropic, Dialect::CommandCode) => {
-            commandcode::to_pivot_response(ctx, body)
-        }
+        (Dialect::OpenAi, Dialect::CommandCodeGo)
+        | (Dialect::Anthropic, Dialect::CommandCodeGo) => commandcode::to_pivot_response(ctx, body),
         (Dialect::OpenAi, Dialect::Codex) | (Dialect::Anthropic, Dialect::Codex) => {
             responses::to_pivot_response(ctx, body)
         }
@@ -269,6 +269,11 @@ pub fn translate_response_body(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<By
 ///
 /// Returning an empty `Vec` means "this frame carries nothing the client needs", which is the
 /// correct handling for keep-alives and for event types the client's dialect has no equivalent for.
+///
+/// **Command Code is not driven through here.** Its stream state must be owned per stream, so the
+/// relay uses [`commandcode::Translator`] for that dialect instead; see its documentation for the
+/// corruption this avoids. Everything else still accumulates in the per-thread state that
+/// [`reset_stream_state`] clears at a stream boundary.
 pub fn translate_sse_data(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<String>> {
     match (ctx.client_dialect, ctx.upstream_dialect) {
         (Dialect::OpenAi, Dialect::Anthropic) => anthropic::sse_to_openai(ctx, data),
@@ -278,9 +283,8 @@ pub fn translate_sse_data(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<Stri
         // the rest.
         (Dialect::OpenAi, Dialect::Copilot) => Ok(vec![data.to_owned()]),
         (Dialect::Anthropic, Dialect::Copilot) => openai::sse_to_anthropic(ctx, data),
-        (Dialect::OpenAi, Dialect::CommandCode) | (Dialect::Anthropic, Dialect::CommandCode) => {
-            commandcode::sse_to_pivot(ctx, data)
-        }
+        (Dialect::OpenAi, Dialect::CommandCodeGo)
+        | (Dialect::Anthropic, Dialect::CommandCodeGo) => commandcode::sse_to_pivot(ctx, data),
         // Cloud Code's stream frames carry the same `{"response": ...}` wrapper, unwrapped per
         // frame inside `google::sse_to_pivot`.
         (Dialect::OpenAi, Dialect::Google)
@@ -301,6 +305,29 @@ pub fn translate_sse_data(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<Stri
 
 /// The `[DONE]` sentinel used by the OpenAI streaming protocol.
 pub const SSE_DONE: &str = "[DONE]";
+
+/// Forget every per-thread translator state this crate keeps.
+///
+/// These are keyed by nothing but the worker thread, and are only self-healing once a *terminal*
+/// frame has been translated — so a stream that ends any other way (the upstream dies, the client
+/// disconnects, the relay abandons the attempt) leaves its partial calls behind, and the next
+/// stream on that thread inherits them. That is how a completed tool call can reappear, or how an
+/// argument fragment can land in a call the client never saw opened.
+///
+/// **This is not sufficient for Command Code**, whose two concurrent streams on one worker thread
+/// provably contaminated each other through exactly this cell; that dialect owns its state per
+/// stream through [`commandcode::Translator`]. Resetting the rest is still meaningful for the
+/// remaining dialects. Resetting all of them is deliberate: one hop can consult more than one
+/// adapter, and a state left behind in *any* of them corrupts the next answer.
+pub fn reset_stream_state() {
+    commandcode::reset_stream_state();
+    google::reset_stream_state();
+    responses::reset_stream_state();
+    // The two halves of the OpenAI module: pivot→Anthropic and Anthropic→pivot.
+    openai::reset_stream_state();
+    openai::reset_openai_stream_state();
+    anthropic::reset_stream_state();
+}
 
 /// The event name the relay emits when it transparently retries a stream with a new model.
 ///
@@ -356,12 +383,12 @@ mod tests {
     fn unsupported_pairings_name_both_dialects_rather_than_failing_obscurely() {
         // Anthropic in, Google out is not wired directly; it must report the pairing rather than
         // silently forwarding an Anthropic body to a Gemini endpoint.
-        let mut ctx = TranslateCtx::new(RouteKind::Messages, Dialect::CommandCode, "m");
+        let mut ctx = TranslateCtx::new(RouteKind::Messages, Dialect::CommandCodeGo, "m");
         ctx.client_dialect = Dialect::Copilot;
         match translate_request(&ctx, b"{}") {
             Err(TranslateError::Unsupported { from, to, .. }) => {
                 assert_eq!(from, "copilot");
-                assert_eq!(to, "commandcode");
+                assert_eq!(to, "command-code-go");
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }

@@ -3,7 +3,7 @@
 
 import { api } from './api.js';
 import {
-  h, chip, field, emptyState, errorBlock, applyFieldErrors, clearFieldErrors,
+  h, chip, field, toggle, emptyState, errorBlock, applyFieldErrors, clearFieldErrors,
 } from './dom.js';
 import { extractList, linesToList, listToLines, formatCompact } from './format.js';
 
@@ -64,24 +64,90 @@ export async function renderKeys(mount, ctx) {
         h('td', { class: 'mono' }, allowSummary(k.allow_models)),
         h('td', { class: 'mono' }, allowSummary(k.allow_routes)),
         h('td', { class: 'num' }, k.limit_requests ? formatCompact(k.limit_requests) : '∞'),
+        h('td', {}, rollingCaps(k.limits)),
         h('td', { class: 'actions' }, editBtn, rotateBtn, delBtn)));
     }
-    tableWrap.replaceChildren(h('table', { class: 'tbl' },
-      h('thead', {}, h('tr', {},
-        h('th', { scope: 'col' }, 'Label'),
-        h('th', { scope: 'col' }, 'Prefix'),
-        h('th', { scope: 'col' }, 'State'),
-        h('th', { scope: 'col' }, 'Allowed models'),
-        h('th', { scope: 'col' }, 'Allowed routes'),
-        h('th', { scope: 'col' }, 'Req limit'),
-        h('th', { scope: 'col' }, ''))),
-      tbody));
+    tableWrap.replaceChildren(
+      h('p', { class: 'hint' },
+        'Edit a key to change its rolling caps. Per-key usage and counters are not reported by this API, so they are not shown as zero. Enforcement is not confirmed.'),
+      h('table', { class: 'tbl' },
+        h('thead', {}, h('tr', {},
+          h('th', { scope: 'col' }, 'Label'),
+          h('th', { scope: 'col' }, 'Prefix'),
+          h('th', { scope: 'col' }, 'State'),
+          h('th', { scope: 'col' }, 'Allowed models'),
+          h('th', { scope: 'col' }, 'Allowed routes'),
+          h('th', { scope: 'col' }, 'Req limit'),
+          h('th', { scope: 'col' }, 'Rolling caps'),
+          h('th', { scope: 'col' }, ''))),
+        tbody));
   }
 
   function allowSummary(list) {
     if (!list || !list.length) return '—';
     if (list.length <= 2) return list.join(' ');
     return `${list.slice(0, 2).join(' ')} +${list.length - 2}`;
+  }
+
+  function rollingCaps(limits) {
+    const windows = [
+      ['5h', limits?.session_5h],
+      ['1w', limits?.weekly_1w],
+      ['30d', limits?.monthly_30d],
+    ];
+    const configured = windows.some(([, cap]) => cap && (Number(cap.tokens) > 0 || Number(cap.requests) > 0));
+    if (!configured) return 'No rolling caps (uncapped)';
+    return h('div', {}, ...windows.map(([name, cap]) => {
+      if (!cap) return h('div', {}, `${name}: uncapped`);
+      return h('div', {}, `${name}: ${capValue(cap.tokens)} tokens / ${capValue(cap.requests)} requests`);
+    }));
+  }
+
+  function capValue(value) {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? formatCompact(n) : '∞';
+  }
+
+  function capValuePayload(form, windowKey) {
+    const tokens = form.querySelector(`[data-field="limits.${windowKey}.tokens"]`);
+    const requests = form.querySelector(`[data-field="limits.${windowKey}.requests"]`);
+    const tokenCount = parseCap(tokens);
+    const requestCount = parseCap(requests);
+    return tokenCount === null || requestCount === null
+      ? null
+      : { tokens: tokenCount, requests: requestCount };
+  }
+
+  function parseCap(input) {
+    const value = input?.value.trim() ?? '';
+    const n = Number(value);
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(n)) {
+      input?.setAttribute('aria-invalid', 'true');
+      return null;
+    }
+    input.removeAttribute('aria-invalid');
+    return n;
+  }
+
+  function capInputs(limits = {}) {
+    const windows = [
+      ['session_5h', '5h'],
+      ['weekly_1w', '1w'],
+      ['monthly_30d', '30d'],
+    ];
+    return windows.flatMap(([key, label]) => {
+      const cap = limits?.[key] ?? {};
+      return [
+        field(`${label} token cap (0 = uncapped)`, h('input', {
+          class: 'input', type: 'number', min: '0', step: '1', inputmode: 'numeric',
+          'data-field': `limits.${key}.tokens`, value: cap.tokens ?? 0,
+        })),
+        field(`${label} request cap (0 = uncapped)`, h('input', {
+          class: 'input', type: 'number', min: '0', step: '1', inputmode: 'numeric',
+          'data-field': `limits.${key}.requests`, value: cap.requests ?? 0,
+        })),
+      ];
+    });
   }
 
   // ------------------------------------------------------------------ form
@@ -95,8 +161,7 @@ export async function renderKeys(mount, ctx) {
     routes.value = listToLines(k?.allow_routes);
     const limit = h('input', { class: 'input', type: 'number', min: '0', 'data-field': 'limit_requests', value: k?.limit_requests ?? 0 });
     const note = h('input', { class: 'input', type: 'text', 'data-field': 'note', value: k?.note ?? '' });
-    const enabled = h('input', { type: 'checkbox' });
-    enabled.checked = k?.enabled ?? true;
+    const enabled = toggle('Key enabled', { checked: k?.enabled ?? true });
 
     const save = h('button', { class: 'btn btn-primary', type: 'submit' }, isEdit ? 'Save key' : 'Create key');
     const cancel = h('button', { class: 'btn', type: 'button' }, 'Cancel');
@@ -108,23 +173,39 @@ export async function renderKeys(mount, ctx) {
       h('div', { class: 'grid-fields' },
         field('Label', label),
         field('Request limit (0 = unlimited)', limit)),
+      h('fieldset', { class: 'card' },
+        h('legend', {}, 'Rolling caps'),
+        h('p', { class: 'hint' }, 'Enter 0 for uncapped. Token caps apply to prompt + completion tokens over rolling windows.'),
+        h('div', { class: 'grid-fields' },
+          ...capInputs(k?.limits))),
       field('Allowed models (one per line, empty = all models)', models, { hint: 'Empty list means no restriction.' }),
       field('Allowed routes (one per line, empty = all routes)', routes),
       field('Note', note),
-      h('div', { class: 'check-row' }, enabled, h('label', {}, 'Key enabled')),
+      enabled.row,
       h('div', { class: 'dialog-actions' }, cancel, save));
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       clearFieldErrors(form);
       save.disabled = true;
+      const limits = {
+        session_5h: capValuePayload(form, 'session_5h'),
+        weekly_1w: capValuePayload(form, 'weekly_1w'),
+        monthly_30d: capValuePayload(form, 'monthly_30d'),
+      };
+      if (Object.values(limits).some((cap) => cap === null)) {
+        ctx.toast.warning('Enter whole-number caps of 0 or greater.');
+        save.disabled = false;
+        return;
+      }
       const payload = {
         label: label.value || 'unnamed key',
         allow_models: linesToList(models.value),
         allow_routes: linesToList(routes.value),
         limit_requests: Number(limit.value) || 0,
         note: note.value || null,
-        enabled: enabled.checked,
+        enabled: enabled.input.checked,
+        limits,
       };
       try {
         if (isEdit) {

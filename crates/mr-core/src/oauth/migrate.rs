@@ -1055,6 +1055,7 @@ async fn import_one(
             models_allow: Vec::new(),
             models_deny: Vec::new(),
             quota: Vec::new(),
+            proxy: None,
             extra: Default::default(),
         });
     }
@@ -1171,8 +1172,13 @@ fn merge_models(
                     context_length: entry.input_token_limit,
                     max_output_tokens: entry.output_token_limit,
                     capabilities: Vec::new(),
+                    input_modalities: Vec::new(),
+                    reasoning_levels: Vec::new(),
+                    default_reasoning_level: None,
+                    reasoning_wire: None,
                     input_price_per_mtok: None,
                     output_price_per_mtok: None,
+                    pricing: None,
                     synced_at: None,
                     hidden: false,
                 });
@@ -1313,8 +1319,13 @@ mod tests {
             context_length: None,
             max_output_tokens: None,
             capabilities: Vec::new(),
+            input_modalities: Vec::new(),
+            reasoning_levels: Vec::new(),
+            default_reasoning_level: None,
+            reasoning_wire: None,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
+            pricing: None,
             synced_at: None,
             hidden: false,
         });

@@ -4,8 +4,9 @@
 //! establishes: `manual` entries are authoritative and a sync never overwrites them.
 
 use clap::Subcommand;
+use std::collections::{HashMap, HashSet};
 
-use mr_core::dialect::AuthKind;
+use mr_core::dialect::{AuthKind, ReasoningLevel};
 use mr_core::ids::Millis;
 use mr_core::model::{ModelEntry, ModelSource, Provider};
 
@@ -162,6 +163,8 @@ fn list(ctx: &Ctx, provider: Option<&str>, source: &Option<String>) -> Result<()
 #[derive(Debug)]
 struct Fetched {
     id: String,
+    /// Canonical `-<level>` suffixes folded from separate provider ids, when present.
+    reasoning_levels: Vec<ReasoningLevel>,
     label: Option<String>,
     context_length: Option<u32>,
     max_output_tokens: Option<u32>,
@@ -170,7 +173,9 @@ struct Fetched {
 
 /// Parse a `/models` reply: OpenAI's `{"data":[{"id":...}]}`, Google's
 /// `{"models":[{"name":"models/...",...}]}`, or a bare array. The Google `models/` prefix is
-/// stripped — the relay's `model` field carries the bare id and the endpoint re-adds it.
+/// stripped — the relay's `model` field carries the bare id and the endpoint re-adds it. Canonical
+/// reasoning-level suffixes are folded into the base model only when that base is also reported;
+/// otherwise an id such as `foo-high` remains a real model in its own right.
 fn parse_models(body: &str) -> Result<Vec<Fetched>, CliError> {
     let v: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| CliError::failure(format!("the /models response is not JSON: {e}")))?;
@@ -192,10 +197,12 @@ fn parse_models(body: &str) -> Result<Vec<Fetched>, CliError> {
     };
 
     let mut out: Vec<Fetched> = Vec::new();
+    let mut ids = HashSet::new();
     for item in arr {
         let f = if let Some(s) = item.as_str() {
             Fetched {
                 id: s.to_owned(),
+                reasoning_levels: Vec::new(),
                 label: None,
                 context_length: None,
                 max_output_tokens: None,
@@ -227,6 +234,7 @@ fn parse_models(body: &str) -> Result<Vec<Fetched>, CliError> {
                 .unwrap_or_default();
             Fetched {
                 id: id.to_owned(),
+                reasoning_levels: Vec::new(),
                 label,
                 context_length: number(
                     item,
@@ -245,9 +253,59 @@ fn parse_models(body: &str) -> Result<Vec<Fetched>, CliError> {
         if id.is_empty() {
             continue;
         }
+        ids.insert(id.clone());
         out.push(Fetched { id, ..f });
     }
-    Ok(out)
+
+    // Decide against the complete id set, not only ids seen so far, so suffix-first provider lists
+    // fold identically to base-first lists. A base that is absent keeps the suffixed id intact.
+    let mut levels_by_base: HashMap<String, Vec<ReasoningLevel>> = HashMap::new();
+    let mut retained = Vec::with_capacity(out.len());
+    for fetched in out {
+        if let Some((base, level)) = canonical_level_suffix(&fetched.id) {
+            if ids.contains(base) {
+                levels_by_base
+                    .entry(base.to_owned())
+                    .or_default()
+                    .push(level);
+                continue;
+            }
+        }
+        retained.push(fetched);
+    }
+    for fetched in &mut retained {
+        if let Some(levels) = levels_by_base.get(&fetched.id) {
+            for level in levels {
+                if !fetched.reasoning_levels.contains(level) {
+                    fetched.reasoning_levels.push(*level);
+                }
+            }
+        }
+    }
+    Ok(retained)
+}
+
+/// Split an id only when it ends in one of the canonical level spellings and has a non-empty base.
+///
+/// `ReasoningLevel::parse` accepts human-friendly aliases (`x-high`, `extra-high`) that are useful
+/// in config but are not canonical provider id tokens; this helper deliberately uses the canonical
+/// seven-token import vocabulary instead.
+fn canonical_level_suffix(id: &str) -> Option<(&str, ReasoningLevel)> {
+    let (base, suffix) = id.rsplit_once('-')?;
+    if base.is_empty() {
+        return None;
+    }
+    let level = match suffix {
+        "none" => ReasoningLevel::None,
+        "low" => ReasoningLevel::Low,
+        "medium" => ReasoningLevel::Medium,
+        "high" => ReasoningLevel::High,
+        "xhigh" => ReasoningLevel::XHigh,
+        "ultra" => ReasoningLevel::Ultra,
+        "max" => ReasoningLevel::Max,
+        _ => return None,
+    };
+    Some((base, level))
 }
 
 /// Merge a fetch into a provider's catalogue. Returns `(added, refreshed)`.
@@ -273,6 +331,9 @@ fn merge(p: &mut Provider, fetched: Vec<Fetched>, now: Millis) -> (usize, usize)
                     if !f.capabilities.is_empty() {
                         existing.capabilities = f.capabilities;
                     }
+                    if !f.reasoning_levels.is_empty() {
+                        existing.reasoning_levels = f.reasoning_levels;
+                    }
                 }
                 existing.synced_at = Some(now);
                 refreshed += 1;
@@ -285,8 +346,13 @@ fn merge(p: &mut Provider, fetched: Vec<Fetched>, now: Millis) -> (usize, usize)
                     context_length: f.context_length,
                     max_output_tokens: f.max_output_tokens,
                     capabilities: f.capabilities,
+                    input_modalities: Vec::new(),
+                    reasoning_levels: f.reasoning_levels,
+                    default_reasoning_level: None,
+                    reasoning_wire: None,
                     input_price_per_mtok: None,
                     output_price_per_mtok: None,
+                    pricing: None,
                     synced_at: Some(now),
                     hidden: false,
                 });
@@ -496,6 +562,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_models_folds_level_ids_only_when_the_base_is_listed() {
+        // The suffix precedes its base deliberately: model listing order must not change folding.
+        let models = parse_models(r#"["foo-high", "bar-high", "foo"]"#).unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "bar-high");
+        assert!(models[0].reasoning_levels.is_empty());
+        assert_eq!(models[1].id, "foo");
+        assert_eq!(models[1].reasoning_levels, vec![ReasoningLevel::High]);
+    }
+
+    #[test]
+    fn parse_models_keeps_a_suffixed_id_when_no_base_is_listed() {
+        let models = parse_models(r#"["foo-high"]"#).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "foo-high");
+        assert!(models[0].reasoning_levels.is_empty());
+    }
+
+    #[test]
     fn parse_models_handles_openai_and_google_shapes() {
         let openai = parse_models(
             r#"{"object":"list","data":[
@@ -550,8 +635,13 @@ mod tests {
             context_length: Some(42),
             max_output_tokens: None,
             capabilities: Vec::new(),
+            input_modalities: Vec::new(),
+            reasoning_levels: Vec::new(),
+            default_reasoning_level: None,
+            reasoning_wire: None,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
+            pricing: None,
             synced_at: None,
             hidden: false,
         });
@@ -562,8 +652,13 @@ mod tests {
             context_length: None,
             max_output_tokens: None,
             capabilities: Vec::new(),
+            input_modalities: Vec::new(),
+            reasoning_levels: Vec::new(),
+            default_reasoning_level: None,
+            reasoning_wire: None,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
+            pricing: None,
             synced_at: None,
             hidden: false,
         });
@@ -573,6 +668,7 @@ mod tests {
             vec![
                 Fetched {
                     id: "gpt-5.5".into(),
+                    reasoning_levels: Vec::new(),
                     label: Some("provider label".into()),
                     context_length: Some(400_000),
                     max_output_tokens: None,
@@ -580,6 +676,7 @@ mod tests {
                 },
                 Fetched {
                     id: "o3".into(),
+                    reasoning_levels: vec![ReasoningLevel::Low, ReasoningLevel::Max],
                     label: Some("new label".into()),
                     context_length: Some(200_000),
                     max_output_tokens: None,
@@ -587,6 +684,7 @@ mod tests {
                 },
                 Fetched {
                     id: "gpt-5.5-mini".into(),
+                    reasoning_levels: Vec::new(),
                     label: None,
                     context_length: None,
                     max_output_tokens: None,

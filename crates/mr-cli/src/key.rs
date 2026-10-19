@@ -228,6 +228,7 @@ fn build_key(cfg: &Config, args: &CreateArgs) -> Result<(ClientKey, String), Cli
         allow_models,
         allow_routes,
         limit_requests: args.limit_requests.unwrap_or(0),
+        limits: Default::default(),
         note: args.note.clone(),
     };
     Ok((key, plaintext))
@@ -488,6 +489,7 @@ mod tests {
             allow_models: vec!["gpt-5.5".into()],
             allow_routes: vec![],
             limit_requests: 0,
+            limits: Default::default(),
             note: None,
         };
         let v = sanitized(&key);

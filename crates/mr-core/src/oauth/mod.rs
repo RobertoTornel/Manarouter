@@ -32,10 +32,11 @@
 //!
 //! ## Storage
 //!
-//! [`crate::store`] is still a stub ("store not yet implemented"), so durable credential storage
-//! for OAuth accounts is the secret [`crate::secret::Vault`]: [`refresh::CredentialStore`] is the
-//! narrow trait that wraps it, keyed by the account's `oauth_ref`. The relay and conductor own
-//! account mutation; this module only reads and writes credential material.
+//! Credential material lives in the secret [`crate::secret::Vault`]: [`refresh::CredentialStore`]
+//! is the narrow trait that wraps it, keyed by the account's `oauth_ref`. The non-secret metadata —
+//! platform, scopes, expiry, provider identity — lives in [`crate::store`]'s `oauth_credentials`
+//! table ([`crate::store::Store::get_oauth_credential`] and its siblings). The relay and conductor
+//! own account mutation; this module only reads and writes credential material.
 
 pub mod antigravity;
 pub mod codex;

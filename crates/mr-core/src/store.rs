@@ -84,7 +84,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// transaction as the migration it names, but if a future edit ever splits them, a re-run after a
 /// crash must not fail — a migration that errors on its second attempt bricks `open` for a
 /// database whose contents are actually fine.
-const MIGRATIONS: &[&str] = &[MIGRATION_V1];
+const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3];
 
 /// Schema v1: four tables, their indexes, and the revision/tombstone columns every row carries
 /// for v2 sync (see the module docs).
@@ -172,6 +172,73 @@ CREATE TABLE IF NOT EXISTS oplog (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS oplog_pending ON oplog(synced_at);
+"#;
+
+/// Schema v2: the per-key usage ledger and the provider quota cache.
+///
+/// ### Two new tables, not an `ALTER`
+///
+/// `ALTER TABLE ... ADD COLUMN` is **not idempotent** in SQLite — running it twice fails with
+/// "duplicate column name" — and the migration runner's invariant is that a re-run after a crash
+/// must never fail. A migration that errors on its second attempt bricks `open` for a database
+/// whose contents are actually fine. So v2 adds tables rather than columns.
+///
+/// ### `key_usage` is a ledger, not a counter
+///
+/// Each row is one request's token spend, stamped with when it happened. A stored counter plus a
+/// `window_started_at` would be a **tumbling** window: it resets mid-traffic and silently hands
+/// back quota the operator has already spent. Rolling windows need the history, so the history is
+/// what is kept.
+///
+/// ### `provider_quota_state` is a cache, not a source of truth
+///
+/// The provider's own quota is fetched over the network and is only as fresh as the last fetch.
+/// Rows are keyed by `(provider_id, account_id)` and carry the fetched payload verbatim, so the
+/// panel can show the last known state without a network call.
+const MIGRATION_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS key_usage (
+    id                TEXT PRIMARY KEY,
+    client_key_id     TEXT NOT NULL,
+    prompt_tokens     INTEGER,
+    completion_tokens INTEGER,
+    occurred_at       INTEGER NOT NULL,
+    created_at        INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS key_usage_by_key_time ON key_usage(client_key_id, occurred_at);
+
+CREATE TABLE IF NOT EXISTS provider_quota_state (
+    provider_id TEXT NOT NULL,
+    account_id  TEXT NOT NULL,
+    fetched_at  INTEGER NOT NULL,
+    source      TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (provider_id, account_id)
+);
+"#;
+
+/// Schema v3: the per-usage token side table.
+///
+/// `usage` carries prompt and completion tokens. This table carries what the *provider* reported
+/// about those tokens — how many were served from the prompt cache, how many the request wrote
+/// into the cache, and how long the generation window was — because those numbers are not
+/// available for every provider and are needed to divide tokens by time honestly.
+///
+/// It is a side table rather than more columns on `usage` for the same reason v2 used new tables:
+/// `ALTER TABLE ... ADD COLUMN` is not idempotent, and the migration runner must survive a
+/// re-run.
+const MIGRATION_V3: &str = r#"
+CREATE TABLE IF NOT EXISTS usage_tokens (
+    usage_id           TEXT PRIMARY KEY,
+    cached_tokens      INTEGER,
+    cache_write_tokens INTEGER,
+    generation_ms      INTEGER,
+    created_at         INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS usage_tokens_by_usage ON usage_tokens(usage_id);
 "#;
 
 /// Compile-time guarantee that every migration has a schema version and vice versa.
@@ -554,6 +621,149 @@ pub struct UsageGroup {
     pub key: String,
     /// The aggregates for that key.
     pub totals: UsageAggregate,
+}
+
+// -------------------------------------------------------------------------------------------------
+// Per-key usage ledger
+// -------------------------------------------------------------------------------------------------
+
+/// One request's token spend, attributed to a client key.
+///
+/// This is an immutable ledger row: it is written once, when the request finishes, and never
+/// updated. Rolling windows are computed from it, which is what makes them *rolling* — a window
+/// that started at 09:00 does not forget what happened at 08:55 when it is read at 09:30.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyUsageRecord {
+    /// The row id (a UUIDv7 string).
+    pub id: String,
+    /// The client key that made the request.
+    pub client_key_id: String,
+    /// Prompt tokens the upstream reported, if it reported any.
+    pub prompt_tokens: Option<u64>,
+    /// Completion tokens the upstream reported, if it reported any.
+    pub completion_tokens: Option<u64>,
+    /// When the request happened, in milliseconds since the epoch.
+    pub occurred_at: Millis,
+    /// When the row was written, in milliseconds since the epoch.
+    pub created_at: Millis,
+}
+
+impl KeyUsageRecord {
+    /// Build a record for a key, stamping it with the current time.
+    ///
+    /// The id is a fresh UUIDv7, so two concurrent requests for the same key never collide.
+    pub fn new(client_key_id: impl Into<String>, now: Millis) -> Self {
+        Self {
+            id: crate::ids::new_id(),
+            client_key_id: client_key_id.into(),
+            prompt_tokens: None,
+            completion_tokens: None,
+            occurred_at: now,
+            created_at: now,
+        }
+    }
+
+    /// Attach the tokens the upstream reported.
+    pub fn with_tokens(mut self, prompt: Option<u64>, completion: Option<u64>) -> Self {
+        self.prompt_tokens = prompt;
+        self.completion_tokens = completion;
+        self
+    }
+
+    /// Move the occurrence time, for a caller that already knows when the request happened.
+    pub fn at(mut self, at: Millis) -> Self {
+        self.occurred_at = at;
+        self
+    }
+}
+
+/// The token totals of one key over one window.
+///
+/// The three sums are kept separate rather than added together because the two limits are
+/// different: a request cap counts *requests*, and a token cap counts tokens. A window that
+/// collapsed them into one number could not answer either question.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyWindowUsage {
+    /// Number of requests recorded in the window.
+    pub requests: u64,
+    /// Prompt tokens in the window.
+    pub prompt_tokens: u64,
+    /// Completion tokens in the window.
+    pub completion_tokens: u64,
+}
+
+impl KeyWindowUsage {
+    /// Prompt plus completion tokens.
+    pub fn total_tokens(&self) -> u64 {
+        self.prompt_tokens.saturating_add(self.completion_tokens)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// The per-usage token side table
+// -------------------------------------------------------------------------------------------------
+
+/// The token breakdown a provider reported for one request.
+///
+/// Every field is optional: a provider that reports cached tokens but not a generation window
+/// leaves that field `None` rather than inventing a zero. `None` means "not reported"; `Some(0)`
+/// means "reported as zero".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageTokenBreakdown {
+    /// Tokens served from the prompt cache.
+    pub cached_tokens: Option<u64>,
+    /// Tokens the request wrote into the prompt cache.
+    pub cache_write_tokens: Option<u64>,
+    /// How long the generation window was, in milliseconds.
+    pub generation_ms: Option<u64>,
+}
+
+// -------------------------------------------------------------------------------------------------
+// Provider quota cache
+// -------------------------------------------------------------------------------------------------
+
+/// The last known quota state of one provider account.
+///
+/// The provider's quota is fetched over the network, so this is a **cache**: it is exactly as
+/// fresh as `fetched_at` says, and the panel must present it as such. The payload is the
+/// serialized fetch result, stored verbatim so a panel change does not need a migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderQuotaState {
+    /// The provider this belongs to.
+    pub provider_id: String,
+    /// The account within that provider.
+    pub account_id: AccountId,
+    /// When the fetch happened, in milliseconds since the epoch.
+    pub fetched_at: Millis,
+    /// Where the numbers came from (`provider`, `manual`, …).
+    pub source: String,
+    /// The serialized fetch result.
+    pub payload: String,
+    /// When the row was first written.
+    pub created_at: Millis,
+    /// When the row was last updated.
+    pub updated_at: Millis,
+}
+
+impl ProviderQuotaState {
+    /// Build a cache row, stamped with the current time.
+    pub fn new(
+        provider_id: impl Into<String>,
+        account_id: AccountId,
+        source: impl Into<String>,
+        payload: impl Into<String>,
+    ) -> Self {
+        let now = Millis::now();
+        Self {
+            provider_id: provider_id.into(),
+            account_id,
+            fetched_at: now,
+            source: source.into(),
+            payload: payload.into(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1817,6 +2027,264 @@ impl Store {
         }
         Ok(out)
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // The per-key usage ledger
+    // ---------------------------------------------------------------------------------------------
+
+    /// Append one request's token spend to the per-key ledger.
+    ///
+    /// The row is written once and never updated: the ledger is the history that rolling windows
+    /// are computed from, so a corrected row would change what a window meant after the fact.
+    /// Re-recording the same id is a no-op (`ON CONFLICT DO NOTHING`), which makes a retry safe.
+    pub fn record_key_usage(&self, record: &KeyUsageRecord) -> Result<()> {
+        let guard = self.guard()?;
+        guard.execute(
+            "INSERT INTO key_usage (id, client_key_id, prompt_tokens, completion_tokens, \
+             occurred_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(id) DO NOTHING",
+            params![
+                record.id,
+                record.client_key_id,
+                record.prompt_tokens,
+                record.completion_tokens,
+                record.occurred_at.as_millis(),
+                record.created_at.as_millis(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The usage of one key since `since`, in milliseconds since the epoch.
+    ///
+    /// The window is half-open at the far end only: everything from `since` onwards counts, which
+    /// is what "the last five hours" means at the moment it is asked.
+    pub fn key_window_usage(&self, client_key_id: &str, since: Millis) -> Result<KeyWindowUsage> {
+        let guard = self.guard()?;
+        let row = guard.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0) \
+             FROM key_usage WHERE client_key_id = ?1 AND occurred_at >= ?2",
+            params![client_key_id, since.as_millis()],
+            |row| {
+                Ok(KeyWindowUsage {
+                    requests: row.get::<_, i64>(0)? as u64,
+                    prompt_tokens: row.get::<_, i64>(1)? as u64,
+                    completion_tokens: row.get::<_, i64>(2)? as u64,
+                })
+            },
+        )?;
+        Ok(row)
+    }
+
+    /// The usage of many keys since `since`, in one query.
+    ///
+    /// The map is **dense**: every requested key is present, with zeroes for the keys that have
+    /// used nothing. A panel that reads five keys therefore does not need to know which of them
+    /// had traffic, and it does not need one query per key.
+    pub fn key_window_usage_many(
+        &self,
+        since: Millis,
+        client_key_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, KeyWindowUsage>> {
+        let mut out = std::collections::HashMap::with_capacity(client_key_ids.len());
+        for key in client_key_ids {
+            out.insert(key.clone(), KeyWindowUsage::default());
+        }
+        if client_key_ids.is_empty() {
+            return Ok(out);
+        }
+        let guard = self.guard()?;
+        let placeholders = vec!["?"; client_key_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT client_key_id, COUNT(*), COALESCE(SUM(prompt_tokens), 0), \
+             COALESCE(SUM(completion_tokens), 0) FROM key_usage \
+             WHERE client_key_id IN ({placeholders}) AND occurred_at >= ? \
+             GROUP BY client_key_id"
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = client_key_ids
+            .iter()
+            .map(|k| Box::new(k.clone()) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        params.push(Box::new(since.as_millis()));
+        let mut stmt = guard.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let key: String = row.get(0)?;
+            Ok((
+                key,
+                KeyWindowUsage {
+                    requests: row.get::<_, i64>(1)? as u64,
+                    prompt_tokens: row.get::<_, i64>(2)? as u64,
+                    completion_tokens: row.get::<_, i64>(3)? as u64,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (key, usage) = row?;
+            out.insert(key, usage);
+        }
+        Ok(out)
+    }
+
+    /// Delete ledger rows that happened before `before`, returning how many were removed.
+    ///
+    /// The ledger grows with traffic, so it needs a retention policy. Pruning is by occurrence
+    /// time, not write time: a row written late about an old request is still old.
+    pub fn prune_key_usage(&self, before: Millis) -> Result<u64> {
+        let guard = self.guard()?;
+        let removed = guard.execute(
+            "DELETE FROM key_usage WHERE occurred_at < ?1",
+            params![before.as_millis()],
+        )?;
+        Ok(u64::try_from(removed).unwrap_or(0))
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The provider quota cache
+    // ---------------------------------------------------------------------------------------------
+
+    /// Store the last known quota state of one provider account.
+    ///
+    /// A second fetch for the same `(provider, account)` updates the row in place and keeps the
+    /// original `created_at`, so "first seen" and "last updated" stay distinct.
+    pub fn put_provider_quota_state(&self, row: &ProviderQuotaState) -> Result<()> {
+        let guard = self.guard()?;
+        guard.execute(
+            "INSERT INTO provider_quota_state (provider_id, account_id, fetched_at, source, \
+             payload, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(provider_id, account_id) DO UPDATE SET \
+             fetched_at = excluded.fetched_at, source = excluded.source, \
+             payload = excluded.payload, updated_at = excluded.updated_at",
+            params![
+                row.provider_id,
+                row.account_id.as_str(),
+                row.fetched_at.as_millis(),
+                row.source,
+                row.payload,
+                row.created_at.as_millis(),
+                row.updated_at.as_millis(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The cached quota state of every account of one provider.
+    ///
+    /// An empty vector means "nothing cached", which is different from "cached and empty" and is
+    /// reported as such: the caller must not treat a missing cache as a zero quota.
+    pub fn provider_quota_state(&self, provider_id: &str) -> Result<Vec<ProviderQuotaState>> {
+        let guard = self.guard()?;
+        let mut stmt = guard.prepare(
+            "SELECT provider_id, account_id, fetched_at, source, payload, created_at, updated_at \
+             FROM provider_quota_state WHERE provider_id = ?1 ORDER BY account_id",
+        )?;
+        let rows = stmt.query_map(params![provider_id], |row| {
+            Ok(ProviderQuotaState {
+                provider_id: row.get(0)?,
+                account_id: AccountId::from(row.get::<_, String>(1)?),
+                fetched_at: Millis::from_millis(row.get(2)?),
+                source: row.get(3)?,
+                payload: row.get(4)?,
+                created_at: Millis::from_millis(row.get(5)?),
+                updated_at: Millis::from_millis(row.get(6)?),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every cached quota row, for every provider.
+    pub fn all_provider_quota_state(&self) -> Result<Vec<ProviderQuotaState>> {
+        let guard = self.guard()?;
+        let mut stmt = guard.prepare(
+            "SELECT provider_id, account_id, fetched_at, source, payload, created_at, updated_at \
+             FROM provider_quota_state ORDER BY provider_id, account_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ProviderQuotaState {
+                provider_id: row.get(0)?,
+                account_id: AccountId::from(row.get::<_, String>(1)?),
+                fetched_at: Millis::from_millis(row.get(2)?),
+                source: row.get(3)?,
+                payload: row.get(4)?,
+                created_at: Millis::from_millis(row.get(5)?),
+                updated_at: Millis::from_millis(row.get(6)?),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Forget the cached quota of one provider account.
+    ///
+    /// Returns whether a row was actually removed, so a caller can tell "deleted" from "was never
+    /// there".
+    pub fn delete_provider_quota_state(&self, provider_id: &str, account_id: &str) -> Result<bool> {
+        let guard = self.guard()?;
+        let removed = guard.execute(
+            "DELETE FROM provider_quota_state WHERE provider_id = ?1 AND account_id = ?2",
+            params![provider_id, account_id],
+        )?;
+        Ok(removed > 0)
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The per-usage token side table
+    // ---------------------------------------------------------------------------------------------
+
+    /// Attach the provider-reported token breakdown to a usage row.
+    ///
+    /// The breakdown is optional in every field: a provider that reports cached tokens but not a
+    /// generation window leaves the other column `NULL` rather than inventing a zero. A `NULL`
+    /// means "not reported"; a zero means "reported as zero".
+    pub fn record_usage_tokens(
+        &self,
+        usage_id: &str,
+        cached_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+        generation_ms: Option<u64>,
+    ) -> Result<()> {
+        let guard = self.guard()?;
+        guard.execute(
+            "INSERT INTO usage_tokens (usage_id, cached_tokens, cache_write_tokens, generation_ms, \
+             created_at) VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(usage_id) DO UPDATE SET cached_tokens = excluded.cached_tokens, \
+             cache_write_tokens = excluded.cache_write_tokens, generation_ms = excluded.generation_ms",
+            params![
+                usage_id,
+                cached_tokens,
+                cache_write_tokens,
+                generation_ms,
+                Millis::now().as_millis(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The token breakdown of one usage row, if the provider reported one.
+    pub fn usage_tokens(&self, usage_id: &str) -> Result<Option<UsageTokenBreakdown>> {
+        let guard = self.guard()?;
+        let mut stmt = guard.prepare(
+            "SELECT cached_tokens, cache_write_tokens, generation_ms FROM usage_tokens \
+             WHERE usage_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![usage_id], |row| {
+            Ok(UsageTokenBreakdown {
+                cached_tokens: row.get::<_, Option<i64>>(0)?.map(|v| v as u64),
+                cache_write_tokens: row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
+                generation_ms: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -2057,6 +2525,183 @@ mod tests {
             v
         };
         assert_eq!(store_version, SCHEMA_VERSION + 1, "refusal must not write");
+    }
+
+    // -- the per-key usage ledger -------------------------------------------------------
+
+    #[test]
+    fn a_v1_database_upgrades_to_the_current_schema_and_keeps_its_rows() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        // A database written by the first build: v1 only.
+        {
+            let conn = Connection::open(&path).expect("open raw");
+            conn.execute_batch(MIGRATION_V1).expect("apply v1");
+            conn.pragma_update(None, "user_version", 1).expect("v1");
+            conn.execute(
+                "INSERT INTO account_health (account_id, state, reset_at, consecutive_failures, \
+                 last_failure_kind, last_failure_reason, created_at, updated_at, revision, \
+                 deleted_at) VALUES ('acct-a', 'ready', NULL, 0, NULL, NULL, 1, 1, 1, NULL)",
+                [],
+            )
+            .expect("insert");
+            conn.close().expect("close");
+        }
+
+        let store = Store::open(&path).expect("open");
+        assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
+        // The v1 row survived the upgrade…
+        let health = store
+            .account_health_including_deleted(&account("a"))
+            .expect("query")
+            .expect("row");
+        assert_eq!(health.account_id, account("a"));
+        // …and the new tables exist.
+        let usage = store.key_window_usage("key-a", t(0)).expect("query");
+        assert_eq!(usage.requests, 0);
+    }
+
+    #[test]
+    fn the_ledger_counts_requests_and_tokens_over_a_rolling_window() {
+        let store = Store::open_in_memory().expect("open");
+        // Two requests inside the window, one before it.
+        for (at, prompt, completion) in [(1_000i64, 10u64, 5u64), (2_000, 20, 7), (500, 99, 99)] {
+            let record =
+                KeyUsageRecord::new("key-a", t(at)).with_tokens(Some(prompt), Some(completion));
+            store.record_key_usage(&record).expect("record");
+        }
+
+        let window = store.key_window_usage("key-a", t(1_000)).expect("query");
+        assert_eq!(
+            window.requests, 2,
+            "the row before the window must not count"
+        );
+        assert_eq!(window.prompt_tokens, 30);
+        assert_eq!(window.completion_tokens, 12);
+        assert_eq!(window.total_tokens(), 42);
+
+        // A later window rolls forward: what was in the window falls out of it.
+        let later = store.key_window_usage("key-a", t(1_500)).expect("query");
+        assert_eq!(later.requests, 1);
+        assert_eq!(later.prompt_tokens, 20);
+    }
+
+    #[test]
+    fn the_window_of_many_keys_is_dense_and_one_query() {
+        let store = Store::open_in_memory().expect("open");
+        let record = KeyUsageRecord::new("key-a", t(10)).with_tokens(Some(4), Some(6));
+        store.record_key_usage(&record).expect("record");
+
+        let keys = vec!["key-a".to_owned(), "key-b".to_owned()];
+        let windows = store.key_window_usage_many(t(0), &keys).expect("query");
+        assert_eq!(windows.len(), 2, "every requested key must be present");
+        assert_eq!(windows["key-a"].requests, 1);
+        assert_eq!(windows["key-a"].total_tokens(), 10);
+        assert_eq!(
+            windows["key-b"],
+            KeyWindowUsage::default(),
+            "a key with no traffic reports zeroes, not a missing entry"
+        );
+    }
+
+    #[test]
+    fn pruning_the_ledger_removes_only_rows_older_than_the_cutoff() {
+        let store = Store::open_in_memory().expect("open");
+        for at in [100i64, 200, 300] {
+            let record = KeyUsageRecord::new("key-a", t(at));
+            store.record_key_usage(&record).expect("record");
+        }
+        let removed = store.prune_key_usage(t(250)).expect("prune");
+        assert_eq!(removed, 2);
+        let window = store.key_window_usage("key-a", t(0)).expect("query");
+        assert_eq!(window.requests, 1);
+    }
+
+    #[test]
+    fn recording_the_same_ledger_row_twice_does_not_double_count() {
+        let store = Store::open_in_memory().expect("open");
+        let record = KeyUsageRecord::new("key-a", t(10)).with_tokens(Some(3), Some(4));
+        store.record_key_usage(&record).expect("first");
+        store.record_key_usage(&record).expect("second");
+        let window = store.key_window_usage("key-a", t(0)).expect("query");
+        assert_eq!(window.requests, 1);
+        assert_eq!(window.total_tokens(), 7);
+    }
+
+    // -- the provider quota cache -------------------------------------------------------
+
+    #[test]
+    fn quota_state_is_stored_per_account_and_replaced_on_a_later_fetch() {
+        let store = Store::open_in_memory().expect("open");
+        let first = ProviderQuotaState::new("openai", account("a"), "provider", "{\"w\":1}");
+        store.put_provider_quota_state(&first).expect("put");
+
+        let second = ProviderQuotaState::new("openai", account("a"), "provider", "{\"w\":2}");
+        store.put_provider_quota_state(&second).expect("put again");
+
+        let rows = store.provider_quota_state("openai").expect("query");
+        assert_eq!(rows.len(), 1, "the same account must not gain a second row");
+        assert_eq!(rows[0].payload, "{\"w\":2}", "the newer fetch wins");
+        assert_eq!(
+            rows[0].created_at, first.created_at,
+            "the creation stamp is kept across updates"
+        );
+        assert!(rows[0].updated_at >= first.updated_at);
+    }
+
+    #[test]
+    fn quota_state_can_be_read_for_every_provider_and_deleted() {
+        let store = Store::open_in_memory().expect("open");
+        store
+            .put_provider_quota_state(&ProviderQuotaState::new(
+                "openai",
+                account("a"),
+                "provider",
+                "{}",
+            ))
+            .expect("put");
+        store
+            .put_provider_quota_state(&ProviderQuotaState::new(
+                "anthropic",
+                account("b"),
+                "provider",
+                "{}",
+            ))
+            .expect("put");
+
+        assert_eq!(store.all_provider_quota_state().expect("query").len(), 2);
+        assert!(store
+            .delete_provider_quota_state("openai", account("a").as_str())
+            .expect("delete"));
+        assert!(
+            !store
+                .delete_provider_quota_state("openai", account("a").as_str())
+                .expect("delete again"),
+            "deleting a row that is not there reports false"
+        );
+        assert_eq!(store.all_provider_quota_state().expect("query").len(), 1);
+    }
+
+    // -- the token side table -----------------------------------------------------------
+
+    #[test]
+    fn token_breakdowns_round_trip_and_distinguish_unreported_from_zero() {
+        let store = Store::open_in_memory().expect("open");
+        assert!(
+            store.usage_tokens("usage-1").expect("query").is_none(),
+            "an unknown usage row has no breakdown"
+        );
+        store
+            .record_usage_tokens("usage-1", Some(12), Some(0), None)
+            .expect("record");
+        let breakdown = store.usage_tokens("usage-1").expect("query").expect("row");
+        assert_eq!(breakdown.cached_tokens, Some(12));
+        assert_eq!(
+            breakdown.cache_write_tokens,
+            Some(0),
+            "a reported zero is not a missing value"
+        );
+        assert_eq!(breakdown.generation_ms, None, "an unreported window stays unknown");
     }
 
     // -- account health -----------------------------------------------------------------

@@ -1,18 +1,22 @@
-// view-settings.js — ports and relay pool settings (with restart warnings), panel password, and
-// the raw configuration editor with validate + save.
+// view-settings.js — relay ports, pool, authentication, proxy and quota display settings,
+// panel password, and the raw configuration editor with validate + save.
 
 import { api } from './api.js';
-import { h, chip, field, errorBlock, applyFieldErrors, clearFieldErrors } from './dom.js';
+import { h, chip, field, toggle, errorBlock, applyFieldErrors, clearFieldErrors } from './dom.js';
 import { describePortChange } from './format.js';
 
 export async function renderSettings(mount, ctx) {
   const portsCard = h('div', { class: 'card' }, h('h2', {}, 'Listen ports'));
   const latencyCard = h('div', { class: 'card' }, h('h2', {}, 'Relay connection pool'));
+  const accessCard = h('div', { class: 'card' }, h('h2', {}, 'Client-key access'));
+  const proxiesCard = h('div', { class: 'card' }, h('h2', {}, 'Upstream proxies'));
+  const quotaDisplayCard = h('div', { class: 'card' }, h('h2', {}, 'Quota display'));
+  const pricingCard = h('div', { class: 'card' }, h('h2', {}, 'Pricing data'));
   const passwordCard = h('div', { class: 'card' }, h('h2', {}, 'Panel password'));
   const rawCard = h('div', { class: 'card' }, h('h2', {}, 'Raw configuration'));
-  mount.replaceChildren(portsCard, latencyCard, passwordCard, rawCard);
+  mount.replaceChildren(portsCard, latencyCard, accessCard, proxiesCard, quotaDisplayCard, pricingCard, passwordCard, rawCard);
 
-  await Promise.all([renderPorts(), renderPassword(), renderLatency()]);
+  await Promise.all([renderPorts(), renderPassword(), renderLatency(), renderAccess(), renderProxies(), renderQuotaDisplay(), renderPricing()]);
   renderRaw(); // sequential on purpose: the textarea is heavy and it can stream in last
 
   // ------------------------------------------------------------------ ports
@@ -198,7 +202,11 @@ export async function renderSettings(mount, ctx) {
         ? latency.pool_max_idle_per_host : defaults.pool_max_idle_per_host,
     };
     const lowResource = effective.pool_idle_secs === 30 && effective.pool_max_idle_per_host === 2;
-    const profile = h('input', { type: 'checkbox', 'aria-label': 'Low-resource profile', checked: lowResource });
+    const profileToggle = toggle('Low-resource profile (30s idle, 2 connections per host)', {
+      checked: lowResource,
+      help: 'Use shorter idle connection lifetime and a smaller per-host connection pool to retain fewer sockets.',
+    });
+    const profile = profileToggle.input;
     const advanced = h('details', { style: 'margin:12px 0;padding:10px;border:1px solid var(--line);border-radius:8px;' });
     const idleSecs = h('input', { class: 'input mono', type: 'number', min: '0', max: '86400', step: '1', value: String(effective.pool_idle_secs), 'aria-label': 'Idle connection lifetime in seconds' });
     const maxIdle = h('input', { class: 'input mono', type: 'number', min: '1', step: '1', value: String(effective.pool_max_idle_per_host), 'aria-label': 'Maximum idle connections per host' });
@@ -237,9 +245,12 @@ export async function renderSettings(mount, ctx) {
       }
       save.disabled = true;
       try {
-        // Preserve every raw/unknown field; only patch the two settings this view owns.
-        config.latency = { ...latency, pool_idle_secs: idleValue, pool_max_idle_per_host: maxValue };
-        await api.putRaw('/api/config/raw', JSON.stringify(config, null, 2));
+        // Re-read before patching so other settings changed since page load are not replaced.
+        const latest = await readConfig();
+        const latestLatency = latest.latency && typeof latest.latency === 'object' && !Array.isArray(latest.latency)
+          ? latest.latency : {};
+        latest.latency = { ...latestLatency, pool_idle_secs: idleValue, pool_max_idle_per_host: maxValue };
+        await api.putRaw('/api/config/raw', JSON.stringify(latest, null, 2));
         status.replaceChildren(chip('Saved · relay restart required', 'warn'), restart);
         ctx.toast.warning('Pool settings saved. Restart the relay for them to take effect.', null);
       } catch (err) {
@@ -257,12 +268,265 @@ export async function renderSettings(mount, ctx) {
     latencyCard.replaceChildren(
       h('h2', {}, 'Relay connection pool'),
       h('p', { class: 'hint' }, `Effective settings: ${effective.pool_idle_secs}s idle lifetime · ${effective.pool_max_idle_per_host} idle connection(s) per host. These values are read from the effective configuration, using defaults only when fields are absent or invalid.`),
-      h('label', { style: 'display:flex;align-items:center;gap:10px;margin:12px 0;' }, profile, h('span', {}, 'Low-resource profile (30s idle, 2 connections per host)')),
+      profileToggle.row,
       advanced,
       restart,
       h('div', { style: 'display:flex;gap:8px;margin-top:12px;' }, save),
       status,
     );
+  }
+
+  // --------------------------------------------------------------- client-key access
+
+  async function renderAccess() {
+    let config;
+    try {
+      config = await readConfig();
+    } catch (err) {
+      accessCard.replaceChildren(h('h2', {}, 'Client-key access'), errorBlock(err));
+      return;
+    }
+
+    const noKey = toggle('Allow requests without a client key', {
+      checked: config.no_key_required === true,
+      help: 'When enabled, callers may use this relay without a client key. This can spend your upstream provider quota.',
+    });
+    const allowRemote = toggle('Allow keyless access on a remote relay bind', {
+      checked: config.allow_remote_without_key === true,
+      help: 'Explicitly permits an unauthenticated relay on a non-loopback address. Anyone who can reach it may use your provider accounts and incur charges.',
+    });
+    const warning = h('p', { class: 'hint' }, 'Remote exposure warning: do not enable remote keyless access on a network you do not fully trust. A remote open relay can let other people consume your provider quota or spend your money. Keep both switches off unless this exposure is deliberate.');
+    const status = h('div');
+    const save = h('button', { class: 'btn btn-primary', type: 'button' }, 'Save access settings');
+    save.addEventListener('click', async () => {
+      const latest = await readConfig().catch((err) => {
+        status.replaceChildren(errorBlock(err));
+        return null;
+      });
+      if (!latest) return;
+      const previous = { noKey: latest.no_key_required, remote: latest.allow_remote_without_key };
+      latest.no_key_required = noKey.input.checked;
+      latest.allow_remote_without_key = allowRemote.input.checked;
+      try {
+        await api.putRaw('/api/config/raw', JSON.stringify(latest, null, 2));
+        await renderValidation(status);
+        ctx.toast.success('Client-key access settings saved.');
+      } catch (err) {
+        noKey.input.checked = previous.noKey === true;
+        allowRemote.input.checked = previous.remote === true;
+        status.replaceChildren(errorBlock(err));
+      }
+    });
+    accessCard.replaceChildren(
+      h('h2', {}, 'Client-key access'),
+      h('p', { class: 'hint' }, 'Control whether the relay accepts requests with no client key. These are relay authentication settings, not upstream provider credentials.'),
+      noKey.row, allowRemote.row, warning,
+      h('div', { class: 'dialog-actions' }, save), status,
+    );
+  }
+
+  // ------------------------------------------------------------------- proxy pool
+
+  async function renderProxies() {
+    let config;
+    try {
+      config = await readConfig();
+    } catch (err) {
+      proxiesCard.replaceChildren(h('h2', {}, 'Upstream proxies'), errorBlock(err));
+      return;
+    }
+
+    const proxies = Array.isArray(config.proxies) ? config.proxies.map((proxy) => ({ ...proxy })) : [];
+    const strategy = h('select', { class: 'input', 'aria-label': 'Proxy selection strategy' });
+    for (const [value, label] of [['priority', 'Priority'], ['least-used', 'Least used'], ['random', 'Random'], ['round-robin', 'Round robin']]) {
+      strategy.append(h('option', { value }, label));
+    }
+    strategy.value = config.proxy_strategy ?? 'priority';
+    const list = h('div', { class: 'stack' });
+    const status = h('div');
+    const controlsByProxy = new Map();
+
+    function syncProxyControls() {
+      for (const [proxy, controls] of controlsByProxy) {
+        proxy.id = controls.id.value.trim();
+        proxy.url = controls.url.value.trim();
+        proxy.enabled = controls.enabled.checked;
+        proxy.priority = Number(controls.priority.value);
+      }
+    }
+
+    function drawProxies() {
+      controlsByProxy.clear();
+      list.replaceChildren();
+      if (!proxies.length) list.append(h('p', { class: 'hint' }, 'No upstream proxies configured.'));
+      for (const [index, proxy] of proxies.entries()) {
+        const id = h('input', { class: 'input mono', type: 'text', value: proxy.id ?? '', 'aria-label': `Proxy ${index + 1} id` });
+        const url = h('input', { class: 'input mono', type: 'text', value: proxy.url ?? '', placeholder: 'http://proxy.example:8080', 'aria-label': `Proxy ${index + 1} URL` });
+        const enabled = toggle(`Proxy ${index + 1} enabled`, {
+          checked: proxy.enabled !== false,
+          help: 'Disabled proxies stay configured but are not selected for upstream requests.',
+        });
+        const priority = h('input', { class: 'input mono', type: 'number', step: '1', value: String(Number.isInteger(proxy.priority) ? proxy.priority : 0), 'aria-label': `Proxy ${index + 1} priority` });
+        const remove = h('button', { class: 'btn btn-sm', type: 'button' }, 'Remove proxy');
+        remove.addEventListener('click', () => {
+          syncProxyControls();
+          proxies.splice(index, 1);
+          drawProxies();
+        });
+        const row = h('div', { class: 'card', style: 'margin:10px 0;padding:12px;' },
+          h('div', { class: 'grid-2' },
+            field('Proxy ID', id, { hint: 'Stable id used by provider/account proxy references.' }),
+            field('Proxy URL', url, { hint: 'Use http://, https://, socks4:// or socks5://. Authentication secrets are managed separately; do not include passwords in the URL.' })),
+          enabled.row,
+          field('Priority', priority, { hint: 'Lower numbers are selected first with the priority strategy.' }),
+          remove,
+        );
+        list.append(row);
+        controlsByProxy.set(proxy, { id, url, enabled: enabled.input, priority });
+      }
+    }
+    drawProxies();
+
+    const add = h('button', { class: 'btn', type: 'button' }, 'Add proxy');
+    add.addEventListener('click', () => {
+      syncProxyControls();
+      proxies.push({ id: '', url: '', enabled: true, priority: proxies.length });
+      drawProxies();
+    });
+    const save = h('button', { class: 'btn btn-primary', type: 'button' }, 'Save proxies');
+    save.addEventListener('click', async () => {
+      const latest = await readConfig().catch((err) => {
+        status.replaceChildren(errorBlock(err));
+        return null;
+      });
+      if (!latest) return;
+      syncProxyControls();
+      const nextProxies = proxies.map((proxy) => ({ ...proxy }));
+      const invalid = nextProxies.find((proxy) => !proxy.id || !proxy.url || !Number.isInteger(proxy.priority));
+      if (invalid) {
+        status.replaceChildren(h('div', { class: 'form-errors', role: 'alert' }, 'Each proxy needs a non-empty id, a URL, and an integer priority.'));
+        return;
+      }
+      latest.proxies = nextProxies;
+      latest.proxy_strategy = strategy.value;
+      try {
+        await api.putRaw('/api/config/raw', JSON.stringify(latest, null, 2));
+        await renderValidation(status);
+        ctx.toast.success('Proxy settings saved.');
+      } catch (err) {
+        status.replaceChildren(errorBlock(err));
+      }
+    });
+    proxiesCard.replaceChildren(
+      h('h2', {}, 'Upstream proxies'),
+      h('p', { class: 'hint' }, 'These endpoints route upstream provider traffic. URLs can reveal internal hostnames; passwords must not be embedded in the URL. No proxy URLs or credentials are written to browser logs.'),
+      field('Selection strategy', strategy, { help: 'Priority chooses the lowest number first; least-used, random and round-robin distribute among eligible enabled proxies.' }),
+      list,
+      h('div', { class: 'dialog-actions' }, add, save), status,
+    );
+  }
+
+  // --------------------------------------------------------------- quota display
+
+  async function renderQuotaDisplay() {
+    let config;
+    try {
+      config = await readConfig();
+    } catch (err) {
+      quotaDisplayCard.replaceChildren(h('h2', {}, 'Quota display'), errorBlock(err));
+      return;
+    }
+    const display = config.quota?.display && typeof config.quota.display === 'object' ? config.quota.display : {};
+    const mode = h('select', { class: 'input', 'aria-label': 'Quota display mode' },
+      h('option', { value: 'chunks', selected: (display.mode ?? 'chunks') === 'chunks' }, 'Chunks'),
+      h('option', { value: 'percentage', selected: display.mode === 'percentage' }, 'Percentage'));
+    const chunks = h('input', { class: 'input mono', type: 'number', min: '1', max: '200', step: '1', value: String(Number.isInteger(display.chunks) ? display.chunks : 20), 'aria-label': 'Global quota chunk count' });
+    const refreshOnLoad = toggle('Refresh quota when opening the Quota view', {
+      checked: display.reset_on_load === true,
+      help: 'When enabled, opening the Quota view refreshes every account from provider endpoints. This can make provider requests and hit rate limits; it does not run inference.',
+    });
+    const status = h('div');
+    const save = h('button', { class: 'btn btn-primary', type: 'button' }, 'Save quota display');
+    save.addEventListener('click', async () => {
+      const count = Number(chunks.value);
+      if (!Number.isInteger(count) || count < 1 || count > 200) {
+        status.replaceChildren(h('div', { class: 'form-errors', role: 'alert' }, 'Global chunk count must be an integer from 1 to 200.'));
+        return;
+      }
+      const latest = await readConfig().catch((err) => {
+        status.replaceChildren(errorBlock(err));
+        return null;
+      });
+      if (!latest) return;
+      const quota = latest.quota && typeof latest.quota === 'object' ? latest.quota : {};
+      const oldDisplay = quota.display && typeof quota.display === 'object' ? quota.display : {};
+      quota.display = { ...oldDisplay, mode: mode.value, chunks: count, reset_on_load: refreshOnLoad.input.checked };
+      latest.quota = quota;
+      try {
+        await api.putRaw('/api/config/raw', JSON.stringify(latest, null, 2));
+        await renderValidation(status);
+        ctx.toast.success('Quota display settings saved.');
+      } catch (err) {
+        status.replaceChildren(errorBlock(err));
+      }
+    });
+    quotaDisplayCard.replaceChildren(
+      h('h2', {}, 'Quota display'),
+      h('p', { class: 'hint' }, 'Choose how remaining quota is rendered. Chunk count is global across accounts and applies in chunks mode.'),
+      field('Display mode', mode, { help: 'Chunks display approximate blocks of remaining allowance; percentage displays a percentage where the provider supplies enough information.' }),
+      field('Global chunk count', chunks, { hint: '1–200 chunks per full allowance.' }),
+      refreshOnLoad.row,
+      h('div', { class: 'dialog-actions' }, save), status,
+    );
+  }
+
+  // --------------------------------------------------------------------- pricing
+
+  async function renderPricing() {
+    const status = h('p', { class: 'hint', role: 'status' });
+    const sync = h('button', { class: 'btn', type: 'button' }, 'Sync bundled prices');
+    sync.addEventListener('click', async () => {
+      sync.disabled = true;
+      status.textContent = 'Applying bundled price metadata…';
+      try {
+        const result = await api.post('/api/pricing/sync', {});
+        const changed = Number(result?.updated ?? 0);
+        status.textContent = `Bundled price metadata synced; ${changed} configured model(s) updated. Manual prices are preserved.`;
+        ctx.toast.success('Bundled pricing metadata synced.');
+      } catch (err) {
+        status.textContent = `Pricing sync failed: ${err.message}`;
+      } finally {
+        sync.disabled = false;
+      }
+    });
+    pricingCard.replaceChildren(
+      h('h2', {}, 'Pricing data'),
+      h('p', { class: 'hint' }, 'Sync model price metadata from the bundled LiteLLM-derived table. This does not contact providers or estimate request costs; missing prices are unknown, not free.'),
+      sync,
+      status,
+    );
+  }
+
+  // --------------------------------------------------------------- config helpers
+
+  async function readConfig() {
+    const raw = await api.getRaw('/api/config/raw');
+    const config = JSON.parse(raw);
+    if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('Configuration must be an object.');
+    return config;
+  }
+
+  async function renderValidation(target) {
+    const validation = await api.get('/api/config/validate');
+    const problems = Array.isArray(validation.problems) ? validation.problems : [];
+    if (!problems.length) {
+      target.replaceChildren(h('div', { class: 'form-ok', role: 'status' }, 'Configuration validated with no problems.'));
+      return true;
+    }
+    target.replaceChildren(h('div', { class: 'form-errors', role: 'alert' },
+      h('strong', {}, `${problems.length} configuration problem${problems.length === 1 ? '' : 's'} found:`),
+      h('ul', {}, ...problems.map((problem) => h('li', {}, typeof problem === 'string' ? problem : (problem.message ?? JSON.stringify(problem)))))));
+    return false;
   }
 
   // ------------------------------------------------------------------ raw config

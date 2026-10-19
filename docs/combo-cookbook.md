@@ -15,11 +15,14 @@ local model as the last resort that costs nothing.
 
 ```bash
 mr combo add coding \
-  --label "Coding" \
   --step openai-codex/gpt-5-codex \
   --step anthropic/claude-sonnet-4-5 \
   --step ollama/qwen3-coder:30b
 ```
+
+There is no `--label` flag on `mr combo add`: the `label` field exists in the schema but is set by the
+panel or by editing `config.json` directly, so passing one is an argument error rather than a cosmetic
+miss.
 
 **Use when** the first step is a flat-rate subscription and the second bills per token.
 
@@ -55,12 +58,16 @@ mr combo add fast \
   --step anthropic/claude-sonnet-4-5 \
   --step openai/gpt-5 \
   --step google/gemini-2.5-pro \
-  --hedge --participants 0,1,2 --window-ms 250 \
-  --winner-metric first-response-byte \
-  --on-winner-fail pick-highest-passed
+  --hedge --participants 0,1,2 --window-ms 250
 ```
 
 **Use when** per-request latency matters more than cost.
+
+Two caveats before you rely on this. The CLI accepts only `--hedge`, `--participants` and `--window-ms`;
+there is **no** `--winner-metric` and no `--on-winner-fail` flag, so those values are set by editing
+`config.json`. And the relay does not yet dispatch concurrent hedged requests — `hedge.enabled` on a
+`priority` combo only opts it into sticky-success preference, so this recipe records a policy the
+relay does not execute today. See [the hedged race](07-hedged-race.md) §8.
 
 **Costs quota.** All three legs consume quota; a loser cancelled before its first byte costs little,
 but a loser that had begun generating is billed. See
@@ -81,12 +88,13 @@ When a provider-wide outage is the risk rather than a single model being slow.
 mr combo add resilient \
   --step openai/gpt-5 \
   --step anthropic/claude-sonnet-4-5 \
-  --hedge --participants 0,1 --window-ms 400 \
-  --on-winner-fail pick-highest-passed-different-provider
+  --hedge --participants 0,1 --window-ms 400
 ```
 
 Two participants, not three, and the failure mode is the one that will not hand the retry back to the
-provider that just failed.
+provider that just failed. As in recipe 3, `--on-winner-fail
+pick-highest-passed-different-provider` is not a flag — set `on_winner_fail` in `config.json` — and
+the race itself is not executed yet.
 
 ---
 
@@ -117,14 +125,16 @@ Route by context size rather than by preference.
 
 ```bash
 mr combo add longcontext \
-  --context-length 1000000 \
   --step google/gemini-2.5-pro \
   --step anthropic/claude-sonnet-4-5 \
   --step openai/gpt-5
 ```
 
-`context_length` is informational: the panel warns when a request will not fit, and the router
-**does not truncate**. Silently dropping a conversation's middle is worse than a clear failure.
+There is no `--context-length` flag; `context_length` is a schema field set by editing `config.json`.
+It is **purely informational today** — neither the relay nor `GET /v1/models` reads it, and there is
+no panel warning wired to it yet, so it records the operator's intent rather than affecting routing or
+truncation. What the router does guarantee is that it **does not truncate**: silently dropping a
+conversation's middle is worse than a clear failure.
 
 **Breaks first when** a client sends a request larger than every step's window. You get the provider's
 own error, which is the correct outcome but may be less clear than you would like.
@@ -143,8 +153,10 @@ mr combo add agent \
 ```
 
 `terminate` rather than `restart`, because an agent has usually already acted on the partial tool
-call. Under **both** policies the relay refuses to splice once a `tool_calls` delta has been
-emitted, so a mid-stream failure is a clean truncation rather than a corrupt call.
+call. Be aware that `--midstream-policy` only records the choice: the relay does not read
+`midstream_policy` yet, so under **either** value a mid-stream failure currently just ends the stream,
+and the tool-call guard described in [Combos §7](06-combos.md#7-midstream_policy) is part of the same
+unwired path.
 
 ---
 
@@ -227,8 +239,10 @@ mr combo add internal-canary --hidden \
   --step openai/gpt-5-mini
 ```
 
-`hidden` means callable but not advertised on `GET /v1/models`. Useful for a canary you want to test
-by name without every client's model picker offering it.
+`hidden` is **intended** to mean callable but not advertised, and the compiler does honour it for
+models (hidden models are dropped from the direct-lookup index). For a combo it is currently inert:
+`GET /v1/models` lists every combo in the snapshot without checking `hidden`, so the canary is
+advertised. Until that is fixed, keep the name obscure rather than relying on `hidden`.
 
 ---
 

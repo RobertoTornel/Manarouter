@@ -199,15 +199,15 @@ async function enterApp() {
 // ---------------------------------------------------------------------------
 
 const ROUTES = [
-  { id: 'overview', re: /^#\/overview$/, title: 'Overview', render: renderOverview },
-  { id: 'providers', re: /^#\/providers$/, title: 'Providers', render: renderProviders },
-  { id: 'combos', re: /^#\/combos(?:\/(.+))?$/, title: 'Combos', render: renderCombos },
-  { id: 'keys', re: /^#\/keys$/, title: 'Keys', render: renderKeys },
-  { id: 'aliases', re: /^#\/aliases$/, title: 'Aliases', render: renderAliases },
-  { id: 'models', re: /^#\/models$/, title: 'Models', render: renderModels },
-  { id: 'quota', re: /^#\/quota$/, title: 'Quota', render: renderQuota },
-  { id: 'settings', re: /^#\/settings$/, title: 'Settings', render: renderSettings },
-  { id: 'docs', re: /^#\/docs(?:\/(.+))?$/, title: 'Documentation', render: renderDocs },
+  { id: 'overview', re: /^#\/overview$/, title: 'Overview', navLabel: 'Overview', navTitle: 'See gateway health and configured resource counts.', render: renderOverview },
+  { id: 'providers', re: /^#\/providers$/, title: 'Providers', navLabel: 'Providers', navTitle: 'Manage upstream providers, accounts, and models.', render: renderProviders },
+  { id: 'combos', re: /^#\/combos(?:\/(.+))?$/, title: 'Combos', navLabel: 'Combos', navTitle: 'Combine models into reusable routing presets.', render: renderCombos },
+  { id: 'keys', re: /^#\/keys$/, title: 'Keys', navLabel: 'Keys', navTitle: 'Create and manage client API keys.', render: renderKeys },
+  { id: 'aliases', re: /^#\/aliases$/, title: 'Aliases', navLabel: 'Aliases', navTitle: 'Create operator-authored model-name rewrites.', render: renderAliases },
+  { id: 'models', re: /^#\/models$/, title: 'Models', navLabel: 'Models', navTitle: 'Browse available models and their capabilities.', render: renderModels },
+  { id: 'quota', re: /^#\/quota$/, title: 'Quota', navLabel: 'Quota', navTitle: 'Review declared limits and observed usage.', render: renderQuota },
+  { id: 'settings', re: /^#\/settings$/, title: 'Settings', navLabel: 'Settings', navTitle: 'Configure panel access, listen ports, and relay settings.', render: renderSettings },
+  { id: 'docs', re: /^#\/docs(?:\/(.+))?$/, title: 'Documentation', navLabel: 'Documentation', navTitle: 'Read and download Manarouter documentation.', render: renderDocs },
 ];
 
 function renderRoute() {
@@ -225,6 +225,11 @@ function renderRoute() {
   document.title = `Manarouter — ${route.title}`;
   document.getElementById('topbar-title').textContent = route.title;
   for (const a of document.querySelectorAll('#nav-list a')) {
+    const navRoute = ROUTES.find((r) => r.id === a.dataset.route);
+    if (navRoute) {
+      a.textContent = navRoute.navLabel;
+      a.title = navRoute.navTitle;
+    }
     if (a.dataset.route === route.id) a.setAttribute('aria-current', 'page');
     else a.removeAttribute('aria-current');
   }
@@ -320,12 +325,9 @@ onUnauthorized(() => {
   showLogin('Your session has expired — please sign in again.');
 });
 
-document.getElementById('logout-btn').addEventListener('click', async () => {
-  try { await api.post('/api/logout'); } catch { /* logging out of a dead session is fine */ }
-  state.session = { authenticated: false, password_required: state.session?.password_required ?? false };
-  if (state.session.password_required) showLogin();
-  else { toast.info('Logged out.'); await enterApp(); }
-});
+// There is no log-out button in the shell any more (see index.html): the panel is a local
+// single-operator console. The session still ends server-side, and a 401 from any call lands in
+// the handler above and returns to the sign-in screen — that path is unchanged.
 
 document.getElementById('topbar-health').addEventListener('click', () => {
   location.hash = '#/overview';

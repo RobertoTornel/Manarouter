@@ -10,14 +10,26 @@
 
 import { api } from './api.js';
 import {
-  h, icon, chip, field, kv, emptyState, errorBlock, applyFieldErrors, clearFieldErrors,
+  h, icon, chip, field, toggle, kv, emptyState, errorBlock, applyFieldErrors, clearFieldErrors,
 } from './dom.js';
 import {
   deriveProviderHealth, accountState, formatAge, formatCompact,
 } from './format.js';
 
-const DIALECTS = ['open-ai', 'anthropic', 'google', 'codex', 'copilot', 'antigravity', 'command-code'];
+// Must list exactly the spellings `Dialect::parse` accepts (mr-core `dialect.rs`). A value here
+// that the backend rejects turns "Add provider" into a save-time error, which is how the
+// pre-rename `command-code` spelling was caught.
+const DIALECTS = ['open-ai', 'anthropic', 'google', 'codex', 'copilot', 'antigravity', 'command-code-go'];
 const KEY_STRATEGIES = ['priority', 'round-robin', 'random', 'least-used'];
+const DELETE_PROVIDER_CONFIRM_KEY = 'manarouter.confirm.deleteProvider';
+// Sourced from catalog/providers.toml and the OAuth dialect docs. These are documented production
+// endpoints, but remain suggestions: account-specific gateways or a deliberate proxy can differ.
+const DIALECT_BASE_URLS = {
+  codex: 'https://chatgpt.com/backend-api/codex',
+  antigravity: 'https://cloudcode-pa.googleapis.com',
+  'command-code-go': 'https://api.commandcode.ai',
+  copilot: 'https://api.githubcopilot.com',
+};
 const AUTH_KINDS = [
   ['bearer', 'Authorization: Bearer'],
   ['api-key-header', 'API key header (x-api-key)'],
@@ -29,19 +41,46 @@ const AUTH_KINDS = [
 export async function renderProviders(mount, ctx) {
   let providers = [];
   let drawerId = null;
+  // Keep in-progress inline number edits across any redraw caused by a refresh or another action.
+  const inlineDrafts = new Map();
 
   const tableWrap = h('div', { class: 'table-scroll' });
   const count = h('span', { class: 'count' });
   const newBtn = h('button', { class: 'btn btn-primary', type: 'button' }, 'New provider');
   const refreshBtn = h('button', { class: 'btn', type: 'button' }, 'Refresh');
+  // The preference is an explicit opt-out from warnings, never an automatic delete action. Keeping
+  // the checkbox in the list toolbar also makes reversing it discoverable without opening a drawer.
+  const deleteWarning = toggle('Do not warn me again', {
+    checked: deleteProviderWarningDisabled(),
+    hint: 'Provider deletion still requires an explicit Delete click.',
+  });
+  deleteWarning.input.addEventListener('change', () => {
+    try {
+      if (deleteWarning.input.checked) localStorage.setItem(DELETE_PROVIDER_CONFIRM_KEY, 'true');
+      else localStorage.removeItem(DELETE_PROVIDER_CONFIRM_KEY);
+    } catch {
+      ctx.toast.warning('This browser could not save the provider deletion preference.');
+    }
+  });
 
   mount.replaceChildren(
-    h('div', { class: 'toolbar' }, newBtn, refreshBtn, h('span', { class: 'spacer' }), count),
+    h('div', { class: 'toolbar' }, newBtn, refreshBtn, deleteWarning.row, h('span', { class: 'spacer' }), count),
     tableWrap,
   );
 
   newBtn.addEventListener('click', () => openFormDrawer(null));
   refreshBtn.addEventListener('click', () => reload(true));
+
+  function deleteProviderWarningDisabled() {
+    try { return localStorage.getItem(DELETE_PROVIDER_CONFIRM_KEY) === 'true'; }
+    catch { return false; }
+  }
+
+  function refreshInlineDrawer(providerId) {
+    const p = providers.find((provider) => provider.id === providerId);
+    const body = mount.querySelector('.drawer .drawer-body');
+    if (p && drawerId === providerId && body) renderDetail(body, p);
+  }
 
   async function reload(force = false) {
     try {
@@ -107,7 +146,7 @@ export async function renderProviders(mount, ctx) {
     tableWrap.replaceChildren(h('table', { class: 'tbl' },
       h('thead', {}, h('tr', {},
         h('th', { scope: 'col' }, 'ID'),
-        h('th', { scope: 'col' }, 'Label'),
+        h('th', { scope: 'col' }, 'Provider Name'),
         h('th', { scope: 'col' }, 'Dialect'),
         h('th', { scope: 'col' }, 'Accounts'),
         h('th', { scope: 'col' }, 'Models'),
@@ -173,12 +212,7 @@ export async function renderProviders(mount, ctx) {
       chip(health.label, health.cls, `health: ${health.key}`),
       p.enabled === false ? chip('provider disabled', 'chip-neutral', 'intentionally off — not an error') : null,
       p.models_synced_at ? chip(`models synced ${formatAge(p.models_synced_at)}`) : null);
-    body.append(meta, kv([
-      ['base URL', h('span', { class: 'mono' }, p.base_url ?? '—')],
-      ['auth', authLabel(p.auth)],
-      ['key strategy', h('span', { class: 'mono' }, p.key_strategy ?? 'priority')],
-      ['note', p.note ?? '—'],
-    ]));
+    body.append(meta);
 
     // --- actions ---
     const syncBtn = h('button', { class: 'btn', type: 'button' }, icon('sync'), ' Sync models');
@@ -224,15 +258,18 @@ export async function renderProviders(mount, ctx) {
       const warns = accounts.length
         ? [`This provider has ${accounts.length} account${accounts.length === 1 ? '' : 's'}. Deleting it removes their stored credentials too — they cannot be recovered from the panel.`]
         : [];
-      // Destination of this confirm: DELETE /api/providers/{id}. Red, because it is destructive.
-      const ok = await ctx.confirm({
-        title: `Delete provider “${p.id}”?`,
-        message: 'Combos and aliases referencing its models will stop resolving.',
-        warnLines: warns,
-        confirmLabel: 'Delete provider',
-        danger: true,
-      });
-      if (!ok) return;
+      // Even with the warning preference enabled, this handler only runs after the explicit Delete
+      // click. The trade-off is one fewer safeguard against an accidental click, not auto-deletion.
+      if (!deleteProviderWarningDisabled()) {
+        const ok = await ctx.confirm({
+          title: `Delete provider “${p.id}”?`,
+          message: 'Combos and aliases referencing its models will stop resolving.',
+          warnLines: warns,
+          confirmLabel: 'Delete provider',
+          danger: true,
+        });
+        if (!ok) return;
+      }
       try {
         await api.del(`/api/providers/${encodeURIComponent(p.id)}`);
         ctx.toast.success(`Provider ${p.id} deleted.`);
@@ -263,8 +300,8 @@ export async function renderProviders(mount, ctx) {
           h('td', { class: 'mono' }, a.id ?? ''),
           h('td', {}, a.label ?? a.identity ?? ''),
           h('td', {}, chip(s.label, s.cls, `state: ${s.key}`)),
-          h('td', { class: 'num' }, String(a.priority ?? 0)),
-          h('td', { class: 'num' }, String(a.weight ?? 0)),
+          buildInlineAccountNumber(p, a, 'priority', 'priority'),
+          buildInlineAccountNumber(p, a, 'weight', 'weight'),
           h('td', { class: 'actions' }, toggle, del)));
       }
       accSection.append(h('div', { class: 'table-scroll', style: 'max-height:200px;' },
@@ -298,14 +335,26 @@ export async function renderProviders(mount, ctx) {
           class: 'icon-btn danger', type: 'button', 'aria-label': `Delete model ${m.id}`,
         }, icon('trash'));
         del.addEventListener('click', () => deleteModel(p, m));
+        const metadata = [];
+        if (Array.isArray(m.reasoning_levels) && m.reasoning_levels.length) {
+          metadata.push(...m.reasoning_levels.map((level) => chip(String(level), 'chip-neutral', 'reasoning level')));
+        }
+        if (Array.isArray(m.input_modalities) && m.input_modalities.length) {
+          metadata.push(...m.input_modalities.map((modality) => chip(String(modality), 'chip-neutral', 'input modality')));
+        }
+        const pricing = modelPricing(m);
+        if (pricing) metadata.push(chip(pricing, 'chip-neutral', 'pricing per million tokens'));
+        const idCell = h('td', {},
+          h('span', { class: 'mono', style: 'overflow-wrap:anywhere;' }, m.id),
+          metadata.length ? h('div', { style: 'display:flex;gap:4px;flex-wrap:wrap;margin-top:4px;' }, metadata) : null);
         tb.append(h('tr', {},
-          h('td', { class: 'mono' }, m.id),
+          idCell,
           h('td', {}, chip(m.source ?? 'synced', 'chip-neutral', 'source')),
           m.hidden ? h('td', {}, chip('hidden')) : h('td', {}),
-          h('td', { class: 'num' }, m.context_length ? formatCompact(m.context_length) : ''),
+          buildInlineModelNumber(p, m, 'context_length', 'context length'),
           h('td', { class: 'actions' }, toggle, del)));
       }
-      modelSection.append(h('div', { class: 'table-scroll', style: 'max-height:220px;' },
+      modelSection.append(h('div', { class: 'table-scroll', style: 'max-height: min(48vh, 460px); overflow:auto;' },
         h('table', { class: 'tbl' },
           h('thead', {}, h('tr', {},
             h('th', { scope: 'col' }, 'Model'), h('th', { scope: 'col' }, 'Source'),
@@ -318,18 +367,176 @@ export async function renderProviders(mount, ctx) {
     modelSection.append(buildModelForm(p));
     body.append(modelSection);
 
-    // --- timeouts / headers / overrides (read-only facts) ---
+    // Base URL, auth and note follow Models so the provider's main content stays easy to scan.
+    body.append(h('section', {}, h('h3', {}, 'Connection details'), kv([
+      ['base URL', h('span', { class: 'mono' }, p.base_url ?? '—')],
+      ['auth', authLabel(p.auth)],
+      ['key strategy', h('span', { class: 'mono' }, p.key_strategy ?? 'priority')],
+      ['note', p.note ?? '—'],
+    ])));
+
+    // --- timeouts / headers / overrides ---
+    const timeoutSection = h('section', {}, h('h3', {}, 'Timeouts'));
+    const timeoutFields = [
+      ['connect_timeout_ms', 'connect'], ['ttfb_timeout_ms', 'TTFB'],
+      ['idle_timeout_ms', 'idle'], ['total_timeout_ms', 'total'],
+    ];
+    for (const [key, label] of timeoutFields) timeoutSection.append(buildInlineNumber(p, key, label, 'Provider timeout in milliseconds.'));
+    timeoutSection.append(h('p', { class: 'hint' }, 'Blank values inherit the configured timeout defaults.'));
+    const prewarmState = chip(p.prewarm ? 'on' : 'off', 'chip-neutral', 'per-provider prewarm override');
+    timeoutSection.append(kv([
+      ['prewarm override', h('span', {}, prewarmState, ' ', h('span', { class: 'hint' }, 'Global latency.prewarm also applies server-side.'))],
+    ]));
     body.append(
-      h('section', {}, h('h3', {}, 'Timeouts'), kv([
-        ['connect', ms(p.connect_timeout_ms)], ['TTFB', ms(p.ttfb_timeout_ms)],
-        ['idle', ms(p.idle_timeout_ms)], ['total', ms(p.total_timeout_ms)],
-        ['prewarm', p.prewarm ? 'yes' : 'no'],
-      ])),
-      h('section', {}, h('h3', {}, 'Headers'),
-        mapKvSection(p.headers)),
-      h('section', {}, h('h3', {}, 'Route overrides'),
-        mapKvSection(p.route_overrides)),
+      timeoutSection,
+      h('section', {}, h('h3', {}, 'Headers'), mapKvSection(p.headers)),
+      h('section', {}, h('h3', {}, 'Route overrides'), mapKvSection(p.route_overrides)),
     );
+  }
+
+  function modelPricing(model) {
+    const pricing = model.pricing ?? {};
+    const input = pricing.input_per_mtok ?? model.input_price_per_mtok;
+    const output = pricing.output_per_mtok ?? model.output_price_per_mtok;
+    if (input == null && output == null) return null;
+    const rate = (value) => value == null ? '—' : formatCompact(Number(value));
+    return `$${rate(input)} / $${rate(output)} / 1M in/out`;
+  }
+
+  async function updateProviderField(p, patch, errorTitle = 'Could not update the provider') {
+    try {
+      await api.put(`/api/providers/${encodeURIComponent(p.id)}`, { ...p, ...patch });
+      await reload(true);
+      return true;
+    } catch (err) {
+      ctx.toast.error(errorTitle, err);
+      return false;
+    }
+  }
+
+  function buildInlineAccountNumber(p, account, key, label) {
+    const slot = `account:${p.id}:${account.id}:${key}`;
+    return buildInlineNumericCell(account[key], label, slot, async (value) => {
+      await api.put(`/api/providers/${encodeURIComponent(p.id)}/accounts/${encodeURIComponent(account.id)}`,
+        { ...account, [key]: value });
+      await reload(true);
+    }, (err) => ctx.toast.error(`Could not update account ${label}`, err), { allowNegative: key === 'priority' });
+  }
+
+  function buildInlineModelNumber(p, model, key, label) {
+    const slot = `model:${p.id}:${model.id}:${key}`;
+    return buildInlineNumericCell(model[key], label, slot, async (value) => {
+      await api.post(`/api/providers/${encodeURIComponent(p.id)}/models`, { ...model, [key]: value });
+      await reload(true);
+    }, (err) => ctx.toast.error(`Could not update model ${label}`, err), { compact: true });
+  }
+
+  function buildInlineNumericCell(value, label, slot, persist, reportError, { compact = false, suffix = '', allowNegative = false } = {}) {
+    const cell = h('td', { class: compact ? 'num' : '' });
+    const showValue = (n) => n == null ? '—' : `${compact ? formatCompact(Number(n)) : n}${suffix}`;
+    const edit = h('button', { class: 'btn btn-sm', type: 'button', 'aria-label': `Edit ${label}` }, 'Edit');
+    const renderView = () => cell.replaceChildren(h('span', { class: 'mono' }, showValue(value)), edit);
+    const draft = inlineDrafts.get(slot);
+    if (draft !== undefined) renderEditor(draft);
+    else renderView();
+
+    function renderEditor(initial) {
+      const input = h('input', { class: 'input', type: 'number', min: allowNegative ? '-2147483648' : '0', step: '1', value: initial, 'aria-label': label });
+      const save = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, 'Save');
+      const cancel = h('button', { class: 'btn btn-sm', type: 'button' }, 'Cancel');
+      cell.replaceChildren(h('div', { style: 'display:flex;gap:4px;align-items:center;min-width:140px;' }, input, save, cancel));
+      input.addEventListener('input', () => inlineDrafts.set(slot, input.value));
+      const restore = () => {
+        inlineDrafts.delete(slot);
+        renderView();
+      };
+      const finish = async () => {
+        if (!input.value.trim()) {
+          ctx.toast.warning(`Enter a value for ${label}.`);
+          return;
+        }
+        const number = Number(input.value);
+        if (!Number.isSafeInteger(number) || (!allowNegative && number < 0) || (allowNegative && number < -2147483648) || number > (allowNegative ? 2147483647 : 4294967295)) {
+          ctx.toast.warning(`${label} must be a whole number in the supported range.`);
+          return;
+        }
+        inlineDrafts.set(slot, input.value);
+        save.disabled = true;
+        try {
+          await persist(number);
+          inlineDrafts.delete(slot);
+          refreshInlineDrawer(p.id);
+        } catch (err) {
+          save.disabled = false;
+          reportError(err);
+        }
+      };
+      save.addEventListener('click', finish);
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') { event.preventDefault(); finish(); }
+        if (event.key === 'Escape') { event.preventDefault(); restore(); }
+      });
+      cancel.addEventListener('click', restore);
+      input.addEventListener('blur', () => {
+        // Blur keeps a valid draft for later editing; save is explicit to avoid losing intent.
+        inlineDrafts.set(slot, input.value);
+      });
+    }
+
+    edit.addEventListener('click', () => {
+      renderEditor(inlineDrafts.get(slot) ?? value ?? '');
+    });
+    return cell;
+  }
+
+  function buildInlineNumber(p, key, label, hint) {
+    const slot = `provider:${p.id}:${key}`;
+    const row = h('div', { class: 'field' });
+    const value = p[key];
+    const draft = inlineDrafts.get(slot);
+    const edit = h('button', { class: 'btn btn-sm', type: 'button', 'aria-label': `Edit ${label} timeout` }, 'Edit');
+    const renderView = () => {
+      row.replaceChildren(h('div', { class: 'label-line' }, h('span', {}, label), edit),
+        h('span', { class: 'mono' }, value == null ? '—' : `${value} ms`),
+        hint ? h('p', { class: 'hint' }, hint) : null);
+    };
+    const renderEditor = (initial) => {
+      const input = h('input', { class: 'input', type: 'number', min: '0', step: '1', value: initial, 'aria-label': `${label} timeout in milliseconds` });
+      const save = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, 'Save');
+      const cancel = h('button', { class: 'btn btn-sm', type: 'button' }, 'Cancel');
+      row.replaceChildren(h('div', { class: 'label-line' }, h('span', {}, label)),
+        h('div', { style: 'display:flex;gap:6px;align-items:center;' }, input, save, cancel),
+        hint ? h('p', { class: 'hint' }, hint) : null);
+      input.addEventListener('input', () => inlineDrafts.set(slot, input.value));
+      const closeEditor = () => {
+        inlineDrafts.delete(slot);
+        const latest = providers.find((provider) => provider.id === p.id) ?? p;
+        const body = row.closest('.drawer-body');
+        if (body) renderDetail(body, latest);
+      };
+      const finish = async () => {
+        if (!input.value.trim()) { ctx.toast.warning('Enter a timeout value in milliseconds.'); return; }
+        const number = Number(input.value);
+        if (!Number.isSafeInteger(number) || number < 0 || number > 18446744073709551615) { ctx.toast.warning('Timeout must be a non-negative whole number in the supported range.'); return; }
+        inlineDrafts.set(slot, input.value);
+        save.disabled = true;
+        if (await updateProviderField(p, { [key]: number })) {
+          inlineDrafts.delete(slot);
+          refreshInlineDrawer(p.id);
+        } else save.disabled = false;
+      };
+      save.addEventListener('click', finish);
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') { event.preventDefault(); finish(); }
+        if (event.key === 'Escape') { event.preventDefault(); closeEditor(); }
+      });
+      input.addEventListener('blur', () => inlineDrafts.set(slot, input.value));
+      cancel.addEventListener('click', closeEditor);
+    };
+    if (draft !== undefined) renderEditor(draft);
+    else renderView();
+    edit.addEventListener('click', () => renderEditor(inlineDrafts.get(slot) ?? value ?? ''));
+    return row;
   }
 
   function ms(v) { return v == null ? '—' : `${v} ms`; }
@@ -627,10 +834,29 @@ export async function renderProviders(mount, ctx) {
 
     const keyStrat = h('select', { class: 'input', 'data-field': 'key_strategy' },
       ...KEY_STRATEGIES.map((k) => h('option', { value: k, selected: (p?.key_strategy ?? 'priority') === k }, k)));
-    const prewarm = h('input', { type: 'checkbox' });
-    prewarm.checked = p?.prewarm ?? true;
-    const enabled = h('input', { type: 'checkbox' });
-    enabled.checked = p?.enabled ?? true;
+    const prewarmToggle = toggle('Prewarm connections at startup', {
+      checked: p?.prewarm ?? false,
+      hint: 'Per-provider override; global latency.prewarm still applies server-side.',
+    });
+    const enabledToggle = toggle('Provider enabled', { checked: p?.enabled ?? true });
+
+    // Track user edits rather than testing the current value: an operator who clears the URL
+    // intentionally should not have the dialect handler silently fill it back in.
+    let baseUrlDirty = false;
+    let lastSuggestedBaseUrl = '';
+    baseUrl.addEventListener('input', () => { baseUrlDirty = true; });
+    const baseUrlSuggestion = h('p', { class: 'hint' });
+    dialectIn.addEventListener('change', () => {
+      const suggestion = DIALECT_BASE_URLS[dialectIn.value];
+      const current = baseUrl.value.trim();
+      if (!suggestion || baseUrlDirty || (current && current !== lastSuggestedBaseUrl)) return;
+      baseUrl.value = suggestion;
+      lastSuggestedBaseUrl = suggestion;
+      baseUrlSuggestion.textContent = `Suggested documented endpoint: ${suggestion}. Change it if this deployment uses another endpoint.`;
+    });
+    if (!isEdit && DIALECT_BASE_URLS[dialectIn.value]) {
+      baseUrlSuggestion.textContent = `Suggested documented endpoint for ${dialectIn.value}: ${DIALECT_BASE_URLS[dialectIn.value]}. Change it if this deployment uses another endpoint.`;
+    }
 
     const save = h('button', { class: 'btn btn-primary', type: 'submit' }, isEdit ? 'Save changes' : 'Create provider');
     const cancel = h('button', { class: 'btn', type: 'button' }, 'Cancel');
@@ -638,16 +864,19 @@ export async function renderProviders(mount, ctx) {
 
     const form = h('form', { novalidate: true },
       h('div', { class: 'grid-fields' },
-        field('ID (immutable once created)', idIn, { hint: 'Used in combos as the provider reference.' }),
-        field('Label', labelIn)),
+        field('Provider ID', idIn, { hint: 'Used in combos as the provider reference; immutable once created.' }),
+        field('Provider Name', labelIn)),
       h('div', { class: 'grid-fields' },
         field('Dialect', dialectIn),
-        field('Key strategy', keyStrat)),
+        h('div', { class: 'field' }, h('label', {}, 'Key strategy'),
+          h('div', { style: 'display:flex;gap:8px;align-items:center;' },
+            keyStrat, h('span', { class: 'hint' }, 'Selects the account key rotation mode.')))),
       field('Base URL', baseUrl),
+      baseUrlSuggestion,
       h('fieldset', { class: 'plain' }, h('legend', {}, 'Auth'), authSel, authBox),
       h('fieldset', { class: 'plain' }, h('legend', {}, 'Timeouts'), timeouts),
-      h('div', { class: 'check-row' }, prewarm, h('label', {}, 'Prewarm connections at startup')),
-      h('div', { class: 'check-row' }, enabled, h('label', {}, 'Provider enabled')),
+      prewarmToggle.row,
+      enabledToggle.row,
       field('Note (optional)', note),
       h('div', { class: 'dialog-actions' }, cancel, save));
 
@@ -665,8 +894,8 @@ export async function renderProviders(mount, ctx) {
       payload.base_url = baseUrl.value.trim();
       payload.note = note.value || null;
       payload.key_strategy = keyStrat.value;
-      payload.prewarm = prewarm.checked;
-      payload.enabled = enabled.checked;
+      payload.prewarm = prewarmToggle.input.checked;
+      payload.enabled = enabledToggle.input.checked;
       const t = authSel.value;
       payload.auth = t === 'bearer' ? { type: 'bearer' }
         : t === 'api-key-header' ? { type: 'api-key-header', header: authHeader.value || 'x-api-key' }

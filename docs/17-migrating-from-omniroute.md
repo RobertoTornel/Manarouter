@@ -28,12 +28,16 @@ refresh presented by a different client. That is the general rule, and it is why
 this document said grants could not be migrated at all. For these platforms the rule does not bite,
 and the reason is checkable rather than a matter of trust:
 
-**The reference and this project ship the same public installed-app client identities.** The Codex
-client id, and the Antigravity client id and secret, are the ones published in each vendor's own
-open-source CLI. Both projects copied the same constants, so a refresh token issued to one is
-accepted from the other. `crates/mr-core/src/published.rs` holds them, and there is a test asserting
-each digest, so a future edit that changed one would fail the build rather than silently break
-migration.
+**The reference and this project ship the same public client identities.** The Codex client id is
+published in OpenAI's own open-source Codex CLI (`openai/codex`). The Antigravity pair is the **IDE
+(T2) client identity**, which was extracted from the shipped Antigravity IDE bundle rather than
+published in an open-source repository — `docs/12-oauth-antigravity.md` §2 marks that extraction
+UNCERTAIN, and the open-source gemini-cli pair is the separate (T1) tier. Both projects copied the
+same constants, so a refresh token issued to one is accepted from the other.
+`crates/mr-core/src/published.rs` holds them, and a digest test pins each of the four Google
+constants (`GEMINI_CLI_CLIENT_ID`/`SECRET` and `ANTIGRAVITY_CLIENT_ID`/`SECRET`); the Codex client id
+is not digest-pinned, only used. So a future edit that changed a pinned constant would fail the build
+rather than silently break migration.
 
 The migration therefore does **one refresh per account** and stores the result:
 
@@ -44,8 +48,12 @@ The migration therefore does **one refresh per account** and stores the result:
 
 After step 3 the credential belongs to *this* installation and the reference is irrelevant: it can be
 stopped, uninstalled or deleted. `crates/mr-core/tests/imported_grants_are_independent.rs` is the
-executable form of that claim — it reads this installation's vault with the reference database
-closed and requires every imported grant to work.
+executable form of that claim. By default it reads this installation's own vault/store only (it never
+opens the reference database) and proves each imported credential is present, well-formed and usable
+without a network call when it is not yet due. Setting `MANAROUTER_FORCE_REFRESH=1` makes it perform
+the real rotation through `refresh::Refresher::ensure_fresh`, which is what proves the grants are
+independently refreshable; that mode is destructive for single-use Codex refresh tokens, which is why
+it is opt-in rather than the default.
 
 #### WARNING: for Codex this is a *move*, not a copy
 
@@ -71,11 +79,12 @@ Practical consequences:
   refresh token has already been used to generate a new access token"`, which is distinguishable
   from an expired one ("sign in again" alone) and from a wrong client (`invalid_client`).
 - **A test or diagnostic must not refresh a credential it will not persist.** This was learned the
-  hard way during development: a verification test that called `refresh_with_context` directly to
-  "check" the accounts rotated 6 live Codex tokens and discarded the replacements, permanently
-  killing one account. `Refresher::ensure_fresh(.., false)` is the safe read: it returns the stored
-  token without a network call when it is not yet due, and persists any rotation when it is. The
-  test now uses that path.
+  hard way during development: an earlier version of the independence test called
+  `refresh_with_context` directly to "check" the accounts, discarded the replacements, and
+  permanently killed a Codex account — on the development installation the forced run therefore
+  reports **9 of 10** credentials rotating. `Refresher::ensure_fresh(.., false)` is the safe read: it
+  returns the stored token without a network call when it is not yet due, and persists any rotation
+  when it is. The test now uses that path.
 
 #### What each platform carries
 
@@ -152,7 +161,7 @@ reason for each.
 `claude-web`, `deepseek-web`, `gemini-web`, `zai-web`, `duckduckgo-web` and `veoaifree-web` are
 **refused**. Manarouter does not support cookie or browser-session authentication for any provider,
 at any time, behind any flag. This is a settled design decision
-([Security §6](21-security.md#6-cookie-authentication-is-never-supported)), not a gap to be filled.
+([Security §4](21-security.md#4-authentication-methods-that-are-refused)), not a gap to be filled.
 
 The distinction between "refused" and "skipped" matters in the output: a refusal is a policy, and the
 panel says so. An operator who sees six providers silently missing will reasonably assume a bug.
@@ -289,7 +298,7 @@ Only the id reaches `config.json`. A credential that fails the format check is *
 imported** — importing a malformed credential produces an account that is configured, enabled, and
 guaranteed to fail, which is worse than an account that is visibly absent.
 
-The vault key is generated on first use and stored `0600`. See [Security](21-security.md#3-the-vault).
+The vault key is generated on first use and stored `0600`. See [Security §2](21-security.md#2-credential-storage).
 
 ## Aliases
 
@@ -308,9 +317,8 @@ An alias is only created when the target resolves unambiguously. If two enabled 
 same bare model id, no bare alias is created, and the migration says so — a bare alias that resolved
 to whichever provider happened to be compiled last would be worse than no alias.
 
-Alias resolution is a single hop and not transitive ([Combos §how a client
-addresses a combo](06-combos.md#how-a-client-addresses-a-combo)), so an alias pointing at another
-alias is never generated.
+Alias resolution is a single hop and not transitive ([Combos §8](06-combos.md#8-addressing-a-combo)),
+so an alias pointing at another alias is never generated.
 
 ## Idempotency
 
@@ -342,15 +350,20 @@ A checklist, because the migration deliberately does not do these:
       models came from the reference already have entries, so this is a top-up rather than a
       prerequisite.
 - [ ] **Check the accounts reported as needing a fresh login.** `mr account list <provider>`. Each
-      one is listed with the reason it could not be imported; log in with `mr account add` only for
-      those.
-- [ ] **Restart the relay.** The imported accounts are in the compiled snapshot, which the relay
-      reads at startup. `systemctl --user restart manarouter-relay.service`.
+      one is listed with the reason it could not be imported; re-login only for those, through the
+      panel's Connect action (`mr account add` writes a pasted secret, not an OAuth grant, and is
+      not the login path for these providers).
+- [ ] **Wait for the relay to pick up the change, or restart it.** The relay re-reads an externally
+      written `config.json` every ~2 s and recompiles without a restart; the conductor adopts it on
+      the next authenticated `GET`. A restart (`systemctl --user restart manarouter-relay.service`)
+      remains a valid way to make it immediate.
 - [ ] **Review any combo with a missing step.** A step whose provider did not come across is
       reported, and the combo is kept with that step disabled rather than silently shortened.
 - [ ] **Check the alias list.** `mr alias list`. Particularly the bare aliases, which are only
       created when unambiguous.
-- [ ] **Validate.** `mr config validate` prints every problem at once.
+- [ ] **Validate.** `mr config validate` is the intended check, but `mr config` is not implemented
+      yet — until it is, the conductor reports a configuration that fails to validate rather than
+      adopting it.
 
 ## Rollback
 

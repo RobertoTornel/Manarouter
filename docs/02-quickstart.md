@@ -3,12 +3,11 @@
 This is the path from an empty machine to a routed request, with the failure modes named at each
 step. It is written so that every command can be typed in order.
 
-> **Interface status.** The `mr` CLI is a skeleton in this tree: `crates/mr-cli/src/main.rs` parses
-> only `--config-dir` and logs a startup line. The commands below are the intended interface — the
-> names and arguments the CLI is being built to. Where a flag cannot be verified against code yet it
-> is called out as *unverified* rather than presented as working. The `config.json` edits shown in
-> [configuration](03-configuration.md) are the ground truth in the meantime: hand-editing the file is
-> always supported, and is the one path that is verified today.
+> **Interface status.** The `mr` CLI implements every command below; `crates/mr-cli/src/main.rs` and
+> the subcommand modules are the reference for the flags. Two subcommands parse but are not wired up
+> yet: `mr vault` and `mr config` both exit with *"is not implemented yet"*, so `mr config validate`,
+> `mr config set-port` and `mr config path` do not work — edit `config.json` by hand for those, as
+> shown in [configuration](03-configuration.md). Nothing else here is unverified.
 
 ---
 
@@ -41,9 +40,10 @@ is where the latency target lives, and `[profile.release]` settings — LTO, `co
 
 - `error: package ... requires rustc 1.82` — your default toolchain is older. `rustup show` in the
   repository root should report the pinned stable; `rustup update stable` if not.
-- A linker error on the SQLite dependency — the workspace builds `rusqlite` through `libsqlite3-sys`,
-  which finds a system SQLite or builds the bundled one depending on features. Report the exact
-  message rather than working around it, because the feature choice is deliberate.
+- A compiler or linker error on the SQLite dependency — the workspace builds `rusqlite` through
+  `libsqlite3-sys` with the `bundled` feature, so it compiles SQLite from source and needs a working C
+  compiler; it does not use a system `libsqlite3`. Report the exact message rather than working around
+  it, because the feature choice is deliberate.
 
 ---
 
@@ -69,8 +69,8 @@ first command writes a provider equivalent to:
   "dialect": "open-ai",
   "base_url": "https://api.openai.com/v1",
   "auth": { "type": "bearer" },
-  "capabilities": ["chat", "responses", "embeddings", "audio.transcription",
-                   "audio.speech", "images.generations", "models", "tool-calling",
+  "capabilities": ["chat", "responses", "embeddings", "audio-transcription",
+                   "audio-speech", "images-generations", "models", "tool-calling",
                    "reasoning", "vision"],
   "accounts": [],
   "key_strategy": "priority",
@@ -78,9 +78,10 @@ first command writes a provider equivalent to:
 }
 ```
 
-The `anthropic` template differs in exactly the two ways that matter: `dialect` is `anthropic`,
-`base_url` is `https://api.anthropic.com/v1`, and `auth` is
-`{ "type": "api-key-header", "header": "x-api-key" }`. It also carries an
+The `anthropic` template differs in the ways that matter: `dialect` is `anthropic`,
+`base_url` is `https://api.anthropic.com/v1`, `auth` is
+`{ "type": "api-key-header", "header": "x-api-key" }`, and its capabilities are the Messages set
+rather than OpenAI's chat/embeddings/audio/images list. It also carries an
 `anthropic-version: 2023-06-01` header, because a missing version header is a hard upstream 400
 rather than a warning.
 
@@ -91,9 +92,10 @@ A provider you cannot find in the catalogue is added by hand — any OpenAI-comp
   --id gateway --base-url https://gateway.internal/v1
 ```
 
-*`--id` on `provider add` is unverified: the flag names come from the README, and the CLI that would
-parse them is still a stub. If the flag is rejected, add the provider by hand in `config.json`; the
-shape above and in [configuration](03-configuration.md) §4 is what the parser expects.*
+`--id` names the new provider and `--base-url` is its endpoint; both are options on `provider add`
+(see `crates/mr-cli/src/provider.rs`). If either is rejected, add the provider by hand in
+`config.json`; the shape above and in [configuration](03-configuration.md) §4 is what the parser
+expects.
 
 ---
 
@@ -103,19 +105,28 @@ A provider with no accounts routes nothing. An **account** is one credential for
 three API keys for OpenAI are three accounts, each with its own health, quota and rotation position.
 
 ```bash
-./target/release/mr account add openai --label "personal" --key "<your-api-key>"
+./target/release/mr account add openai --label "personal" --secret-stdin
+# paste the key when prompted, then press Ctrl-D
 ```
+
+`--key` is a visible alias for `--secret`, which takes the value on the command line and is visible to
+`ps`; `--secret-stdin` is the form to use.
 
 The key value is passed to the vault and encrypted with AES-256-GCM before it touches disk; what
-lands in `config.json` is an id reference, never the value. Confirm that:
+lands in `config.json` is an id reference, never the value. Confirm that by inspecting what was
+written, not by grepping for the secret — a `grep "<your-api-key>" …` line would put the real key in
+your shell history and in `ps` output, which is exactly what `--secret-stdin` avoided:
 
 ```bash
-grep -c "<your-api-key>" ~/.config/manarouter/config.json   # expect 0
+grep -n 'secret_ref' ~/.config/manarouter/config.json   # one reference per account, no value
 ```
 
+The value lives only in the encrypted store; `vault.enc` is ciphertext and the separate `vault.key`
+is what decrypts it, so protect both (see [security](21-security.md) §2).
+
 **Never commit a real key, and never paste one into an issue.** `scripts/check-secrets.sh` runs on
-every push and fails the build on `sk-`, `ghp_`, `AIza`, `ya29.`, `GOCSPX-` and JWT-shaped strings.
-The placeholder `<your-api-key>` above is deliberately not shaped like any of them.
+every push and fails the build on `sk-`, `ghp_`, `AIza`, `ya29.`, `glpat-` and JWT-shaped strings.
+Placeholders like `<your-api-key>` are deliberately not shaped like any of them.
 
 For a loopback runtime such as Ollama (`http://127.0.0.1:11434/v1`) the account still exists but its
 key may be a dummy, because the server ignores it. Keep the account anyway: health, quota and
@@ -257,8 +268,9 @@ curl -sS http://127.0.0.1:20900/v1/chat/completions \
       }'
 ```
 
-The response is an ordinary Chat Completions object. `GET /v1/models` lists combos (unless hidden),
-synced model ids, and qualified `provider/model` ids — it is a local read, not an upstream call, so it
+The response is an ordinary Chat Completions object. `GET /v1/models` lists combos (hidden ones
+included: the flag hides them from pickers, not from the API) and the qualified `provider/model` ids
+of every non-hidden synced model — it is a local read, not an upstream call, so it
 returns immediately.
 
 ### Anthropic-compatible clients
@@ -301,6 +313,18 @@ For manual startup, run the panel/control plane and router/API relay as two proc
 ./target/release/manarouter-relay         # data plane, traffic on :20900
 ```
 
+Or start both with one foreground command, which is the quickest way to bring everything up:
+
+```bash
+./target/release/mr serve                                        # relay on relay.port, conductor on control.port
+./target/release/mr serve --relay-port 20900 --control-port 20901
+```
+
+`mr serve` finds `manarouter-relay` and `manarouter-conductor` beside the `mr` executable first, then
+on `PATH`; puts each child in its own process group; forwards Ctrl-C/SIGTERM to both and waits. It is
+not an init system: it does **not** restart a child that dies — it stops the other service and exits
+non-zero (a child that exits 0 ends it cleanly). Use the systemd units below to run it unattended.
+
 On Linux, the repository installer can instead install both as systemd user services:
 
 ```bash
@@ -316,18 +340,17 @@ both. Use `systemctl --user status manarouter-conductor manarouter-relay` and
 services to remain active when logged out, enable lingering with `loginctl enable-linger "$USER"`.
 
 The conductor must run first in the intended design: it owns `config.json` and compiles the snapshot
-the relay loads. The relay's load path treats a missing snapshot as a cold start rather than a fatal
-error, so the order is a robustness preference, not a hard dependency — but a relay started with no
-snapshot serves no routes until the conductor publishes one.
+the relay loads. The relay's load path, though, recompiles a missing or stale snapshot from
+`config.json` itself rather than treating it as fatal, so the order is a robustness preference rather
+than a hard dependency — the relay does not need the conductor to have published one first.
 
 Open the panel at <http://127.0.0.1:20901>. It is loopback-only: reaching it from another machine
 requires setting a password first, because it can add providers and mint client keys. That rule, and
 the origin check behind it, are in [security](21-security.md) §2.
 
-> Both binaries are skeletons in this tree — `manarouter-relay` logs *"data plane not yet wired up:
-> no listener is bound"* and exits, and the conductor logs its version. The ports, the panel address
-> and the `--config-dir` global flag on `mr` are fixed by the code; the listener itself is the work
-> in progress.
+> Both binaries are wired up in this tree — `manarouter-relay` binds the relay port and serves the
+> OpenAI- and Anthropic-shaped API, and `manarouter-conductor` serves the panel and control API. The
+> ports, the panel address and the `--config-dir` global flag on `mr` are fixed by the code.
 
 ---
 
@@ -336,7 +359,7 @@ the origin check behind it, are in [security](21-security.md) §2.
 | Purpose | Path | Override |
 |---|---|---|
 | Configuration | `~/.config/manarouter/config.json` | `MANAROUTER_CONFIG_DIR` |
-| Encrypted credentials | `~/.config/manarouter/vault.json` | same directory |
+| Encrypted credentials | `~/.config/manarouter/vault.enc` | same directory |
 | Vault key | `~/.config/manarouter/vault.key` | same directory, mode `0600` |
 | Compiled routing table | `~/.local/state/manarouter/routes.snapshot` | `MANAROUTER_STATE_DIR` |
 | Runtime state database | `~/.local/state/manarouter/state.sqlite` | `MANAROUTER_STATE_DIR` |
@@ -348,19 +371,20 @@ backing up (without the vault); state is derived, churns constantly, and can be 
 
 - `state.sqlite` — you lose observed account health, quota counters and usage history. Those rebuild
   from live traffic. The config is untouched.
-- `routes.snapshot` — the conductor recompiles it. Deleting it while the relay is running changes
-  nothing until the next reload, because the relay holds the decoded table in memory.
+- `routes.snapshot` — it is recompiled from `config.json` when missing or stale. Deleting it while the
+  relay is running changes nothing until the next reload, because the relay holds the decoded table in
+  memory.
 - Anything in the state directory, in fact. Nothing there is the source of truth.
 
 **Not safe to delete:**
 
-- `vault.key` — every credential in `vault.json` becomes undecryptable. There is no recovery path,
-  because there is no key escrow. Back it up separately from `vault.json`, or accept that losing it
+- `vault.key` — every credential in `vault.enc` becomes undecryptable. There is no recovery path,
+  because there is no key escrow. Back it up separately from `vault.enc`, or accept that losing it
   means re-entering every key.
 - `config.json` — it is the only record of providers, combos, aliases and client keys. Client keys
   cannot be recovered even in principle: only their hashes are stored, so a lost key is a re-issued
   key.
-- `vault.json` without `vault.key`, or vice versa. The pair is the unit.
+- `vault.enc` without `vault.key`, or vice versa. The pair is the unit.
 
 `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honoured when the `MANAROUTER_*_DIR` overrides are unset,
 so a session-scoped or second instance can be run without touching the real configuration.
@@ -376,7 +400,7 @@ Do not conclude from "the process is running" that traffic is flowing. Three che
 ```bash
 curl -sS -i http://127.0.0.1:20900/healthz
 # HTTP/1.1 200 OK
-# body: ok
+# body: {"status":"ok"}
 ```
 
 `/healthz` is **liveness only**. It never routes upstream, never checks a provider, and is

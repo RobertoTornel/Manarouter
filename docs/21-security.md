@@ -74,9 +74,9 @@ These are real limitations. Stating them is the point.
 - **A decryption failure is an error, not an absence.** `Vault::get` returns `Ok(None)` for an
   unknown id but an `Err` for a failed decryption. Returning `None` would make the router believe no
   credential is configured and quietly route around a provider the operator expects to work.
-- **Rekeying is supported.** `Vault::rekey` decrypts every entry and rewrites it under a fresh key,
-  so an operator who suspects the key file was copied has a remedy that does not require re-doing
-  every OAuth login.
+- **Rekeying is supported in the library.** `Vault::rekey` decrypts every entry and rewrites it under
+  a fresh key, so an operator who suspects the key file was copied has a remedy that does not require
+  re-doing every OAuth login. It is not yet reachable from the CLI (`mr vault` is a stub).
 
 ### Why a key file and not a passphrase
 
@@ -258,11 +258,15 @@ Three checks, all in `.github/workflows/ci.yml`:
    everything below is cleanup.
 2. Purge it from history. A force-push is not sufficient on its own — anyone who already cloned has
    it, and GitHub retains unreachable objects for a time. Treat the credential as burned regardless.
-3. Delete the vault entry and re-authenticate: `mr provider logout <id>` then `mr provider login
-   <id>`.
-4. If the *vault key* itself leaked, everything in the vault must be treated as compromised. Rekey
-   (`mr vault rekey`) is not enough by itself — it protects future writes, but you should also
-   rotate every credential, because the attacker may have copied the plaintext before you rekeyed.
+3. Remove the provider's stored credential: `mr provider remove <id> --force` drops the provider and
+   its vault entries. There is no `mr provider logout`/`login` pair; an OAuth account is re-authorized
+   through the panel's OAuth flow (`POST /api/oauth/...`), which writes a fresh vault entry.
+4. If the *vault key* itself leaked, everything in the vault must be treated as compromised. Rekeying
+   (`Vault::rekey`) is not enough by itself — it protects future writes, but you should also rotate
+   every credential, because the attacker may have copied the plaintext before you rekeyed. There is
+   no `mr vault rekey` command yet (`mr vault` is a stub), so until re-encryption under a fresh key is
+   available the operational step is to rotate the credentials themselves at the providers and protect
+   `vault.key` and any backups of it going forward.
 
 ---
 

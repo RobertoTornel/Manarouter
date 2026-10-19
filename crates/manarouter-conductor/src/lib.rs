@@ -31,5 +31,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod models_api;
+pub mod quota_api;
 pub mod serve;
 pub mod state;

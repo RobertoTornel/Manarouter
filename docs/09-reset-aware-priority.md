@@ -81,47 +81,56 @@ an unknown reset degrades the ordering but never the correctness of the partitio
 
 Here is where a naive implementation breaks, and it is worth being precise about.
 
-An account's cooldown expires. The timer marks it `Ready`. The step moves back to the healthy group at
-its authored position. The next request uses it, the provider is still throttling, and it returns 429
-again. The account cools down, the step is demoted, and the cycle repeats.
+An account's cooldown expires. The next selection treats it as eligible again. The step moves back to
+the healthy group at its authored position. The next request uses it, the provider is still throttling,
+and it returns 429 again. The account cools down, the step is demoted, and the cycle repeats.
 
 Every cycle costs a failed request, and — worse — the step **interrupts** a working lower step to
 fail. The router becomes less reliable by having the feature enabled.
 
 Three mechanisms prevent this:
 
-**1. The failure count survives the cooldown.** `failures_before_dead` counts *consecutive* failures
-and resets only on a success. A cooldown expiring is not a success, so an account that fails, cools
-down, fails again is at two consecutive failures, not back to zero. After three it is `Dead`, leaves
-the rotation entirely, and stops flapping.
+**1. The failure count survives the cooldown.** `failures_before_dead` is meant to count *consecutive*
+failures and reset only on a success, so an account that fails, cools down, fails again is at two
+consecutive failures, not back to zero, and after three it becomes `Dead`, leaves the rotation
+entirely, and stops flapping. The relay does keep a consecutive-failure count on each cooldown entry,
+but **it never reads it back**: no code consults `failures_before_dead` or transitions an account to
+`Dead`, so an account that keeps failing is not yet removed from the rotation.
 
-**2. Backoff grows with repetition.** Each consecutive failure multiplies the next cooldown rather
-than restarting it at the provider's stated value. A provider that says "47 seconds" three times in a
-row gets a longer wait on the third, on the reasoning that its stated reset is not being honoured —
+**2. Backoff grows with repetition.** Each consecutive failure is meant to multiply the next cooldown
+rather than restarting it at the provider's stated value. A provider that says "47 seconds" three times
+in a row gets a longer wait on the third, on the reasoning that its stated reset is not being honoured —
 either it is throttling us harder than it says, or the reset instant is wrong. Either way, retrying
-on the same schedule is not working.
+on the same schedule is not working. The doubling exists in `cooldown_until`, but the relay calls it
+with `previous_failures = 0` at every site, so the growth never actually applies today.
 
 **3. The step is only tried after the healthy group is exhausted.** A demoted step is the last thing
 tried, not the first. So a flapping step costs nothing while any healthy step is working — the
 failure only appears once everything else has already failed, at which point trying it is correct
-regardless.
+regardless. This part *is* implemented: `order_steps` partitions the steps and places the unavailable
+group last.
 
-The combination is what makes it stable: the step cannot interrupt a working path, its repeated
-failures accumulate, and the cooldown lengthens until it either recovers or is marked dead.
+Only mechanism 3 is live. Mechanisms 1 and 2 are the intended stabilisers, and until they are wired a
+badly throttled preferred step can still be retried on a fixed schedule.
 
-## The timer
+## Where the reset is applied
 
-The reset is applied by a timer in the **conductor**, off the request path entirely.
+The reset is applied in the **relay**, on the selection that observes it. The relay keeps account health
+in memory (`manarouter-relay/src/select.rs`): a `HashMap` of account id to `Cooldown { until_ms,
+reason, failures }` behind an `ArcSwap`. A selection compares `now` against each entry's `until_ms`
+lazily (`is_over(now)`). There is no timer thread in either process and no wake-up at `reset_at`.
 
-The relay must not be woken per cooldown, and must not perform a timer calculation per request. What
-it has is the compiled snapshot plus one relaxed `AtomicU64` per step for round-robin. Health and
-cooldown state reach it as part of a **new compiled snapshot** — the conductor recompiles when the
-available-account picture changes and the relay hot-swaps it via `ArcSwap`. There is no IPC per
-request, and there is no per-request timer.
+Health is not carried in the compiled snapshot and there is no IPC per request: the snapshot holds the
+authored ordering and each account's scheduling metadata, while the live view is relay-local and
+rebuilt from `429`/`401` observations as they happen. Because that state is process-local and in
+memory, a relay restart forgets every cooldown and treats all accounts as healthy again; a conductor
+restart changes nothing about cooldowns, and the conductor being absent does not freeze them.
 
-The timer's only job is to notice that a `reset_at` has passed and trigger a recompile. If the
-conductor is not running, cooldowns simply do not expire — the relay keeps routing around them,
-which is a degradation and not a failure.
+Two consequences worth stating. The relay currently builds `QuotaConfig::default()` on the request
+path rather than reading `config.quota`, so the documented `default_cooldown_secs` (60),
+`auth_failure_cooldown_secs` (900) and `live_signals_win` values are the ones in force, but editing
+those keys in `config.json` has no effect yet. And nothing about the cooldown is persisted, so the
+panel's live view of it depends on relay-local state, not on `state.sqlite`.
 
 ## Worked example
 
@@ -134,12 +143,14 @@ A combo with three steps, where step 1's provider has a 20-minute cooldown start
 | t=19min | cooling, reset 1:00 | healthy | healthy | **2, 3, 1** |
 | t=21min | **ready** | healthy | healthy | **1, 2, 3** |
 | t=21min + 1 req | fails again, reset 22:00 | healthy | healthy | **2, 3, 1** |
-| t=22min, 2nd failure | fails, count 2, longer reset | healthy | healthy | **2, 3, 1** |
-| t after 3rd failure | `Dead` | healthy | healthy | **2, 3** |
+| t=22min, 2nd failure | fails, count 2, reset 23:00 | healthy | healthy | **2, 3, 1** |
+| t after 3rd failure | still cooling, reset 24:00 | healthy | healthy | **2, 3, 1** |
 
-The last row is the mechanism working: an account that keeps failing after its resets leaves the
-rotation rather than flapping forever. Note that in every row where steps 2 and 3 are healthy, they
-are tried first — step 1 never interrupts a working path.
+The last row is where the intended design and today's relay diverge: the count reaching three is
+stored, but nothing turns it into `Dead`, so the step does not leave the rotation and the cooldown
+does not lengthen until `failures_before_dead` is actually wired into the request path. Note that in
+every row where steps 2 and 3 are healthy, they are tried first — step 1 never interrupts a working
+path, because that half of the mechanism is live.
 
 ## Two levels of skipping, and why not to conflate them
 

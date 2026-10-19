@@ -185,13 +185,17 @@ pub struct Mock {
 
 impl Mock {
     fn new(opts: Options) -> Self {
-        let mut fault = Fault::default();
-        fault.delay_ms = opts.delay.as_millis().min(u64::MAX as u128) as u64;
-        if opts.fail {
-            fault.status = StatusCode::TOO_MANY_REQUESTS.as_u16();
-            fault.retry_after_secs = opts.retry_after_secs;
-        }
-        fault.fail_after_chunks = opts.die_after;
+        let fault = Fault {
+            delay_ms: opts.delay.as_millis().min(u64::MAX as u128) as u64,
+            status: if opts.fail {
+                StatusCode::TOO_MANY_REQUESTS.as_u16()
+            } else {
+                0
+            },
+            retry_after_secs: if opts.fail { opts.retry_after_secs } else { 0 },
+            fail_after_chunks: opts.die_after,
+            ..Fault::default()
+        };
         Self {
             opts,
             fault: RwLock::new(fault),
@@ -681,15 +685,11 @@ mod tests {
         let data = body.as_bytes();
         let mut out: Vec<u8> = Vec::new();
         let mut pos = 0usize;
-        loop {
-            let crlf = match data[pos..]
-                .windows(2)
-                .position(|w| w == b"\r\n")
-                .map(|i| i + pos)
-            {
-                Some(i) => i,
-                None => break,
-            };
+        while let Some(crlf) = data[pos..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|i| i + pos)
+        {
             let size = std::str::from_utf8(&data[pos..crlf])
                 .ok()
                 .and_then(|s| usize::from_str_radix(s.trim(), 16).ok())

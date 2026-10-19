@@ -291,8 +291,10 @@ pub async fn run(cmd: ServeCmd, ctx: &Ctx) -> Result<(), CliError> {
                 // A child that exited 0 deliberately — the conductor's restart endpoint, for example —
                 // is not a failure of this command.
                 Some(0) => Ok(()),
-                // The child's own code is surfaced verbatim, so a documented code such as the relay's
-                // keyless-bind refusal (2) survives for whatever is supervising `mr serve`.
+                // The child's own status is named in the message, but `mr serve` itself exits with
+                // the generic failure code (1): `CliError` carries an `Exit` enum whose documented
+                // codes are 0-4, so a child's code cannot be forwarded verbatim without widening
+                // that type. Whatever supervises `mr serve` sees exit 1 and reads the message.
                 Some(code) => Err(CliError::failure(format!(
                     "{name} exited with status {code}"
                 ))),

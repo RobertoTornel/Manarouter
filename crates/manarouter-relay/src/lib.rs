@@ -28,6 +28,8 @@
 //!   routing state in the process.
 //! * [`select`] — step and account selection and the hedged-race policy. Pure functions, so the
 //!   decisions that are most likely to be wrong can be tested without a network.
+//! * [`usage_tap`] — folds token counts and the first-to-last output window out of a response body
+//!   as it streams past, so usage is measured without buffering the stream it is measuring.
 //! * [`server`] — the route table and the accept loop.
 //!
 //! See `docs/01-architecture.md` for the intended shape and `docs/16-latency-engineering.md` for
@@ -42,9 +44,11 @@ use mimalloc::MiMalloc;
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
 pub mod model_scan;
+pub mod proxy;
 pub mod select;
 pub mod server;
 pub mod startup;
 pub mod state;
 pub mod sticky;
 pub mod upstream;
+pub mod usage_tap;
