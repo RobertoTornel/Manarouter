@@ -34,8 +34,11 @@ request path, failing closed), per-key quota *enforcement* (D2, admitted before 
 the `responses.rs` reachability tests, the `tools/bench` latency harness and the provider-dialects
 document. Automatic modality fallback (D3) was already implemented — a bounded, complete reroute.
 
-**Still not implemented, and still described as such:** the **hedged race runner** — the largest
-remaining gap — and the mid-stream splice and the four `WinnerFailMode`s that belong to it. See §4.
+**Still not implemented, and still described as such:** the **mid-stream splice and the four
+`WinnerFailMode`s** that depend on it — a winner that dies while its body is streaming is not
+replaced. The **hedged race runner itself is implemented**: a combo with `hedge.enabled` dispatches
+every participant at once and commits the highest-priority participant that answers inside the
+eligibility window. See §4.
 
 ---
 
@@ -45,7 +48,7 @@ Yes, within these limits:
 
 | Gate | Result |
 |---|---|
-| `cargo test --workspace --all-targets` | **1 168 passed, 0 failed**, 1 ignored (the opt-in live test) — re-run in the 2026-10-20 revision (34 + 247 + 3 + 96 + 642 + 147) |
+| `cargo test --workspace --all-targets` | **1 172 passed, 0 failed**, 1 ignored (the opt-in live test) — re-run after the hedge runner landed (34 + 251 + 3 + 96 + 641 + 147) |
 | `cargo test --workspace --release` | **passed** (release profile: LTO, `panic = "abort"`, `strip`) — re-run in this revision |
 | `cargo test -p mr-core --lib store` | **50 passed / 0 failed** (7 new: v1→v3 upgrade, rolling window, dense many-key map, prune, idempotent re-record, quota cache CRUD, token breakdown) |
 | `cargo test -p mr-core --test imported_grants_are_independent -- --ignored` | passes; 10/10 imported grants usable with the reference stopped — **not re-run in this revision** (it needs the live reference account) |
@@ -328,9 +331,6 @@ is not a fallback; a default naming no known model is reported; a default that c
 image either fails rather than looping; and the rewritten body keeps the request and replaces only
 the model.
 
-### P1 — Proxy egress (D4): configured, selected, and never used
-
-`crates/manarouter-relay/src/proxy.rs` implements HTTP CONNECT, SOCKS4, SOCKS5 and SOCKS5h
 ### Closed — Proxy egress (D4): on the request path, failing closed
 
 **Done in the 2026-10-20 revision.** `crates/manarouter-relay/src/egress.rs` is the connector hyper
@@ -371,32 +371,66 @@ Two things are still not done, and are worth knowing before relying on this for 
   connector that opened the connection, and a tunnel is opened by this crate's own connector, which
   cannot say whether the pool handed it an old connection. A `false` there means "not known".
 
-### P1 — The hedged race has no runner
+### P1 — The hedged race runner: implemented; the winner's recovery is not
 
-**Still open, and it is still the largest gap.** `select::hedge_decide` exists and is tested
-(`crates/manarouter-relay/src/select.rs`), and `docs/07-hedged-race.md` describes the behaviour in
-detail — but **it is called 0 times from `server.rs`**, which dispatches sequentially (`for step in
-&steps`, `crates/manarouter-relay/src/server.rs`). The entire feature — the eligibility window, the
-four `WinnerFailMode`s, `winner_metric` — is documented and unreachable.
+**The runner is implemented.** `select::hedge_decide` (`crates/manarouter-relay/src/select.rs`) is now
+called from the request path. `crates/manarouter-relay/src/server.rs` holds:
 
-This is the same failure class as the dialect-wiring bug fixed earlier. The design is settled
-(decision Q2), so this is implementation, not design:
+- `attempt_step` — the body of the old sequential step loop, extracted into a function that returns
+  an `Attempt` (`Answer`, `Failed`, `Skip`, `Fatal`). The sequential chain and the race call the
+  *same* function, so the two paths cannot drift; that was the point of the extraction.
+- `run_hedge` — dispatches every participant of the combo's `hedge.participants` at once, polls them
+  together with `futures_util::future::select_all`, feeds each settlement to `hedge_decide`, and
+  commits the winner. The losers' pending futures are dropped, which drops their upstream responses
+  and closes those connections rather than leaking them.
+- `AttemptContext` — the inputs an attempt needs, so that neither call site carries twenty
+  parameters.
 
-- Dispatch to the chosen participants **concurrently**, not sequentially.
-- `window_ms` is an **eligibility gate, not a timeout**: a participant answering after the window is
-  not an error, and window expiry must never fail a request.
-- Winner = highest-priority participant replying inside the window.
-- Pick up the losers' bodies and drop them without leaking connections.
-- `MidstreamPolicy::Restart` must refuse to splice once any `tool_calls` delta has been emitted
-  (the guard is documented; confirm it is enforced at the splice site).
+The rules it implements, as documented in `docs/07-hedged-race.md`:
 
-Verify by *running* it: two mock participants with the second artificially faster.
+- `window_ms` is an **eligibility gate, not a timeout**: window expiry never fails a request.
+- Winner = the **highest-priority** participant that answered inside the window, not the fastest.
+- A participant that fails before answering is not a failed winner; it loses the race, and the race
+  continues.
+- A combo without the hedge takes the sequential path unchanged.
+
+Verified by *running* it: four new tests in `server.rs` use two mock upstreams — the
+higher-priority one is deliberately the slower one, so a race that rewarded speed would fail the
+test. The tests cover the priority rule, a failed participant handing the race over, a race whose
+participants all fail, and a combo without the hedge calling only its first step.
+
+**Two things about the implementation that a reader should know.**
+
+1. **Past the window, priority stops being the tiebreak.** `hedge_decide`'s last branch commits the
+   first participant that replies once the window has closed, even if a higher-priority one is still
+   pending. `docs/07-hedged-race.md` Case D said the opposite; the doc has been corrected to match
+   the implemented and tested rule, and the configuration reference in `mr-core`'s `HedgeSpec` —
+   "a participant that replies after it simply loses its priority protection" — already described
+   this behaviour.
+2. **`winner_metric` does not yet distinguish its two values.** The race commits a participant when
+   its upstream *response* arrives, which is the same moment for `first_response_byte` and
+   `first_complete_token`. Distinguishing them needs the first parsed content frame, which is
+   streamed to the client as it arrives. Choosing `first_complete_token` therefore changes nothing
+   today; the doc says so.
+
+**Still open, and it is the remaining half of the feature.**
+
+- **The four `WinnerFailMode`s are unreachable.** The winner is committed before its body streams, so
+  the relay never discovers that the committed winner has died. `on_winner_fail` describes exactly
+  that case, and there is no code path that evaluates it.
+- **The mid-stream splice is not implemented.** A step that dies after bytes are on the wire ends
+  the client stream as-is, with no second attempt, no `manarouter.retry` boundary and no tool-call
+  guard. `MidstreamPolicy::Restart` must refuse to splice once any `tool_calls` delta has been
+  emitted; the guard is documented, and the splice site that would enforce it does not exist yet.
+- **A loser's cancellation is local.** Dropping the loser closes this relay's connection to the
+  provider, but the provider may keep generating and keep billing. A hedge can therefore cost a full
+  completion on every participant it dispatched.
 
 **Interaction with the latency constraint.** The standing requirement is that the relay is optimised
 obsessively for latency and combo logic lives outside it. Concurrent dispatch adds a join and
-cancellation machinery to the request path, so measure the added overhead before and after rather
-than assuming it is free. The measurement tool now exists: `tools/bench` (see §6) measures the
-relay's total added overhead, and the hedge's own overhead is not yet measured separately.
+cancellation machinery to the request path, so the added overhead is measured rather than assumed:
+`tools/bench` (see §6) measures the relay's total added overhead. The hedge's own overhead — one
+extra upstream request per participant — is not measured separately, and it is not free.
 
 
 ### Closed — `crates/mr-dialects/src/responses.rs`: reachability tests
@@ -547,7 +581,7 @@ tree; this is the disposition, so nobody redoes finished work:
 | Previous item | Now | Evidence |
 |---|---|---|
 | P0 Panel never seen in a browser | **Closed** | `panel/test/browser.e2e.mjs` exists and **passes on Firefox and Chromium** (run in this session). The blank-page defect is also fixed: `boot()` wraps everything in try/catch and calls `showBootError` (`panel/app.js:354`). |
-| P1 Hedged race has no runner | **Open** | §4. `hedge_decide` called 0 times from `server.rs`; relay still loops sequentially. |
+| P1 Hedged race runner | **Closed** (runner) / **Open** (winner recovery) | §4. `hedge_decide` is called from `server.rs`; the participants race. The four `WinnerFailMode`s and the mid-stream splice are still unreachable. |
 | P1 `responses.rs` 0 tests | **Closed** | Five reachability tests added in the 2026-10-20 revision; the crate runs 147 tests. |
 | P1 Antigravity OAuth incomplete | **Closed** | `antigravity.rs` is 742 lines with `authorization_url` (`:266`), `exchange_code` (`:300`), `refresh` (`:339`), `refresh_with_context` (`:344`), `complete_login` (`:374`) and Google identity parsing (`:114`). The relay injects the project (`server.rs:222`, called at `:511`). |
 | P2 `tools/bench/` empty | **Closed** | The harness exists and measures the relay's added overhead: 14.6 µs p50, 110.5 µs p99 on an idle machine. |

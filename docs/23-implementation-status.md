@@ -6,7 +6,7 @@ given so you can re-run it.
 
 > **Status note (2026-10-20):** this document retains earlier implementation-history sections below;
 > they are not a comprehensive audit of every Round 2 item. The checks for this close-out passed:
-> workspace tests (1 168 passed, 1 ignored), the release-profile test run, `cargo fmt --all -- --check`,
+> workspace tests (1 172 passed, 1 ignored), the release-profile test run, `cargo fmt --all -- --check`,
 > strict workspace Clippy, strict Clippy and tests in `tools/mock-upstream` and `tools/bench`, the
 > panel Node tests, the secret scan, the isolated installer test, and the isolated
 > relay/conductor/mock-upstream smoke. The store schema is at **v3** — unchanged, because the quota
@@ -24,10 +24,13 @@ given so you can re-run it.
 > the configured `routing.defaults` entry, as a complete reroute against the same pinned snapshot,
 > with a budget of one fallback (a target that also lacks the modality, or names no known model, fails
 > with HTTP 501).
-> **The hedged race runner is still not implemented**: the relay dispatches a combo's steps
-> sequentially, `hedge_decide` is still not called from the request path, and the mid-stream splice
-> and the four `WinnerFailMode`s are unreachable. `tools/bench` now measures the relay's own added
-> latency, but the hedge's own overhead is not measured.
+> **The hedged race runner is implemented**: a combo with `hedge.enabled` dispatches every
+> participant at once, `hedge_decide` is called from the request path, and the
+> highest-priority participant that answers inside the eligibility window is committed while the
+> losers are dropped. The mid-stream splice and the four `WinnerFailMode`s are still unreachable,
+> because the winner is committed before its body streams. `tools/bench` measures the relay's own
+> added latency; the hedge's own overhead — one extra upstream request per participant — is not
+> measured separately.
 > Re-run before release and inspect `git status`.
 
 
@@ -37,7 +40,7 @@ given so you can re-run it.
 |---|---|---|
 | `mr-core` — config, snapshot compiler, vault, usage store, OAuth | **Substantial, not complete** | Codex, Copilot, and Antigravity OAuth authorization/token exchange/refresh/Google userinfo identity code is wired; Antigravity IDE client details remain reverse-engineered and unverified. |
 | `mr-dialects` — OpenAI, Anthropic, Responses, Google, Command Code translation | **Reachable, test coverage uneven** | Relay dispatches request and response translation per selected step. The Responses implementation now has five reachability tests for the arms that are only reachable in combination; the other dialects are better covered than it is. `docs/24-provider-dialects.md` documents the seven dialects. |
-| `manarouter-relay` — HTTP API, auth, snapshot, account selection, translation | **Runs; concurrent hedging not wired** | Startup, flag/config precedence, listener bind selection and the 2 s `config.json` reload poller live in `crates/manarouter-relay/src/startup.rs` (declared at `crates/manarouter-relay/src/lib.rs:47`; 17 tests). Sequential step loop remains the request executor; `hedge_decide` is not called by the relay. Priority combos with `hedge.enabled` now remember the successful provider/model for a configurable inactivity window (default 1800s), combo-wide across callers; the preference is process-local and rechecked against current eligibility on each request. Client-key scan exits at first match (a deliberate latency tradeoff that reveals configured match position to a local timing observer). |
+| `manarouter-relay` — HTTP API, auth, snapshot, account selection, translation | **Runs; the hedged race runs, winner recovery does not** | Startup, flag/config precedence, listener bind selection and the 2 s `config.json` reload poller live in `crates/manarouter-relay/src/startup.rs` (declared at `crates/manarouter-relay/src/lib.rs:47`; 17 tests). The step loop and the race share one attempt implementation (`attempt_step` in `crates/manarouter-relay/src/server.rs`), so the sequential and concurrent paths cannot drift; `hedge_decide` decides the race and the losers are dropped when a winner is committed. Winner recovery (`on_winner_fail`) and the mid-stream switch are not implemented, because the winner is committed before its body streams. Priority combos with `hedge.enabled` now remember the successful provider/model for a configurable inactivity window (default 1800s), combo-wide across callers; the preference is process-local and rechecked against current eligibility on each request. Client-key scan exits at first match (a deliberate latency tradeoff that reveals configured match position to a local timing observer). |
 | `manarouter-conductor` — auth, API, state, serving, provider quota refresh | **Partial** | `/api/quota` returns cached provider/account quota snapshots and declares refresh routes. Provider-specific OAuth refresh is reported unsupported. Historical request-usage rows are a separate Store ledger and relay currently does not write them. No live/provider refresh was exercised in this audit. |
 | `mr-cli` | **Partial** | Account/provider/combo/key/model families dispatch; `mr key rotate` is supported; `mr doctor` performs read-only config, vault metadata, snapshot freshness, and listener exposure checks; it fails if no enabled client key is present while relay bind is not confirmed loopback-only. `mr migrate omniroute` imports OAuth grants (by one refresh), model lists and effort-variant aliases — dry run by default, `--apply` to write, reading a copy of the reference database. `mr serve` runs both service binaries as child processes for a foreground session (`crates/mr-cli/src/serve.rs`, 6 tests, committed as `65f543d`; one Ctrl-C stops both, either child exiting stops the other, and the failure message names the child and its status — `mr serve` itself exits 1, it does not forward the child's code); `config` and `vault` remain unimplemented (`crates/mr-cli/src/config.rs:46`, `crates/mr-cli/src/vault.rs:24`). |
 | `panel/` | **Implemented; critical browser workflow verified** | Firefox E2E covers panel login, client-key creation, and rotation against an isolated mock API; other routes remain unverified. |
@@ -114,21 +117,23 @@ snapshot without contacting a provider, `--host 0.0.0.0` refused, `--host ::1` b
 
 ## 3. The honest gap in the headline feature
 
-**The hedged race is decided but not run in parallel.**
+**The hedged race runs; the recovery of a dead winner does not.**
 
-`select::hedge_decide` implements and tests the entire policy — eligibility window, priority winner,
-the four `WinnerFailMode`s, immediate resolution when the top participant replies in window. The
-relay's server sends a request to **one step at a time, in priority order**.
+`select::hedge_decide` implements and tests the entire *decision* policy — eligibility window,
+priority winner, immediate resolution when the top participant replies in window. The relay now calls
+it: a combo with `hedge.enabled` dispatches every participant at once, the highest-priority
+participant that answers inside the window is committed, and the losers are dropped. The step loop
+and the race share one attempt implementation, so the two paths cannot drift.
 
-So: hedging is a design with a tested decision function and no concurrent runner. It reduces today to
-"try each step in order", which is genuinely useful and is *not* the feature as described. Do not
-take a latency measurement from this tree and attribute it to hedging.
+What is still missing is the *recovery* half. The winner is committed when the upstream response
+arrives, before its body streams, so a winner that dies mid-stream is not replaced, and the four
+`WinnerFailMode`s — which describe exactly that case — are unreachable. `winner_metric` also does
+not yet distinguish `first_response_byte` from `first_complete_token`: both resolve at the response
+arrival.
 
-A safe executor remains a separate implementation task: request preparation currently sits inside
-sequential dispatch, responses may stream immediately after commitment, and upstream cancellation
-cannot promise that a provider stops generation or billing. Any runner must define those semantics,
-limit fan-out, preserve current sequential behavior when disabled, and test cancellation/fallback with
-a mock upstream before enabling it for users.
+A loser's cancellation is local. Dropping the loser closes this relay's connection to the provider,
+but a provider may keep generating and keep billing, so a hedge can cost a full completion on every
+participant it dispatched.
 
 ## 4. Verified implementation properties and limits
 

@@ -183,8 +183,10 @@ thousand times is never marked dead.
 
 ## Hedging costs quota
 
-> **Status.** This section is prospective: the relay does not yet dispatch concurrent hedged requests,
-> so no hedge is spending quota today. The accounting below is the design.
+> **Status.** The race runs, so a hedge does spend quota today. The accounting below is the
+> behaviour, not a proposal. One caveat the race adds: a loser is dropped when the winner is
+> committed, and the tokens a loser had already produced are not accounted to the key — the key is
+> charged for the winner's usage.
 
 This is stated plainly because it is a real cost that is easy to forget when reading about the
 latency benefit.

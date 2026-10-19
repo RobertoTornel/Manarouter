@@ -876,7 +876,12 @@ pub struct Combo {
     #[serde(default)]
     pub strategy: ComboStrategy,
     /// The hedged race configuration. `enabled` also opts priority combos into sticky-success
-    /// selection; concurrent hedged execution remains a separate capability.
+    /// selection.
+    ///
+    /// The race itself runs: the relay dispatches every participant at once and commits the
+    /// highest-priority participant that answers inside the eligibility window. Winner recovery
+    /// (`on_winner_fail`) and the mid-stream switch are not implemented, because the winner is
+    /// committed before its body streams.
     #[serde(default)]
     pub hedge: HedgeSpec,
     /// Inactivity window in seconds for combo-wide sticky-success selection. Used only when

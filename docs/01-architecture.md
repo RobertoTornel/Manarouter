@@ -50,9 +50,11 @@ hedge participant selection — is genuinely *outside* the router. It is resolve
 relay executes a table-driven procedure with no interpretation, no allocation, and no branch that
 depends on configuration structure.
 
-One part of that table is compiled but not yet executed: hedging is resolved into the snapshot and
-`hedge_decide` is unit-tested, but the relay still walks a combo's steps sequentially, so nothing on
-the request path calls it. See §4 and [`23-implementation-status.md`](23-implementation-status.md).
+One part of that table is compiled but only partly executed: the hedged race is resolved into the
+snapshot, `hedge_decide` is called from the request path, and the participants are dispatched
+concurrently — but the four winner-fail modes and the mid-stream switch are not implemented, because
+the winner is committed before its body streams. See §4 and
+[`23-implementation-status.md`](23-implementation-status.md).
 
 The tradeoff is honest and worth stating: **the relay is fast at the cost of being dumb.** It cannot
 make a judgement call, because a judgement call would need context it deliberately does not have. If
@@ -169,7 +171,7 @@ frames when it has to rewrite their payloads.
 | Reading the routing table | `manarouter-relay` | `ArcSwap` load; no locks. |
 | Dialect detection and passthrough | `mr-core::dialect` | A `const fn` on two enums. |
 | Dialect translation | `mr-dialects` | Not on the path when dialects match. |
-| Hedged race execution | **not wired** | `hedge_decide` exists and is unit-tested, but the relay runs the sequential step loop, so nothing on the request path calls it. |
+| Hedged race execution | `manarouter-relay` | `hedge_decide` is called from the request path: the participants are dispatched at once, the highest-priority one that answers inside the window wins, and the losers are dropped. Winner recovery is not implemented. |
 | Combo and key-strategy compilation | `manarouter-conductor` | Resolved into ordered steps and account orders once per config change, not per request. |
 | Request-time step and account choice | `manarouter-relay` | `select.rs` walks the compiled steps, applies the key strategy and advances the rotation counters. |
 | Quota accounting | `manarouter-conductor` | `/api/quota` reads usage rows from `Store`, but nothing writes them yet; the relay applies transient cooldowns from its own in-memory health state. |

@@ -11,15 +11,21 @@
 //! that is not needed to hold the bytes. The budget in `docs/16-latency-engineering.md` §6 assigns
 //! each stage a cost, and this module is where those costs are paid.
 //!
-//! # What this module does not do, and says so
+//! # The hedged race
 //!
-//! The hedge **policy** is complete and tested in [`crate::select`], but the concurrent execution of a
-//! race is not wired here: a request is sent to one step at a time, in priority order. Everything the
-//! race decides is therefore decided, and the runner that acts on it in parallel is the remaining
-//! piece. Saying that plainly matters more than a comment implying a live hedge — a reader who
-//! assumes one is running will misread every latency measurement they take.
+//! A combo whose hedge is enabled races its participants: every participant is dispatched at once,
+//! and the highest-priority participant that produced a usable answer inside the eligibility
+//! window wins. The policy — who wins, and when — lives in [`crate::select::hedge_decide`]; the
+//! runner that dispatches the participants and commits the winner lives here.
+//!
+//! What the race does **not** do is replace a winner that dies mid-stream. The commit happens when
+//! the upstream response arrives, before the body streams, so the four `WinnerFailMode`s — which
+//! all describe what to do in exactly that case — are unreachable. A reader who assumes a failed
+//! winner is being replaced will misread what the relay does with a dead upstream.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -836,375 +842,106 @@ async fn dispatch_routed(
     // The model the request should be retried against when no step can carry its modality.
     let mut fallback_target: Option<String> = None;
 
-    for step in &steps {
-        let is_sticky_step = sticky_index.is_some_and(|i| {
-            combo.is_some_and(|c| {
-                c.steps
-                    .get(i)
-                    .is_some_and(|candidate| std::ptr::eq(candidate, *step))
-            })
-        });
-        let Some(provider) = table.snapshot.providers().get(step.provider_index as usize) else {
-            if is_sticky_step {
-                if let Some(combo) = combo {
-                    app.sticky_success.clear(&combo.id);
-                }
-                sticky_index = None;
-            }
-            continue;
-        };
+    // The inputs every attempt needs. The same context serves the ordinary chain below and the
+    // hedged race, so the two cannot drift apart.
+    let attempt_ctx = AttemptContext {
+        app: &app,
+        table: &table,
+        now_ms,
+        combo,
+        client_dialect,
+        method: &method,
+        headers: &headers,
+        head,
+        bytes: &bytes,
+        model_name,
+        route,
+        uri: &uri,
+        level_override,
+        quota: &quota,
+        ticket: ticket.clone(),
+        started,
+        auth_done,
+        scan_done,
+        lookup_done,
+        sticky_index,
+    };
 
-        let account_counter = table.advance_rr(&unique_counter_key(step));
-        let Some(account) = select::pick_account(
-            provider,
-            provider.key_strategy,
-            account_counter,
-            &health,
-            now_ms,
-            &step.model,
-        ) else {
-            if is_sticky_step {
-                if let Some(combo) = combo {
-                    app.sticky_success.clear(&combo.id);
-                }
-                sticky_index = None;
-            }
-            continue;
-        };
-
-        // The credential comes from the vault, never from the configuration, and is never logged.
-        // OAuth references resolve to a full token set and platform-specific request headers.
-        let mut oauth_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
-        let mut oauth_tokens: Option<mr_core::oauth::TokenSet> = None;
-        let credential = if let Some(oauth_ref) = account.oauth_ref.as_deref() {
-            let oauth_id = mr_core::OAuthCredentialId::from_raw(oauth_ref);
-            let AuthKind::OAuth { platform } = &step.auth else {
-                tracing::error!(account = %account.id, "OAuth account is attached to non-OAuth provider auth");
-                continue;
-            };
-            let record = match app.oauth_store.get_oauth_credential(&oauth_id) {
-                Ok(Some(record)) if record.platform == *platform => record,
-                _ => {
-                    tracing::warn!(account = %account.id, "OAuth credential metadata is missing or mismatched");
-                    continue;
-                }
-            };
-            let Some(oauth_platform) = oauth_platform(platform) else {
-                tracing::error!(platform, "OAuth platform is not available in this build");
-                continue;
-            };
-            let Some(refresher) = app.oauth_refreshers.get(platform) else {
-                continue;
-            };
-            match refresher.ensure_fresh(&record.vault_ref, false).await {
-                Ok(tokens) => {
-                    oauth_headers = oauth_platform.apply_credential(&tokens);
-                    oauth_tokens = Some(tokens.clone());
-                    Some(tokens.access_token.clone())
-                }
-                Err(failure) => {
-                    tracing::warn!(platform, class = %failure.class, "OAuth credential refresh failed");
-                    continue;
-                }
-            }
-        } else {
-            match account.secret_ref.as_deref() {
-                Some(id) => match app.vault.get(id) {
-                    Ok(Some(v)) => Some(v),
-                    Ok(None) => {
-                        tracing::warn!(account = %account.id, "no credential in the vault for this account");
-                        let reason = select::CooldownReason::AuthFailed;
-                        app.health.cool_down(
-                            account.id.as_str(),
-                            select::cooldown_until(reason, 0, None, &quota),
-                            reason,
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        // A vault that cannot be decrypted is not an account problem, and cooling the
-                        // account down would hide the real cause behind a symptom.
-                        tracing::error!(error = %e, "the credential vault could not be read");
-                        return error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            client_dialect,
-                            "vault_error",
-                            "the credential vault could not be read",
-                        );
-                    }
-                },
-                None => None,
-            }
-        };
-
-        // --- Dialect translation, per step, because the upstream dialect belongs to the provider
-        // and a combo may mix dialects across its steps. ---
-        //
-        // `translate_request` returns `None` when the client and the upstream speak the same shape,
-        // and that is the fast path: the original bytes go upstream with no parse and no re-encode,
-        // which preserves provider-specific fields this router does not understand — a re-encode
-        // would silently delete them. A body is built only when the dialects actually differ.
-        let ctx = TranslateCtx {
-            route,
-            client_dialect,
-            upstream_dialect: provider.dialect,
-            upstream_model: step.model.as_str(),
-            client_streaming: head.wants_stream(),
-            session_id: None,
-        };
-        let translated = match translate_request(&ctx, &bytes) {
-            Ok(t) => t,
-            Err(e) => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    client_dialect,
-                    "invalid_request_error",
-                    &e.to_string(),
-                );
-            }
-        };
-        // Destructured in one move rather than read field-by-field: taking `path_override` by
-        // reference and then moving `body` out of the same value is a borrow conflict, and cloning
-        // the body to sidestep it would copy the whole request for every translated call.
-        let (mut outgoing, force_stream, dialect_content_type, dialect_path, translated_body) =
-            match translated {
-                Some(t) => (
-                    t.body,
-                    t.force_stream,
-                    Some(t.content_type),
-                    t.path_override,
-                    true,
-                ),
-                None => (bytes.clone(), false, None, None, false),
-            };
-        if step.dialect == Dialect::Antigravity {
-            match inject_antigravity_project(&outgoing, oauth_tokens.as_ref()) {
-                Ok(body) => outgoing = body.into(),
-                Err(message) => {
-                    return error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        client_dialect,
-                        "server_error",
-                        message,
-                    )
-                }
-            }
-        }
-
-        // --- The reasoning level, applied to the bytes that actually go upstream. ---
-        //
-        // This runs *after* translation so it lands on the upstream's own shape: an OpenAI client
-        // routed to Gemini gets `generationConfig.thinkingConfig`, not a field Gemini never reads.
-        // It also runs on the passthrough path, where `outgoing` is still the client's own bytes —
-        // which is exactly why the rewrite is a merge rather than a re-encode, and why it retargets
-        // the `model` field in the same pass.
-        match apply_reasoning_level(&outgoing, step, translated_body, level_override) {
-            Ok(Some(body)) => outgoing = body.into(),
-            Ok(None) => {}
-            Err(message) => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    client_dialect,
-                    "invalid_request_error",
-                    &message,
-                )
-            }
-        }
-
-        // Modality detection runs on the translated upstream shape, so the same helper can inspect
-        // both passthrough and cross-dialect requests. Only a differing configured default changes
-        // the model field; the request content is never dropped or rewritten.
-        let mut modality_body: serde_json::Value = match serde_json::from_slice(&outgoing) {
-            Ok(body) => body,
-            Err(_) => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    client_dialect,
-                    "invalid_request_error",
-                    "the request body must be valid JSON to inspect its modalities",
-                )
-            }
-        };
-        match crate::upstream::rewrite_model_for_modalities(
-            &mut modality_body,
-            |modality| step.accepts_modality(modality),
-            table.snapshot.routing_defaults(),
-        ) {
-            Ok(Some(target)) => {
-                // This route cannot carry the request's modality. The next step of the combo may
-                // be able to, so the step is skipped rather than failed. The configured default
-                // is remembered and used after the loop, where a *complete* reroute is possible:
-                // the target is resolved against the same snapshot, with its own provider,
-                // account, credential, URL, dialect and headers.
-                fallback_target = Some(target);
-                continue;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    client_dialect,
-                    "invalid_request_error",
-                    &error.with_model(&step.model).to_string(),
-                )
-            }
-        }
-
-        // A path the translator named wins over the provider's route override. The translator knows
-        // which dialect it just wrote the body for; a route override is keyed by the *client's*
-        // route, and says nothing about an upstream that does not follow OpenAI's path convention.
-        let copilot_host = oauth_tokens
-            .as_ref()
-            .and_then(|t| t.extra_str("copilot_api_host"));
-        let mut url_step = (*step).clone();
-        if step.dialect == Dialect::Copilot {
-            if let Some(host) =
-                copilot_host.filter(|host| host.starts_with("https://") && !host.contains('@'))
-            {
-                url_step.base_url = host.trim_end_matches('/').to_owned();
-            }
-        }
-        let copilot_override = if step.dialect == Dialect::Copilot {
-            dialect_path.as_ref()
-        } else {
-            dialect_path
-                .as_ref()
-                .or_else(|| provider.route_overrides.get(route_key(&uri)))
-        };
-        let Some(url) = build_url(&url_step, copilot_override) else {
-            continue;
-        };
-
-        // --- The proxy this attempt must egress through. ---
-        //
-        // Resolved here, after the account is known and before anything is sent, because the proxy
-        // is a property of the *account*: two accounts of one provider can egress differently, and
-        // that is the whole reason the override exists.
-        //
-        // A proxy that cannot be used at all — a missing vault secret, an unusable URL — is a
-        // configuration problem, and the request fails rather than quietly going out directly. The
-        // failure is deliberately *not* a routing fallback: trying the next step would send the
-        // request somewhere the operator did not intend.
-        let proxy = match resolve_proxy(&app, &table.snapshot, provider, account) {
-            Ok(choice) => choice,
-            Err(message) => {
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    client_dialect,
-                    "proxy_error",
-                    &message,
-                )
-            }
-        };
-        let proxy_endpoint = proxy.as_ref().map(|choice| choice.endpoint.clone());
-
-        let request = UpstreamRequest {
-            method: method.clone(),
-            url,
-            headers: upstream_headers(
-                provider,
-                step,
-                credential.as_deref(),
-                &headers,
-                &head,
-                force_stream,
-                dialect_content_type,
-                &oauth_headers,
-            ),
-            proxy: proxy_endpoint,
-            body: outgoing,
-            http2: provider.http2,
-            connect_timeout: Duration::from_millis(step.connect_timeout_ms),
-            ttfb_timeout: Duration::from_millis(step.ttfb_timeout_ms),
-            total_timeout: (step.total_timeout_ms > 0)
-                .then(|| Duration::from_millis(step.total_timeout_ms)),
-        };
-
-        match app.relay.upstream().send(request).await {
-            Ok(response) if response.status.is_success() => {
-                app.health.record_success(account.id.as_str());
-                if let Some(combo) = combo.filter(|c| {
-                    c.strategy == mr_core::ComboStrategy::Priority
-                        && c.hedge.enabled
-                        && c.sticky_success_window_secs > 0
-                }) {
-                    app.sticky_success.record_success(
-                        &combo.id,
-                        step,
-                        Duration::from_secs(combo.sticky_success_window_secs as u64),
-                        std::time::Instant::now(),
-                    );
-                }
+    // --- The hedged race. ---
+    //
+    // A combo whose hedge is enabled races its participants: every participant is dispatched at
+    // once, and the winner is the highest-priority participant that produced a usable answer
+    // inside the eligibility window.
+    let mut raced: Vec<&StepPlan> = Vec::new();
+    if let Some(combo) = combo {
+        if combo.hedge.enabled {
+            let participants: Vec<&StepPlan> = combo
+                .hedge
+                .participants
+                .iter()
+                .filter_map(|index| combo.steps.get(*index as usize))
+                .collect();
+            if participants.len() >= 2 {
                 tracing::debug!(
-                    model = model_name,
-                    provider = %step.provider_id,
-                    auth_us = auth_done.as_micros() as u64,
-                    scan_us = (scan_done - auth_done).as_micros() as u64,
-                    lookup_us = (lookup_done - scan_done).as_micros() as u64,
-                    total_us = started.elapsed().as_micros() as u64,
-                    "served"
+                    combo = %combo.id,
+                    participants = participants.len(),
+                    window_ms = combo.hedge.window_ms,
+                    "hedged race"
                 );
-                return build_client_response(ctx, translated_body, response, ticket).await;
-            }
-            Ok(response) => {
-                if is_sticky_step {
-                    if let Some(combo) = combo {
-                        app.sticky_success.clear(&combo.id);
+                match run_hedge(&attempt_ctx, &participants, &combo.hedge).await {
+                    HedgeOutcome::Won(response) => return response,
+                    HedgeOutcome::Fatal(response) => return response,
+                    HedgeOutcome::NoWinner {
+                        last_failure: failure,
+                        fallback_target: target,
+                        sticky_cleared: cleared,
+                    } => {
+                        last_failure = failure;
+                        if target.is_some() {
+                            fallback_target = target;
+                        }
+                        if cleared {
+                            sticky_index = None;
+                        }
+                        // The participants have been tried. The ordinary chain continues with the
+                        // steps that were not in the race, so a failed race does not send the
+                        // same request to the same provider twice.
+                        raced = participants.clone();
                     }
+                }
+            }
+        }
+    }
+
+    for step in &steps {
+        // A step that was in the race has already been tried.
+        if raced.iter().any(|tried| std::ptr::eq(*tried, *step)) {
+            continue;
+        }
+        let is_sticky = sticky_step_is(combo, sticky_index, step);
+        match attempt_step(&attempt_ctx, step, is_sticky).await {
+            Attempt::Answer(response) => return response,
+            Attempt::Failed {
+                response,
+                sticky_cleared,
+            } => {
+                if sticky_cleared {
                     sticky_index = None;
                 }
-                let reason = classify_status(response.status);
-                app.health.cool_down(
-                    account.id.as_str(),
-                    select::cooldown_until(reason, 0, retry_after_ms(&response.headers), &quota),
-                    reason,
-                );
-                last_failure = Some(build_response(response, None));
+                last_failure = response;
             }
-            Err(e) => {
-                if is_sticky_step {
-                    if let Some(combo) = combo {
-                        app.sticky_success.clear(&combo.id);
-                    }
+            Attempt::Skip {
+                sticky_cleared,
+                fallback_target: target,
+            } => {
+                if sticky_cleared {
                     sticky_index = None;
                 }
-                // A proxy failure ends the attempt, and the request, here.
-                //
-                // The fallback loop exists to survive a *provider* failure by trying a different
-                // route. A proxy failure is not that: the egress the operator configured is broken,
-                // and the next step might egress directly, which is exactly the silent downgrade a
-                // proxy is supposed to prevent. So the request fails, loudly, with the proxy's own
-                // error.
-                if let UpstreamError::Proxy(message) = &e {
-                    tracing::warn!(
-                        model = model_name,
-                        provider = %step.provider_id,
-                        error = %e,
-                        "the configured proxy could not be used; the request is not being rerouted"
-                    );
-                    return error_response(
-                        StatusCode::BAD_GATEWAY,
-                        client_dialect,
-                        "proxy_error",
-                        &format!(
-                            "the request could not be sent through the configured proxy: {message}"
-                        ),
-                    );
+                if target.is_some() {
+                    fallback_target = target;
                 }
-                let reason = select::CooldownReason::Backoff;
-                app.health.cool_down(
-                    account.id.as_str(),
-                    select::cooldown_until(reason, 0, None, &quota),
-                    reason,
-                );
-                tracing::warn!(
-                    model = model_name,
-                    provider = %step.provider_id,
-                    error = %e,
-                    "upstream failed"
-                );
-                last_failure = None;
             }
+            Attempt::Fatal { response } => return response,
         }
     }
 
@@ -1304,6 +1041,696 @@ fn dispatch_routed_boxed(
 /// The counter is per step rather than per provider so that two steps on one provider do not advance
 /// each other's position — otherwise adding a second step would silently change which key the first
 /// one uses.
+/// What one attempt at a step produced.
+enum Attempt {
+    /// The step was not usable; the caller should try the next one.
+    Skip {
+        /// Whether the sticky preference was cleared by this attempt.
+        sticky_cleared: bool,
+        /// The configured default to retry against, when the step could not carry the modality.
+        fallback_target: Option<String>,
+    },
+    /// The step answered with a success; the response is ready for the client.
+    Answer(Response),
+    /// The step failed.
+    Failed {
+        /// The failure response, when there is one to show the client.
+        response: Option<Response>,
+        /// Whether the sticky preference was cleared by this attempt.
+        sticky_cleared: bool,
+    },
+    /// The step failed in a way that ends the request rather than the attempt.
+    Fatal {
+        /// The response to send the client.
+        response: Response,
+    },
+}
+
+/// The inputs one attempt at a step needs.
+///
+/// Grouped into a struct because an attempt runs in more than one place — the ordinary sequential
+/// fallback and the hedged race — and a function with twenty parameters is not reviewable.
+struct AttemptContext<'a> {
+    /// The relay's shared state.
+    app: &'a AppState,
+    /// The routing table the request is pinned to.
+    table: &'a RouteTable,
+    /// The wall clock the account selection uses.
+    now_ms: u64,
+    /// The combo the request resolved to, when it resolved to one.
+    combo: Option<&'a mr_core::snapshot::ComboPlan>,
+    /// The dialect the client speaks.
+    client_dialect: Dialect,
+    /// The client's method.
+    method: &'a Method,
+    /// The client's headers.
+    headers: &'a HeaderMap,
+    /// What the body scan found.
+    head: RequestHead,
+    /// The request body, as received.
+    bytes: &'a Bytes,
+    /// The model the client asked for.
+    model_name: &'a str,
+    /// The route the client asked for.
+    route: RouteKind,
+    /// The request URI.
+    uri: &'a Uri,
+    /// The reasoning level the client asked for, if any.
+    level_override: Option<ReasoningLevel>,
+    /// The quota settings the cooldown calculation uses.
+    quota: &'a mr_core::config::QuotaConfig,
+    /// The admission ticket for this request, when the key is metered.
+    ticket: Option<Arc<crate::quota::QuotaTicket>>,
+    /// When the request started.
+    started: std::time::Instant,
+    /// How long authentication took.
+    auth_done: std::time::Duration,
+    /// How long the body scan took.
+    scan_done: std::time::Duration,
+    /// How long the route lookup took.
+    lookup_done: std::time::Duration,
+    /// The combo step the sticky preference points at, when there is one.
+    sticky_index: Option<usize>,
+}
+
+/// Run one attempt at one step.
+///
+/// This is the body of the step loop, extracted so that the same code can run in the ordinary
+/// sequential fallback and in the hedged race, where several attempts run at once. The two paths
+/// must not differ in any way that matters: a race that dispatched requests slightly differently
+/// from the sequential path would be a race nobody could reason about.
+///
+/// The `is_sticky_step` flag says whether this step is the one the combo's sticky preference
+/// points at. A step that turns out to be unusable clears that preference, which is why the
+/// outcome carries a `sticky_cleared` flag rather than the caller deciding it.
+async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step: bool) -> Attempt {
+    let app = actx.app;
+    let table = actx.table;
+    // The cooldown view is taken per attempt rather than once for the whole request, so that a
+    // race sees the accounts that the other participants just cooled down.
+    let health = app.health.view();
+    let now_ms = actx.now_ms;
+    let combo = actx.combo;
+    let client_dialect = actx.client_dialect;
+    let method = actx.method;
+    let headers = actx.headers;
+    let head = actx.head;
+    let bytes = actx.bytes;
+    let model_name = actx.model_name;
+    let route = actx.route;
+    let uri = actx.uri;
+    let level_override = actx.level_override;
+    let quota = actx.quota;
+    let ticket = actx.ticket.clone();
+    let started = actx.started;
+    let auth_done = actx.auth_done;
+    let scan_done = actx.scan_done;
+    let lookup_done = actx.lookup_done;
+    let mut sticky_cleared = false;
+    let mut fallback_target: Option<String> = None;
+    let Some(provider) = table.snapshot.providers().get(step.provider_index as usize) else {
+        if is_sticky_step {
+            if let Some(combo) = combo {
+                app.sticky_success.clear(&combo.id);
+            }
+            sticky_cleared = true;
+        }
+        return Attempt::Skip {
+            sticky_cleared,
+            fallback_target: fallback_target.take(),
+        };
+    };
+
+    let account_counter = table.advance_rr(&unique_counter_key(step));
+    let Some(account) = select::pick_account(
+        provider,
+        provider.key_strategy,
+        account_counter,
+        &health,
+        now_ms,
+        &step.model,
+    ) else {
+        if is_sticky_step {
+            if let Some(combo) = combo {
+                app.sticky_success.clear(&combo.id);
+            }
+            sticky_cleared = true;
+        }
+        return Attempt::Skip {
+            sticky_cleared,
+            fallback_target: fallback_target.take(),
+        };
+    };
+
+    // The credential comes from the vault, never from the configuration, and is never logged.
+    // OAuth references resolve to a full token set and platform-specific request headers.
+    let mut oauth_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
+    let mut oauth_tokens: Option<mr_core::oauth::TokenSet> = None;
+    let credential = if let Some(oauth_ref) = account.oauth_ref.as_deref() {
+        let oauth_id = mr_core::OAuthCredentialId::from_raw(oauth_ref);
+        let AuthKind::OAuth { platform } = &step.auth else {
+            tracing::error!(account = %account.id, "OAuth account is attached to non-OAuth provider auth");
+            return Attempt::Skip {
+                sticky_cleared,
+                fallback_target: fallback_target.take(),
+            };
+        };
+        let record = match app.oauth_store.get_oauth_credential(&oauth_id) {
+            Ok(Some(record)) if record.platform == *platform => record,
+            _ => {
+                tracing::warn!(account = %account.id, "OAuth credential metadata is missing or mismatched");
+                return Attempt::Skip {
+                    sticky_cleared,
+                    fallback_target: fallback_target.take(),
+                };
+            }
+        };
+        let Some(oauth_platform) = oauth_platform(platform) else {
+            tracing::error!(platform, "OAuth platform is not available in this build");
+            return Attempt::Skip {
+                sticky_cleared,
+                fallback_target: fallback_target.take(),
+            };
+        };
+        let Some(refresher) = app.oauth_refreshers.get(platform) else {
+            return Attempt::Skip {
+                sticky_cleared,
+                fallback_target: fallback_target.take(),
+            };
+        };
+        match refresher.ensure_fresh(&record.vault_ref, false).await {
+            Ok(tokens) => {
+                oauth_headers = oauth_platform.apply_credential(&tokens);
+                oauth_tokens = Some(tokens.clone());
+                Some(tokens.access_token.clone())
+            }
+            Err(failure) => {
+                tracing::warn!(platform, class = %failure.class, "OAuth credential refresh failed");
+                return Attempt::Skip {
+                    sticky_cleared,
+                    fallback_target: fallback_target.take(),
+                };
+            }
+        }
+    } else {
+        match account.secret_ref.as_deref() {
+            Some(id) => match app.vault.get(id) {
+                Ok(Some(v)) => Some(v),
+                Ok(None) => {
+                    tracing::warn!(account = %account.id, "no credential in the vault for this account");
+                    let reason = select::CooldownReason::AuthFailed;
+                    app.health.cool_down(
+                        account.id.as_str(),
+                        select::cooldown_until(reason, 0, None, quota),
+                        reason,
+                    );
+                    return Attempt::Skip {
+                        sticky_cleared,
+                        fallback_target: fallback_target.take(),
+                    };
+                }
+                Err(e) => {
+                    // A vault that cannot be decrypted is not an account problem, and cooling the
+                    // account down would hide the real cause behind a symptom.
+                    tracing::error!(error = %e, "the credential vault could not be read");
+                    return Attempt::Fatal {
+                        response: error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            client_dialect,
+                            "vault_error",
+                            "the credential vault could not be read",
+                        ),
+                    };
+                }
+            },
+            None => None,
+        }
+    };
+
+    // --- Dialect translation, per step, because the upstream dialect belongs to the provider
+    // and a combo may mix dialects across its steps. ---
+    //
+    // `translate_request` returns `None` when the client and the upstream speak the same shape,
+    // and that is the fast path: the original bytes go upstream with no parse and no re-encode,
+    // which preserves provider-specific fields this router does not understand — a re-encode
+    // would silently delete them. A body is built only when the dialects actually differ.
+    let ctx = TranslateCtx {
+        route,
+        client_dialect,
+        upstream_dialect: provider.dialect,
+        upstream_model: step.model.as_str(),
+        client_streaming: head.wants_stream(),
+        session_id: None,
+    };
+    let translated = match translate_request(&ctx, bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            return Attempt::Fatal {
+                response: error_response(
+                    StatusCode::BAD_REQUEST,
+                    client_dialect,
+                    "invalid_request_error",
+                    &e.to_string(),
+                ),
+            };
+        }
+    };
+    // Destructured in one move rather than read field-by-field: taking `path_override` by
+    // reference and then moving `body` out of the same value is a borrow conflict, and cloning
+    // the body to sidestep it would copy the whole request for every translated call.
+    let (mut outgoing, force_stream, dialect_content_type, dialect_path, translated_body) =
+        match translated {
+            Some(t) => (
+                t.body,
+                t.force_stream,
+                Some(t.content_type),
+                t.path_override,
+                true,
+            ),
+            None => (bytes.clone(), false, None, None, false),
+        };
+    if step.dialect == Dialect::Antigravity {
+        match inject_antigravity_project(&outgoing, oauth_tokens.as_ref()) {
+            Ok(body) => outgoing = body.into(),
+            Err(message) => {
+                return Attempt::Fatal {
+                    response: error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        client_dialect,
+                        "server_error",
+                        message,
+                    ),
+                };
+            }
+        }
+    }
+
+    // --- The reasoning level, applied to the bytes that actually go upstream. ---
+    //
+    // This runs *after* translation so it lands on the upstream's own shape: an OpenAI client
+    // routed to Gemini gets `generationConfig.thinkingConfig`, not a field Gemini never reads.
+    // It also runs on the passthrough path, where `outgoing` is still the client's own bytes —
+    // which is exactly why the rewrite is a merge rather than a re-encode, and why it retargets
+    // the `model` field in the same pass.
+    match apply_reasoning_level(&outgoing, step, translated_body, level_override) {
+        Ok(Some(body)) => outgoing = body.into(),
+        Ok(None) => {}
+        Err(message) => {
+            return Attempt::Fatal {
+                response: error_response(
+                    StatusCode::BAD_REQUEST,
+                    client_dialect,
+                    "invalid_request_error",
+                    &message,
+                ),
+            };
+        }
+    }
+
+    // Modality detection runs on the translated upstream shape, so the same helper can inspect
+    // both passthrough and cross-dialect requests. Only a differing configured default changes
+    // the model field; the request content is never dropped or rewritten.
+    let mut modality_body: serde_json::Value = match serde_json::from_slice(&outgoing) {
+        Ok(body) => body,
+        Err(_) => {
+            return Attempt::Fatal {
+                response: error_response(
+                    StatusCode::BAD_REQUEST,
+                    client_dialect,
+                    "invalid_request_error",
+                    "the request body must be valid JSON to inspect its modalities",
+                ),
+            };
+        }
+    };
+    match crate::upstream::rewrite_model_for_modalities(
+        &mut modality_body,
+        |modality| step.accepts_modality(modality),
+        table.snapshot.routing_defaults(),
+    ) {
+        Ok(Some(target)) => {
+            // This route cannot carry the request's modality. The next step of the combo may
+            // be able to, so the step is skipped rather than failed. The configured default
+            // is remembered and used after the loop, where a *complete* reroute is possible:
+            // the target is resolved against the same snapshot, with its own provider,
+            // account, credential, URL, dialect and headers.
+            fallback_target = Some(target);
+            return Attempt::Skip {
+                sticky_cleared,
+                fallback_target: fallback_target.take(),
+            };
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Attempt::Fatal {
+                response: error_response(
+                    StatusCode::BAD_REQUEST,
+                    client_dialect,
+                    "invalid_request_error",
+                    &error.with_model(&step.model).to_string(),
+                ),
+            };
+        }
+    }
+
+    // A path the translator named wins over the provider's route override. The translator knows
+    // which dialect it just wrote the body for; a route override is keyed by the *client's*
+    // route, and says nothing about an upstream that does not follow OpenAI's path convention.
+    let copilot_host = oauth_tokens
+        .as_ref()
+        .and_then(|t| t.extra_str("copilot_api_host"));
+    let mut url_step = (*step).clone();
+    if step.dialect == Dialect::Copilot {
+        if let Some(host) =
+            copilot_host.filter(|host| host.starts_with("https://") && !host.contains('@'))
+        {
+            url_step.base_url = host.trim_end_matches('/').to_owned();
+        }
+    }
+    let copilot_override = if step.dialect == Dialect::Copilot {
+        dialect_path.as_ref()
+    } else {
+        dialect_path
+            .as_ref()
+            .or_else(|| provider.route_overrides.get(route_key(uri)))
+    };
+    let Some(url) = build_url(&url_step, copilot_override) else {
+        return Attempt::Skip {
+            sticky_cleared,
+            fallback_target: fallback_target.take(),
+        };
+    };
+
+    // --- The proxy this attempt must egress through. ---
+    //
+    // Resolved here, after the account is known and before anything is sent, because the proxy
+    // is a property of the *account*: two accounts of one provider can egress differently, and
+    // that is the whole reason the override exists.
+    //
+    // A proxy that cannot be used at all — a missing vault secret, an unusable URL — is a
+    // configuration problem, and the request fails rather than quietly going out directly. The
+    // failure is deliberately *not* a routing fallback: trying the next step would send the
+    // request somewhere the operator did not intend.
+    let proxy = match resolve_proxy(app, &table.snapshot, provider, account) {
+        Ok(choice) => choice,
+        Err(message) => {
+            return Attempt::Fatal {
+                response: error_response(
+                    StatusCode::BAD_GATEWAY,
+                    client_dialect,
+                    "proxy_error",
+                    &message,
+                ),
+            };
+        }
+    };
+    let proxy_endpoint = proxy.as_ref().map(|choice| choice.endpoint.clone());
+
+    let request = UpstreamRequest {
+        method: method.clone(),
+        url,
+        headers: upstream_headers(
+            provider,
+            step,
+            credential.as_deref(),
+            headers,
+            &head,
+            force_stream,
+            dialect_content_type,
+            &oauth_headers,
+        ),
+        proxy: proxy_endpoint,
+        body: outgoing,
+        http2: provider.http2,
+        connect_timeout: Duration::from_millis(step.connect_timeout_ms),
+        ttfb_timeout: Duration::from_millis(step.ttfb_timeout_ms),
+        total_timeout: (step.total_timeout_ms > 0)
+            .then(|| Duration::from_millis(step.total_timeout_ms)),
+    };
+
+    match app.relay.upstream().send(request).await {
+        Ok(response) if response.status.is_success() => {
+            app.health.record_success(account.id.as_str());
+            if let Some(combo) = combo.filter(|c| {
+                c.strategy == mr_core::ComboStrategy::Priority
+                    && c.hedge.enabled
+                    && c.sticky_success_window_secs > 0
+            }) {
+                app.sticky_success.record_success(
+                    &combo.id,
+                    step,
+                    Duration::from_secs(combo.sticky_success_window_secs as u64),
+                    std::time::Instant::now(),
+                );
+            }
+            tracing::debug!(
+                model = model_name,
+                provider = %step.provider_id,
+                auth_us = auth_done.as_micros() as u64,
+                scan_us = (scan_done - auth_done).as_micros() as u64,
+                lookup_us = (lookup_done - scan_done).as_micros() as u64,
+                total_us = started.elapsed().as_micros() as u64,
+                "served"
+            );
+            Attempt::Answer(build_client_response(ctx, translated_body, response, ticket).await)
+        }
+        Ok(response) => {
+            if is_sticky_step {
+                if let Some(combo) = combo {
+                    app.sticky_success.clear(&combo.id);
+                }
+                sticky_cleared = true;
+            }
+            let reason = classify_status(response.status);
+            app.health.cool_down(
+                account.id.as_str(),
+                select::cooldown_until(reason, 0, retry_after_ms(&response.headers), quota),
+                reason,
+            );
+            Attempt::Failed {
+                response: Some(build_response(response, None)),
+                sticky_cleared,
+            }
+        }
+        Err(e) => {
+            if is_sticky_step {
+                if let Some(combo) = combo {
+                    app.sticky_success.clear(&combo.id);
+                }
+                sticky_cleared = true;
+            }
+            // A proxy failure ends the attempt, and the request, here.
+            //
+            // The fallback loop exists to survive a *provider* failure by trying a different
+            // route. A proxy failure is not that: the egress the operator configured is broken,
+            // and the next step might egress directly, which is exactly the silent downgrade a
+            // proxy is supposed to prevent. So the request fails, loudly, with the proxy's own
+            // error.
+            if let UpstreamError::Proxy(message) = &e {
+                tracing::warn!(
+                    model = model_name,
+                    provider = %step.provider_id,
+                    error = %e,
+                    "the configured proxy could not be used; the request is not being rerouted"
+                );
+                return Attempt::Fatal {
+                    response: error_response(
+                        StatusCode::BAD_GATEWAY,
+                        client_dialect,
+                        "proxy_error",
+                        &format!(
+                            "the request could not be sent through the configured proxy: {message}"
+                        ),
+                    ),
+                };
+            }
+            let reason = select::CooldownReason::Backoff;
+            app.health.cool_down(
+                account.id.as_str(),
+                select::cooldown_until(reason, 0, None, quota),
+                reason,
+            );
+            tracing::warn!(
+                model = model_name,
+                provider = %step.provider_id,
+                error = %e,
+                "upstream failed"
+            );
+            Attempt::Failed {
+                response: None,
+                sticky_cleared,
+            }
+        }
+    }
+}
+
+/// One pending attempt in a race, boxed so that several of them can be polled at once.
+type PendingAttempt<'a> = Pin<Box<dyn Future<Output = (usize, Attempt)> + Send + 'a>>;
+
+/// The outcome of a hedged race.
+enum HedgeOutcome {
+    /// A participant won; the response is ready for the client.
+    Won(Response),
+    /// No participant produced an answer; the caller continues with the ordinary chain.
+    NoWinner {
+        /// The last failure seen, to report if the ordinary chain also fails.
+        last_failure: Option<Response>,
+        /// The configured default to retry against, when a participant could not carry the
+        /// modality.
+        fallback_target: Option<String>,
+        /// Whether the sticky preference was cleared by one of the participants.
+        sticky_cleared: bool,
+    },
+    /// A participant failed in a way that ends the request rather than the race.
+    Fatal(Response),
+}
+
+/// Run a hedged race over a combo's participants.
+///
+/// Every participant is dispatched at once. The winner is the **highest-priority** participant that
+/// produced a usable answer inside the eligibility window — not the fastest one, because a race
+/// that rewarded raw speed would make the operator's ordering decorative. `select::hedge_decide`
+/// owns that rule; this function owns the machinery around it.
+///
+/// The window is an **eligibility gate, not a timeout**: it never fails a request, and a
+/// participant that answers after it is still an answer.
+///
+/// What is *not* implemented here is the mid-stream half of the feature: a winner that dies while
+/// its body is streaming is not replaced, and the four `WinnerFailMode`s — which all describe
+/// what to do in exactly that case — are unreachable. The commit below happens when the upstream
+/// response arrives, which is before the body streams.
+async fn run_hedge(
+    actx: &AttemptContext<'_>,
+    participants: &[&StepPlan],
+    hedge: &mr_core::snapshot::HedgePlan,
+) -> HedgeOutcome {
+    let started = std::time::Instant::now();
+    let window_ms = u64::from(hedge.window_ms);
+
+    // Every participant is dispatched at once. The window is not a delay before the second
+    // request goes out: it is the deadline by which a reply keeps its priority protection, and a
+    // hedged request that waited for the window before sending the second request would be
+    // strictly worse than an unhedged one.
+    let mut pending: Vec<PendingAttempt<'_>> = participants
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            let future = attempt_step(
+                actx,
+                step,
+                sticky_step_is(actx.combo, actx.sticky_index, step),
+            );
+            Box::pin(async move { (index, future.await) }) as PendingAttempt<'_>
+        })
+        .collect();
+
+    let mut states: Vec<select::Participant> =
+        vec![select::Participant::PENDING; participants.len()];
+    let mut outcomes: Vec<Option<Attempt>> = (0..participants.len()).map(|_| None).collect();
+    let mut fallback_target: Option<String> = None;
+    let mut sticky_cleared = false;
+
+    while !pending.is_empty() {
+        // The first participant to settle is the one the decision is taken on. `select_all` polls
+        // every pending attempt, so a participant that is already ready wins the poll immediately
+        // and the others keep their place in the queue.
+        let (settled, _index, rest) = futures_util::future::select_all(pending.drain(..)).await;
+        pending = rest;
+        let (participant, attempt) = settled;
+        let now_ms = started.elapsed().as_millis() as u64;
+
+        // A participant that answered is "arrived"; one that failed is settled and can never win.
+        states[participant] = match &attempt {
+            Attempt::Answer(_) => select::Participant::arrived(now_ms),
+            _ => select::Participant::FAILED,
+        };
+        match &attempt {
+            Attempt::Failed {
+                sticky_cleared: cleared,
+                ..
+            } => {
+                sticky_cleared = sticky_cleared || *cleared;
+            }
+            Attempt::Skip {
+                fallback_target: target,
+                sticky_cleared: cleared,
+            } => {
+                if target.is_some() {
+                    fallback_target = target.clone();
+                }
+                sticky_cleared = sticky_cleared || *cleared;
+            }
+            Attempt::Fatal { .. } => {}
+            Attempt::Answer(_) => {}
+        }
+
+        // A fatal failure — a broken proxy — ends the request rather than the race. The other
+        // participants are dropped with it.
+        if let Attempt::Fatal { response } = attempt {
+            return HedgeOutcome::Fatal(response);
+        }
+
+        outcomes[participant] = Some(attempt);
+
+        // The decision belongs to one place: `hedge_decide` knows the priority order, the
+        // eligibility window and the rule that a lower-priority participant cannot win while a
+        // higher-priority one might still reply in time.
+        if let select::HedgeDecision::Resolved(winner) =
+            select::hedge_decide(&states, window_ms, now_ms)
+        {
+            let response = match outcomes[winner].take() {
+                Some(Attempt::Answer(response)) => response,
+                _ => {
+                    // The decision named a participant that did not answer, which the rule does
+                    // not allow. Rather than serve the wrong answer, keep waiting.
+                    outcomes[winner] = None;
+                    continue;
+                }
+            };
+            // The losers are dropped here. Their futures are still pending, and dropping a
+            // pending attempt drops the upstream response with it, which closes that connection
+            // rather than leaking it. The upstream may still be generating — that is the
+            // documented cost of a hedge — but this relay does not hold the socket open.
+            return HedgeOutcome::Won(response);
+        }
+    }
+
+    // Every participant failed. The failure to report is the one the ordinary chain would have
+    // reported: the last participant that failed *with a response*, unless a later participant
+    // failed in a way that produced no response at all, which clears it — the same rule the
+    // sequential chain uses.
+    let mut last_failure: Option<Response> = None;
+    for outcome in outcomes.into_iter().flatten() {
+        if let Attempt::Failed { response, .. } = outcome {
+            last_failure = response;
+        }
+    }
+
+    HedgeOutcome::NoWinner {
+        last_failure,
+        fallback_target,
+        sticky_cleared,
+    }
+}
+
+/// Whether a step is the one the combo's sticky preference points at.
+///
+/// The same comparison the sequential chain uses, in one place, so the race and the chain agree
+/// about which step the preference is about.
+fn sticky_step_is(
+    combo: Option<&mr_core::snapshot::ComboPlan>,
+    sticky_index: Option<usize>,
+    step: &StepPlan,
+) -> bool {
+    sticky_index.is_some_and(|index| {
+        combo.is_some_and(|combo| {
+            combo
+                .steps
+                .get(index)
+                .is_some_and(|candidate| std::ptr::eq(candidate, step))
+        })
+    })
+}
 fn unique_counter_key(step: &StepPlan) -> mr_core::ids::ComboId {
     mr_core::ids::ComboId::from_raw(format!("{}#{}", step.provider_id, step.model))
 }
@@ -3599,5 +4026,262 @@ mod tests {
             "a disabled proxy was dialled"
         );
         assert_eq!(upstream_seen.lock().unwrap().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The hedged race
+    // -----------------------------------------------------------------------------------------
+
+    /// A fake upstream that answers after a delay, with a body that says which one it was.
+    ///
+    /// The delay is what makes the race observable: the slower participant is the higher-priority
+    /// one in the tests below, and a race that rewarded speed instead of priority would answer
+    /// with the other body.
+    async fn delayed_upstream(
+        delay_ms: u64,
+        content: &'static str,
+        fail: bool,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(move |body: Bytes| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&body).to_string());
+                if delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+                let status = if fail {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::OK
+                };
+                (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    format!(
+                        r#"{{"id":"cmpl-1","object":"chat.completion","choices":[{{"index":0,"message":{{"role":"assistant","content":"{content}"}},"finish_reason":"stop"}}]}}"#
+                    ),
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// What the race fixture should look like.
+    struct RaceSpec {
+        /// How long the first (higher-priority) participant takes.
+        first_delay_ms: u64,
+        /// Whether the first participant fails.
+        first_fails: bool,
+        /// How long the second participant takes.
+        second_delay_ms: u64,
+        /// Whether the second participant fails.
+        second_fails: bool,
+        /// Whether the combo hedges at all.
+        hedge: bool,
+    }
+
+    impl Default for RaceSpec {
+        fn default() -> Self {
+            Self {
+                first_delay_ms: 0,
+                first_fails: false,
+                second_delay_ms: 0,
+                second_fails: false,
+                hedge: true,
+            }
+        }
+    }
+
+    /// A relay whose only route is a two-step combo.
+    ///
+    /// The first step is the higher-priority one. In the tests below the second answers faster
+    /// than the first, so a race that picked the fastest answer would be caught immediately.
+    async fn race_state(
+        spec: RaceSpec,
+    ) -> (
+        AppState,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let (first_url, first_seen) =
+            delayed_upstream(spec.first_delay_ms, "first", spec.first_fails).await;
+        let (second_url, second_seen) =
+            delayed_upstream(spec.second_delay_ms, "second", spec.second_fails).await;
+
+        let mut combo = mr_core::model::Combo::new(
+            "race",
+            mr_core::model::ComboStep::new("first", "race-model"),
+        );
+        combo
+            .steps
+            .push(mr_core::model::ComboStep::new("second", "race-model"));
+        combo.hedge = mr_core::model::HedgeSpec {
+            enabled: spec.hedge,
+            participants: vec![0, 1],
+            window_ms: 2_000,
+            ..Default::default()
+        };
+
+        let config = mr_core::config::Config {
+            providers: vec![
+                provider_serving("first", &first_url, "race-model", &[InputModality::Text]),
+                provider_serving("second", &second_url, "race-model", &[InputModality::Text]),
+            ],
+            combos: vec![combo],
+            ..Default::default()
+        };
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let vault = Arc::new(opened);
+
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: store,
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+        };
+        (state, first_seen, second_seen)
+    }
+
+    /// A request for the combo the race fixture serves.
+    fn race_body() -> String {
+        serde_json::json!({
+            "model": "race",
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        .to_string()
+    }
+
+    /// The text of a response body, as a string.
+    async fn body_text(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    #[tokio::test]
+    async fn the_race_serves_the_highest_priority_answer_even_when_it_is_the_slower_one() {
+        let (state, first_seen, second_seen) = race_state(RaceSpec {
+            first_delay_ms: 120,
+            second_delay_ms: 0,
+            ..Default::default()
+        })
+        .await;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(race_body()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = body_text(response).await;
+        assert!(
+            text.contains("first"),
+            "the race did not serve the higher-priority answer: {text}"
+        );
+        // Both participants were dispatched: that is what a race is.
+        assert_eq!(first_seen.lock().unwrap().len(), 1);
+        assert_eq!(second_seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_participant_hands_the_race_to_the_one_that_answered() {
+        let (state, first_seen, second_seen) = race_state(RaceSpec {
+            first_fails: true,
+            ..Default::default()
+        })
+        .await;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(race_body()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = body_text(response).await;
+        assert!(
+            text.contains("second"),
+            "the race did not fall to the participant that answered: {text}"
+        );
+        assert_eq!(first_seen.lock().unwrap().len(), 1);
+        assert_eq!(second_seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_race_whose_participants_all_fail_reports_the_failure_rather_than_succeeding() {
+        let (state, _first_seen, _second_seen) = race_state(RaceSpec {
+            first_fails: true,
+            second_fails: true,
+            ..Default::default()
+        })
+        .await;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(race_body()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn a_combo_without_the_hedge_calls_only_its_first_step() {
+        let (state, first_seen, second_seen) = race_state(RaceSpec {
+            hedge: false,
+            ..Default::default()
+        })
+        .await;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(race_body()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(first_seen.lock().unwrap().len(), 1);
+        assert!(
+            second_seen.lock().unwrap().is_empty(),
+            "the second step was called without a hedge"
+        );
     }
 }

@@ -135,8 +135,9 @@ configuring quota tracking.
 > **Status.** All three values compile into the snapshot and are covered by tests. `priority`,
 > `round-robin` and `reset-aware-priority` are executed by the relay: the round-robin cursor is a
 > relaxed atomic in the relay's own `RouteTable`, and reset-aware demotion is computed at selection
-> time from the reset time rather than by a background loop. Concurrent hedging is not yet executed —
-> see [the hedged race](07-hedged-race.md). See [overview](00-overview.md) §7 for the live status
+> time from the reset time rather than by a background loop. The hedged race is executed as well:
+> the participants are dispatched at once and the highest-priority one that answers inside the window
+> wins — see [the hedged race](07-hedged-race.md). See [overview](00-overview.md) §7 for the live status
 > table.
 
 ---

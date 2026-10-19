@@ -45,6 +45,21 @@ Adding without `--at` appends the step. The CLI reports the inserted, moved, or 
 
 To pause a combo without deleting its configuration, run `mr combo disable <COMBO_NAME>`; `mr combo enable <COMBO_NAME>` makes it callable again. Removing a combo is different: `mr combo remove <COMBO_NAME>` deletes it. If aliases or client-key allow-lists still refer to it, removal is refused unless `--force` is supplied; force removal also drops those references. Review them first. See [troubleshooting](10-troubleshooting.md) before changing a route used by clients.
 
-## Important runtime limit: no concurrent hedge
+## Hedging: what it does and does not do
 
-The CLI accepts hedge-related options, but concurrent hedging is not wired into the relay: requests still try one step at a time. Do not enable hedge settings expecting two providers to race or latency to improve. With a priority combo, enabling its hedge setting can also activate a process-local preference for the last successful step; this is not a concurrent race.
+With `--hedge`, the relay dispatches the combo's participants **at the same time** and commits the
+highest-priority participant that answers inside the window (`--window-ms`). It is not a
+fastest-wins race: if the first step answers within the window, it wins even when a lower-priority
+step answered earlier. That is the point — the combo's order is your choice of model, and hedging
+buys insurance against the first one failing, not a lower average latency.
+
+Two things to keep in mind:
+
+- **It costs quota.** Every participant that was dispatched consumes provider quota, including the
+  losers. A loser that had begun generating is billed.
+- **A winner that dies mid-stream is not replaced.** The winner is committed when the upstream
+  response arrives, before the body is streamed, so a stream that breaks afterwards ends the client
+  stream as-is. The `on_winner_fail` modes that would describe a replacement are not implemented.
+
+With a priority combo, enabling the hedge setting can also activate a process-local preference for
+the last successful step.

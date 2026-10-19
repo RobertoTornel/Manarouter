@@ -13,8 +13,9 @@ filename — the file that documents it is listed below.**
 
 **Manarouter** is a small, fast, self-hosted AI router. It presents one OpenAI-compatible and one
 Anthropic-compatible API surface in front of many upstream providers, and it adds named **combos**
-(a combo is a *model name* that tries configured provider/model steps in order; concurrent hedging is
-not wired into the relay yet).
+(a combo is a *model name* that tries configured provider/model steps in order, and — when the hedge
+is enabled — races the chosen steps at once, committing the highest-priority one that answers
+inside the eligibility window).
 
 **Language:** Rust, edition 2021, MSRV 1.82. Workspace of five crates.
 
@@ -22,7 +23,7 @@ not wired into the relay yet).
 
 | Process | Crate | Default port | Responsibility |
 |---|---|---|---|
-| `manarouter-relay` — the **data plane** | `crates/manarouter-relay` | 20900 | Accept a request, look up a compiled route, select an account, translate/forward. Applies relay auth and reasoning policy, enforces per-key quota caps, and egresses through a configured proxy when one applies. The hedged race is still not wired: a combo's steps run sequentially. |
+| `manarouter-relay` — the **data plane** | `crates/manarouter-relay` | 20900 | Accept a request, look up a compiled route, select an account, translate/forward. Applies relay auth and reasoning policy, enforces per-key quota caps, and egresses through a configured proxy when one applies. A combo with the hedge enabled races its participants: the highest-priority one that answers inside the eligibility window wins, and the losers are dropped. |
 | `manarouter-conductor` — the **control plane** | `crates/manarouter-conductor` | 20901 | Configuration, snapshot compilation, quota snapshot refresh APIs, OAuth, and the web panel. Request-usage ledger recording is not wired. |
 
 `mr serve` runs both binaries as supervised child processes for a foreground session; for an
@@ -146,7 +147,7 @@ client ──► relay :20900
              └─ 9. emit usage              fire-and-forget; dropped rather than backpressured
 ```
 
-Dialect translation is reachable per selected step when the client and upstream shapes differ; translated requests may override the path or force streaming. Matching dialects keep the original bytes. Hedged winner-policy helpers exist, but concurrent hedged execution is not wired: steps currently execute sequentially. `docs/16-latency-engineering.md` §6 states the per-step budget.
+Dialect translation is reachable per selected step when the client and upstream shapes differ; translated requests may override the path or force streaming. Matching dialects keep the original bytes. The hedged race runs: participants are dispatched concurrently and the highest-priority one that answers inside the eligibility window wins. Winner recovery is not implemented, because the winner is committed before its body streams. `docs/16-latency-engineering.md` §6 states the per-step budget.
 
 ---
 

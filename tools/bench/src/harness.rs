@@ -56,7 +56,10 @@ const CLIENT_MODEL: &str = "bench/bench-model";
 /// The vault entry the account's credential is stored under.
 const SECRET_ID: &str = "bench-credential";
 /// The synthetic credential. It is not a key to anything.
-const SECRET_VALUE: &str = "sk-bench-not-a-real-key";
+///
+/// The `sk-` prefix is here so the bench exercises the same bearer path a real provider would;
+/// the value itself opens nothing.
+const SECRET_VALUE: &str = "sk-bench-not-a-real-key"; // secret-scan: allow
 /// A marker from the canned completion, checked in every response so that a short circuit cannot
 /// masquerade as a proxied answer.
 const FAKE_MARKER: &[u8] = b"chatcmpl-bench";

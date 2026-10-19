@@ -111,8 +111,8 @@ Four different problems, and they need different fixes. Distinguish them:
 |---|---|---|
 | The **first** request after a restart is slow, the rest are fast | A cold connection pool: TCP and TLS handshakes | Expected. The `prewarm` flag is carried in the configuration but nothing calls the prewarm routine yet, so the first real request still pays for the handshakes. |
 | Every request is consistently slow | A distant provider, or a model that is genuinely slow | Compare `mr provider test` across providers. The router adds microseconds; a provider adds hundreds of milliseconds. |
-| Latency is **highly variable** and no model is consistently chosen | A hedge whose window is too short | Cannot be the cause yet: hedging is not wired up — `hedge_decide` is never called by the relay — so this row describes the intended design. |
-| Slow only for one combo | A step earlier in the list is slow but not failing | `priority` has no opinion on latency. Reorder; a hedge ([Combo cookbook recipe 3](combo-cookbook.md#3-fastest-wins--a-hedged-race)) is not wired up yet either. |
+| Latency is **highly variable** and no model is consistently chosen | A hedge whose window is too short | A short window expires priority protection early, so past it the first reply wins rather than the highest-priority one. Widen `window_ms` to keep the operator's ordering. |
+| Slow only for one combo | A step earlier in the list is slow but not failing | `priority` has no opinion on latency. Reorder; a hedge ([Combo cookbook recipe 3](combo-cookbook.md#3-fastest-wins--a-hedged-race)) races the steps but still prefers the higher-priority one, so it buys insurance rather than speed. |
 
 **The router is almost never the cause of a slow request.** Its budget is under a millisecond of added
 overhead against providers whose own TTFB is hundreds of milliseconds. If you suspect it anyway, see

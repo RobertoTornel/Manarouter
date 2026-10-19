@@ -65,9 +65,10 @@ mr combo add fast \
 
 Two caveats before you rely on this. The CLI accepts only `--hedge`, `--participants` and `--window-ms`;
 there is **no** `--winner-metric` and no `--on-winner-fail` flag, so those values are set by editing
-`config.json`. And the relay does not yet dispatch concurrent hedged requests — `hedge.enabled` on a
-`priority` combo only opts it into sticky-success preference, so this recipe records a policy the
-relay does not execute today. See [the hedged race](07-hedged-race.md) §8.
+`config.json`. The race itself runs: every participant is dispatched at once, and the
+highest-priority participant that answers inside the window wins — not the fastest one. What the
+relay does not yet do is replace a winner that dies mid-stream, so the `--on-winner-fail` modes are
+not implemented. See [the hedged race](07-hedged-race.md) §5.
 
 **Costs quota.** All three legs consume quota; a loser cancelled before its first byte costs little,
 but a loser that had begun generating is billed. See

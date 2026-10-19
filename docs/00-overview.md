@@ -104,7 +104,7 @@ The full request path, step by step, is in [architecture](01-architecture.md).
 | Per-account health states and provider rollup | implemented | [key selection](05-key-selection.md) §6 |
 | Key strategies: `priority`, `round-robin`, `random`, `least-used` | implemented (config, compile and relay selection) | [key selection](05-key-selection.md) |
 | Combos and the three combo strategies | implemented (schema, compile and relay execution) | [combos](06-combos.md) |
-| Hedged race with four winner-fail modes | plan implemented and unit-tested; the relay still runs the sequential step loop, so `hedge_decide` is never called | [the hedged race](07-hedged-race.md) |
+| Hedged race with four winner-fail modes | the race is implemented and unit-tested; the four winner-fail modes are not, because the winner is committed before its body streams | [the hedged race](07-hedged-race.md) |
 | Reset-aware priority | implemented (the selector demotes an exhausted step and restores it once its reset passes) | [combos](06-combos.md) §3 |
 | Session affinity for a combo winner | implemented (combo-wide, process-local, default 1800 s window) | [the hedged race](07-hedged-race.md) |
 | Quota windows, live signals, cooldowns | cooldowns and live signals implemented in the relay; `/api/quota` reads a `usage` table that nothing writes yet, so it reports nothing | [configuration](03-configuration.md) §3 |

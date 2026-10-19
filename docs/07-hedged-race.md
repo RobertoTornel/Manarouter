@@ -11,9 +11,24 @@ The latency window is an **eligibility gate**, not a stopwatch race. Reading it 
 produces a system that is slower *and* more expensive, so this document works through the
 consequences carefully.
 
-> **Implementation status:** this page describes the intended hedge policy. The relay currently runs
-> combo steps sequentially; hedged execution, winner recovery, mid-stream switching, and session
-> affinity described below are not wired. `hedge.enabled` does not start concurrent requests. It now also opts a `priority` combo into the separate sticky-success preference: after a successful call the relay prefers that provider/model for the configured inactivity window (default 1800 seconds), subject to current eligibility. This preference is combo-wide across callers, process-local, bounded, and makes no inference or keepalive calls. Because the relay streams responses once upstream headers/first byte succeed, success for stickiness is committed at header/HTTP 2xx receipt; if an upstream stream breaks mid-body after headers, the relay does not retroactively clear the pin on that request. It changes only the next call's preference; normal priority fallback remains available.
+> **Implementation status.** The race runs. A combo with `hedge.enabled` dispatches every
+> participant at once, and the highest-priority participant that produces a usable reply inside the
+> eligibility window is committed as the winner; the losers are dropped when it is. The policy —
+> who wins, and when — is [`hedge_decide`](../crates/manarouter-relay/src/select.rs), and the runner
+> that dispatches the participants is
+> [`run_hedge`](../crates/manarouter-relay/src/server.rs).
+>
+> Three things described below are **not** implemented, and the document says so where it describes
+> them: winner recovery when the committed winner dies mid-stream (§5's four `on_winner_fail` modes
+> are unreachable, because the winner is committed before its body streams), the mid-stream switch
+> (§6), and session affinity (§8). `hedge.enabled` also opts a `priority` combo into the separate
+> sticky-success preference: after a successful call the relay prefers that provider/model for the
+> configured inactivity window (default 1800 seconds), subject to current eligibility. This
+> preference is combo-wide across callers, process-local, bounded, and makes no inference or keepalive
+> calls. Because the relay streams responses once upstream headers/first byte succeed, success for
+> stickiness is committed at header/HTTP 2xx receipt; if an upstream stream breaks mid-body after
+> headers, the relay does not retroactively clear the pin on that request. It changes only the next
+> call's preference; normal priority fallback remains available.
 
 ---
 
@@ -162,25 +177,36 @@ The winner is the next highest participant that replied inside the window.
 
 ```
   0 ms   dispatch step1 and step2
-800 ms   window expires for step1
-900 ms   step2 first byte
-1200 ms  step1 first byte   ──►  commit step1
+ 800 ms   window expires for step1
+ 900 ms   step2 first byte   ──►  step1 is still pending, and the window is gone
+1200 ms  step1 first byte   ──►  too late: step2 is already committed
 ```
 
 **The request does not fail.** The window expiring does not cancel anything; it only expires a
-participant's *priority protection*. The race keeps waiting, and the highest-priority participant
-that eventually replies still wins.
+participant's *priority protection*. Once the window is gone, a participant that has not replied yet
+no longer holds the ones below it back, and the first reply after the window is committed.
+
+The consequence is worth stating plainly, because it is the one place where the rule trades the
+operator's ordering for latency: **past the window, priority stops being the tiebreak.** A step
+that stalls past the window and a step that replies just after it will not be compared on their
+order; the one that replies first is served. An operator whose ordering must hold in every case
+should set `window_ms` generously — it is the window inside which priority is protected, not a
+timeout that fails the request.
 
 This is the case that distinguishes an eligibility gate from a timeout. A timeout-based design would
-have failed the request at 800 ms or committed step2; this design commits step1 at 1200 ms because
-step1 is what the operator asked for and it did, eventually, work.
+have failed the request at 800 ms; this design serves step2 at 900 ms, because a working answer is
+worth more than the ordering it came from.
 
 ### The general rule
 
 Participant `i` is committed as winner as soon as **every participant above it** is resolved — where
 resolved means either replied outside the window, or failed. Worst-case added latency is therefore
-bounded by `window_ms`, and that cost is only ever paid when a higher-priority model is slow, which
-is exactly the situation where waiting is the point.
+bounded by `window_ms` for a participant that has already replied: past the window, a reply that is
+already in hand is committed rather than waited on. A participant that has not replied at all is
+still waited for, bounded by the upstream request timeout.
+
+The cost of that wait is only ever paid when a higher-priority model is slow, which is exactly the
+situation where waiting is the point.
 
 ---
 
@@ -205,9 +231,23 @@ non-streaming request with a slow preferred model can cost a full completion on 
 
 Ties are always broken by the operator's step order. Never by arrival order, and never nondeterministically.
 
+> **Status.** The two metrics are currently **the same measurement**: the race commits a participant
+> when its upstream response arrives, and the relay knows that moment for both settings. Distinguishing
+> them — waiting for the first *parsed content delta* — needs the response body, which is streamed to
+> the client as it arrives, so the two cannot be told apart without buffering the first frame. Until
+> that is done, choosing `first_complete_token` changes nothing, and the table above describes the
+> intent rather than the measured behaviour.
+
 ---
 
 ## 5. When the chosen model dies: four modes
+
+> **Status.** These four modes are **not implemented**, and they are unreachable in the current
+> runner rather than merely unused: the race commits its winner when the upstream *response*
+> arrives, which is before the body is streamed, so there is no point at which the relay can discover
+> that the committed winner has died. A participant that fails *before* answering is not a failed
+> winner — it simply loses the race, and the race continues. The modes below describe what should
+> happen when the winner dies, and the runner that could evaluate them is the missing piece.
 
 `on_winner_fail` is evaluated when the committed winner fails — either before delivering anything, or
 mid-stream. It has four values because there are four genuinely different things an operator might
@@ -363,12 +403,15 @@ same step instead of at the head of the ordered list. What it actually does is n
 **Session affinity is not wired.** The intended feature — pinning a whole conversation to a step via
 the client-supplied `x-manarouter-session` header or a hash of the conversation's first system message
 plus its first user message, kept in a sharded LRU — is still a design goal. `Combo::affinity` is
-compiled into the plan but the relay never reads it. The concurrent race is likewise not yet wired;
-sticky-success is a separate, narrower capability.
+compiled into the plan but the relay never reads it.
 
-The rest of this document describes the race as designed. Where a paragraph reads as present-tense
-behaviour that the relay does not yet perform — the concurrent dispatch, the retry pass, the
-mid-stream boundary — the implementation status is the sentence above, not the tense.
+Sticky-success reorders where the **sequential** chain begins; it does not run anything concurrently.
+It applies to the race as well: a sticky step is still a participant, and it is still the winner when
+it answers inside the window.
+
+Where a paragraph in this document reads as present-tense behaviour that the relay does not perform —
+the retry pass, the mid-stream boundary, the four `on_winner_fail` modes — the implementation status
+is the note above it, not the tense.
 
 ---
 
