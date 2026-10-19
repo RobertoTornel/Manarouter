@@ -1201,6 +1201,20 @@ pub fn sse_to_pivot(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
+    use crate::{translate_request, translate_response_body, translate_sse_data};
+
+    /// The JSON payload of one `data:` frame a Chat Completions client is given.
+    ///
+    /// The frames are SSE, but what the client parses out of them is JSON, so the tests assert
+    /// on the parsed payload rather than on the framing.
+    fn frame_payload(frame: &str) -> Value {
+        let payload = frame
+            .trim()
+            .strip_prefix("data: ")
+            .expect("a translated frame carries a `data: ` prefix");
+        serde_json::from_str(payload).expect("a translated frame carries a JSON payload")
+    }
+
     #[test]
     fn responses_client_suppresses_done_but_chat_client_gets_it() {
         let responses = TranslateCtx::new(RouteKind::Responses, Dialect::Codex, "gpt-5");
@@ -1216,6 +1230,217 @@ mod tests {
         let terminal = r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}"#;
         let frames = sse_to_pivot(&chat, terminal).unwrap();
         assert!(frames.iter().any(|frame| frame.contains(SSE_DONE)));
+        reset_stream_state();
+    }
+
+    // A Chat Completions client against a Codex upstream is the pairing that has to go through
+    // the whole translation chain — the request is rewritten into the Responses shape, and the
+    // answer comes back in a shape the client never asked for. These tests pin the three legs of
+    // that chain so the arm cannot rot unnoticed.
+
+    #[test]
+    fn a_chat_request_becomes_a_responses_request() {
+        let ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Codex, "gpt-5-codex");
+        let body = br#"{
+            "model": "gpt-5",
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "Hello"}
+            ],
+            "max_tokens": 100,
+            "stop": ["\n"],
+            "n": 2
+        }"#;
+
+        let translated = translate_request(&ctx, body)
+            .expect("the pairing is supported")
+            .expect("a Codex upstream is not a passthrough for an OpenAI client");
+        let upstream: Value =
+            serde_json::from_slice(&translated.body).expect("the upstream body is JSON");
+
+        // The transcript is a typed item array now, and the free-form `messages` array is gone:
+        // Codex rejects the Chat Completions shape outright.
+        assert!(
+            upstream.get("messages").is_none(),
+            "the upstream body must not still carry `messages`"
+        );
+        let input = upstream
+            .get("input")
+            .and_then(Value::as_array)
+            .expect("the transcript lives in `input`");
+        assert_eq!(input.len(), 1, "only the user turn is an input item");
+        assert_eq!(input[0]["type"], json!("message"));
+        assert_eq!(input[0]["role"], json!("user"));
+        assert_eq!(
+            input[0]["content"],
+            json!([{"type": "input_text", "text": "Hello"}]),
+            "a user turn carries `input_text` parts"
+        );
+
+        // The system turn has no place in the item array, so it becomes the top-level
+        // `instructions` slot instead of being smuggled through as a message.
+        assert_eq!(upstream["instructions"], json!("Be brief."));
+
+        // The token cap is renamed rather than dropped, but the fields Responses has no
+        // equivalent for are dropped rather than smuggled through — Codex rejects what it does
+        // not understand.
+        assert_eq!(upstream["max_output_tokens"], json!(100));
+        assert!(upstream.get("max_tokens").is_none());
+        assert!(upstream.get("stop").is_none());
+        assert!(upstream.get("n").is_none());
+
+        // The Responses endpoint is SSE-first, so both flags are forced regardless of what the
+        // client asked for, and the relay is told to expect a stream.
+        assert_eq!(upstream["stream"], json!(true));
+        assert_eq!(upstream["store"], json!(false));
+        assert!(translated.force_stream);
+
+        // The model is the upstream's name for it, and `/responses` is the Codex default path.
+        assert_eq!(upstream["model"], json!("gpt-5-codex"));
+        assert!(translated.path_override.is_none());
+    }
+
+    #[test]
+    fn a_responses_response_becomes_a_chat_completion() {
+        let ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Codex, "gpt-5");
+        let body = br#"{
+            "id": "resp_1",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-5-codex",
+            "created_at": 1700000000,
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hello there"}]
+                }
+            ],
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 5,
+                "total_tokens": 16,
+                "input_tokens_details": {"cached_tokens": 3}
+            }
+        }"#;
+
+        let out = translate_response_body(&ctx, body).expect("the response translates");
+        let client: Value = serde_json::from_slice(&out).expect("the client body is JSON");
+
+        // The client asked for a Chat Completions document, so that is what it gets — the
+        // Responses object itself would be unreadable to it.
+        assert_eq!(client["object"], json!("chat.completion"));
+        assert_eq!(client["id"], json!("resp_1"));
+        // The upstream's own model name is carried over, not the one the client asked for.
+        assert_eq!(client["model"], json!("gpt-5-codex"));
+        assert_eq!(client["created"], json!(1700000000));
+
+        // The answer is the text of the output message, flattened out of the typed item array.
+        let choice = &client["choices"][0];
+        assert_eq!(choice["index"], json!(0));
+        assert_eq!(choice["message"]["role"], json!("assistant"));
+        assert_eq!(choice["message"]["content"], json!("Hello there"));
+        // A completed response with no function call in it is a plain `stop`.
+        assert_eq!(choice["finish_reason"], json!("stop"));
+
+        // Usage is respelled: the Responses token counts become the Chat Completions ones, and
+        // the cached count survives as the detail the client expects.
+        assert_eq!(client["usage"]["prompt_tokens"], json!(11));
+        assert_eq!(client["usage"]["completion_tokens"], json!(5));
+        assert_eq!(client["usage"]["total_tokens"], json!(16));
+        assert_eq!(
+            client["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(3)
+        );
+    }
+
+    #[test]
+    fn a_buffered_responses_stream_becomes_a_chat_completion() {
+        let ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Codex, "gpt-5");
+        // Codex always streams, so a client that asked for one JSON document is handed the whole
+        // buffered event stream, and the translator has to fold it back into a response first.
+        let body = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"gpt-5-codex\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hello\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\" there\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5-codex\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello there\"}]}],\"usage\":{\"input_tokens\":11,\"output_tokens\":5,\"total_tokens\":16}}}\n\n";
+
+        let out = translate_response_body(&ctx, body.as_bytes()).expect("the response translates");
+        let client: Value = serde_json::from_slice(&out).expect("the client body is JSON");
+
+        assert_eq!(client["object"], json!("chat.completion"));
+        assert_eq!(client["id"], json!("resp_1"));
+        assert_eq!(client["model"], json!("gpt-5-codex"));
+        assert_eq!(
+            client["choices"][0]["message"]["content"],
+            json!("Hello there")
+        );
+        assert_eq!(client["choices"][0]["finish_reason"], json!("stop"));
+        assert_eq!(client["usage"]["prompt_tokens"], json!(11));
+        assert_eq!(client["usage"]["completion_tokens"], json!(5));
+        assert_eq!(client["usage"]["total_tokens"], json!(16));
+    }
+
+    #[test]
+    fn a_truncated_responses_stream_still_becomes_a_chat_completion() {
+        let ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Codex, "gpt-5");
+        // A stream that dies before its terminal event is rebuilt from the items and the text
+        // deltas that did arrive, so the client still gets an answer rather than a 502.
+        let body = "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hello there\"}\n\n";
+
+        let out = translate_response_body(&ctx, body.as_bytes()).expect("the response translates");
+        let client: Value = serde_json::from_slice(&out).expect("the client body is JSON");
+
+        assert_eq!(client["object"], json!("chat.completion"));
+        assert_eq!(
+            client["choices"][0]["message"]["content"],
+            json!("Hello there")
+        );
+        assert_eq!(client["choices"][0]["finish_reason"], json!("stop"));
+        // Nothing reported a token count, so nothing is invented.
+        assert_eq!(client["usage"]["prompt_tokens"], json!(0));
+        assert_eq!(client["usage"]["completion_tokens"], json!(0));
+    }
+
+    #[test]
+    fn a_responses_delta_becomes_a_chat_completion_chunk() {
+        let ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Codex, "gpt-5");
+        reset_stream_state();
+
+        // The opening event carries the response envelope, which is where the chunk identity and
+        // the model come from — the translator keeps the upstream's own id rather than minting
+        // a `chatcmpl-` one, so a client correlating the stream sees one id for all of it.
+        let created = r#"{"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress","model":"gpt-5-codex"}}"#;
+        assert!(
+            translate_sse_data(&ctx, created).unwrap().is_empty(),
+            "the opening event carries no text, so it produces no client frame"
+        );
+
+        let frames = translate_sse_data(
+            &ctx,
+            r#"{"type":"response.output_text.delta","delta":"Hello"}"#,
+        )
+        .expect("the delta translates");
+        assert_eq!(frames.len(), 1, "one delta is one client frame");
+        let chunk = frame_payload(&frames[0]);
+        assert_eq!(chunk["object"], json!("chat.completion.chunk"));
+        assert_eq!(chunk["id"], json!("resp_1"));
+        assert_eq!(chunk["model"], json!("gpt-5-codex"));
+        let delta = &chunk["choices"][0]["delta"];
+        assert_eq!(delta["content"], json!("Hello"));
+        // The role rides the first delta of the stream and no other, so a client that reads
+        // `role` sees it exactly once.
+        assert_eq!(delta["role"], json!("assistant"));
+
+        // The terminal event closes the answer: a finish chunk carrying the reason and the
+        // usage, then the `[DONE]` sentinel a Chat Completions client waits for.
+        let terminal = r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5-codex","usage":{"input_tokens":11,"output_tokens":5,"total_tokens":16}}}"#;
+        let frames = translate_sse_data(&ctx, terminal).expect("the terminal event translates");
+        assert_eq!(frames.len(), 2, "the finish chunk and the sentinel");
+        let chunk = frame_payload(&frames[0]);
+        assert_eq!(chunk["object"], json!("chat.completion.chunk"));
+        assert_eq!(chunk["choices"][0]["delta"], json!({}));
+        assert_eq!(chunk["choices"][0]["finish_reason"], json!("stop"));
+        assert_eq!(chunk["usage"]["prompt_tokens"], json!(11));
+        assert_eq!(chunk["usage"]["completion_tokens"], json!(5));
+        assert_eq!(frames[1].trim(), format!("data: {SSE_DONE}"));
+
         reset_stream_state();
     }
 }

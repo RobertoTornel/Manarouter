@@ -203,6 +203,7 @@ pub fn build_state(
         health: Arc::new(Health::new()),
         vault,
         oauth_refreshers: Arc::new(oauth_refreshers),
+        quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&oauth_store))),
         oauth_store,
         sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
     };

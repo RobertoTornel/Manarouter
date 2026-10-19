@@ -46,6 +46,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use mr_core::config::{ProxyConfig, ProxyStrategy};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -306,29 +307,53 @@ impl ProxyEndpoint {
     /// be locked, and egressing directly through an open proxy in that state is exactly the kind of
     /// silent downgrade a proxy is supposed to prevent.
     pub fn from_config(proxy: &ProxyConfig, password: Option<&str>) -> Result<Self, ProxyUrlError> {
-        let mut endpoint = Self::parse(&proxy.url)?;
-        match (proxy.username.as_deref(), password) {
+        let endpoint = Self::parse(&proxy.url)?;
+        endpoint.with_auth(proxy.username.as_deref(), password, &proxy.id)
+    }
+
+    /// Build an endpoint from a compiled proxy plan plus the already-resolved vault secret.
+    ///
+    /// The plan is what the routing snapshot carries, so this is the shape the request path has
+    /// when it resolves a proxy for an account. The rules are the ones
+    /// [`ProxyEndpoint::from_config`] documents, because the plan is a compiled copy of the same
+    /// configuration.
+    pub fn from_plan(
+        plan: &mr_core::snapshot::ProxyPlan,
+        password: Option<&str>,
+    ) -> Result<Self, ProxyUrlError> {
+        let endpoint = Self::parse(&plan.url)?;
+        endpoint.with_auth(plan.username.as_deref(), password, &plan.id)
+    }
+
+    /// Attach the credential, refusing the shapes that would mean an unauthenticated dial.
+    fn with_auth(
+        mut self,
+        username: Option<&str>,
+        password: Option<&str>,
+        id: &str,
+    ) -> Result<Self, ProxyUrlError> {
+        match (username, password) {
             // SOCKS4 has a userid field and no password field; allowing it without a vault password
             // is the common, intended shape. It still uses ProxyAuth so control bytes are refused.
-            (Some(username), None) if endpoint.scheme == ProxyScheme::Socks4 => {
-                endpoint.auth = Some(ProxyAuth::new(username, "")?);
+            (Some(username), None) if self.scheme == ProxyScheme::Socks4 => {
+                self.auth = Some(ProxyAuth::new(username, "")?);
             }
             (Some(username), Some(password)) => {
-                endpoint.auth = Some(ProxyAuth::new(username, password)?);
+                self.auth = Some(ProxyAuth::new(username, password)?);
             }
             (Some(_), None) => {
                 return Err(ProxyUrlError::MissingProxyPassword {
-                    proxy: proxy.id.clone(),
+                    proxy: id.to_owned(),
                 });
             }
             (None, Some(_)) => {
                 return Err(ProxyUrlError::PasswordWithoutUsername {
-                    proxy: proxy.id.clone(),
+                    proxy: id.to_owned(),
                 });
             }
             (None, None) => {}
         }
-        Ok(endpoint)
+        Ok(self)
     }
 
     /// `host:port`, with IPv6 brackets, as it appears in a `CONNECT` request line.
@@ -339,6 +364,40 @@ impl ProxyEndpoint {
     /// The proxy's dialable host: port, with IPv6 brackets removed.
     pub fn dial_target(&self) -> (&str, u16) {
         (self.host.as_str(), self.port)
+    }
+
+    /// A key that identifies this proxy **and its credential**, for pooling.
+    ///
+    /// The credential is part of the key because a pooled connection was opened with it: the
+    /// `CONNECT` request that opened the tunnel carried the `Proxy-Authorization` header, and a
+    /// connection reused for a *different* credential would be a tunnel opened for someone else.
+    ///
+    /// The password appears only as a truncated SHA-256 fingerprint. The key is not a secret, but a
+    /// key that *contained* the password would be a password in a map key, in a `Debug` dump and in
+    /// a heap dump.
+    pub fn pool_key(&self) -> String {
+        let credential = match &self.auth {
+            Some(auth) => {
+                let mut hasher = Sha256::new();
+                hasher.update(auth.username().as_bytes());
+                hasher.update(b"\x00");
+                hasher.update(auth.password().as_bytes());
+                let digest = hasher.finalize();
+                let mut hex = String::with_capacity(16);
+                for byte in &digest[..8] {
+                    hex.push_str(&format!("{byte:02x}"));
+                }
+                format!("{}:{hex}", auth.username())
+            }
+            None => String::new(),
+        };
+        format!(
+            "{}://{}:{}/{}",
+            self.scheme.as_str(),
+            self.host,
+            self.port,
+            credential
+        )
     }
 }
 
@@ -1497,6 +1556,38 @@ pub fn base64(input: &[u8]) -> String {
     out
 }
 
+/// What the selector needs to know about a proxy.
+///
+/// The configuration entry an operator wrote and the compiled plan the routing snapshot holds carry
+/// the same selection information. Selecting over a trait rather than over one concrete type keeps
+/// **one** implementation of the strategies, so the pool the operator configured and the pool the
+/// snapshot compiled cannot disagree about what "the second proxy" means.
+pub trait SelectableProxy {
+    /// The stable id, which is also the key the in-flight counters use.
+    fn proxy_id(&self) -> &str;
+    /// Whether the proxy may be chosen.
+    fn proxy_enabled(&self) -> bool;
+}
+
+impl SelectableProxy for ProxyConfig {
+    fn proxy_id(&self) -> &str {
+        &self.id
+    }
+    fn proxy_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+impl SelectableProxy for mr_core::snapshot::ProxyPlan {
+    fn proxy_id(&self) -> &str {
+        &self.id
+    }
+    /// The snapshot only carries the proxies that are enabled, so every one of them is selectable.
+    fn proxy_enabled(&self) -> bool {
+        true
+    }
+}
+
 /// Choose a proxy for one request.
 ///
 /// `state` carries the only mutable inputs selection needs (the round-robin ticket and the in-flight
@@ -1508,20 +1599,20 @@ pub fn base64(input: &[u8]) -> String {
 /// should either filter the slice or retry with the one it was given. Keeping health out of this
 /// signature is deliberate — a selector that silently hides a proxy makes "why did nothing egress
 /// through the proxy I configured?" unanswerable from a log.
-pub fn choose<'a>(
-    proxies: &'a [ProxyConfig],
+pub fn choose<'a, P: SelectableProxy>(
+    proxies: &'a [P],
     strategy: ProxyStrategy,
     state: &ProxySelectionState,
-) -> Option<&'a ProxyConfig> {
+) -> Option<&'a P> {
     choose_index(proxies, strategy, state).map(|index| &proxies[index])
 }
 
 /// [`choose`], returning the position in `proxies` instead of a reference.
 ///
-/// The caller needs the index to open a [`ProxyLease`] on the same proxy, which is how `least-used`
-/// learns about in-flight requests at all.
-pub fn choose_index(
-    proxies: &[ProxyConfig],
+/// The caller needs the proxy's id to open a [`ProxyLease`] on it, which is how `least-used` learns
+/// about in-flight requests at all.
+pub fn choose_index<P: SelectableProxy>(
+    proxies: &[P],
     strategy: ProxyStrategy,
     state: &ProxySelectionState,
 ) -> Option<usize> {
@@ -1534,8 +1625,8 @@ pub fn choose_index(
 /// Every strategy iterates the enabled subset lazily: no `Vec` is built, because this runs once per
 /// upstream attempt and allocating a list of proxies per request would be a small, permanent tax on
 /// the hot path.
-pub fn choose_index_with_rng<R: rand::Rng + ?Sized>(
-    proxies: &[ProxyConfig],
+pub fn choose_index_with_rng<P: SelectableProxy, R: rand::Rng + ?Sized>(
+    proxies: &[P],
     strategy: ProxyStrategy,
     state: &ProxySelectionState,
     rng: &mut R,
@@ -1566,23 +1657,23 @@ pub fn choose_index_with_rng<R: rand::Rng + ?Sized>(
         ProxyStrategy::LeastUsed => enabled_indices(proxies).min_by_key(|&index| {
             // Ties fall to declaration order through the index, which makes the choice stable for a
             // burst of simultaneous requests arriving at an idle pool.
-            (state.inflight(index), index)
+            (state.inflight(proxies[index].proxy_id()), index)
         }),
     }
 }
 
 /// The positions of the enabled proxies, in declaration order.
-fn enabled_indices(proxies: &[ProxyConfig]) -> impl Iterator<Item = usize> + '_ {
+fn enabled_indices<P: SelectableProxy>(proxies: &[P]) -> impl Iterator<Item = usize> + '_ {
     proxies
         .iter()
         .enumerate()
-        .filter(|(_, proxy)| proxy.enabled)
+        .filter(|(_, proxy)| proxy.proxy_enabled())
         .map(|(index, _)| index)
 }
 
 /// How many proxies are enabled.
-fn enabled_count(proxies: &[ProxyConfig]) -> usize {
-    proxies.iter().filter(|proxy| proxy.enabled).count()
+fn enabled_count<P: SelectableProxy>(proxies: &[P]) -> usize {
+    proxies.iter().filter(|proxy| proxy.proxy_enabled()).count()
 }
 
 #[cfg(test)]
@@ -2495,7 +2586,7 @@ mod tests {
             ProxyStrategy::LeastUsed,
         ] {
             assert!(choose(&proxies, strategy, &state).is_none());
-            assert!(choose(&[], strategy, &ProxySelectionState::with_proxy_count(0)).is_none());
+            assert!(choose::<ProxyConfig>(&[], strategy, &ProxySelectionState::empty()).is_none());
         }
     }
 
@@ -2547,9 +2638,9 @@ mod tests {
             proxy("disabled", "http://proxy:8004", false, 0),
         ];
         let state = ProxySelectionState::new(&proxies);
-        let first_lease = state.lease(0);
-        let second_lease = state.lease(1);
-        let second_lease2 = state.lease(1);
+        let first_lease = state.lease("first");
+        let second_lease = state.lease("second");
+        let second_lease2 = state.lease("second");
         assert_eq!(
             choose(&proxies, ProxyStrategy::LeastUsed, &state)
                 .unwrap()

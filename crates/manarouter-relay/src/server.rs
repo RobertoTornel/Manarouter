@@ -41,9 +41,10 @@ use mr_core::snapshot::{Resolution, StepPlan};
 use mr_dialects::{translate_request, TranslateCtx};
 
 use crate::model_scan::{scan_request_head, RequestHead};
+use crate::proxy::{self, ProxyEndpoint};
 use crate::select::{self, Health};
-use crate::state::{AuthOutcome, RelayState, RouteTable};
-use crate::upstream::UpstreamRequest;
+use crate::state::{AuthOutcome, ProxyLease, RelayState, RouteTable};
+use crate::upstream::{UpstreamError, UpstreamRequest};
 
 /// How much of a request body the relay will buffer.
 ///
@@ -114,6 +115,11 @@ pub struct AppState {
     pub oauth_refreshers: Arc<std::collections::HashMap<String, Arc<Refresher>>>,
     /// Metadata lookup for OAuth references attached to snapshot accounts.
     pub oauth_store: Arc<mr_core::store::Store>,
+    /// Per-key quota admission and settlement.
+    ///
+    /// The ledger it reads and writes is the same `key_usage` table the panel reads, so a cap that
+    /// is being enforced and a cap that is being displayed are the same number.
+    pub quota: Arc<crate::quota::QuotaManager>,
     /// Bounded combo-wide successful-step memory; reset when the relay process restarts.
     pub sticky_success: Arc<crate::sticky::StickySuccess>,
 }
@@ -540,6 +546,89 @@ async fn dispatch(
     .await
 }
 
+/// The proxy one upstream attempt must egress through.
+struct ProxyChoice {
+    /// The endpoint to dial.
+    endpoint: ProxyEndpoint,
+    /// The lease that keeps this proxy marked in flight.
+    ///
+    /// It is held for its `Drop`, not for anything it returns: when the attempt ends — served,
+    /// failed, or given up on — the lease is dropped and the proxy stops looking busy. The
+    /// `least-used` strategy is a tie-break, not a health check.
+    _lease: ProxyLease,
+}
+
+/// Resolve the proxy for one upstream attempt.
+///
+/// The precedence is: the account's override, then the provider's, then the configured strategy
+/// over the enabled pool. `Ok(None)` means a direct connection.
+///
+/// # Why a named proxy that is not in the pool is not an error
+///
+/// A proxy the operator *disabled* is one they said not to use, and the request goes out directly
+/// — the same answer [`mr_core::config::Config::effective_proxy`] documents. A proxy that does not
+/// exist at all cannot reach this point: the configuration names an unknown proxy id as a
+/// validation problem, and the relay refuses to start on an invalid configuration.
+///
+/// # Why the credential is read here
+///
+/// The password lives in the vault, and the vault is the only place it can come from. It is read
+/// per attempt rather than cached, for the same reason the provider credential is: the vault is
+/// the authority on what the current password is, and a cached copy would keep dialling with a
+/// password the operator has already rotated.
+fn resolve_proxy(
+    app: &AppState,
+    snapshot: &mr_core::snapshot::RoutingSnapshot,
+    provider: &mr_core::snapshot::ProviderPlan,
+    account: &mr_core::snapshot::AccountPlan,
+) -> Result<Option<ProxyChoice>, String> {
+    let wanted = account.proxy.as_deref().or(provider.proxy.as_deref());
+    let plan = match wanted {
+        Some(id) => match snapshot.proxy(id) {
+            Some(plan) => plan,
+            // Disabled: a direct connection, as `Config::effective_proxy` documents.
+            None => return Ok(None),
+        },
+        None => {
+            let pool = snapshot.proxies();
+            if pool.is_empty() {
+                return Ok(None);
+            }
+            match proxy::choose(pool, snapshot.proxy_strategy(), app.relay.proxy_selection()) {
+                Some(plan) => plan,
+                None => return Ok(None),
+            }
+        }
+    };
+
+    let password = match plan.secret_ref.as_deref() {
+        Some(secret_ref) => match app.vault.get(secret_ref) {
+            Ok(Some(password)) => Some(password),
+            Ok(None) => {
+                return Err(format!(
+                    "the proxy `{}` names the vault secret `{}`, which does not exist",
+                    plan.id, secret_ref
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "the credential for the proxy `{}` could not be read: {e}",
+                    plan.id
+                ));
+            }
+        },
+        None => None,
+    };
+
+    let endpoint = ProxyEndpoint::from_plan(plan, password.as_deref())
+        .map_err(|e| format!("the proxy `{}` is not usable: {e}", plan.id))?;
+    let lease = app.relay.proxy_selection().lease(&plan.id);
+    Ok(Some(ProxyChoice {
+        endpoint,
+        _lease: lease,
+    }))
+}
+
 /// The request path, with the modality-fallback budget and the snapshot generation it may use.
 ///
 /// `fallback_depth` counts the fallbacks already taken. One is the budget: a fallback target that
@@ -580,6 +669,41 @@ async fn dispatch_routed(
     // --- The model field, without parsing the JSON. ---
     let head = scan_request_head(&bytes);
     let scan_done = started.elapsed();
+
+    // --- Quota admission, before anything is sent upstream. ---
+    //
+    // The check is here rather than after the routing lookup because a cap is a property of the
+    // *key*, not of the route: a key that is out of budget must be refused whatever model it
+    // asked for, and refusing it before the upstream is contacted is the whole point of
+    // admitting rather than accounting after the fact.
+    //
+    // The fallback re-entry inherits the ticket of the request it is retrying, so a reroute is
+    // still one admitted request and not two.
+    let ticket = if fallback_depth == 0 {
+        match &auth {
+            AuthOutcome::Ok(entry) if entry.is_metered() => {
+                let request_id = mr_core::ids::new_id();
+                let estimate = crate::quota::estimate_prompt_tokens(bytes.len());
+                match app.quota.admit(
+                    &entry.id,
+                    &entry.limits,
+                    entry.limit_requests,
+                    &request_id,
+                    estimate,
+                    mr_core::ids::Millis::now(),
+                ) {
+                    crate::quota::Admission::Allowed(ticket) => Some(ticket),
+                    crate::quota::Admission::Unmetered => None,
+                    crate::quota::Admission::Denied(denial) => {
+                        return quota_error(&denial, client_dialect);
+                    }
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     // The client's route decides the pivot the body is read in, and therefore which translation
     // applies. Derived from the path rather than passed in by each handler so that a new route
@@ -951,6 +1075,29 @@ async fn dispatch_routed(
             continue;
         };
 
+        // --- The proxy this attempt must egress through. ---
+        //
+        // Resolved here, after the account is known and before anything is sent, because the proxy
+        // is a property of the *account*: two accounts of one provider can egress differently, and
+        // that is the whole reason the override exists.
+        //
+        // A proxy that cannot be used at all — a missing vault secret, an unusable URL — is a
+        // configuration problem, and the request fails rather than quietly going out directly. The
+        // failure is deliberately *not* a routing fallback: trying the next step would send the
+        // request somewhere the operator did not intend.
+        let proxy = match resolve_proxy(&app, &table.snapshot, provider, account) {
+            Ok(choice) => choice,
+            Err(message) => {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    client_dialect,
+                    "proxy_error",
+                    &message,
+                )
+            }
+        };
+        let proxy_endpoint = proxy.as_ref().map(|choice| choice.endpoint.clone());
+
         let request = UpstreamRequest {
             method: method.clone(),
             url,
@@ -964,7 +1111,7 @@ async fn dispatch_routed(
                 dialect_content_type,
                 &oauth_headers,
             ),
-            proxy: None,
+            proxy: proxy_endpoint,
             body: outgoing,
             http2: provider.http2,
             connect_timeout: Duration::from_millis(step.connect_timeout_ms),
@@ -997,7 +1144,7 @@ async fn dispatch_routed(
                     total_us = started.elapsed().as_micros() as u64,
                     "served"
                 );
-                return build_client_response(ctx, translated_body, response).await;
+                return build_client_response(ctx, translated_body, response, ticket).await;
             }
             Ok(response) => {
                 if is_sticky_step {
@@ -1012,7 +1159,7 @@ async fn dispatch_routed(
                     select::cooldown_until(reason, 0, retry_after_ms(&response.headers), &quota),
                     reason,
                 );
-                last_failure = Some(build_response(response));
+                last_failure = Some(build_response(response, None));
             }
             Err(e) => {
                 if is_sticky_step {
@@ -1020,6 +1167,29 @@ async fn dispatch_routed(
                         app.sticky_success.clear(&combo.id);
                     }
                     sticky_index = None;
+                }
+                // A proxy failure ends the attempt, and the request, here.
+                //
+                // The fallback loop exists to survive a *provider* failure by trying a different
+                // route. A proxy failure is not that: the egress the operator configured is broken,
+                // and the next step might egress directly, which is exactly the silent downgrade a
+                // proxy is supposed to prevent. So the request fails, loudly, with the proxy's own
+                // error.
+                if let UpstreamError::Proxy(message) = &e {
+                    tracing::warn!(
+                        model = model_name,
+                        provider = %step.provider_id,
+                        error = %e,
+                        "the configured proxy could not be used; the request is not being rerouted"
+                    );
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        client_dialect,
+                        "proxy_error",
+                        &format!(
+                            "the request could not be sent through the configured proxy: {message}"
+                        ),
+                    );
                 }
                 let reason = select::CooldownReason::Backoff;
                 app.health.cool_down(
@@ -1468,9 +1638,10 @@ async fn build_client_response(
     ctx: TranslateCtx<'_>,
     translated: bool,
     upstream: crate::upstream::UpstreamResponse,
+    ticket: Option<std::sync::Arc<crate::quota::QuotaTicket>>,
 ) -> Response {
     if !translated {
-        return build_response(upstream);
+        return build_response(upstream, ticket);
     }
 
     let status = upstream.status;
@@ -1489,7 +1660,15 @@ async fn build_client_response(
         let client_streaming = ctx.client_streaming;
         let model = ctx.upstream_model.to_owned();
 
-        let frames = BodyStream::new(upstream.body);
+        let frames = BodyStream::new(match &ticket {
+            // The tap is only present for a metered key. Wrapping every body would mean parsing
+            // every frame of every request, and the accounting is only worth that where a cap
+            // depends on it.
+            Some(ticket) => http_body_util::combinators::UnsyncBoxBody::new(
+                crate::quota::TapBody::new(upstream.body, std::sync::Arc::clone(ticket)),
+            ),
+            None => http_body_util::combinators::UnsyncBoxBody::new(upstream.body),
+        });
         // The buffer is carried across frames because a `data:` line has no obligation to arrive in
         // one piece; translating a half-line would corrupt the stream in a way that looks like an
         // upstream fault. `scan` is what makes the carry-over expressible without a mutex.
@@ -1534,7 +1713,14 @@ async fn build_client_response(
         });
         AxumBody::new(StreamBody::new(stream))
     } else {
-        let collected = upstream.body.collect().await;
+        let collected = match &ticket {
+            Some(ticket) => {
+                crate::quota::TapBody::new(upstream.body, std::sync::Arc::clone(ticket))
+                    .collect()
+                    .await
+            }
+            None => upstream.body.collect().await,
+        };
         match collected {
             Ok(collected) => {
                 let raw = collected.to_bytes();
@@ -1653,9 +1839,19 @@ const HOP_BY_HOP: &[&str] = &[
     "content-length",
 ];
 
-fn build_response(upstream: crate::upstream::UpstreamResponse) -> Response {
+fn build_response(
+    upstream: crate::upstream::UpstreamResponse,
+    ticket: Option<std::sync::Arc<crate::quota::QuotaTicket>>,
+) -> Response {
     let status = upstream.status;
-    let mut response = Response::new(AxumBody::new(upstream.body));
+    let mut response = Response::new(AxumBody::new(match &ticket {
+        // The tap reads the bytes the client is about to receive and changes none of them; it only
+        // notices what the upstream said it spent.
+        Some(ticket) => http_body_util::combinators::UnsyncBoxBody::new(
+            crate::quota::TapBody::new(upstream.body, std::sync::Arc::clone(ticket)),
+        ),
+        None => http_body_util::combinators::UnsyncBoxBody::new(upstream.body),
+    }));
     *response.status_mut() = status;
 
     // Hop-by-hop headers describe the connection between the relay and the provider. Forwarding them
@@ -1698,6 +1894,30 @@ fn error_response(status: StatusCode, dialect: Dialect, code: &str, message: &st
         }),
     };
     json_response(status, body)
+}
+
+/// A refused request, in the dialect the client asked in.
+///
+/// The status is 429 and the code is `rate_limit_error`, because that is what a client already
+/// knows how to read: a budget that has been spent is a rate limit from the caller's point of
+/// view, and a client that retries on a 429 with backoff will behave sensibly against it.
+fn quota_error(denial: &crate::quota::Denial, dialect: Dialect) -> Response {
+    let mut response = error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        dialect,
+        "rate_limit_error",
+        &denial.message,
+    );
+    if let Some(ms) = denial.retry_after_ms {
+        // `retry-after` is in seconds, and a fractional value is not allowed by the header's
+        // grammar, so a sub-second wait is rounded up to one second rather than to zero — telling
+        // a client to retry immediately is worse than telling it to wait a moment too long.
+        let seconds = (ms as f64 / 1000.0).ceil().max(1.0) as u64;
+        if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+            response.headers_mut().insert("retry-after", value);
+        }
+    }
+    response
 }
 
 /// Bind a listener that several workers can share.
@@ -2870,13 +3090,15 @@ mod tests {
         opened.put("test-credential", "sk-not-a-real-key").unwrap();
         let vault = Arc::new(opened);
 
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
         let state = AppState {
             relay,
             no_key_required: true,
             health: Arc::new(crate::select::Health::new()),
             vault,
             oauth_refreshers: Arc::new(std::collections::HashMap::new()),
-            oauth_store: Arc::new(mr_core::store::Store::open_in_memory().unwrap()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: store,
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
         };
         (state, text_seen, vision_seen)
@@ -2975,6 +3197,129 @@ mod tests {
         assert!(vision_seen.lock().unwrap().is_empty());
     }
 
+    // -----------------------------------------------------------------------------------------
+    // Per-key quota enforcement
+    // -----------------------------------------------------------------------------------------
+
+    /// A state with one client key that carries a request budget.
+    ///
+    /// The key is presented in the `Authorization` header, and the budget is deliberately small
+    /// enough to be reached inside the test.
+    async fn quota_state(budget: u64) -> (AppState, Arc<std::sync::Mutex<Vec<String>>>) {
+        let (url, seen) = fake_upstream().await;
+        let mut provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+
+        // The relay compares hashes, so the configuration carries the hash of the key the test
+        // presents — never the key itself.
+        let presented = "mr-test-key";
+        let hash = RelayState::hash_presented(presented);
+        let key_hash: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        provider.accounts[0].secret_ref = Some("test-credential".to_owned());
+
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            client_keys: vec![mr_core::model::ClientKey {
+                id: mr_core::ids::ClientKeyId::from_raw("key-1"),
+                label: "quota-test".to_owned(),
+                key_hash,
+                prefix: Some("mr-test".to_owned()),
+                enabled: true,
+                allow_models: Vec::new(),
+                allow_routes: Vec::new(),
+                limit_requests: budget,
+                limits: Default::default(),
+                note: None,
+            }],
+            ..Default::default()
+        };
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let vault = Arc::new(opened);
+
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: false,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: store,
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+        };
+        (state, seen)
+    }
+
+    /// A chat request for the model the quota fixture serves.
+    fn quota_body() -> String {
+        serde_json::json!({
+            "model": "p/m",
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_key_within_its_budget_is_served_and_the_next_one_is_refused() {
+        let (state, seen) = quota_state(1).await;
+        let auth = headers(&[("authorization", "Bearer mr-test-key")]);
+
+        let first = dispatch(
+            state.clone(),
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            auth.clone(),
+            AxumBody::from(quota_body()),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        let second = dispatch(
+            state.clone(),
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            auth,
+            AxumBody::from(quota_body()),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        // The refusal happened before the upstream was contacted: the budget is spent by the
+        // request, not by the round trip.
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_key_with_no_budget_is_never_refused() {
+        // Zero means unlimited, and a key that asked for no budget is not metered at all.
+        let (state, seen) = quota_state(0).await;
+        let auth = headers(&[("authorization", "Bearer mr-test-key")]);
+        for _ in 0..3 {
+            let response = dispatch(
+                state.clone(),
+                Dialect::OpenAi,
+                Method::POST,
+                Uri::from_static("/v1/chat/completions"),
+                auth.clone(),
+                AxumBody::from(quota_body()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(seen.lock().unwrap().len(), 3);
+    }
+
     #[tokio::test]
     async fn a_default_that_cannot_carry_the_image_either_fails_instead_of_looping() {
         // The budget is one fallback. A default that points back at a text-only route must fail
@@ -3017,5 +3362,242 @@ mod tests {
     fn a_body_that_is_not_json_is_not_rewritten() {
         let original = Bytes::from_static(b"not json");
         assert!(request_with_model(&original, "vision/vision-model").is_none());
+    }
+
+    // =========================================================================================
+    // Proxy egress
+    // =========================================================================================
+
+    /// A fake HTTP `CONNECT` proxy.
+    ///
+    /// It records the target of every tunnel it is asked for and then pipes bytes to it, so the
+    /// relay's tunnel really is exercised end to end: a stub that only recorded the request would
+    /// not prove that the relay speaks the protocol, nor that the bytes arrive.
+    ///
+    /// `refuse` makes it answer `403` instead of establishing the tunnel, which is how a proxy that
+    /// will not carry a request behaves.
+    async fn fake_connect_proxy(refuse: bool) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let sink = Arc::clone(&sink);
+                tokio::spawn(async move {
+                    // Read the CONNECT head: the request line and the headers.
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while socket.read(&mut byte).await.unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                        if head.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&head).to_string();
+                    let target = text.split_whitespace().nth(1).unwrap_or("").to_string();
+                    sink.lock().unwrap().push(target.clone());
+
+                    if refuse {
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await;
+
+                    let Ok(upstream) = tokio::net::TcpStream::connect(&target).await else {
+                        return;
+                    };
+                    let (mut client_read, mut client_write) = socket.into_split();
+                    let (mut upstream_read, mut upstream_write) = upstream.into_split();
+                    let to_upstream = tokio::spawn(async move {
+                        tokio::io::copy(&mut client_read, &mut upstream_write).await
+                    });
+                    let to_client = tokio::spawn(async move {
+                        tokio::io::copy(&mut upstream_read, &mut client_write).await
+                    });
+                    let _ = tokio::join!(to_upstream, to_client);
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// A state whose provider egresses through a proxy.
+    ///
+    /// `provider_proxy` is what the provider names: `Some("edge")` for the explicit assignment,
+    /// `None` to let the configured strategy choose from the pool.
+    async fn proxy_state(
+        proxy_url: &str,
+        provider_proxy: Option<&str>,
+        proxy_enabled: bool,
+    ) -> (AppState, Arc<std::sync::Mutex<Vec<String>>>) {
+        let (url, upstream_seen) = fake_upstream().await;
+        let mut provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+        provider.proxy = provider_proxy.map(str::to_owned);
+
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            proxies: vec![mr_core::config::ProxyConfig {
+                id: "edge".to_owned(),
+                label: None,
+                url: proxy_url.to_owned(),
+                username: None,
+                secret_ref: None,
+                enabled: proxy_enabled,
+                priority: 0,
+                extra: Default::default(),
+            }],
+            proxy_strategy: mr_core::config::ProxyStrategy::Priority,
+            ..Default::default()
+        };
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: store,
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+        };
+        (state, upstream_seen)
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_names_a_proxy_egresses_through_it() {
+        let (proxy_url, proxy_seen) = fake_connect_proxy(false).await;
+        let (state, upstream_seen) = proxy_state(&proxy_url, Some("edge"), true).await;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(
+                serde_json::json!({
+                    "model": "p/m",
+                    "messages": [{"role": "user", "content": "hello"}],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            proxy_seen.lock().unwrap().len(),
+            1,
+            "the request did not go through the proxy"
+        );
+        assert_eq!(
+            upstream_seen.lock().unwrap().len(),
+            1,
+            "the upstream did not receive the request"
+        );
+        let tunnelled = proxy_seen.lock().unwrap()[0].clone();
+        assert!(
+            tunnelled.starts_with("127.0.0.1:"),
+            "the proxy was asked for the wrong target: {tunnelled}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proxy_that_refuses_the_tunnel_fails_the_request_without_going_direct() {
+        let (proxy_url, proxy_seen) = fake_connect_proxy(true).await;
+        let (state, upstream_seen) = proxy_state(&proxy_url, Some("edge"), true).await;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(
+                serde_json::json!({
+                    "model": "p/m",
+                    "messages": [{"role": "user", "content": "hello"}],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            upstream_seen.lock().unwrap().len(),
+            0,
+            "the request reached the upstream directly, which is the leak the proxy exists to stop"
+        );
+        assert_eq!(proxy_seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_provider_with_no_override_uses_the_configured_strategy() {
+        let (proxy_url, proxy_seen) = fake_connect_proxy(false).await;
+        let (state, upstream_seen) = proxy_state(&proxy_url, None, true).await;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(
+                serde_json::json!({
+                    "model": "p/m",
+                    "messages": [{"role": "user", "content": "hello"}],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(proxy_seen.lock().unwrap().len(), 1);
+        assert_eq!(upstream_seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_proxy_is_not_dialed_and_the_request_goes_out_directly() {
+        let (proxy_url, proxy_seen) = fake_connect_proxy(false).await;
+        let (state, upstream_seen) = proxy_state(&proxy_url, Some("edge"), false).await;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(
+                serde_json::json!({
+                    "model": "p/m",
+                    "messages": [{"role": "user", "content": "hello"}],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            proxy_seen.lock().unwrap().is_empty(),
+            "a disabled proxy was dialled"
+        );
+        assert_eq!(upstream_seen.lock().unwrap().len(), 1);
     }
 }

@@ -93,6 +93,11 @@ pub struct UpstreamResponse {
     ///
     /// Surfaced because it is the difference between a 5 ms request and a 200 ms one, and because a
     /// pool that has silently stopped reusing connections is otherwise invisible.
+    ///
+    /// It is always `false` for a **proxied** request: the reuse flag is reported by the connector
+    /// that opened the connection, and a tunnel through a proxy is opened by this crate's own
+    /// connector, which has no way to say whether the pool handed it an old connection or a new
+    /// one. A `false` here means "not known", not "not reused".
     pub reused_connection: bool,
 }
 
@@ -244,6 +249,13 @@ pub enum UpstreamError {
     /// The body was too large to buffer for a non-streaming request.
     #[error("upstream response exceeded {0} bytes")]
     BodyTooLarge(usize),
+    /// The proxy could not be reached, or refused the tunnel.
+    ///
+    /// A distinct variant because it is not the provider that failed: the request never left the
+    /// machine, and the operator needs to be told that the *egress* is broken rather than that the
+    /// provider is down. It is also the variant that must never be retried as a direct connection.
+    #[error("proxy egress failed: {0}")]
+    Proxy(String),
 }
 
 /// The result type for this module.
@@ -265,7 +277,6 @@ pub struct Upstream {
 /// by `tools/bench` and by the panel's diagnostic view: "the pool is configured for 4 idle
 /// connections per host" is the first thing to check when requests are mysteriously slow, and
 /// re-deriving it from the configuration would risk reporting something other than what was built.
-#[derive(Debug)]
 struct UpstreamInner {
     /// How long an idle connection is kept before being closed.
     pool_idle: Duration,
@@ -282,12 +293,93 @@ struct UpstreamInner {
         hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
         http_body_util::Full<Bytes>,
     >,
+    /// One client per proxy, each with its own pool.
+    ///
+    /// The pools are separate on purpose. A pool is keyed by origin, so a single pool holding both
+    /// direct and proxied connections to the same provider could hand a proxied request a direct
+    /// connection that was already open — and the request would leave from this machine instead of
+    /// from the proxy, which is precisely what an egress policy exists to prevent.
+    ///
+    /// The map is keyed by [`crate::proxy::ProxyEndpoint::pool_key`], which includes a fingerprint
+    /// of the credential: a tunnel that was opened with one password must not be reused for
+    /// another.
+    proxied: std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            hyper_util::client::legacy::Client<
+                crate::egress::ProxyConnector,
+                http_body_util::Full<Bytes>,
+            >,
+        >,
+    >,
+    /// TLS to the origin, shared by every proxied client.
+    ///
+    /// The same configuration the direct client uses, ALPN included: it is the origin that speaks
+    /// HTTP/2, not the proxy.
+    origin_tls: tokio_rustls::TlsConnector,
+    /// TLS to the proxy, for an `https://` proxy.
+    ///
+    /// It must not offer `h2`: `CONNECT` is HTTP/1.1, and offering `h2` to a proxy and then
+    /// speaking HTTP/1.1 over it is a protocol violation some proxies answer by hanging up.
+    proxy_tls: Option<tokio_rustls::TlsConnector>,
+}
+
+impl std::fmt::Debug for UpstreamInner {
+    /// A hand-written `Debug`, because the TLS connectors are not `Debug` and the pool map is
+    /// noise. The proxy count is reported because "how many pools are there" is the question an
+    /// operator asks when a request went out through a proxy they did not expect.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamInner")
+            .field("pool_idle", &self.pool_idle)
+            .field("pool_max_idle_per_host", &self.pool_max_idle_per_host)
+            .field(
+                "proxies",
+                &self.proxied.lock().map(|m| m.len()).unwrap_or(0),
+            )
+            .finish()
+    }
 }
 
 impl UpstreamInner {
     /// The pool settings this client was built with, for diagnostics.
     pub fn pool_settings(&self) -> (Duration, usize) {
         (self.pool_idle, self.pool_max_idle_per_host)
+    }
+
+    /// The client for a proxy, built the first time that proxy is used.
+    ///
+    /// One client per proxy means one pool per proxy, and a pool that holds only connections that
+    /// went through that proxy. The client is keyed by the endpoint *and its credential*, because a
+    /// tunnel is opened with a credential: reusing it for a different one would send the request
+    /// through a tunnel that was opened for someone else.
+    fn proxy_client(
+        &self,
+        endpoint: &crate::proxy::ProxyEndpoint,
+    ) -> Result<
+        hyper_util::client::legacy::Client<
+            crate::egress::ProxyConnector,
+            http_body_util::Full<Bytes>,
+        >,
+    > {
+        let key = endpoint.pool_key();
+        let mut clients = self.proxied.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(client) = clients.get(&key) {
+            return Ok(client.clone());
+        }
+        let connector = crate::egress::ProxyConnector::new(
+            endpoint.clone(),
+            crate::proxy::TunnelLimits::default(),
+            self.origin_tls.clone(),
+            self.proxy_tls.clone(),
+        );
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .pool_idle_timeout(self.pool_idle)
+                .pool_max_idle_per_host(self.pool_max_idle_per_host)
+                .http2_only(false)
+                .build(connector);
+        clients.insert(key, client.clone());
+        Ok(client)
     }
 }
 
@@ -311,13 +403,29 @@ impl Upstream {
         // means an h2-capable provider gets h2 and everyone else falls back to HTTP/1.1.
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
+        // The same trust store and ALPN offer for the origin hop of a proxied request: the
+        // certificate is verified against the *origin's* name, and the origin is what speaks h2.
+        let tls = std::sync::Arc::new(tls);
+        let origin_tls = tokio_rustls::TlsConnector::from(tls.clone());
+
+        // The proxy hop is a different handshake with a different peer. It gets its own
+        // configuration, and it must not offer `h2`: `CONNECT` is HTTP/1.1, and a proxy that
+        // answers an h2 ALPN with HTTP/1.1 bytes is a broken proxy.
+        let mut proxy_tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            })
+            .with_no_client_auth();
+        proxy_tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let proxy_tls = tokio_rustls::TlsConnector::from(std::sync::Arc::new(proxy_tls_config));
+
         let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
         // Nagle would delay a small request write while waiting for an ACK. See
         // `docs/16-latency-engineering.md` §3.5.
         http.set_nodelay(true);
         http.enforce_http(false);
 
-        let https = hyper_rustls::HttpsConnector::from((http, std::sync::Arc::new(tls)));
+        let https = hyper_rustls::HttpsConnector::from((http, tls));
 
         let client =
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
@@ -333,6 +441,9 @@ impl Upstream {
                 pool_idle,
                 pool_max_idle_per_host,
                 client,
+                proxied: std::sync::Mutex::new(std::collections::HashMap::new()),
+                origin_tls: origin_tls.clone(),
+                proxy_tls: Some(proxy_tls),
             }),
         })
     }
@@ -404,17 +515,16 @@ impl Upstream {
 
         let started = Instant::now();
 
-        let send_fut = self.inner.client.request(req);
-        let resp = match request.total_timeout {
-            Some(total) => match tokio::time::timeout(total, send_fut).await {
-                Ok(r) => r,
-                Err(_) => return Err(UpstreamError::TotalTimeout(total)),
-            },
-            None => send_fut.await,
+        // A proxied request uses the client of its proxy, and that client's pool holds only
+        // connections that went through that proxy. There is no path by which a proxied request is
+        // served on a direct connection, and no path by which a failed tunnel falls back to one.
+        let resp = match &request.proxy {
+            Some(endpoint) => {
+                let client = self.inner.proxy_client(endpoint)?;
+                send_with(&client, req, &request, started).await?
+            }
+            None => send_with(&self.inner.client, req, &request, started).await?,
         };
-        let headers_at = started.elapsed();
-
-        let resp = resp.map_err(|e| classify(&e, &request, headers_at))?;
 
         let status = resp.status();
         let headers = resp.headers().clone();
@@ -516,6 +626,32 @@ impl Upstream {
     }
 }
 
+/// Send one request through `client` and return the response with its body unread.
+///
+/// Generic over the connector so that the direct client and a proxied one share this code path.
+/// The difference between them is which pool the connection comes from, not how the request is
+/// written or how its failures are classified.
+async fn send_with<C>(
+    client: &hyper_util::client::legacy::Client<C, http_body_util::Full<Bytes>>,
+    req: http::Request<http_body_util::Full<Bytes>>,
+    request: &UpstreamRequest,
+    started: Instant,
+) -> Result<hyper::Response<hyper::body::Incoming>>
+where
+    C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
+{
+    let send_fut = client.request(req);
+    let resp = match request.total_timeout {
+        Some(total) => match tokio::time::timeout(total, send_fut).await {
+            Ok(r) => r,
+            Err(_) => return Err(UpstreamError::TotalTimeout(total)),
+        },
+        None => send_fut.await,
+    };
+    let headers_at = started.elapsed();
+    resp.map_err(|e| classify(&e, request, headers_at))
+}
+
 /// Map a transport error onto the variant that tells the caller what to do about it.
 ///
 /// The distinction is not cosmetic. A connect failure means the next step should be tried
@@ -528,6 +664,19 @@ fn classify(
     request: &UpstreamRequest,
     headers_at: Duration,
 ) -> UpstreamError {
+    if request.proxy.is_some() {
+        // The request was on its way through a proxy and never reached the provider. Reporting this
+        // as a plain connect failure would point the operator at the provider when the proxy is
+        // what broke — and it is the one failure that must never be retried as a direct
+        // connection, because that would defeat the egress policy the proxy was configured for.
+        if headers_at >= request.connect_timeout {
+            return UpstreamError::Proxy(format!(
+                "the tunnel did not complete within {:?}",
+                request.connect_timeout
+            ));
+        }
+        return UpstreamError::Proxy(error.to_string());
+    }
     if headers_at >= request.connect_timeout {
         return UpstreamError::ConnectTimeout(request.connect_timeout);
     }

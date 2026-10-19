@@ -433,8 +433,13 @@ pub struct ProviderPlan {
     /// override.
     ///
     /// An account-level override takes precedence; when neither is set the snapshot's
-    /// [`ProxyStrategy`] chooses. A reference to a proxy that is missing or disabled compiles to
-    /// `None`, mirroring [`Config::effective_proxy`], which never dials one.
+    /// [`ProxyStrategy`] chooses. The id is kept **verbatim** rather than resolved to the set of
+    /// dialable proxies, because "no override" and "an override that names a proxy which is
+    /// currently disabled" are different situations and must not compile to the same value: the
+    /// first is answered by the strategy, the second by a direct connection.
+    ///
+    /// A reference to a proxy that does not exist at all is a configuration error, reported by
+    /// [`Config::validate`] before the relay ever starts.
     pub proxy: Option<String>,
     /// Routes this provider can serve.
     pub capabilities: Vec<Capability>,
@@ -491,6 +496,8 @@ pub struct AccountPlan {
     /// region-locked: moving just that account behind a proxy must not move the whole provider.
     /// `None` is not "direct": it means the provider's override applies next, and if that is also
     /// absent the snapshot's [`ProxyStrategy`] decides.
+    ///
+    /// The id is kept verbatim, for the same reason as [`ProviderPlan::proxy`].
     pub proxy: Option<String>,
 }
 
@@ -687,7 +694,6 @@ impl RoutingSnapshot {
             .filter(|proxy| proxy.enabled)
             .map(proxy_plan)
             .collect();
-        let dialable: HashSet<&str> = proxies.iter().map(|proxy| proxy.id.as_str()).collect();
 
         let keys: Vec<KeyPlan> = config
             .client_keys
@@ -715,7 +721,7 @@ impl RoutingSnapshot {
             accounts.sort_by_key(|a| a.priority);
             let accounts = accounts
                 .into_iter()
-                .map(|a| account_plan(provider.id.as_str(), a, &dialable))
+                .map(|a| account_plan(provider.id.as_str(), a))
                 .collect();
 
             let mut plan = ProviderPlan {
@@ -726,7 +732,7 @@ impl RoutingSnapshot {
                 auth: provider.auth.clone(),
                 key_strategy: provider.key_strategy,
                 accounts,
-                proxy: usable_proxy(provider.proxy.as_deref(), &dialable),
+                proxy: provider.proxy.as_deref().map(str::to_owned),
                 capabilities: provider.capabilities.clone(),
                 connect_timeout_ms: provider.connect_timeout_ms,
                 ttfb_timeout_ms: provider.ttfb_timeout_ms,
@@ -1637,7 +1643,7 @@ fn temp_sibling(path: &Path) -> PathBuf {
 /// with no OAuth reference falls back to the conventional [`account_secret_id`] vault path, and an
 /// OAuth account keeps only its metadata reference. The relay opens the vault after resolving its
 /// metadata record; this module only handles ids.
-fn account_plan(provider_id: &str, account: &Account, dialable: &HashSet<&str>) -> AccountPlan {
+fn account_plan(provider_id: &str, account: &Account) -> AccountPlan {
     let secret_ref = match &account.secret_ref {
         Some(explicit) => Some(explicit.clone()),
         None if account.oauth_ref.is_none() => {
@@ -1656,17 +1662,8 @@ fn account_plan(provider_id: &str, account: &Account, dialable: &HashSet<&str>) 
         max_concurrent: account.max_concurrent,
         models_allow: account.models_allow.clone(),
         models_deny: account.models_deny.clone(),
-        proxy: usable_proxy(account.proxy.as_deref(), dialable),
+        proxy: account.proxy.as_deref().map(str::to_owned),
     }
-}
-
-/// Keep only a proxy override the relay may actually dial.
-///
-/// An explicit id that refers to a missing or disabled proxy is already a config-validation error.
-/// Compiling it to `None` is nevertheless the safe data-plane behaviour: it cannot send traffic via
-/// a disabled endpoint, and means the configured strategy can select from the enabled list.
-fn usable_proxy(proxy: Option<&str>, dialable: &HashSet<&str>) -> Option<String> {
-    proxy.filter(|id| dialable.contains(id)).map(str::to_owned)
 }
 
 /// Build a proxy plan without its disabled configuration metadata.

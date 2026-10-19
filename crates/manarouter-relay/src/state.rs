@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use mr_core::config::Config;
@@ -26,30 +26,47 @@ use crate::upstream::Upstream;
 
 /// Mutable proxy-selection counters, separate from the hot-swapped routing table.
 ///
-/// The vector index matches `Config::proxies` order. Keeping counters indexed (rather than keyed by
-/// proxy id) makes the hot path a pair of relaxed atomic loads, and this state must be rebuilt when
-/// the config's proxy list changes so that indexes cannot silently refer to a different proxy.
-/// Selection itself remains independent of `RelayState`; the caller can hold this beside the config
-/// generation and pass it to `proxy::choose`.
+/// The counters are keyed by proxy **id**, not by position in a list. A position has to be resolved
+/// against one particular generation of the proxy list, and the request path reads the *compiled*
+/// snapshot: a proxy added or removed between two requests would make a position refer to a
+/// different proxy, which is exactly the kind of near-miss that becomes a wrong egress decision.
+/// An id names one proxy and cannot be reused for another, so a counter that outlives a
+/// configuration change still counts the proxy it was counting.
+///
+/// The round-robin ticket is global and survives every change, because fairness is a property of
+/// the sequence of requests, not of the list they are chosen from.
+///
+/// Selection itself remains independent of `RelayState`; the caller holds this beside the routing
+/// table and passes it to `proxy::choose`.
 pub struct ProxySelectionState {
     round_robin: AtomicU64,
-    inflight: Vec<AtomicUsize>,
+    inflight: Mutex<HashMap<String, Arc<AtomicUsize>>>,
 }
 
 impl ProxySelectionState {
     /// Construct counters for a config's proxy list.
+    ///
+    /// The list is only used to pre-register the ids, so that the first request for a proxy does
+    /// not have to grow the map. A proxy that is not in the list is still counted correctly when it
+    /// is used: an id that is unknown simply starts at zero.
     pub fn new(proxies: &[mr_core::config::ProxyConfig]) -> Self {
-        Self::with_proxy_count(proxies.len())
+        let state = Self::empty();
+        {
+            let mut inflight = state.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            for proxy in proxies {
+                inflight
+                    .entry(proxy.id.clone())
+                    .or_insert_with(|| Arc::new(AtomicUsize::new(0)));
+            }
+        }
+        state
     }
 
-    /// Construct counters for `proxy_count` entries.
-    ///
-    /// This is useful in tests and for a caller that has already reduced a config into its own
-    /// immutable generation. Indexes must still be the indexes into that same config's proxy slice.
-    pub fn with_proxy_count(proxy_count: usize) -> Self {
+    /// Construct counters for no proxies at all.
+    pub fn empty() -> Self {
         Self {
             round_robin: AtomicU64::new(0),
-            inflight: (0..proxy_count).map(|_| AtomicUsize::new(0)).collect(),
+            inflight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -58,29 +75,34 @@ impl ProxySelectionState {
         self.round_robin.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Current number of leases for the proxy at `index`.
+    /// Current number of leases for the proxy with this id.
     ///
-    /// An out-of-range index is a programming error: silently returning zero would make a stale
-    /// state generation look like an idle proxy, so this method deliberately panics with the index.
-    pub fn inflight(&self, index: usize) -> usize {
-        self.inflight
-            .get(index)
-            .unwrap_or_else(|| panic!("proxy index {index} is outside selection state"))
-            .load(Ordering::Relaxed)
+    /// An id nobody has leased yet has zero leases. That is not a stale generation being mistaken
+    /// for an idle proxy: the counters are keyed by id, so a counter that exists is always the
+    /// counter of the proxy it names.
+    pub fn inflight(&self, id: &str) -> usize {
+        self.counter(id).load(Ordering::Relaxed)
     }
 
-    /// Mark `index` in flight until the returned lease is dropped.
+    /// Mark the proxy with this id in flight until the returned lease is dropped.
     ///
     /// The call site should create the lease immediately after selection, then keep it alive until
     /// the upstream request ends (including TLS setup and response streaming). If connect fails, the
     /// same drop releases the count; no hand-written decrement path can be forgotten.
-    pub fn lease(&self, index: usize) -> ProxyLease<'_> {
-        let counter = self
-            .inflight
-            .get(index)
-            .unwrap_or_else(|| panic!("proxy index {index} is outside selection state"));
+    pub fn lease(&self, id: &str) -> ProxyLease {
+        let counter = self.counter(id);
         counter.fetch_add(1, Ordering::Relaxed);
         ProxyLease { counter }
+    }
+
+    /// The counter for a proxy id, creating it the first time it is used.
+    fn counter(&self, id: &str) -> Arc<AtomicUsize> {
+        let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(
+            inflight
+                .entry(id.to_owned())
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
+        )
     }
 }
 
@@ -89,11 +111,11 @@ impl ProxySelectionState {
 /// The counter is atomic and relaxed because it chooses a tie-breaker, not a synchronization
 /// boundary. A stale count can only change which equally eligible proxy the next request uses; it
 /// cannot affect the request currently holding this lease.
-pub struct ProxyLease<'a> {
-    counter: &'a AtomicUsize,
+pub struct ProxyLease {
+    counter: Arc<AtomicUsize>,
 }
 
-impl Drop for ProxyLease<'_> {
+impl Drop for ProxyLease {
     fn drop(&mut self) {
         let previous = self.counter.fetch_sub(1, Ordering::Relaxed);
         debug_assert!(previous > 0, "proxy lease counter underflowed");
@@ -178,6 +200,18 @@ pub struct KeyEntry {
     pub allow_models: Vec<String>,
     /// Routes this key may use. Empty means any.
     pub allow_routes: Vec<String>,
+    /// The flat, non-rolling request budget. Zero means unlimited.
+    ///
+    /// It travels with the key because the relay has to be able to answer "may this key make this
+    /// request?" without reading the configuration file on the request path.
+    pub limit_requests: u64,
+    /// The rolling token and request caps, by window.
+    ///
+    /// Behind an `Arc` because the entry is copied on every authenticated request, and the three
+    /// windows are 72 bytes that would otherwise be copied with it. The `Arc` is cloned instead,
+    /// which is a single atomic increment rather than a memcpy — and it keeps
+    /// [`AuthOutcome`] small enough that the enum is not dominated by one variant.
+    pub limits: Arc<mr_core::model::KeyLimits>,
 }
 
 impl KeyEntry {
@@ -210,7 +244,17 @@ impl KeyEntry {
             hash,
             allow_models: key.allow_models.clone(),
             allow_routes: key.allow_routes.clone(),
+            limit_requests: key.limit_requests,
+            limits: Arc::new(key.limits),
         })
+    }
+
+    /// Whether this key is metered at all.
+    ///
+    /// A key with no caps pays nothing on the request path: no ledger read, no row written. That
+    /// is what keeps quota enforcement free for the keys that never asked for it.
+    pub fn is_metered(&self) -> bool {
+        crate::quota::QuotaManager::is_metered(&self.limits, self.limit_requests)
     }
 
     /// Whether a presented key matches, in constant time.
@@ -237,6 +281,13 @@ pub struct RelayState {
     keys: Vec<KeyEntry>,
     /// The configuration directory, so a reload knows where to look.
     config_dir: std::path::PathBuf,
+    /// Proxy-selection counters: the round-robin ticket and the per-proxy in-flight counts.
+    ///
+    /// They live here rather than in the routing table because they are *not* a property of a
+    /// snapshot: a ticket that restarted on every reload would make the round-robin strategy
+    /// unfair, and an in-flight count that restarted would make `least-used` send a burst of
+    /// requests through one proxy.
+    proxy_selection: ProxySelectionState,
 }
 
 impl RelayState {
@@ -252,6 +303,7 @@ impl RelayState {
             upstream,
             keys,
             config_dir: mr_core::config::config_dir(),
+            proxy_selection: ProxySelectionState::new(&config.proxies),
         }
     }
 
@@ -348,6 +400,11 @@ impl RelayState {
     /// The shared upstream client.
     pub fn upstream(&self) -> &Upstream {
         &self.upstream
+    }
+
+    /// The proxy-selection counters, shared by every worker.
+    pub fn proxy_selection(&self) -> &ProxySelectionState {
+        &self.proxy_selection
     }
 
     /// The configuration directory this instance was started against.
@@ -474,6 +531,8 @@ mod tests {
             hash: RelayState::hash_presented(key),
             allow_models: Vec::new(),
             allow_routes: Vec::new(),
+            limit_requests: 0,
+            limits: Arc::new(Default::default()),
         }
     }
 
@@ -487,6 +546,7 @@ mod tests {
             upstream: Upstream::default_pool().expect("a client can always be built"),
             keys,
             config_dir: std::path::PathBuf::from("/tmp"),
+            proxy_selection: ProxySelectionState::empty(),
         }
     }
 

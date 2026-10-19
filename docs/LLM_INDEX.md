@@ -51,7 +51,7 @@ measured baseline of an existing Javascript router on the development machine �
 | Understand the whole system | `docs/01-architecture.md` |
 | Change something on the request path | `docs/01-architecture.md`, `docs/16-latency-engineering.md` |
 | Add a provider | `docs/providers/README.md`, `catalog/providers.toml`, `crates/mr-core/src/model.rs` |
-| Add a dialect or translator | `crates/mr-dialects/src/lib.rs`, `docs/18-api-reference.md` |
+| Add a dialect or translator | `crates/mr-dialects/src/lib.rs`, `docs/24-provider-dialects.md`, `docs/18-api-reference.md` |
 | Change combo behaviour | `docs/06-combos.md`, `docs/07-hedged-race.md`, `crates/mr-core/src/model.rs` |
 | Work on the hedged race | `docs/07-hedged-race.md` — read all of it; the semantics are counterintuitive |
 | Change account/key selection | `docs/05-key-selection.md`, `crates/mr-core/src/dialect.rs` (`KeyStrategy`) |
@@ -192,7 +192,7 @@ Exhaustive lists. With the one exception noted under `RouteKind`, these are the 
 accepted in configuration and returned by the API. Anything not listed is a validation error.
 
 ### `Dialect` — how a provider speaks
-`open-ai` · `anthropic` · `google` · `codex` · `copilot` · `antigravity` · `command-code`
+`open-ai` · `anthropic` · `google` · `codex` · `copilot` · `antigravity` · `command-code-go`
 
 Passthrough pairs include `open-ai → open-ai`, `anthropic → anthropic`, and OpenAI chat to Copilot's OpenAI-shaped surface. OpenAI chat to Antigravity is **not** a body passthrough: it uses the Google/Antigravity translator and still lacks OAuth/project-context completion.
 
@@ -416,9 +416,17 @@ trigger.
     { "path": "docs/21-security.md", "purpose": "Threat model, the vault, cookie prohibition, ToS posture", "read_when": "before writing credential code" },
     { "path": "docs/22-sync-design.md", "purpose": "The intended cross-instance sync design; v1 implements nothing", "read_when": "touching ids, revisions or tombstones" },
     { "path": "docs/23-implementation-status.md", "purpose": "What actually runs today, with the command that checks each claim", "read_when": "before claiming a feature is implemented" },
+    { "path": "docs/24-provider-dialects.md", "purpose": "The seven wire dialects: what each upstream speaks, which client routes reach it, and what the relay translates", "read_when": "adding a dialect or tracing a translation" },
     { "path": "docs/combo-cookbook.md", "purpose": "Copy-pasteable combo configurations for common goals", "read_when": "building a combo" },
+    { "path": "docs/credits.md", "purpose": "Attribution for the quota fetchers derived from OmniRoute", "read_when": "checking licensing or provenance" },
     { "path": "docs/providers/README.md", "purpose": "How the provider catalogue works and how to add an entry", "read_when": "adding a provider" },
     { "path": "docs/providers/catalog.md", "purpose": "Generated: every provider, its dialect, auth and base URL", "read_when": "looking up a provider" },
+    { "path": "docs/providers/anthropic-compatible.md", "purpose": "Providers that serve the Anthropic Messages API natively", "read_when": "routing to an Anthropic-shaped upstream" },
+    { "path": "docs/providers/openai-compatible.md", "purpose": "Providers that serve the OpenAI chat surface, and the base-URL convention", "read_when": "routing to an OpenAI-shaped upstream" },
+    { "path": "docs/providers/commandcode.md", "purpose": "The Command Code CLI envelope, its event stream and its fingerprint headers", "read_when": "working on Command Code" },
+    { "path": "docs/providers/codex.md", "purpose": "The Codex provider: OAuth, fingerprint headers and the Responses surface", "read_when": "working on Codex" },
+    { "path": "docs/providers/antigravity.md", "purpose": "The Antigravity provider: tiers, Cloud Code onboarding and scopes", "read_when": "working on Antigravity" },
+    { "path": "docs/providers/copilot.md", "purpose": "The GitHub Copilot provider: the device flow and the mandatory fingerprint headers", "read_when": "working on Copilot" },
     { "path": "docs/local-latency-benchmark.md", "purpose": "The report-only local benchmark method and its caveats", "read_when": "running tests/local_latency_bench.py" }
   ],
   "machine_readable_state": {

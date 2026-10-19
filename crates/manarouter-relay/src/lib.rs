@@ -43,8 +43,10 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
+pub mod egress;
 pub mod model_scan;
 pub mod proxy;
+pub mod quota;
 pub mod select;
 pub mod server;
 pub mod startup;

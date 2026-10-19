@@ -340,10 +340,21 @@ one; do not reorder without recording why in §7.
       tests and strict Clippy passed in the earlier round verification. Remaining: change unresolved
       model errors to the spec's preferred 400 only if the API contract is intentionally revised;
       current docs describe 404 for name misses.
-- [ ] **D2** **Not implemented in relay runtime.** Key UI/snapshot/store structures exist, but the
-      dispatch path neither atomically admits requests against limits nor writes usage rows or taps
-      upstream tokens. Request-only accounting is not a substitute for token + request caps; strict
-      token limits require a reservation/settlement contract. No claim of enforcement is safe.
+- [x] **D2** **Implemented as an admission/settlement contract.** `crates/manarouter-relay/src/quota.rs`
+      admits a request against the key's caps *before* anything is sent upstream, and settles it
+      afterwards. Admission is one atomic step: the `key_usage` ledger is read for the key's
+      windows, the caps are compared, and a reservation is taken, all under one lock — so two
+      concurrent requests cannot both slip past a budget of one. A reservation counts the request and
+      an estimate of the prompt tokens (`body length / 4`); completion tokens are not reserved,
+      because their size is not knowable before the model has answered, so a token cap can be
+      overshot by the request that crosses it and the *next* request is refused. Settlement writes
+      one `key_usage` row per admitted request, with the tokens the upstream reported, and only then
+      releases the reservation. A refused request writes nothing, and a ledger that cannot be read
+      refuses the request rather than allowing it. Only keys that carry a cap are metered at all: an
+      uncapped key pays no ledger I/O and no parsing cost. The live database schema is unchanged
+      (`user_version` stays 3) — no migration was needed, and none was added. Ten unit tests in
+      `quota.rs` and two end-to-end tests in `server.rs` cover the caps, the flat request budget,
+      the refusal path and the ledger write.
 - [x] **D3** **Implemented as a bounded re-dispatch.** When the selected route cannot carry the
       request's modality, the relay retries the *whole request* against the configured
       `routing.defaults` entry: the client body's `model` is replaced with the target and the request
@@ -354,15 +365,30 @@ one; do not reorder without recording why in §7.
       `modality_fallback_unavailable` instead of looping. Covered by five tests in
       `crates/manarouter-relay/src/server.rs`, including the end-to-end reroute against two fake
       upstreams.
-- [~] **D4** Proxy parser/tunnel and selector utilities exist and have focused tests, but the relay
-      request has `proxy: None` and the upstream client still uses its direct pooled connector. No
-      provider traffic is routed through configured proxies; do not rely on this for egress policy.
+- [x] **D4** Proxy egress is on the request path. `crates/manarouter-relay/src/egress.rs` adds the
+      connector hyper dials through a proxy with: it opens the tunnel (HTTP `CONNECT`, SOCKS4,
+      SOCKS5, SOCKS5h), and encrypts to the *origin* when the origin is `https://` — separately from
+      the hop to an `https://` proxy, which is a different handshake with a different peer. Each
+      proxy gets **its own client and therefore its own pool**, so a request that was supposed to
+      leave through a proxy can never be served on a connection that was opened directly. The
+      request path resolves the proxy per attempt (account override, then provider override, then
+      the configured strategy over the enabled pool) and reads the password from the vault when the
+      tunnel is opened. **Fail closed**: a tunnel that fails ends the request with HTTP 502
+      `proxy_error`; there is no direct fallback and no reroute to another provider, because the
+      next provider might egress directly. A named proxy that is disabled goes out directly, which
+      is what `Config::effective_proxy` documents; an id that does not exist is a configuration
+      error and the relay refuses to start. The compiled snapshot now keeps the *authored* proxy
+      id rather than resolving it away, so "no override" and "an override naming a disabled proxy"
+      stay distinguishable. Four end-to-end tests in `crates/manarouter-relay/src/server.rs` drive a
+      real `CONNECT` proxy on loopback: traffic goes through it, a refused tunnel fails without
+      reaching the upstream, the strategy picks from the pool, and a disabled proxy is not dialed.
 - [x] **D5** No-key auth and startup guard are integrated. Explicit keyless mode allows absent keys;
       presented invalid keys remain rejected. Remote binding with keyless mode requires the separate
       `allow_remote_without_key` switch. Focused tests and strict Clippy passed in this verification.
 - [~] **D6** Model import preserves canonical reasoning-tier variants and selection retains steps
-      that share an upstream model but differ in reasoning level. Proxy eligibility is only a seam;
-      proxy selection is not integrated.
+      that share an upstream model but differ in reasoning level. Proxy eligibility is a seam; proxy
+      selection is now integrated (D4), so what remains here is the per-model selection detail, not
+      the proxy path.
 
 ### Phase E — control-plane API
 
