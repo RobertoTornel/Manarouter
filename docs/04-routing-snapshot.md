@@ -488,7 +488,7 @@ everything the compiler reads, and deliberately nothing else:
 | Alias `from`, `to` | Alias resolution is compile-time. |
 | Client key `id`, `enabled`, `allow_models`, `allow_routes` | They change authentication and authorization at the edge of routing. |
 | `quota.enabled`, `quota.live_signals_win`, `quota.failures_before_dead` | They change when an account becomes unusable. |
-| `latency.hedge_width`, `hedge_window_ms`, `hedge_max_requests` | Defaults a combo may inherit. |
+| `latency.hedge_width`, `hedge_window_ms`, `hedge_max_requests` | **Inert.** They are validated (a zero is refused) and hashed, but no combo inherits them: a hedge's width and window come from the combo's own `hedge` block, and `hedge_max_requests` caps nothing. Recorded as an open discrepancy in `HANDOVER.md` §4. |
 
 The list is hashed **field by field** rather than by deriving `Hash`, because both config blocks carry
 a flattened `extra` map for unknown-key preservation and a map cannot be hashed. That restriction is

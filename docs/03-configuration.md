@@ -99,9 +99,9 @@ health, never configuration. Putting the snapshot and the database in a separate
     "pool_idle_secs": 90,
     "pool_max_idle_per_host": 4,
     "tcp_nodelay": true,
-    "hedge_width": 3,
-    "hedge_window_ms": 400,
-    "hedge_max_requests": 4,
+    "hedge_width": 3,                   // validated but inert: a combo's own hedge block wins
+    "hedge_window_ms": 400,             // ditto
+    "hedge_max_requests": 4,            // ditto: nothing is capped by it today
     "snapshot_swap_budget_ms": 50,
     "upstream_http2": true
   },

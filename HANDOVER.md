@@ -488,7 +488,15 @@ repository and re-derive them.
   docs; a `/v1` base URL together with an absolute `default_path` produces `/v1/v1/…` on the
   passthrough path; the `count_tokens` estimate in `docs/providers/anthropic-compatible.md` does not
   exist in the code; the `gemini` template uses query-parameter authentication the relay never
-  sends; and `COMMAND_CODE_VERSION` (1.82.1) overrides the catalogue value (1.79.2).
+  sends; and `COMMAND_CODE_VERSION` (1.82.1) overrides the catalogue value (1.79.2). A sixth, found
+  while landing the race: **`latency.hedge_width`, `hedge_window_ms` and `hedge_max_requests` are
+  inert.** They are validated (a zero is refused) and hashed into the snapshot's signature, but no
+  combo inherits them — a hedge's width and window come from the combo's own `hedge` block, whose
+  defaults are the constants `3` and `800 ms`, and `hedge_max_requests` caps nothing. Wiring them
+  means deciding two things the configuration does not say: whether a combo that sets `count`
+  explicitly still inherits the global width (it cannot, as the two are the same field with the
+  same default), and whether `hedge_max_requests` counts the extra calls beyond the first or all
+  of them. That is a decision, not a patch.
 
 ### P3 — Release and design debt
 
