@@ -42,7 +42,7 @@ use mr_dialects::{translate_request, TranslateCtx};
 
 use crate::model_scan::{scan_request_head, RequestHead};
 use crate::select::{self, Health};
-use crate::state::{AuthOutcome, RelayState};
+use crate::state::{AuthOutcome, RelayState, RouteTable};
 use crate::upstream::UpstreamRequest;
 
 /// How much of a request body the relay will buffer.
@@ -498,6 +498,25 @@ fn inject_antigravity_project(
     serde_json::to_vec(&envelope).map_err(|_| "failed to encode Antigravity request envelope")
 }
 
+/// A request as the dispatch path needs it: who it is from, what it asks for, and its bytes.
+///
+/// Bundled into one value because the dispatch path can be re-entered — for a modality fallback —
+/// and eight positional arguments make a re-entry easy to get wrong.
+struct DispatchRequest {
+    /// The shared state.
+    app: AppState,
+    /// The dialect the client speaks.
+    client_dialect: Dialect,
+    /// The request method.
+    method: Method,
+    /// The request URI.
+    uri: Uri,
+    /// The request headers.
+    headers: HeaderMap,
+    /// The request body, still unread.
+    body: AxumBody,
+}
+
 async fn dispatch(
     app: AppState,
     client_dialect: Dialect,
@@ -506,6 +525,43 @@ async fn dispatch(
     headers: HeaderMap,
     body: AxumBody,
 ) -> Response {
+    dispatch_routed(
+        DispatchRequest {
+            app,
+            client_dialect,
+            method,
+            uri,
+            headers,
+            body,
+        },
+        0,
+        None,
+    )
+    .await
+}
+
+/// The request path, with the modality-fallback budget and the snapshot generation it may use.
+///
+/// `fallback_depth` counts the fallbacks already taken. One is the budget: a fallback target that
+/// itself cannot carry the request's modality must fail rather than fall back again, because a
+/// cycle of defaults would otherwise loop.
+///
+/// `table` pins the routing table to the generation the original request resolved against. A
+/// fallback must not mix a step from one snapshot with a provider from another, so the pinned
+/// table is passed down rather than re-read.
+async fn dispatch_routed(
+    request: DispatchRequest,
+    fallback_depth: u8,
+    table: Option<Arc<RouteTable>>,
+) -> Response {
+    let DispatchRequest {
+        app,
+        client_dialect,
+        method,
+        uri,
+        headers,
+        body,
+    } = request;
     let started = std::time::Instant::now();
 
     // --- Authentication, before anything reads the body. ---
@@ -540,7 +596,14 @@ async fn dispatch(
     };
 
     // --- Routing lookup. ---
-    let table = app.relay.table();
+    //
+    // The table is pinned for the whole request, and a modality fallback inherits the pinned
+    // generation rather than reading a newer one: a fallback must resolve its target against the
+    // same snapshot that produced the original step.
+    let table = match table {
+        Some(pinned) => pinned,
+        None => Arc::clone(&*app.relay.table()),
+    };
     let resolution = table.snapshot.resolve(model_name);
     let lookup_done = started.elapsed();
 
@@ -646,6 +709,8 @@ async fn dispatch(
     // --- Try each step in order, until one answers successfully. ---
     let mut last_failure: Option<Response> = None;
     let quota = mr_core::config::QuotaConfig::default();
+    // The model the request should be retried against when no step can carry its modality.
+    let mut fallback_target: Option<String> = None;
 
     for step in &steps {
         let is_sticky_step = sticky_index.is_some_and(|i| {
@@ -841,17 +906,14 @@ async fn dispatch(
             |modality| step.accepts_modality(modality),
             table.snapshot.routing_defaults(),
         ) {
-            Ok(Some(_target)) => {
-                // Do not dispatch a body for a fallback model through the originally selected
-                // provider/account. Correct fallback needs full snapshot resolution and a new step
-                // selection (including credentials, URL, dialect and headers), not just a model
-                // string rewrite. Keep the helper available for that complete reroute path.
-                return error_response(
-                    StatusCode::NOT_IMPLEMENTED,
-                    client_dialect,
-                    "modality_fallback_unavailable",
-                    "the selected route does not support this input modality and automatic fallback routing is not available yet",
-                );
+            Ok(Some(target)) => {
+                // This route cannot carry the request's modality. The next step of the combo may
+                // be able to, so the step is skipped rather than failed. The configured default
+                // is remembered and used after the loop, where a *complete* reroute is possible:
+                // the target is resolved against the same snapshot, with its own provider,
+                // account, credential, URL, dialect and headers.
+                fallback_target = Some(target);
+                continue;
             }
             Ok(None) => {}
             Err(error) => {
@@ -976,6 +1038,59 @@ async fn dispatch(
         }
     }
 
+    // No step could carry the request's modality. The configured default names a model that can,
+    // so the request is retried against it — as a **complete** reroute: the target is resolved
+    // against the same snapshot, with its own provider, account, credential, URL, dialect and
+    // headers. Rewriting only the model string and sending it to the original provider would be
+    // a silent misroute, which is why the retry goes back through the whole request path.
+    if let Some(target) = fallback_target {
+        if fallback_depth == 0 {
+            // A default that names no known model cannot be routed. Saying so is more useful than
+            // letting the retry fail with a 404 for a model the client never asked for.
+            if let Resolution::NotFound { reason } = table.snapshot.resolve(&target) {
+                return error_response(
+                    StatusCode::NOT_IMPLEMENTED,
+                    client_dialect,
+                    "modality_fallback_unavailable",
+                    &format!(
+                        "the selected route does not support this input modality, and the configured default \"{target}\" is not a model this build can route ({reason})"
+                    ),
+                );
+            }
+            if let Some(retry_body) = request_with_model(&bytes, &target) {
+                tracing::debug!(
+                    model = model_name,
+                    fallback = %target,
+                    "the selected route cannot carry this modality; retrying against the configured default"
+                );
+                // The retry goes through a boxed call: an async function that calls itself has an
+                // infinitely recursive future type, so the one re-entry point is made through a
+                // `BoxFuture`. The allocation happens only on the rare fallback path.
+                return dispatch_routed_boxed(
+                    DispatchRequest {
+                        app,
+                        client_dialect,
+                        method,
+                        uri,
+                        headers,
+                        body: AxumBody::from(retry_body),
+                    },
+                    fallback_depth + 1,
+                    Some(table),
+                )
+                .await;
+            }
+        }
+        return error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            client_dialect,
+            "modality_fallback_unavailable",
+            &format!(
+                "the selected route does not support this input modality, and the configured default \"{target}\" cannot be used for it"
+            ),
+        );
+    }
+
     // Every step was tried. Where a provider gave a specific error, that is more informative than
     // anything synthesized here, so it is returned. Where the accounts were the problem, the answer
     // is our own 429 with the earliest known recovery.
@@ -1001,6 +1116,19 @@ async fn dispatch(
     }
 }
 
+/// A boxed call to [`dispatch_routed`], for the one place that re-enters it.
+///
+/// An async function that calls itself has an infinitely recursive future type, which the compiler
+/// cannot lay out. Routing the recursive call through a `BoxFuture` gives it a concrete type at
+/// that point, so the recursion terminates in the type system.
+fn dispatch_routed_boxed(
+    request: DispatchRequest,
+    fallback_depth: u8,
+    table: Option<Arc<RouteTable>>,
+) -> futures_util::future::BoxFuture<'static, Response> {
+    Box::pin(dispatch_routed(request, fallback_depth, table))
+}
+
 /// A stable per-step key for the account round-robin counter.
 ///
 /// The counter is per step rather than per provider so that two steps on one provider do not advance
@@ -1008,6 +1136,26 @@ async fn dispatch(
 /// one uses.
 fn unique_counter_key(step: &StepPlan) -> mr_core::ids::ComboId {
     mr_core::ids::ComboId::from_raw(format!("{}#{}", step.provider_id, step.model))
+}
+
+/// The client's request body with its `model` field replaced.
+///
+/// Used by the modality fallback, which retries the request against a different model. The
+/// replacement is the *client-facing* model id — the same one the client would have sent — because
+/// the retry goes back through the whole request path and must be resolved by the snapshot, not
+/// carried over from the previous route.
+///
+/// Returns `None` when the body is not a JSON object, or has no `model` field to replace. Guessing
+/// would be worse than refusing: a request retried against the wrong model is a misroute the
+/// operator would never see.
+fn request_with_model(body: &Bytes, model: &str) -> Option<Bytes> {
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let object = value.as_object_mut()?;
+    if !object.contains_key("model") {
+        return None;
+    }
+    object.insert("model".into(), serde_json::Value::String(model.to_owned()));
+    serde_json::to_vec(&value).ok().map(Bytes::from)
 }
 
 /// Read the whole body, refusing anything over the limit.
@@ -2625,5 +2773,249 @@ mod tests {
     fn a_streaming_request_asks_the_upstream_for_events() {
         let head = scan_request_head(br#"{"model":"m","stream":true}"#);
         assert!(head.wants_stream());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The modality fallback
+    // -----------------------------------------------------------------------------------------
+
+    /// A provider serving one model, with the modalities that model accepts.
+    fn provider_serving(
+        id: &str,
+        base_url: &str,
+        model: &str,
+        modalities: &[InputModality],
+    ) -> mr_core::model::Provider {
+        let mut provider = mr_core::model::Provider::new(id, Dialect::OpenAi, base_url);
+        let mut account = mr_core::model::Account::new(id);
+        // An account without an explicit reference falls back to a conventional vault path, so the
+        // test names one explicitly and puts a value there.
+        account.secret_ref = Some("test-credential".to_owned());
+        provider.accounts = vec![account];
+        let mut entry = dm();
+        entry.id = model.to_owned();
+        entry.input_modalities = modalities.to_vec();
+        provider.models = vec![entry];
+        provider
+    }
+
+    /// A fake upstream: records every body it receives and answers with a canned completion.
+    ///
+    /// Returns the base URL to point a provider at, and the recorded bodies.
+    async fn fake_upstream() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(move |body: Bytes| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push(String::from_utf8_lossy(&body).to_string());
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// A relay state wired to two fake upstreams: one that takes text only, one that takes images.
+    ///
+    /// `default_image` is the `routing.defaults.image` entry, so a test can point it at a model
+    /// that does not exist, or at one that cannot carry the image either.
+    async fn fallback_state_with(
+        default_image: &str,
+    ) -> (
+        AppState,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let (text_url, text_seen) = fake_upstream().await;
+        let (vision_url, vision_seen) = fake_upstream().await;
+
+        let config = mr_core::config::Config {
+            providers: vec![
+                provider_serving("text", &text_url, "text-model", &[InputModality::Text]),
+                provider_serving(
+                    "vision",
+                    &vision_url,
+                    "vision-model",
+                    &[InputModality::Text, InputModality::Image],
+                ),
+            ],
+            routing: mr_core::config::RoutingConfig {
+                defaults: mr_core::config::RoutingDefaults {
+                    image: Some(default_image.to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+
+        // A vault in a private temporary directory, holding the one credential the accounts name.
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let vault = Arc::new(opened);
+
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            oauth_store: Arc::new(mr_core::store::Store::open_in_memory().unwrap()),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+        };
+        (state, text_seen, vision_seen)
+    }
+
+    /// A chat body that carries an image, which the text-only route cannot serve.
+    fn image_body(model: &str) -> String {
+        serde_json::json!({
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is in this picture?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                ],
+            }],
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn an_image_request_falls_back_to_the_configured_default_and_reroutes_completely() {
+        let (state, text_seen, vision_seen) = fallback_state_with("vision/vision-model").await;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(image_body("text/text-model")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The text-only upstream must not have been called at all: the fallback is a *reroute*,
+        // not a second attempt at the same provider with a different model name.
+        assert!(
+            text_seen.lock().unwrap().is_empty(),
+            "the route that cannot carry the image was called anyway"
+        );
+
+        // The vision upstream got the request, with the fallback model in the body. The upstream
+        // sees its own model id, not the client-facing one the fallback was resolved from.
+        let seen = vision_seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one upstream call");
+        let body: serde_json::Value = serde_json::from_str(&seen[0]).unwrap();
+        assert_eq!(body["model"], "vision-model");
+        // The request's content travelled with it: the fallback retried the request, it did not
+        // replace it with a stub.
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            "what is in this picture?"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_the_route_can_serve_is_not_fallback() {
+        let (state, text_seen, vision_seen) = fallback_state_with("vision/vision-model").await;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(
+                serde_json::json!({
+                    "model": "text/text-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(text_seen.lock().unwrap().len(), 1);
+        assert!(vision_seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_default_that_names_no_known_model_is_reported_rather_than_routed() {
+        let (state, text_seen, vision_seen) = fallback_state_with("nosuch/model").await;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(image_body("text/text-model")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(text_seen.lock().unwrap().is_empty());
+        assert!(vision_seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_default_that_cannot_carry_the_image_either_fails_instead_of_looping() {
+        // The budget is one fallback. A default that points back at a text-only route must fail
+        // the request, not send it around the loop again.
+        let (state, text_seen, vision_seen) = fallback_state_with("text/text-model").await;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(image_body("text/text-model")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(text_seen.lock().unwrap().is_empty());
+        assert!(vision_seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_fallback_body_keeps_the_request_and_replaces_the_model() {
+        let original =
+            Bytes::from_static(br#"{"model":"old","messages":[{"role":"user","content":"hi"}]}"#);
+        let rewritten = request_with_model(&original, "vision/vision-model").unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(value["model"], "vision/vision-model");
+        assert_eq!(value["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn a_body_without_a_model_is_not_rewritten() {
+        // There is no field to replace, and guessing one would retarget a request the client
+        // never named.
+        let original = Bytes::from_static(br#"{"messages":[]}"#);
+        assert!(request_with_model(&original, "vision/vision-model").is_none());
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_is_not_rewritten() {
+        let original = Bytes::from_static(b"not json");
+        assert!(request_with_model(&original, "vision/vision-model").is_none());
     }
 }

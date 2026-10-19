@@ -2701,7 +2701,10 @@ mod tests {
             Some(0),
             "a reported zero is not a missing value"
         );
-        assert_eq!(breakdown.generation_ms, None, "an unreported window stays unknown");
+        assert_eq!(
+            breakdown.generation_ms, None,
+            "an unreported window stays unknown"
+        );
     }
 
     // -- account health -----------------------------------------------------------------

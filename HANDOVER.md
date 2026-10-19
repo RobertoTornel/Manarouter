@@ -22,15 +22,16 @@ This revision is the Feature Round 2 close-out. What it contains, and what it de
 |---|---|---|
 | Store schema | **v3**, with the v2 and v3 migrations restored and tested | `crates/mr-core/src/store.rs`: `MIGRATION_V2` (`key_usage`, `provider_quota_state`), `MIGRATION_V3` (`usage_tokens`). A half-applied edit had bumped `SCHEMA_VERSION` to 4 without adding a migration, which broke the build; the constant is back at 3 and the compile-time assert holds. |
 | Per-key usage ledger | **Stored, not enforced** | `record_key_usage`, `key_window_usage`, `key_window_usage_many`, `prune_key_usage` exist and are tested (rolling-window maths, dense many-key map, prune, idempotent re-record). **The relay does not write to it and does not enforce any cap** — see §4. |
+| Automatic modality fallback | **Implemented, bounded to one hop** | A request whose modality the selected route cannot carry is retried against the configured `routing.defaults` entry, as a complete reroute against the same pinned snapshot — its own provider, account, credential, URL and dialect. A target that also lacks the modality, or names no known model, fails with HTTP 501. Five tests; see §4. |
 | Provider quota cache | **Wired to the panel** | `put_provider_quota_state` / `provider_quota_state` / `all_provider_quota_state` / `delete_provider_quota_state` back the conductor's `/api/quota` routes. |
 | CI | **Green, and wider than before** | `.github/workflows/ci.yml` runs fmt, strict Clippy, the secret scan, build, workspace tests, release tests, the isolated installer test, the isolated mock-upstream smoke, and the panel Node tests. The standalone `tools/mock-upstream` job passes strict Clippy again (three lints fixed). |
 | Test files | **Tracked again** | The earlier session's staged deletions of `tests/smoke_e2e.py`, `tests/local_latency_bench.py`, `panel/test/browser.e2e.mjs` and `scripts/test-installer-systemd.sh` were reverted: CI now *runs* them, so removing them from the repository would have removed the checks rather than protected them. `.gitignore` no longer ignores `/tests/`, `/panel/test/` or `/scripts/test-*.sh`. |
 | Documentation | **Reconciled with the code** | `plan.md`, `docs/23-implementation-status.md`, `docs/user/08-proxies.md` and this file now say the same thing about what is and is not implemented. A broken relative link in `docs/user/08-proxies.md` was fixed. |
 
-**Still not implemented, and still described as such:** automatic modality fallback (D3, fail-closed
-with HTTP 501), proxy egress (D4, the transport is direct-only), and per-key quota *enforcement*
-(D2, the ledger exists but nothing writes to it yet). The hedged race runner, `responses.rs` test
-coverage, and the `tools/bench/` fixture directory are also still open — see §4.
+**Still not implemented, and still described as such:** proxy egress (D4, the transport is direct-only)
+and per-key quota *enforcement* (D2, the ledger exists but nothing writes to it yet). Automatic
+modality fallback (D3) is now implemented — a bounded, complete reroute, described in §4. The hedged
+race runner, `responses.rs` test coverage, and the `tools/bench/` fixture directory are alsostill open — see §4.
 
 ---
 
@@ -40,7 +41,7 @@ Yes, within these limits:
 
 | Gate | Result |
 |---|---|
-| `cargo test --workspace --all-targets` | **1 139 passed, 0 failed**, 1 ignored (the opt-in live test) — re-run in this revision |
+| `cargo test --workspace --all-targets` | **1 146 passed, 0 failed**, 1 ignored (the opt-in live test) — re-run in this revision |
 | `cargo test --workspace --release` | **passed** (release profile: LTO, `panic = "abort"`, `strip`) — re-run in this revision |
 | `cargo test -p mr-core --lib store` | **50 passed / 0 failed** (7 new: v1→v3 upgrade, rolling window, dense many-key map, prune, idempotent re-record, quota cache CRUD, token breakdown) |
 | `cargo test -p mr-core --test imported_grants_are_independent -- --ignored` | passes; 10/10 imported grants usable with the reference stopped — **not re-run in this revision** (it needs the live reference account) |
@@ -49,22 +50,16 @@ Yes, within these limits:
 | `cargo fmt --all -- --check` | clean |
 | `cargo clippy --all-targets -- -D warnings` in `tools/mock-upstream` | clean (three lints fixed: an unnecessary cast, a field assigned after `default()`, and a `loop` that should be `while let`) |
 | `cargo test` in `tools/mock-upstream` | **22 passed / 0 failed** |
-| `bash scripts/check-secrets.sh` | `check-secrets: OK` (140 files, re-run in this revision) |
+| `bash scripts/check-secrets.sh` | `check-secrets: OK` (189 files, re-run in this revision) |
 | `python3 tests/smoke_e2e.py` | **PASS** — isolated conductor + relay + mock-upstream, synthetic credential, disposable config and state |
 | `bash scripts/test-installer-systemd.sh` | **passed** — isolated HOME, mocked `git`/`cargo`/`systemctl`; install, update and `--no-start` |
 | `node --test panel/test/*.test.mjs` | **42 passed / 0 failed** (`markdown.test.mjs`, `dom.test.mjs`) |
+| Panel browser E2E (Firefox and Chromium) | PASS in the `a13405e` session — **not re-run in this revision**: Playwright and the browser binaries are not project dependencies, so the browser test stays a local opt-in |
 | `curl http://127.0.0.1:20900/healthz` | `{"status":"ok"}` — no upstream call |
 
-| `python3 tests/smoke_e2e.py` | PASS — isolated conductor + relay + mock upstream, routed a chat request |
-| `bash scripts/test-installer-systemd.sh` | passed at `a13405e` (isolated HOME; install, update, `--no-start`); `b63fb47` extended it to run `scripts/check-systemd-cycle.py` — the extended script was not re-run here |
-| Panel browser E2E — **Firefox** | PASS: login, one-time client-key lifecycle, low-resource settings save |
-| Panel browser E2E — **Chromium** | PASS (same spec) |
-
-> The clippy, fmt, smoke-E2E and browser-E2E rows record the `a13405e` session. `73bceab` then rewrote
-> the panel's OAuth flow and the `startup.rs`/`serve.rs` changes (now committed in `65f543d`) touch
-> relay startup, so none of those rows covers this revision — re-run them before trusting them here.
-> The test and secret-scan counts are the recorded run plus a source-level count, not a fresh
-> `cargo test`.
+> The browser-E2E row is the one thing here that a fresh checkout cannot reproduce on its own. The
+> Node panel tests, the smoke harness, the installer harness and the mock-upstream suite are all
+> wired into CI; the browser workflow is not, and says so.
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -80,13 +75,13 @@ Test distribution, so a failure points somewhere. These are the counts from the 
 | Target | Tests |
 |---|---|
 | `mr-core` lib | 641 |
-| `manarouter-relay` lib | 223 |
+| `manarouter-relay` lib | 230 |
 | `mr-dialects` lib | 142 |
 | `mr-cli` bin | 96 |
 | `manarouter-conductor` lib | 34 |
 | `manarouter-relay` bin | 3 |
 | `mr-core` integration (`imported_grants_are_independent`) | 1, **ignored by default** |
-| **total (excluding the ignored one)** | **1 139** |
+| **total (excluding the ignored one)** | **1 146** |
 
 Three more suites live outside the workspace crate list and are run separately:
 `tools/mock-upstream` (22), `panel/test/*.test.mjs` (42, Node) and the two Python/bash harnesses
@@ -269,22 +264,31 @@ reservation, because the number of tokens is only known after the upstream has a
 ledger (in-flight reservations) — a second table, or a `reserved` column — so that two concurrent
 requests cannot both pass a check that only one of them may pass.
 
-### P1 — Automatic modality fallback (D3): fail-closed, deliberately
+### Closed — Automatic modality fallback (D3): a bounded re-dispatch
 
-`upstream::rewrite_model_for_modalities` detects the input modalities, consults `routing.defaults`
-and returns the configured target model. The relay then answers **HTTP 501
-`modality_fallback_unavailable`** rather than sending the rewritten body to the *original* provider
-(`crates/manarouter-relay/src/server.rs`, the modality check inside the step loop).
+**Done in this revision.** `upstream::rewrite_model_for_modalities` detects the input modalities and
+consults `routing.defaults`; when the selected route cannot carry the modality, the relay now retries
+the **whole request** against the configured default rather than refusing it
+(`crates/manarouter-relay/src/server.rs`, `dispatch_routed`).
 
-That refusal is the correct behaviour for a half-built feature: sending an image-bearing body to a
-text-only provider, under the original provider's credentials, would be a silent misroute. But the
-feature is not finished, and the panel and the user guide say so.
+The retry is a complete reroute, not a model-string swap: the client body's `model` is replaced with
+the target, and the request goes back through the whole path — resolution against the *same* pinned
+`RouteTable`, so the provider, account, credential, URL, dialect and headers all come from the
+snapshot generation that produced the original step. The route that could not carry the modality is
+never asked to serve it.
 
-To finish it, the fallback must rebuild **everything** for the target — provider, account,
-credential, URL, dialect, headers — from one snapshot generation, not just swap a model string. The
-cleanest shape is a bounded re-dispatch: rewrite the *client* body's `model` to the target and run
-the whole resolution again against the same `RouteTable`, with a depth limit of one so a target that
-also lacks the modality fails instead of looping.
+The budget is **one** fallback (`fallback_depth`): a target that also lacks the modality fails with
+HTTP 501 `modality_fallback_unavailable` instead of looping, and a default that names no known model
+fails with the same code and says so, rather than routing to something the operator did not name.
+
+The re-entry is a boxed call (`dispatch_routed_boxed`): an async function that calls itself has an
+infinitely recursive future type, so the single re-entry point is made through a `BoxFuture`.
+
+Five tests cover it (`crates/manarouter-relay/src/server.rs`): the fallback reroutes to the provider
+that can take the image and the text-only upstream is never called; a request the route *can* serve
+is not a fallback; a default naming no known model is reported; a default that cannot carry the
+image either fails rather than looping; and the rewritten body keeps the request and replaces only
+the model.
 
 ### P1 — Proxy egress (D4): configured, selected, and never used
 
@@ -503,3 +507,32 @@ Two decisions were extended, not changed, by the migration work:
 The latency constraint is verbatim and load-bearing: the relay is optimised **obsessively** for
 latency, combo logic lives outside it, and it should only send and receive. The honest claim is
 **zero interpretation on the request path**, not zero-copy.
+
+---
+
+## 8. Deployment record (2026-10-19)
+
+The user authorised a rebuild and a restart of the two live services. What was done, and what it
+fixed:
+
+| Step | Result |
+|---|---|
+| `cargo build --release --workspace` | Finished in 1 m 32 s; `manarouter-relay` and `manarouter-conductor` replaced. |
+| `systemctl --user restart manarouter-conductor.service manarouter-relay.service` | Both units **active (running)**. |
+| `curl http://127.0.0.1:20900/healthz` | `{"status":"ok"}` (HTTP 200). |
+| `curl http://127.0.0.1:20901/api/health` | `{"version":"0.1.0","uptime_secs":7,"snapshot":{"digest":"8e088c7662c05ee9",...},"counts":{"providers":3,"combos":0,"aliases":0,"keys":4,"accounts":11},"password_set":false}` — the control plane is serving the real snapshot again. |
+| `curl http://127.0.0.1:20900/v1/models` | HTTP 401 without a client key, which is the correct answer. |
+
+**The control plane had been down.** Before the restart, `manarouter-conductor.service` was in
+`activating (auto-restart)` with a restart counter above 12 000, failing every three seconds with:
+
+> `database schema version 3 is newer than this build supports (2); refusing to open it rather than
+> run a migration set this build does not have`
+
+The deployed binary was the older release that only knew schema v2, while the live database had
+already been migrated to v3 by a build from the working tree. The rebuilt binary knows v3 and opens
+it, so the panel and the `/api/*` routes are back. The relay had stayed up only because it had been
+running since before the database moved.
+
+The database was not touched: it is still at `user_version = 3`, and the v2/v3 migrations are no-ops
+against it. Nothing under `~/.config/manarouter` or `~/.local/state/manarouter` was edited.

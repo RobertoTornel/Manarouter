@@ -6,15 +6,18 @@ given so you can re-run it.
 
 > **Status note (2026-10-19):** this document retains earlier implementation-history sections below;
 > they are not a comprehensive audit of every Round 2 item. Final checks for this close-out passed:
-> workspace tests (1 139 passed, 1 ignored), the release-profile test run, `cargo fmt --all -- --check`,
+> workspace tests (1 146 passed, 1 ignored), the release-profile test run, `cargo fmt --all -- --check`,
 > strict workspace Clippy, strict Clippy and tests in `tools/mock-upstream`, the panel Node tests, the
 > secret scan, the isolated installer test, and the isolated relay/conductor/mock-upstream smoke. The
 > store schema is at **v3**: `key_usage` and `provider_quota_state` (v2) and `usage_tokens` (v3) are
 > present and tested.
 > **D2 remains unimplemented** — the per-key ledger is stored and queryable, but the relay neither
-> writes to it nor enforces a cap; **D3 is partial** (the relay answers HTTP 501 rather than misrouting
-> a fallback model); **proxy egress is not wired** (the transport is direct-only); and the
-> user-guide/E5 reviews are partial. Re-run before release and inspect `git status`.
+> writes to it nor enforces a cap; **proxy egress is not wired** (the transport is direct-only); and
+> the user-guide/E5 reviews are partial. **D3 is now implemented**: a request whose modality the
+> selected route cannot carry is retried against the configured `routing.defaults` entry, as a
+> complete reroute against the same pinned snapshot, with a budget of one fallback (a target that
+> also lacks the modality, or names no known model, fails with HTTP 501). Re-run before release and
+> inspect `git status`.
 
 
 ## 1. What runs
@@ -46,7 +49,7 @@ node --test panel/test/*.test.mjs
 # Browser workflow (local opt-in): Playwright and the browser binaries are not project dependencies.
 BROWSER=firefox PLAYWRIGHT_MODULE=/path/to/playwright FIREFOX_EXECUTABLE=/path/to/firefox node panel/test/browser.e2e.mjs
 ```
-Every line above was re-run for the revision described here and passed: **1 139 workspace tests**
+Every line above was re-run for the revision described here and passed: **1 146 workspace tests**
 (1 ignored), a clean release-profile run, clean strict Clippy in the workspace *and* in
 `tools/mock-upstream` (22 tests there), `check-secrets: OK` over 140 files, the isolated installer
 simulation, the isolated mock-upstream smoke, and 42/42 panel Node tests. The **smoke test, the
@@ -131,6 +134,13 @@ a mock upstream before enabling it for users.
   supports refresh orchestration for supported integrations; OAuth refresh is reported unsupported.
   This is not the request-usage ledger. Relay/conductor do not currently write client-request usage
   rows, and per-key rolling request/token limits are not enforced in relay dispatch.
+* **A modality the route cannot carry is rerouted, not misrouted.** When the selected step's model
+  does not accept the request's modality, the relay retries the whole request against the
+  `routing.defaults` entry for that modality, resolved against the same pinned snapshot, so the
+  target's own provider, account, credential, URL and dialect are used. The budget is one fallback:
+  a target that also lacks the modality, or names no known model, fails with HTTP 501
+  `modality_fallback_unavailable` rather than looping. Covered by five tests in
+  `crates/manarouter-relay/src/server.rs`.
 
 ## 5. Claims that remain unverified or false
 
