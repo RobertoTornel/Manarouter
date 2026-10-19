@@ -769,3 +769,23 @@ version is either absent (Command Code, Codex) or already in the translator's ow
 (Antigravity's `v1internal:generateContent`), and the URLs they were reaching before the change
 are the URLs they reach now. No billable call was made to verify this; the check was made against
 the URL rules themselves, which the relay's own tests cover row for row.
+
+### Fourth deployment (2026-10-21, `190328d`)
+
+The winner-rule revision was deployed the same way:
+
+| Step | Result |
+|---|---|
+| `cargo build --release -p manarouter-relay -p manarouter-conductor -p mr-cli` | Finished in 1 m 18 s. |
+| `systemctl --user restart manarouter-relay.service manarouter-conductor.service` | Both units **active**. |
+| `curl http://127.0.0.1:20900/healthz` | `{"status":"ok"}`. |
+| `curl http://127.0.0.1:20901/api/health` | `{"version":"0.1.0","uptime_secs":5,"snapshot":{"digest":"8e088c7662c05ee9",...},"counts":{"providers":3,"combos":0,"aliases":0,"keys":4,"accounts":11},"password_set":false}` — the same snapshot digest as before, so the live configuration was not disturbed. |
+| `curl http://127.0.0.1:20901/api/usage?limit=5` | `{"rows":[],"totals":{"requests":0,...}}` — the new ledger endpoint answers. |
+| `PRAGMA user_version` on `~/.local/state/manarouter/state.sqlite` (read-only) | **4**, and `key_usage_bytes` exists — the v4 migration applied. |
+
+**This deployment carried a schema migration**, which the previous three did not, and it is worth
+recording why it was safe: the v4 migration is a `CREATE TABLE IF NOT EXISTS` — additive, idempotent,
+and a re-run after a crash cannot fail. The relay and the conductor were rebuilt from the same tree
+and restarted together, so neither could have opened the database with an older schema version than
+the one it was about to write. The live configuration was not edited, and no billable provider call
+was made.
