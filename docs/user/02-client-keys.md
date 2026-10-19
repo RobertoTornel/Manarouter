@@ -43,13 +43,15 @@ Expect a replacement plaintext once, and the old key to become invalid immediate
 
 ## Limits and current controls
 
-The data format has optional rolling limits for **5 hours**, **1 week**, and **30 days**. Each window can cap tokens, requests, or both; zero means that dimension is uncapped. These rolling limits are not exposed in `mr key create` or the panel key form, and the relay does not currently enforce or report them. Do not rely on them as active quota controls.
+The data format has optional rolling limits for **5 hours**, **1 week**, and **30 days**. Each window can cap tokens, requests, or both; zero means that dimension is uncapped. These rolling limits are not exposed in `mr key create` or the panel key form, but **the relay does enforce them**: a request that would exceed a cap is refused with HTTP 429 before it reaches the provider, and the refusal carries a `Retry-After`.
 
-The CLI and panel do expose a separate `--limit-requests` request-count field, but the relay does not currently enforce that field either. The panel key view shows the configured request limit, allowed models/routes, and enabled state; it does not show rolling-window usage. The relay currently uses client keys only to authenticate requests; it does not enforce the configured model or route allow-lists either. Do not treat these fields as an access-control boundary.
+The CLI and panel expose a separate `--limit-requests` request-count field, and the relay enforces that too: it is a flat, non-rolling budget of requests. The panel key view shows the configured request limit, allowed models/routes, and enabled state; it does not show rolling-window usage.
+
+Two things are still not enforced: the **model and route allow-lists** are not applied to API requests, and the **token caps can be overshot** by the request that crosses them — the completion size is not knowable before the model has answered, so the relay reserves an estimate of the prompt and settles with the real usage afterwards. The *next* request is the one that is refused. Treat the allow-lists as configuration, not as an access-control boundary.
 
 ## Understand 401 and 429 responses
 
 - **401 Unauthorized:** check that the app is sending the correct client key in `Authorization: Bearer …`, that the key is enabled, and that it was not rotated. A 401 from the upstream may also indicate the provider credential was rejected; distinguish it from the relay's invalid-client-key error before changing credentials.
-- **429 Too Many Requests:** this is not currently a per-key rolling-limit response. If the response body has error code `no_usable_accounts`, the relay could not find an available account for the requested model/route (for example, accounts are cooling down). Otherwise, the status may be from the upstream provider. Check the response body and provider/account status; avoid repeatedly retrying a provider that is rate-limiting you.
+- **429 Too Many Requests:** this may be a per-key rolling-limit refusal, which the relay raises before contacting the provider. If the response body has error code `no_usable_accounts`, the relay could not find an available account for the requested model/route (for example, accounts are cooling down). Otherwise, the status may be from the upstream provider. Check the response body and provider/account status; avoid repeatedly retrying a provider that is rate-limiting you.
 
 For a first end-to-end request, see [getting started](./00-getting-started.md). To add or replace a provider credential safely, see [add a provider](./01-add-a-provider.md).

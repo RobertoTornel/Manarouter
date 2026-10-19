@@ -58,7 +58,7 @@ configuration parsing are not on the request path at all.
 
 | Process | Crate | Default port | Responsibility |
 |---|---|---|---|
-| `manarouter-relay` — the **data plane** | `crates/manarouter-relay` | 20900 | Accept, look up a compiled route, select an account, apply client auth/reasoning and forward. Key-quota enforcement and configured proxy egress are not wired. |
+| `manarouter-relay` — the **data plane** | `crates/manarouter-relay` | 20900 | Accept, look up a compiled route, select an account, apply client auth/reasoning and forward. Per-key quota caps are enforced, and traffic egresses through a configured proxy when one applies. |
 | `manarouter-conductor` — the **control plane** | `crates/manarouter-conductor` | 20901 | Configuration, snapshot compilation, cached provider-quota refresh APIs, OAuth, the web panel. Request-usage ledger recording is not wired. |
 
 The conductor compiles the authored `config.json` into the routing snapshot and publishes it; the

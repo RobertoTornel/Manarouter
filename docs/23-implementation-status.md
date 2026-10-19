@@ -4,20 +4,31 @@ This file exists because a specification that reads as finished while the code i
 no specification. Everything below is checked against the tree, and the command that checks it is
 given so you can re-run it.
 
-> **Status note (2026-10-19):** this document retains earlier implementation-history sections below;
-> they are not a comprehensive audit of every Round 2 item. Final checks for this close-out passed:
-> workspace tests (1 146 passed, 1 ignored), the release-profile test run, `cargo fmt --all -- --check`,
-> strict workspace Clippy, strict Clippy and tests in `tools/mock-upstream`, the panel Node tests, the
-> secret scan, the isolated installer test, and the isolated relay/conductor/mock-upstream smoke. The
-> store schema is at **v3**: `key_usage` and `provider_quota_state` (v2) and `usage_tokens` (v3) are
+> **Status note (2026-10-20):** this document retains earlier implementation-history sections below;
+> they are not a comprehensive audit of every Round 2 item. The checks for this close-out passed:
+> workspace tests (1 168 passed, 1 ignored), the release-profile test run, `cargo fmt --all -- --check`,
+> strict workspace Clippy, strict Clippy and tests in `tools/mock-upstream` and `tools/bench`, the
+> panel Node tests, the secret scan, the isolated installer test, and the isolated
+> relay/conductor/mock-upstream smoke. The store schema is at **v3** — unchanged, because the quota
+> work needed no migration: `key_usage` and `provider_quota_state` (v2) and `usage_tokens` (v3) are
 > present and tested.
-> **D2 remains unimplemented** — the per-key ledger is stored and queryable, but the relay neither
-> writes to it nor enforces a cap; **proxy egress is not wired** (the transport is direct-only); and
-> the user-guide/E5 reviews are partial. **D3 is now implemented**: a request whose modality the
-> selected route cannot carry is retried against the configured `routing.defaults` entry, as a
-> complete reroute against the same pinned snapshot, with a budget of one fallback (a target that
-> also lacks the modality, or names no known model, fails with HTTP 501). Re-run before release and
-> inspect `git status`.
+> **D2 is now implemented**: the relay admits a request against the key's caps before any upstream
+> side effect and settles it afterwards, in `crates/manarouter-relay/src/quota.rs` — a refused request
+> is HTTP 429 and writes nothing, and a token cap can be overshot by the request that crosses it
+> because the completion size is not knowable in advance.
+> **D4 is now implemented**: proxy egress is on the request path (`crates/manarouter-relay/src/egress.rs`),
+> each proxy has its own connection pool so a proxied request can never be served on a direct
+> connection, and a tunnel that fails ends the request with HTTP 502 `proxy_error` — no direct
+> fallback, no reroute to another provider.
+> **D3 is implemented**: a request whose modality the selected route cannot carry is retried against
+> the configured `routing.defaults` entry, as a complete reroute against the same pinned snapshot,
+> with a budget of one fallback (a target that also lacks the modality, or names no known model, fails
+> with HTTP 501).
+> **The hedged race runner is still not implemented**: the relay dispatches a combo's steps
+> sequentially, `hedge_decide` is still not called from the request path, and the mid-stream splice
+> and the four `WinnerFailMode`s are unreachable. `tools/bench` now measures the relay's own added
+> latency, but the hedge's own overhead is not measured.
+> Re-run before release and inspect `git status`.
 
 
 ## 1. What runs
@@ -25,14 +36,14 @@ given so you can re-run it.
 | Component | State | Evidence / limitation |
 |---|---|---|
 | `mr-core` — config, snapshot compiler, vault, usage store, OAuth | **Substantial, not complete** | Codex, Copilot, and Antigravity OAuth authorization/token exchange/refresh/Google userinfo identity code is wired; Antigravity IDE client details remain reverse-engineered and unverified. |
-| `mr-dialects` — OpenAI, Anthropic, Responses, Google, Command Code translation | **Reachable, test coverage uneven** | Relay dispatches request and response translation per selected step. Responses implementation needs focused regression tests. |
+| `mr-dialects` — OpenAI, Anthropic, Responses, Google, Command Code translation | **Reachable, test coverage uneven** | Relay dispatches request and response translation per selected step. The Responses implementation now has five reachability tests for the arms that are only reachable in combination; the other dialects are better covered than it is. `docs/24-provider-dialects.md` documents the seven dialects. |
 | `manarouter-relay` — HTTP API, auth, snapshot, account selection, translation | **Runs; concurrent hedging not wired** | Startup, flag/config precedence, listener bind selection and the 2 s `config.json` reload poller live in `crates/manarouter-relay/src/startup.rs` (declared at `crates/manarouter-relay/src/lib.rs:47`; 17 tests). Sequential step loop remains the request executor; `hedge_decide` is not called by the relay. Priority combos with `hedge.enabled` now remember the successful provider/model for a configurable inactivity window (default 1800s), combo-wide across callers; the preference is process-local and rechecked against current eligibility on each request. Client-key scan exits at first match (a deliberate latency tradeoff that reveals configured match position to a local timing observer). |
 | `manarouter-conductor` — auth, API, state, serving, provider quota refresh | **Partial** | `/api/quota` returns cached provider/account quota snapshots and declares refresh routes. Provider-specific OAuth refresh is reported unsupported. Historical request-usage rows are a separate Store ledger and relay currently does not write them. No live/provider refresh was exercised in this audit. |
 | `mr-cli` | **Partial** | Account/provider/combo/key/model families dispatch; `mr key rotate` is supported; `mr doctor` performs read-only config, vault metadata, snapshot freshness, and listener exposure checks; it fails if no enabled client key is present while relay bind is not confirmed loopback-only. `mr migrate omniroute` imports OAuth grants (by one refresh), model lists and effort-variant aliases — dry run by default, `--apply` to write, reading a copy of the reference database. `mr serve` runs both service binaries as child processes for a foreground session (`crates/mr-cli/src/serve.rs`, 6 tests, committed as `65f543d`; one Ctrl-C stops both, either child exiting stops the other, and the failure message names the child and its status — `mr serve` itself exits 1, it does not forward the child's code); `config` and `vault` remain unimplemented (`crates/mr-cli/src/config.rs:46`, `crates/mr-cli/src/vault.rs:24`). |
 | `panel/` | **Implemented; critical browser workflow verified** | Firefox E2E covers panel login, client-key creation, and rotation against an isolated mock API; other routes remain unverified. |
 | OAuth | **Partial; flows wired, migration verified live** | Conductor OAuth routes cover Codex (browser **and** device-code flows), Copilot, and Antigravity authorization code flows. Config changes written by the CLI are adopted without a restart by both the conductor (on the next authenticated `GET`) and the relay (2 s poll of `config.json`); tokens are vault-backed, metadata lives in SQLite, and relay resolves/refreshes credentials. Antigravity's interactive loopback OAuth exchange/refresh, v2 userinfo identity, free-tier Cloud Code onboarding with bounded LRO polling, encrypted token context persistence, and account-bound relay project injection are implemented. Paid-tier onboarding remains fail-closed without explicit project input. `mr migrate omniroute` transfers Codex and Antigravity grants by one refresh each, using the client identities in `mr-core/src/published.rs`; this was exercised against a live installation (10 grants imported, all re-refreshed with the reference stopped, and a real completion served through the relay). Copilot tokens issued as `ghu_` GitHub App tokens are refused by GitHub's mint endpoint and are reported as needing a fresh login. T2 client metadata and PKCE remain reverse-engineered/unverified. Cline remains unavailable. |
 | `tools/mock-upstream` | **Fault control API wired; behaviors partial** | Detached crate tests pass; `POST /__control` and request-local `x-mock-fault` merge patches are reachable. Not every field in `Fault` is yet applied to response generation. |
-| `tools/bench` | **Absent** | No harness currently enforces the latency budget. |
+| `tools/bench` | **Present; measures the total added overhead** | A detached crate that measures the relay's added latency against the budget in `docs/16-latency-engineering.md` §6, using a local fake upstream and no network or credentials. On an idle machine it measures 14.6 µs at p50 and 110.5 µs at p99 — inside the budget. It is report-or-threshold and deliberately not a CI gate: a microsecond measurement on a shared runner is dominated by the runner's own load. The six per-stage rows of the budget table are still unmeasured. |
 
 Verification run during this session (all local tests used mock/isolated data):
 
@@ -132,8 +143,9 @@ a mock upstream before enabling it for users.
   translation, translator path overrides, and forced-stream metadata applied in the relay.
 * **Quota APIs are distinct.** `/api/quota` returns cached provider/account quota snapshots and
   supports refresh orchestration for supported integrations; OAuth refresh is reported unsupported.
-  This is not the request-usage ledger. Relay/conductor do not currently write client-request usage
-  rows, and per-key rolling request/token limits are not enforced in relay dispatch.
+  This is not the request-usage ledger. The relay now enforces the per-key rolling request/token
+  caps in dispatch and writes the settled request-usage rows; the conductor's provider-quota view is
+  a separate thing and still does not reflect client-request spend.
 * **A modality the route cannot carry is rerouted, not misrouted.** When the selected step's model
   does not accept the request's modality, the relay retries the whole request against the
   `routing.defaults` entry for that modality, resolved against the same pinned snapshot, so the

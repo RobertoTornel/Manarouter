@@ -22,7 +22,7 @@ not wired into the relay yet).
 
 | Process | Crate | Default port | Responsibility |
 |---|---|---|---|
-| `manarouter-relay` — the **data plane** | `crates/manarouter-relay` | 20900 | Accept a request, look up a compiled route, select an account, translate/forward. Applies relay auth and reasoning policy; key quota enforcement and configured proxy egress are not wired. |
+| `manarouter-relay` — the **data plane** | `crates/manarouter-relay` | 20900 | Accept a request, look up a compiled route, select an account, translate/forward. Applies relay auth and reasoning policy, enforces per-key quota caps, and egresses through a configured proxy when one applies. The hedged race is still not wired: a combo's steps run sequentially. |
 | `manarouter-conductor` — the **control plane** | `crates/manarouter-conductor` | 20901 | Configuration, snapshot compilation, quota snapshot refresh APIs, OAuth, and the web panel. Request-usage ledger recording is not wired. |
 
 `mr serve` runs both binaries as supervised child processes for a foreground session; for an

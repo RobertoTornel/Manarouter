@@ -103,8 +103,8 @@ If you send an API request to the panel listener, its `/v1/*` response identifie
 
 ## Not yet implemented
 
-- **Client-key quotas and usage metering:** per-key rolling token/request caps are not enforced by the relay yet. The quota/usage view is not a reliable record of calls yet because the request path does not write usage rows. A configured limit must not be treated as an active safeguard.
-- **Client-key request-count and model/route restrictions:** the legacy `--limit-requests` field and model/route allow-list fields are not enforced on API requests yet. Do not use these fields as access controls.
+- **Client-key token caps are approximate:** the per-key rolling token cap *is* enforced, but the request that crosses the cap is still served, because the completion size is not knowable before the model has answered. The request after it is refused with HTTP 429. A token cap is therefore a soft ceiling, not a hard one.
+- **Client-key model/route restrictions:** the model and route allow-list fields are still not enforced on API requests. Do not use these fields as access controls. The request-count budget (`--limit-requests`) *is* enforced.
 - **Automatic modality fallback:** the relay detects an unsupported input modality and retries the whole request against the configured `routing.defaults` entry for that modality, with that model's own provider, account, credential and upstream URL. The budget is one fallback: if the default cannot carry the modality, or names no known model, the request fails with HTTP 501 (`modality_fallback_unavailable`). A default makes a request work only when it names a model that really accepts the modality; see [Images, audio, and video](07-images-audio-video.md).
 
 For more request and response details, consult the [API reference](../18-api-reference.md). For command syntax, see the [CLI reference](12-cli-reference.md).

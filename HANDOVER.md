@@ -1,6 +1,6 @@
 # Handover — project state and what still needs implementing
 
-State of the tree: `main` as of **2026-10-19**. This handover is committed *together with* the work it
+State of the tree: `main` as of **2026-10-20**. This handover is committed *together with* the work it
 describes, so the authoritative hash is `git log -1` rather than a number written here that the next
 commit would invalidate. Before the 2026-10-19 work, `main` was at `9439b93` (level with
 `origin/main`) and the tree carried a large body of uncommitted Feature Round 2 work; that work is now
@@ -16,22 +16,26 @@ would send the next person to work that is already done.
 
 ## 0. What the 2026-10-19 revision changed
 
-This revision is the Feature Round 2 close-out. What it contains, and what it deliberately does not:
+This revision is the Feature Round 2 close-out. What it contains, and what it deliberately does not.
+(The 2026-10-20 revision is described at the end of §0 and in §4.)
 
 | Area | State | Evidence / limitation |
 |---|---|---|
 | Store schema | **v3**, with the v2 and v3 migrations restored and tested | `crates/mr-core/src/store.rs`: `MIGRATION_V2` (`key_usage`, `provider_quota_state`), `MIGRATION_V3` (`usage_tokens`). A half-applied edit had bumped `SCHEMA_VERSION` to 4 without adding a migration, which broke the build; the constant is back at 3 and the compile-time assert holds. |
-| Per-key usage ledger | **Stored, not enforced** | `record_key_usage`, `key_window_usage`, `key_window_usage_many`, `prune_key_usage` exist and are tested (rolling-window maths, dense many-key map, prune, idempotent re-record). **The relay does not write to it and does not enforce any cap** — see §4. |
+| Per-key usage ledger | **Stored, and enforced since 2026-10-20** | `record_key_usage`, `key_window_usage`, `key_window_usage_many`, `prune_key_usage` exist and are tested (rolling-window maths, dense many-key map, prune, idempotent re-record). The relay half was added in the 2026-10-20 revision: `crates/manarouter-relay/src/quota.rs` admits a request against the caps before any upstream side effect and settles it afterwards — see §4. |
 | Automatic modality fallback | **Implemented, bounded to one hop** | A request whose modality the selected route cannot carry is retried against the configured `routing.defaults` entry, as a complete reroute against the same pinned snapshot — its own provider, account, credential, URL and dialect. A target that also lacks the modality, or names no known model, fails with HTTP 501. Five tests; see §4. |
 | Provider quota cache | **Wired to the panel** | `put_provider_quota_state` / `provider_quota_state` / `all_provider_quota_state` / `delete_provider_quota_state` back the conductor's `/api/quota` routes. |
 | CI | **Green on `main`, on both runners** | `.github/workflows/ci.yml` runs fmt, strict Clippy, the secret scan, build, workspace tests, release tests, the isolated installer test, the isolated mock-upstream smoke, and the panel Node tests. The standalone `tools/mock-upstream` job passes strict Clippy again (three lints fixed). Two portability bugs in the CI scripts were found and fixed — see below. The run on `aee4dd8` is **green on ubuntu-latest, macos-latest, the tools job and the docs job**. |
 | Test files | **Tracked again** | The earlier session's staged deletions of `tests/smoke_e2e.py`, `tests/local_latency_bench.py`, `panel/test/browser.e2e.mjs` and `scripts/test-installer-systemd.sh` were reverted: CI now *runs* them, so removing them from the repository would have removed the checks rather than protected them. `.gitignore` no longer ignores `/tests/`, `/panel/test/` or `/scripts/test-*.sh`. |
 | Documentation | **Reconciled with the code** | `plan.md`, `docs/23-implementation-status.md`, `docs/user/08-proxies.md` and this file now say the same thing about what is and is not implemented. A broken relative link in `docs/user/08-proxies.md` was fixed. |
 
-**Still not implemented, and still described as such:** proxy egress (D4, the transport is direct-only)
-and per-key quota *enforcement* (D2, the ledger exists but nothing writes to it yet). Automatic
-modality fallback (D3) is now implemented — a bounded, complete reroute, described in §4. The hedged
-race runner, `responses.rs` test coverage, and the `tools/bench/` fixture directory are alsostill open — see §4.
+**Now implemented, in the 2026-10-20 revision** (each is described in §4): proxy egress (D4, on the
+request path, failing closed), per-key quota *enforcement* (D2, admitted before and settled after),
+the `responses.rs` reachability tests, the `tools/bench` latency harness and the provider-dialects
+document. Automatic modality fallback (D3) was already implemented — a bounded, complete reroute.
+
+**Still not implemented, and still described as such:** the **hedged race runner** — the largest
+remaining gap — and the mid-stream splice and the four `WinnerFailMode`s that belong to it. See §4.
 
 ---
 
@@ -41,7 +45,7 @@ Yes, within these limits:
 
 | Gate | Result |
 |---|---|
-| `cargo test --workspace --all-targets` | **1 146 passed, 0 failed**, 1 ignored (the opt-in live test) — re-run in this revision |
+| `cargo test --workspace --all-targets` | **1 168 passed, 0 failed**, 1 ignored (the opt-in live test) — re-run in the 2026-10-20 revision (34 + 247 + 3 + 96 + 642 + 147) |
 | `cargo test --workspace --release` | **passed** (release profile: LTO, `panic = "abort"`, `strip`) — re-run in this revision |
 | `cargo test -p mr-core --lib store` | **50 passed / 0 failed** (7 new: v1→v3 upgrade, rolling window, dense many-key map, prune, idempotent re-record, quota cache CRUD, token breakdown) |
 | `cargo test -p mr-core --test imported_grants_are_independent -- --ignored` | passes; 10/10 imported grants usable with the reference stopped — **not re-run in this revision** (it needs the live reference account) |
@@ -49,6 +53,8 @@ Yes, within these limits:
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | `cargo fmt --all -- --check` | clean |
 | `cargo clippy --all-targets -- -D warnings` in `tools/mock-upstream` | clean (three lints fixed: an unnecessary cast, a field assigned after `default()`, and a `loop` that should be `while let`) |
+| `cargo clippy --all-targets -- -D warnings` in `tools/bench` | clean |
+| `cargo test` in `tools/bench` | **17 passed / 0 failed** |
 | `cargo test` in `tools/mock-upstream` | **22 passed / 0 failed** |
 | `bash scripts/check-secrets.sh` | `check-secrets: OK` (189 files, re-run in this revision) |
 | `python3 tests/smoke_e2e.py` | **PASS** — isolated conductor + relay + mock-upstream, synthetic credential, disposable config and state |
@@ -262,30 +268,39 @@ tests), leaving `main.rs` at 147 lines. Committed and pushed as `65f543d`.
 
 Ordered by what blocks the most.
 
-### P1 — Per-key quota enforcement (D2): the ledger exists, nothing writes to it
+### Closed — Per-key quota enforcement (D2): admitted before, settled after
 
-The store side is done and tested: `key_usage` is an immutable ledger, `record_key_usage` appends to
-it, `key_window_usage` / `key_window_usage_many` compute genuinely **rolling** windows from the
-history, and `prune_key_usage` bounds its growth. The `KeyPlan` in the compiled snapshot carries
-`limit_requests` and the per-window `KeyLimits`.
+**Done in the 2026-10-20 revision.** `crates/manarouter-relay/src/quota.rs` adds the relay half
+that was missing, and the store side it settles into was already there.
 
-What is missing is the relay half, and it is the half that matters:
+The contract is an **admission/settlement** one, because the configured caps are token caps and a
+token cap needs a reservation: the number of tokens is not known until the upstream has answered.
 
-- `crates/manarouter-relay/src/state.rs`'s `KeyEntry` holds only `id`, `label`, `hash` and the two
-  allow-lists — **the snapshot's limits never reach the request path**, so the relay cannot know what
-  a key is allowed to spend.
-- Nothing in the relay calls `record_key_usage`; the `UsageTap` measures a response but does not
-  persist it.
-- Enforcement therefore needs, in this order: carry the limits into `KeyEntry`; **admit** atomically
-  before any upstream side effect (a `BEGIN IMMEDIATE` transaction that counts the window and
-  reserves the request); **settle** the actual token spend when the response ends, releasing the
-  reservation on failure or on an abandoned stream; and answer `429` on denial.
+- **Admission happens before any upstream side effect.** `QuotaManager::admit` reads the key's
+  `key_usage` ledger for the relevant windows, compares the caps, and takes a reservation, all
+  under one lock — so two concurrent requests cannot both slip past a budget of one. A refusal is
+  HTTP 429 and writes nothing.
+- **A reservation counts the request and an estimate of the prompt tokens** (`body length / 4`).
+  Completion tokens are *not* reserved, because their size is not knowable in advance: a token cap
+  can therefore be overshot by the request that crosses it, and the **next** request is refused.
+  That overshoot is a documented consequence, not a bug, and the tests assert it.
+- **Settlement writes one `key_usage` row per admitted request**, with the tokens the upstream
+  reported, and only then releases the reservation. A request that never completes releases its
+  reservation when the ticket is dropped.
+- **Only keys that carry a cap are metered.** An uncapped key pays no ledger I/O and no parsing
+  cost; `QuotaManager::is_metered` decides.
+- The **live schema is unchanged**: `user_version` stays 3. No migration was needed and none was
+  added. The `KeyEntry` in the relay now carries the limits, behind an `Arc` so that the copy made
+  on every authenticated request is an atomic increment rather than a 72-byte memcpy.
 
-A request counter alone is not enough: the configured caps are token caps, and a token cap needs a
-reservation, because the number of tokens is only known after the upstream has answered. The
-`key_usage` ledger is the right place to settle into, but the *admission* decision needs its own
-ledger (in-flight reservations) — a second table, or a `reserved` column — so that two concurrent
-requests cannot both pass a check that only one of them may pass.
+Ten unit tests in `quota.rs` and two end-to-end tests in `server.rs` cover the caps, the flat
+request budget, the refusal path, the ledger write and the fact that the refusal happens *before*
+the upstream is contacted.
+
+What is still open is the *other* half of quota: the relay writes request usage, but it does not
+yet write the **provider** usage rows that the panel's quota views read, and the per-key spend is
+not yet visible in the panel.
+
 
 ### Closed — Automatic modality fallback (D3): a bounded re-dispatch
 
@@ -316,27 +331,53 @@ the model.
 ### P1 — Proxy egress (D4): configured, selected, and never used
 
 `crates/manarouter-relay/src/proxy.rs` implements HTTP CONNECT, SOCKS4, SOCKS5 and SOCKS5h
-handshakes, `Config::proxies` carries the pool, and `snapshot::ProxyPlan` plus `ProxyPlan`/`AccountPlan`
-carry the per-provider and per-account assignments. The selector (`proxy::choose`) picks one.
+### Closed — Proxy egress (D4): on the request path, failing closed
 
-**None of it is on the request path.** `UpstreamRequest.proxy` is set to `None`
-(`crates/manarouter-relay/src/server.rs`), and the relay's hyper client is built on a direct
-`HttpsConnector<HttpConnector>`. So today a configured proxy changes nothing about where traffic
-goes, and `docs/user/08-proxies.md` must keep saying that until it does.
+**Done in the 2026-10-20 revision.** `crates/manarouter-relay/src/egress.rs` is the connector hyper
+dials through a proxy with. It opens the tunnel (HTTP `CONNECT`, SOCKS4, SOCKS5, SOCKS5h) and
+encrypts to the **origin** when the origin is `https://` — separately from the hop to an `https://`
+proxy, which is a different handshake with a different peer and a different certificate check.
 
-Wiring it is a transport change, not a call-site change: TLS to the proxy and TLS to the origin are
-different handshakes, so the connector has to become per-endpoint, with a pool that cannot mix a
-direct connection with a proxied one. The safe rule is **fail closed**: if a proxy is selected and
-the tunnel fails, the request fails — it must never silently fall back to a direct connection, which
-would defeat the operator's egress policy.
+The rule that made this a transport change rather than a call-site change is honoured: **each proxy
+has its own client and therefore its own pool**, so a request that was supposed to leave through a
+proxy can never be served on a connection that was opened directly. The direct and proxied pools
+never mix.
+
+- The request path resolves the proxy per attempt: **account override, then provider override, then
+  the configured strategy over the enabled pool, then direct.** The password is read from the vault
+  when the tunnel is opened, so rotating it takes effect on the next request.
+- **Fail closed.** A tunnel that fails ends the request with HTTP 502 `proxy_error`. There is no
+  direct fallback and no reroute to another provider, because the next provider might egress
+  directly and that would defeat the egress policy the proxy was configured for. A proxy failure is
+  an *egress* failure: it is not classified as a provider failure, so the provider is not put into a
+  cooldown for it.
+- A named proxy that is **disabled** goes out directly, which is what `Config::effective_proxy`
+  documents. A proxy id that does not exist is a configuration error: `Config::validate` rejects it
+  and the relay refuses to start, rather than silently ignoring a typo.
+- The compiled snapshot now keeps the **authored** proxy id rather than resolving it away, so "no
+  override" and "an override naming a disabled proxy" stay distinguishable.
+- The proxy selection counters are keyed by **proxy id** rather than by position, so a configuration
+  change cannot make a counter refer to a different proxy.
+
+Four end-to-end tests in `crates/manarouter-relay/src/server.rs` drive a real `CONNECT` proxy on
+loopback: traffic goes through it, a refused tunnel fails **without the upstream seeing anything**,
+the strategy picks from the pool when nothing overrides it, and a disabled proxy is not dialed.
+
+Two things are still not done, and are worth knowing before relying on this for a policy:
+
+- The **lease is released when the attempt returns**, so a response that is still streaming is not
+  counted as in flight for the `least-used` strategy.
+- `reused_connection` is always `false` for a proxied request: the reuse flag is reported by the
+  connector that opened the connection, and a tunnel is opened by this crate's own connector, which
+  cannot say whether the pool handed it an old connection. A `false` there means "not known".
 
 ### P1 — The hedged race has no runner
 
-**Still open, and this is now the largest gap.** `select::hedge_decide` exists and is tested
-(`crates/manarouter-relay/src/select.rs:456`, tests from `:1035`), and `docs/07-hedged-race.md`
-describes the behaviour in detail — but **it is called 0 times from `server.rs`**, which dispatches
-sequentially (`for step in &steps`, `crates/manarouter-relay/src/server.rs:369`). The entire feature —
-the eligibility window, the four `WinnerFailMode`s, `winner_metric` — is documented and unreachable.
+**Still open, and it is still the largest gap.** `select::hedge_decide` exists and is tested
+(`crates/manarouter-relay/src/select.rs`), and `docs/07-hedged-race.md` describes the behaviour in
+detail — but **it is called 0 times from `server.rs`**, which dispatches sequentially (`for step in
+&steps`, `crates/manarouter-relay/src/server.rs`). The entire feature — the eligibility window, the
+four `WinnerFailMode`s, `winner_metric` — is documented and unreachable.
 
 This is the same failure class as the dialect-wiring bug fixed earlier. The design is settled
 (decision Q2), so this is implementation, not design:
@@ -353,26 +394,35 @@ Verify by *running* it: two mock participants with the second artificially faste
 
 **Interaction with the latency constraint.** The standing requirement is that the relay is optimised
 obsessively for latency and combo logic lives outside it. Concurrent dispatch adds a join and
-cancellation machinery to the request path, so measure the added overhead before and after
-(`tests/local_latency_bench.py`) rather than assuming it is free.
+cancellation machinery to the request path, so measure the added overhead before and after rather
+than assuming it is free. The measurement tool now exists: `tools/bench` (see §6) measures the
+relay's total added overhead, and the hedge's own overhead is not yet measured separately.
 
-### P1 — `crates/mr-dialects/src/responses.rs`: 1221 lines, 1 test
 
-The one test is the important one — `[DONE]` suppression for Responses clients vs Chat clients
-(`:1205`) — and it was written deliberately. But one test over 1221 lines is thin for the dialect that
-sits under the Codex path, which is the provider this session just made live. `google.rs` has 29
-tests, `commandcode.rs` 28, `openai.rs` 25 by comparison. The `(OpenAi, Responses)` arms in
-particular deserve reachability tests: `route_kind_for("/v1/responses")` is wired
-(`server.rs:884`) and asserted (`:1621`), but translation arms reachable only in combination are
-exactly where the two prior "arm present, never taken" bugs lived.
+### Closed — `crates/mr-dialects/src/responses.rs`: reachability tests
 
-### P2 — `tools/bench/` is empty
+**Done in the 2026-10-20 revision.** Five reachability tests were added for the arms that are only
+reachable in combination, which is exactly where the two prior "arm present, never taken" bugs
+lived: a Chat request becomes a Responses request, a Responses response becomes a Chat completion, a
+buffered Responses stream becomes a Chat completion, a **truncated** Responses stream still becomes
+a Chat completion, and a Responses delta becomes a Chat completion chunk. The crate now runs 147
+tests.
 
-The directory exists and contains no files. The latency budget (p50 < 150 µs, p99 < 500 µs added
-overhead) has **no harness behind it**. `tests/local_latency_bench.py` is a different, deliberately
-threshold-free tool. If the budget is meant to be enforced, something has to measure *added* overhead
-on the request path — the one measured number in the project is the relay's `/healthz` at ~0.5 ms,
-which is not that number.
+### Closed — `tools/bench/`: the latency harness exists
+
+**Done in the 2026-10-20 revision.** `tools/bench` is a detached crate (like `tools/mock-upstream`,
+so it cannot break the root workspace check) that measures the relay's **own added overhead**: it
+starts a fake upstream on loopback, sends the same request twice — once straight to the upstream,
+once through the relay's router in-process — and reports the difference. On an idle machine,
+release build, 300 samples, the relay adds **14.6 µs at p50, 41.8 µs at p90, 110.5 µs at p99**,
+inside the budget (150 µs / 500 µs) on every percentile.
+
+The tool is deliberately **report-or-threshold and not a CI gate**: a microsecond measurement on a
+shared runner is dominated by the runner's own load — one run taken while the machine was compiling
+reported a p99 of 1040 µs, and another run minutes later reported 96 µs. The CI tools matrix builds
+and tests the crate (so it cannot rot) but does not assert the threshold.
+
+The six **per-stage** rows of the budget table are still unmeasured; only the total row is.
 
 ### P2 — OmniRoute fidelity is second-hand
 
@@ -386,27 +436,34 @@ repository and re-derive them.
 
 ### P3 — Documentation
 
-- **There is still no provider-dialects document.** `docs/08-*` is quota tracking. `mr-dialects` is on
-  the request path, and a doc covering each dialect, the pivot shape, and what
-  `path_override`/`force_stream` mean is worth writing. This session added none.
-- **`docs/LLM_INDEX.md` does not list every doc.** `23-implementation-status.md` and
-  `local-latency-benchmark.md` are both missing from it (28 docs exist; check after any addition):
+- **The provider-dialects document now exists.** `docs/24-provider-dialects.md` covers each of the
+  seven dialects, the pivot shape, and what `path_override` / `force_stream` mean.
+  `docs/LLM_INDEX.md` lists it, along with `docs/credits.md` and the `docs/providers/*` guides.
+- **The `docs/LLM_INDEX.md` check still needs running after any addition** (28 docs existed before
+  `24-` was added; check after any addition):
   ```bash
   for f in docs/*.md; do b=$(basename "$f"); grep -q "$b" docs/LLM_INDEX.md || echo "NOT LISTED: $b"; done
   ```
+  The **13 `docs/user/*.md` files are still unindexed** — they are a separate series, and the index
+  does not claim them.
 - `docs/17-migrating-from-omniroute.md` and `docs/23-implementation-status.md` were both corrected in
   `9ec3284` and now match the code (`docs/23` was corrected again in `65f543d`).
+- **Discrepancies the dialects document found and did not fix**, because each one is a behaviour
+  change rather than a documentation change, and each should be decided rather than quietly patched:
+  `route_overrides` is keyed by the raw request path in the code but by kebab-case `RouteKind` in the
+  docs; a `/v1` base URL together with an absolute `default_path` produces `/v1/v1/…` on the
+  passthrough path; the `count_tokens` estimate in `docs/providers/anthropic-compatible.md` does not
+  exist in the code; the `gemini` template uses query-parameter authentication the relay never
+  sends; and `COMMAND_CODE_VERSION` (1.82.1) overrides the catalogue value (1.79.2).
 
 ### P3 — Release and design debt
 
-- **No git tag.** `v0.1.0` was planned and still does not exist (`git tag -l` is empty).
+- **The git tag now exists.** `v0.1.0` was planned; it is created in the 2026-10-20 revision.
 - **`refresh.rs`'s `FailureClass` string marker is gone.** It is a real enum now
   (`crates/mr-core/src/oauth/refresh.rs:51`), so this earlier item is closed. The `oauth[permanent] …`
   text is now only the `Display` form at the head of an `InvalidState` message (`:123`).
 - **Cross-instance sync** (`docs/22-sync-design.md`) is inert groundwork by decision Q15.
-- **Nothing is unpushed.** `65f543d` is level with `origin/main`
-  (`https://github.com/RobertoTornel/Manarouter.git`); the only uncommitted work is the working-tree
-  doc/lint edits described at the top of this file.
+- **OmniRoute fidelity is second-hand** for the 52 API-key providers — see the P2 above.
 
 ---
 
@@ -491,15 +548,15 @@ tree; this is the disposition, so nobody redoes finished work:
 |---|---|---|
 | P0 Panel never seen in a browser | **Closed** | `panel/test/browser.e2e.mjs` exists and **passes on Firefox and Chromium** (run in this session). The blank-page defect is also fixed: `boot()` wraps everything in try/catch and calls `showBootError` (`panel/app.js:354`). |
 | P1 Hedged race has no runner | **Open** | §4. `hedge_decide` called 0 times from `server.rs`; relay still loops sequentially. |
-| P1 `responses.rs` 0 tests | **Mostly open** | 1 test now, the `[DONE]`-suppression one specifically asked for (`responses.rs:1205`). 1221 lines, still thin. |
+| P1 `responses.rs` 0 tests | **Closed** | Five reachability tests added in the 2026-10-20 revision; the crate runs 147 tests. |
 | P1 Antigravity OAuth incomplete | **Closed** | `antigravity.rs` is 742 lines with `authorization_url` (`:266`), `exchange_code` (`:300`), `refresh` (`:339`), `refresh_with_context` (`:344`), `complete_login` (`:374`) and Google identity parsing (`:114`). The relay injects the project (`server.rs:222`, called at `:511`). |
-| P2 `tools/bench/` empty | **Still open** | Directory exists, 0 files. |
+| P2 `tools/bench/` empty | **Closed** | The harness exists and measures the relay's added overhead: 14.6 µs p50, 110.5 µs p99 on an idle machine. |
 | P2 `tools/mock-upstream` half-wired | **Closed** | `mod faults;` declared (`lib.rs:29`), `POST /__control` (`:229`), `x-mock-fault` handled (`:205`). |
 | P2 OmniRoute fidelity second-hand | **Partly closed** | OAuth platforms now derived from the live database (§4). 52 API-key providers unchanged. |
-| P3 No provider-dialects doc | **Still open** | No such doc in `docs/`. |
+| P3 No provider-dialects doc | **Closed** | `docs/24-provider-dialects.md` exists and is indexed. |
 | P3 `refresh.rs` string marker | **Closed** | Real `FailureClass` enum (`refresh.rs:51`). |
-| P3 No git tag | **Still open** | `git tag -l` empty. |
-| P3 docs index incomplete | **Still open** | 2 docs missing from `LLM_INDEX.md`. |
+| P3 No git tag | **Closed** | `v0.1.0` created in the 2026-10-20 revision. |
+| P3 docs index incomplete | **Closed** | `docs/LLM_INDEX.md` now lists the dialects document, `credits.md` and the `docs/providers/*` guides. The 13 `docs/user/*.md` files are a separate series and are still not indexed. |
 
 The old document's advice still holds verbatim and is worth repeating: **green tests are not the same
 as a reachable feature**, and two prior bugs were exactly "arm present, never taken".
