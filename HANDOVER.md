@@ -523,6 +523,13 @@ fixed:
 | `curl http://127.0.0.1:20901/api/health` | `{"version":"0.1.0","uptime_secs":7,"snapshot":{"digest":"8e088c7662c05ee9",...},"counts":{"providers":3,"combos":0,"aliases":0,"keys":4,"accounts":11},"password_set":false}` — the control plane is serving the real snapshot again. |
 | `curl http://127.0.0.1:20900/v1/models` | HTTP 401 without a client key, which is the correct answer. |
 
+A second build-and-restart followed the D3 commit (`046ce02`), so the deployed relay carries the
+modality fallback too: `cargo build --release --workspace` (1 m 30 s), both units restarted, both
+**active (running)**, `/healthz` → `{"status":"ok"}`, the panel → HTTP 200, and
+`/api/health` → `{"version":"0.1.0","uptime_secs":3,"snapshot":{"digest":"8e088c7662c05ee9",...},"counts":{"providers":3,"combos":0,"aliases":0,"keys":4,"accounts":11},"password_set":false}`.
+The relay's startup log shows the expected lines (`routing table loaded keys=4 combos=0
+providers=3`, `relay listening addr=127.0.0.1:20900`) and no errors.
+
 **The control plane had been down.** Before the restart, `manarouter-conductor.service` was in
 `activating (auto-restart)` with a restart counter above 12 000, failing every three seconds with:
 
