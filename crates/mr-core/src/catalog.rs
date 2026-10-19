@@ -60,9 +60,12 @@
 //!   is a hard upstream 400, so the requirement belongs in the data even when the value is not
 //!   static.
 //! * `base_url` is the prefix the dialect appends its paths to; a per-route deviation is expressed
-//!   in `route_overrides` keyed by the kebab-case [`RouteKind`] (`chat-completions`, `responses`,
-//!   `messages`, …). `api_key_url` and `docs_url` are omitted wherever the research dumps did not
-//!   record one, because inventing a URL is worse than leaving the panel to say "consult the
+//!   in `route_overrides`, keyed by the **client's** route spelled as the kebab-case
+//!   [`RouteKind`] — that is, [`RouteKind::as_config_key`]: `chat-completions`, `responses`,
+//!   `messages`, `count-tokens`, … The key names the route the client called, never the upstream
+//!   path. The value is the path appended to `base_url`: relative (no leading slash) or absolute
+//!   (a leading slash). `api_key_url` and `docs_url` are omitted wherever the research dumps did
+//!   not record one, because inventing a URL is worse than leaving the panel to say "consult the
 //!   provider".
 //! * `extra` holds provider-specific facts (OAuth constants, an alternate dialect host, a known
 //!   path quirk). It is the escape hatch, so an unknown key is *not* diagnosed as an error — see
@@ -124,8 +127,10 @@ pub struct ProviderTemplate {
     /// upstream 400, which is why they live in the data rather than in a comment.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
-    /// Path segments that override the dialect default, keyed by kebab-case
-    /// [`RouteKind`] id.
+    /// Path segments that override the dialect default, keyed by the **client's** route spelled
+    /// as [`RouteKind::as_config_key`] (`chat-completions`, `responses`, `messages`, …). The key
+    /// is the route the client called, not the upstream path; the value is the path appended to
+    /// `base_url`.
     #[serde(default)]
     pub route_overrides: BTreeMap<String, String>,
     /// Quota windows the provider is known to enforce. Only windows the research actually records
@@ -1098,5 +1103,218 @@ mod tests {
                 .map(|m| m.as_str())
                 .collect::<Vec<_>>())
         );
+    }
+
+    #[test]
+    fn gemini_authenticates_with_a_header_because_the_relay_never_puts_a_key_in_a_url() {
+        // The relay deliberately never applies query-param auth: a credential in a URL leaks into
+        // logs, proxies and browser history. Google accepts the same key as `x-goog-api-key`, so
+        // that is the form the template must ship.
+        let gemini = catalog().get("gemini").expect("gemini is shipped");
+        assert_eq!(
+            gemini.auth,
+            AuthKind::ApiKeyHeader {
+                header: "x-goog-api-key".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn command_code_records_the_version_header_the_relay_actually_sends() {
+        // The relay force-inserts `x-command-code-version` from the constant in
+        // `crates/mr-dialects/src/commandcode.rs`, overwriting whatever the provider configures.
+        // The catalogue entry documents what is sent, so it must not claim a stale version.
+        let command_code = catalog()
+            .get("command-code")
+            .expect("command-code is shipped");
+        assert_eq!(
+            command_code
+                .headers
+                .get("x-command-code-version")
+                .map(String::as_str),
+            Some("1.82.1")
+        );
+    }
+
+    #[test]
+    fn cloudflare_ai_keeps_the_account_placeholder_in_the_base_url_only() {
+        // The relay substitutes nothing, so the account id may only appear as an explicit
+        // placeholder in the base URL — never smuggled into a route override, where it would reach
+        // the upstream as the literal text "{account_id}".
+        let cloudflare = catalog()
+            .get("cloudflare-ai")
+            .expect("cloudflare-ai is shipped");
+        assert!(
+            cloudflare.base_url.contains("{account_id}"),
+            "the account id must be an explicit placeholder in the base URL: {}",
+            cloudflare.base_url
+        );
+        let key = RouteKind::ChatCompletions.as_config_key();
+        let value = cloudflare
+            .route_overrides
+            .get(key)
+            .expect("cloudflare-ai overrides the chat-completions route");
+        assert!(
+            !value.contains('{'),
+            "the route override must be a plain relative path, got {value:?}"
+        );
+        assert_eq!(value, "ai/v1/chat/completions");
+    }
+
+    #[test]
+    fn perplexity_states_its_versionless_chat_path_explicitly() {
+        // Perplexity's base URL is already the endpoint root, so the OpenAI dialect's versioned
+        // default would call a path that does not exist upstream. The override states the real
+        // path, keyed by the client's route.
+        let perplexity = catalog().get("perplexity").expect("perplexity is shipped");
+        assert_eq!(
+            perplexity
+                .route_overrides
+                .get(RouteKind::ChatCompletions.as_config_key())
+                .map(String::as_str),
+            Some("chat/completions")
+        );
+    }
+
+    #[test]
+    fn deepseek_states_its_versionless_paths_explicitly() {
+        // DeepSeek's base URL is already the origin root, so the OpenAI dialect's versioned
+        // default would call paths that do not exist upstream. The overrides state the real
+        // paths, keyed by the client's route.
+        let deepseek = catalog().get("deepseek").expect("deepseek is shipped");
+        assert_eq!(
+            deepseek
+                .route_overrides
+                .get(RouteKind::ChatCompletions.as_config_key())
+                .map(String::as_str),
+            Some("chat/completions")
+        );
+        assert_eq!(
+            deepseek
+                .route_overrides
+                .get(RouteKind::Responses.as_config_key())
+                .map(String::as_str),
+            Some("responses")
+        );
+    }
+
+    #[test]
+    fn every_route_override_key_is_a_canonical_route_key() {
+        // `route_overrides` is keyed by the client's route, spelled as the kebab-case
+        // `RouteKind`. A key that is not one of those spellings can never match a request.
+        let canonical: Vec<&str> = RouteKind::ALL
+            .iter()
+            .map(|route| route.as_config_key())
+            .collect();
+        for provider in catalog().all() {
+            for key in provider.route_overrides.keys() {
+                assert!(
+                    canonical.contains(&key.as_str()),
+                    "{}: {:?} is not a canonical route key",
+                    provider.id,
+                    key
+                );
+            }
+        }
+    }
+
+    /// The catalogue document must not drift from the data it mirrors.
+    ///
+    /// `docs/providers/catalog.md` says it mirrors `catalog/providers.toml`. There is no generator
+    /// script, so this test is what makes that claim true: every provider in the data must appear
+    /// in the document with the same label, dialect, base URL, auth kind and capabilities, and the
+    /// document must not describe a provider the data does not have.
+    #[test]
+    fn the_catalogue_document_mirrors_the_catalogue_data() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/providers/catalog.md");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("docs/providers/catalog.md must be readable: {e}"));
+
+        // The document's tables have six columns: id, label, dialect, base URL, auth, capabilities.
+        let mut rows: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.starts_with("| `") {
+                continue;
+            }
+            let cells: Vec<String> = line
+                .trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_owned())
+                .collect();
+            if cells.len() != 6 {
+                continue;
+            }
+            // The id cell may carry an uncertainty marker after the backticked id.
+            let id = cells[0]
+                .replace('`', " ")
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            if id.is_empty() {
+                continue;
+            }
+            rows.insert(id, cells);
+        }
+
+        for provider in catalog().all() {
+            let row = rows.get(&provider.id).unwrap_or_else(|| {
+                panic!(
+                    "{} has no row in docs/providers/catalog.md — the document must list every \
+                     provider the data has",
+                    provider.id
+                )
+            });
+            assert_eq!(row[1], provider.label, "{}: label", provider.id);
+            assert_eq!(
+                row[2],
+                format!("`{}`", serde_name(&provider.dialect)),
+                "{}: dialect",
+                provider.id
+            );
+            assert_eq!(
+                row[3],
+                format!("`{}`", provider.base_url),
+                "{}: base URL",
+                provider.id
+            );
+            assert_eq!(row[4], auth_cell(&provider.auth), "{}: auth", provider.id);
+            let capabilities: Vec<String> = provider.capabilities.iter().map(serde_name).collect();
+            assert_eq!(
+                row[5],
+                capabilities.join(", "),
+                "{}: capabilities",
+                provider.id
+            );
+        }
+
+        // The document must not describe a provider the data does not have.
+        for id in rows.keys() {
+            assert!(
+                catalog().get(id).is_some(),
+                "docs/providers/catalog.md lists {id}, which catalog/providers.toml does not have"
+            );
+        }
+    }
+
+    /// The serde spelling of a value — the wire form the document shows.
+    fn serde_name<T: serde::Serialize>(value: &T) -> String {
+        serde_json::to_value(value)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default()
+    }
+
+    /// How the catalogue document spells an auth kind: the type, then the detail it names.
+    fn auth_cell(auth: &AuthKind) -> String {
+        match auth {
+            AuthKind::Bearer => "`bearer`".to_owned(),
+            AuthKind::ApiKeyHeader { header } => format!("`api-key-header` ({header})"),
+            AuthKind::Header { name, .. } => format!("`header` ({name})"),
+            AuthKind::QueryParam { param } => format!("`query-param` ({param})"),
+            AuthKind::OAuth { platform } => format!("`oauth` ({platform})"),
+        }
     }
 }

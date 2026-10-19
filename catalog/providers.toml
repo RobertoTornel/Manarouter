@@ -12,18 +12,25 @@
 # uncertain, the entry is still shipped and says so in `note`.
 # Conventions:
 #   * `dialect` is the kebab-case serde spelling: open-ai, anthropic, google, codex, copilot,
-#     antigravity, command-code.
+#     antigravity, command-code-go.
 #   * `auth` is AuthKind's internally-tagged serde shape, so it is always an inline table:
 #     { type = "bearer" }, { type = "api-key-header", header = "x-api-key" },
 #     { type = "query-param", param = "key" } or { type = "oauth", platform = "openai-codex" }.
 # produces; use the same spelling here and in config.json.
 #   * `base_url` is the prefix the dialect appends its route path to. Where a provider deviates
 #     from the dialect default, the deviation is named in `route_overrides`, keyed by the
-#     kebab-case RouteKind (chat-completions, responses, embeddings, messages, ...).
+#     kebab-case RouteKind (chat-completions, responses, embeddings, messages, ...) — that is, the
+#     route the client called, not the upstream path. The value is the path appended to `base_url`.
+#   * A `{...}` placeholder in a `base_url` is a literal the operator replaces before use; the
+#     relay substitutes nothing into it.
 #   * A header value written as `${name}` is a template the OAuth layer fills from the credential
 #     at request time; it is recorded because a missing header is a hard upstream 400.
 #   * Unrecognised keys on an entry are preserved verbatim in the entry's `extra` map: that is
-#     where OAuth constants, alternate hosts and path quirks live.
+#     where OAuth constants, alternate hosts and path quirks live. An unrecognised key is a
+#     RECORDED FACT, not a directive: the relay sends what the template's own fields say and
+#     nothing else, so a key the relay does not read (`glm_url_suffix`, `upstream_path`,
+#     `bridge_default_port`, `user_agent_template`) is documentation of a fact the research
+#     recorded, not something the relay acts on.
 #   * `api_key_url` and `docs_url` are omitted unless the research recorded one. Inventing a URL
 #     would be worse than leaving the panel to say "consult the provider".
 # Binding project decision: no provider that authenticates by browser cookie or by scraping a web
@@ -135,13 +142,13 @@ dialect = "command-code-go"
 base_url = "https://api.commandcode.ai"
 auth = { type = "bearer" }
 capabilities = ["chat", "models", "tool-calling", "reasoning"]
-note = "The alpha/generate envelope is always SSE, even for a non-streaming client request; the relay translates the CLI event stream back. x-command-code-version must track a CLI version the upstream still accepts (1.79.2 at the time of research)."
+note = "The alpha/generate envelope is always SSE, even for a non-streaming client request; the relay translates the CLI event stream back. The relay pins x-command-code-version to the COMMAND_CODE_VERSION constant in crates/mr-dialects/src/commandcode.rs (1.82.1) and overwrites whatever the provider configures, so the value recorded here documents what is actually sent."
 docs_url = "https://github.com/dev2k6/command-code-proxy-server"
 upstream_path = "/alpha/generate"
 bridge_default_port = 3050
 
 [providers.headers]
-"x-command-code-version" = "1.79.2"
+"x-command-code-version" = "1.82.1"
 "x-cli-environment" = "production"
 "accept" = "text/event-stream"
 
@@ -181,9 +188,9 @@ id = "gemini"
 label = "Google Gemini (AI Studio)"
 dialect = "google"
 base_url = "https://generativelanguage.googleapis.com/v1beta"
-auth = { type = "query-param", param = "key" }
+auth = { type = "api-key-header", header = "x-goog-api-key" }
 capabilities = ["chat", "embeddings", "models", "tool-calling", "reasoning", "vision"]
-note = "API-key access to the generativelanguage surface (models/{model}:generateContent). Vertex and service-account access is a different endpoint and is not shipped here. The key may also be sent as x-goog-api-key instead of ?key=."
+note = "API-key access to the generativelanguage surface (models/{model}:generateContent). Vertex and service-account access is a different endpoint and is not shipped here. The key is sent as the x-goog-api-key header; the relay never puts a credential in a URL, so the ?key= query form is not supported."
 
 [[providers]]
 id = "openrouter"
@@ -217,7 +224,11 @@ dialect = "open-ai"
 base_url = "https://api.deepseek.com"
 auth = { type = "bearer" }
 capabilities = ["chat", "responses", "models", "tool-calling", "reasoning"]
-note = "Chat lives at the origin root (/chat/completions), not under /v1. The same key also reaches /responses and an Anthropic-compatible /anthropic/v1/messages surface."
+note = "Chat lives at the origin root (/chat/completions), not under /v1. The same key also reaches /responses and an Anthropic-compatible /anthropic/v1/messages surface, which this entry does not use. These paths are versionless, so they are stated explicitly in route_overrides rather than inherited from the OpenAI dialect's versioned default."
+
+[providers.route_overrides]
+chat-completions = "chat/completions"
+responses = "responses"
 
 [[providers]]
 id = "xai"
@@ -259,6 +270,10 @@ dialect = "open-ai"
 base_url = "https://api.perplexity.ai"
 auth = { type = "bearer" }
 capabilities = ["chat", "models", "tool-calling", "reasoning"]
+note = "Perplexity's chat endpoint is versionless: its base URL is already the endpoint root, so the path is stated explicitly in route_overrides rather than inherited from the OpenAI dialect's versioned default."
+
+[providers.route_overrides]
+chat-completions = "chat/completions"
 
 [[providers]]
 id = "cohere"
@@ -379,13 +394,13 @@ note = "UNCERTAIN: the OmniRoute executor selects the chat or responses URL per 
 id = "cloudflare-ai"
 label = "Cloudflare Workers AI"
 dialect = "open-ai"
-base_url = "https://api.cloudflare.com/client/v4/accounts"
+base_url = "https://api.cloudflare.com/client/v4/accounts/{account_id}"
 auth = { type = "bearer" }
 capabilities = ["chat", "embeddings", "models"]
-note = "UNCERTAIN: the registry base stops at /client/v4/accounts; the account id is a path segment, recorded in route_overrides. The Workers AI binding also exposes embeddings and images."
+note = "UNCERTAIN: the registry base stops at /client/v4/accounts; the account id is a path segment. Replace {account_id} in base_url with your own account id — the relay substitutes nothing — and the Cloudflare Workers AI path is appended to that base URL. The Workers AI binding also exposes embeddings and images."
 
 [providers.route_overrides]
-chat-completions = "{account_id}/ai/v1/chat/completions"
+chat-completions = "ai/v1/chat/completions"
 
 [[providers]]
 id = "deepinfra"

@@ -1161,6 +1161,25 @@ async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step
         };
     };
 
+    // --- The token-counting route, when this step's upstream cannot count. ---
+    //
+    // `POST /v1/messages/count_tokens` asks a provider how many tokens a request would cost. Only
+    // an Anthropic upstream can answer that: the endpoint exists in Anthropic's API and nowhere
+    // else, so asking any other provider would mean asking for a *generation* instead — a billed
+    // answer, in the wrong shape, to a question that was not a question.
+    //
+    // So a step whose dialect is not Anthropic is not called at all. The relay answers locally with
+    // an estimate and marks it with a header, so a client can tell the difference between a number
+    // the provider counted and a number the relay guessed.
+    //
+    // The answer is produced before an account is chosen: there is no upstream to authenticate to,
+    // no credential to read, and no request to bill. It is an ordinary local answer — the same
+    // shape an upstream failure takes — so a step that fails further down still falls through to
+    // the next one in the ordinary way.
+    if route == RouteKind::CountTokens && step.dialect != Dialect::Anthropic {
+        return Attempt::Answer(crate::count_tokens::estimate_response(bytes));
+    }
+
     let account_counter = table.advance_rr(&unique_counter_key(step));
     let Some(account) = select::pick_account(
         provider,
@@ -1393,9 +1412,8 @@ async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step
         }
     }
 
-    // A path the translator named wins over the provider's route override. The translator knows
-    // which dialect it just wrote the body for; a route override is keyed by the *client's*
-    // route, and says nothing about an upstream that does not follow OpenAI's path convention.
+    // The Copilot base host comes from the OAuth token, and replaces the configured base URL
+    // entirely: the token names the host the request must go to.
     let copilot_host = oauth_tokens
         .as_ref()
         .and_then(|t| t.extra_str("copilot_api_host"));
@@ -1407,14 +1425,17 @@ async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step
             url_step.base_url = host.trim_end_matches('/').to_owned();
         }
     }
-    let copilot_override = if step.dialect == Dialect::Copilot {
-        dialect_path.as_ref()
+    // The override table is read for its own sake even when the translator produced a path, so
+    // that a provider still keyed by the raw request path is reported rather than silently
+    // ignored. Copilot is the exception: it has no upstream path of its own for an override to
+    // replace.
+    let operator_path = if step.dialect == Dialect::Copilot {
+        None
     } else {
-        dialect_path
-            .as_ref()
-            .or_else(|| provider.route_overrides.get(route_key(uri)))
+        route_override_for(provider, route, uri.path())
     };
-    let Some(url) = build_url(&url_step, copilot_override) else {
+    let url_path = upstream_path(step.dialect, route, dialect_path.as_deref(), operator_path);
+    let Some(url) = build_url(&url_step, url_path) else {
         return Attempt::Skip {
             sticky_cleared,
             fallback_target: fallback_target.take(),
@@ -1874,39 +1895,243 @@ fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {
     Some(secs.min(86_400).saturating_mul(1000))
 }
 
-/// The route key into a provider's `route_overrides`.
-fn route_key(uri: &Uri) -> &str {
-    uri.path()
+/// The provider's own path for the client's route, if it has one.
+///
+/// `route_overrides` is keyed by the route's *configuration* spelling — "chat-completions",
+/// "responses", "messages" — not by the raw request path, so the lookup is by
+/// [`RouteKind::as_config_key`]. A key that still looks like a raw request path can never match,
+/// and it is worth saying so by name rather than leaving the operator to wonder why the override
+/// never fires. That warning is a report, not a fallback: it is made even when the canonical key
+/// is present, because the stray key is a mistake either way.
+fn route_override_for<'a>(
+    provider: &'a mr_core::snapshot::ProviderPlan,
+    route: RouteKind,
+    request_path: &str,
+) -> Option<&'a String> {
+    if provider.route_overrides.is_empty() {
+        return None;
+    }
+    let canonical = route.as_config_key();
+    let found = provider.route_overrides.get(canonical);
+    if let Some(legacy) = provider
+        .route_overrides
+        .keys()
+        .find(|key| key.starts_with('/'))
+    {
+        tracing::warn!(
+            provider = %provider.id,
+            route = canonical,
+            key = %legacy,
+            request_path,
+            "a route_overrides key is a raw request path; the override is keyed by the route's \
+             configuration spelling instead"
+        );
+    }
+    found
+}
+
+/// The path to put on the upstream URL, and where it came from.
+///
+/// The distinction matters for one thing only: whether a version segment may be added to a path
+/// that has none. A path the dialect produced may have one filled in; an operator's own path is
+/// used exactly as written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpstreamPath<'a> {
+    /// A path the dialect produced: the dialect's own default, or the translator's path.
+    Dialect(&'a str),
+    /// An operator's explicit `route_overrides` path.
+    Operator(&'a str),
+}
+
+/// The path for one attempt, and where it came from.
+///
+/// The precedence is: the provider's own `route_overrides` entry for the client's route, then a
+/// path the translator produced, then the dialect's default path for that route.
+///
+/// The override comes first because it is the operator's explicit statement of where *this*
+/// provider serves *this* route, and that is strictly more specific than a path derived from a
+/// dialect's naming convention. A translator path is a convention; an override is a fact about
+/// the provider, and the fact wins.
+///
+/// Copilot is the exception. Its base host comes from its OAuth token, and it has no upstream
+/// path of its own for an override to replace, so it keeps the translator's path — or, failing
+/// that, the Copilot default.
+///
+/// The count-tokens route is the other exception. A translator names the endpoint for a
+/// *generation* — `/v1/messages`, `/v1/chat/completions` — and a count asked on one of those is a
+/// billed generation rather than a count. So for that route the dialect's own path wins over a
+/// translator's, and the count can only ever reach a counting endpoint.
+fn upstream_path<'a>(
+    dialect: Dialect,
+    route: RouteKind,
+    dialect_path: Option<&'a str>,
+    operator_path: Option<&'a String>,
+) -> UpstreamPath<'a> {
+    if dialect == Dialect::Copilot {
+        return UpstreamPath::Dialect(dialect_path.unwrap_or_else(|| default_path(dialect, route)));
+    }
+    if let Some(path) = operator_path {
+        return UpstreamPath::Operator(path);
+    }
+    if route != RouteKind::CountTokens {
+        if let Some(path) = dialect_path {
+            return UpstreamPath::Dialect(path);
+        }
+    }
+    UpstreamPath::Dialect(default_path(dialect, route))
+}
+
+/// The version segment a dialect's canonical path starts with.
+///
+/// `None` for the dialects whose upstream paths carry no version segment: Codex's `/responses`,
+/// Copilot's `/chat/completions` and Command Code's `/alpha/generate`.
+fn dialect_version(dialect: Dialect) -> Option<&'static str> {
+    match dialect {
+        Dialect::OpenAi => Some("v1"),
+        Dialect::Anthropic => Some("v1"),
+        Dialect::Google => Some("v1beta"),
+        Dialect::Antigravity => Some("v1internal"),
+        Dialect::Codex => None,
+        Dialect::Copilot => None,
+        Dialect::CommandCodeGo => None,
+    }
+}
+
+/// Whether a path segment looks like a version segment: a "v" followed by a digit.
+///
+/// "v1", "v2", "v1beta" and "v4" qualify. The test is a prefix test, so
+/// "v1internal:generateContent" — where the version and the action share one segment — qualifies
+/// too, and that is what stops Antigravity's path from being given a second version.
+fn is_version_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    matches!(chars.next(), Some('v')) && chars.next().is_some_and(|c| c.is_ascii_digit())
+}
+
+/// Whether a path segment is a version and nothing else: `^v\d[a-z0-9]*$`.
+///
+/// "v1", "v4" and "v1beta" qualify. "v1internal:generateContent" does not, because the colon
+/// means the segment carries the action as well as the version — and that segment is the one
+/// Antigravity's path needs. A pure version segment is a version that can be replaced by
+/// another: the base URL's version takes its place, so that the URL carries exactly one.
+fn is_pure_version_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    matches!(chars.next(), Some('v'))
+        && chars.next().is_some_and(|c| c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// The version segment a base URL carries, if it has one.
+///
+/// The segment does not have to be the last one: DeepInfra's base is
+/// "https://api.deepinfra.com/v1/openai", and the version there is "v1", not "openai". The job of
+/// this lookup is to answer "does the base URL already carry a version?", because the rule it
+/// feeds is that the version appears exactly once in the final URL — so the last version-like
+/// segment anywhere in the base's path is the one that counts.
+///
+/// The host is not a path segment: for "https://api.openai.com/v1" the path is "v1", and for
+/// "https://api.deepseek.com" there is no path at all.
+fn base_version_segment(base: &str) -> Option<&str> {
+    // A query string is not part of the path.
+    let base = base.split('?').next().unwrap_or(base);
+    // The path begins after the authority, which begins after the scheme.
+    let after_scheme = base.split_once("://").map_or(base, |(_, rest)| rest);
+    let path = after_scheme
+        .find('/')
+        .map(|index| &after_scheme[index + 1..])?;
+    path.split('/').rfind(|segment| is_version_segment(segment))
 }
 
 /// Build the upstream URL.
 ///
-/// A provider's own override wins, because Command Code's `/alpha/generate` and Google's
-/// `v1internal:generateContent` cannot be derived from a base URL.
-fn build_url(step: &StepPlan, override_path: Option<&String>) -> Option<String> {
+/// The version segment appears exactly once. The base URL may carry one
+/// ("https://api.openai.com/v1") and the path may carry one ("/v1/chat/completions"), and joining
+/// them gives "…/v1/v1/chat/completions"; or the base may carry none
+/// ("https://api.deepseek.com") and the path may carry none ("chat/completions"), which drops the
+/// version altogether. So a duplicated version is dropped, and a missing one is added — the second
+/// only for a path the dialect produced.
+///
+/// The base's version is the one that stands. A path the dialect produced carries the dialect's
+/// version ("v1" for OpenAI, "v1beta" for Google), and the base may carry a different one — the
+/// GLM coding surface's base ends in "v4" — so the path's version is replaced by the base's
+/// rather than sitting beside it. An operator's `route_overrides` path is theirs, spelled out:
+/// only a version that is exactly the base's is dropped from it, and nothing is ever added.
+fn build_url(step: &StepPlan, path: UpstreamPath<'_>) -> Option<String> {
     let base = step.base_url.trim_end_matches('/');
     if base.is_empty() {
         return None;
     }
-    let path = override_path
-        .map(String::as_str)
-        .unwrap_or_else(|| default_path(step.dialect));
-
-    // A declared override may be relative. Command Code's own constant is `alpha/generate`, with no
+    let (raw, is_operator) = match path {
+        UpstreamPath::Dialect(p) => (p, false),
+        UpstreamPath::Operator(p) => (p, true),
+    };
+    // A declared path may be relative. Command Code's own constant is `alpha/generate`, with no
     // leading slash, because it reads as a path fragment rather than a route; the base has just had
     // its trailing slash trimmed, so concatenating the two produced `…commandcode.aialpha/generate`.
     // The separator is supplied here so that no constant has to remember to include it.
-    if path.starts_with('/') {
-        return Some(format!("{base}{path}"));
+    let mut segments: Vec<&str> = raw
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let base_version = base_version_segment(base);
+
+    // A version the base already carries is not repeated.
+    if let Some(version) = base_version {
+        // A path the dialect produced gives up its own version, whatever it is called: the
+        // base's version is the one the URL carries. An operator's path gives up only a version
+        // that is exactly the base's — a version the operator wrote that differs is theirs, and
+        // is never replaced.
+        let droppable = if is_operator {
+            segments.first().is_some_and(|segment| *segment == version)
+        } else {
+            segments
+                .first()
+                .is_some_and(|segment| is_pure_version_segment(segment))
+        };
+        if droppable && segments.len() > 1 {
+            segments.remove(0);
+        }
     }
-    Some(format!("{base}/{path}"))
+    // A version the base does not carry is added, but only to a path the dialect produced.
+    if !is_operator && base_version.is_none() {
+        if let Some(version) = dialect_version(step.dialect) {
+            let already_versioned = segments.first().is_some_and(|s| is_version_segment(s));
+            if !already_versioned {
+                segments.insert(0, version);
+            }
+        }
+    }
+    if segments.is_empty() {
+        return Some(base.to_string());
+    }
+    Some(format!("{base}/{}", segments.join("/")))
 }
 
-/// The default upstream path for a dialect with no declared override.
-fn default_path(dialect: Dialect) -> &'static str {
+/// The default upstream path for a dialect and a route.
+///
+/// The route matters: an OpenAI-shaped provider serves six routes, and an embeddings request sent
+/// to its chat-completions path reaches the wrong endpoint. The dialect's convention says where
+/// each route lives; a provider that deviates from it says so in `route_overrides`.
+fn default_path(dialect: Dialect, route: RouteKind) -> &'static str {
     match dialect {
-        Dialect::OpenAi => "/v1/chat/completions",
-        Dialect::Anthropic => "/v1/messages",
+        Dialect::OpenAi => match route {
+            RouteKind::ChatCompletions => "/v1/chat/completions",
+            RouteKind::Responses => "/v1/responses",
+            RouteKind::Embeddings => "/v1/embeddings",
+            RouteKind::AudioTranscription => "/v1/audio/transcriptions",
+            RouteKind::AudioSpeech => "/v1/audio/speech",
+            RouteKind::ImagesGenerations => "/v1/images/generations",
+            RouteKind::Models => "/v1/models",
+            // An Anthropic client is translated, so the translator names the path. These are the
+            // fallback for a request that was not translated.
+            RouteKind::Messages | RouteKind::CountTokens => "/v1/chat/completions",
+        },
+        Dialect::Anthropic => match route {
+            RouteKind::CountTokens => "/v1/messages/count_tokens",
+            // Every other route falls back to the messages path: an OpenAI client is translated,
+            // so the translator names the path.
+            _ => "/v1/messages",
+        },
         Dialect::Google => "/v1beta/models:generateContent",
         Dialect::Antigravity => "/v1internal:generateContent",
         Dialect::Codex => "/responses",
@@ -2927,7 +3152,7 @@ mod tests {
             Dialect::Antigravity,
             Dialect::CommandCodeGo,
         ] {
-            let p = default_path(d);
+            let p = default_path(d, RouteKind::ChatCompletions);
             assert!(p.starts_with('/'), "{d:?} must have an absolute path");
             assert!(p.len() > 1, "{d:?} must not be the root");
         }
@@ -2972,7 +3197,11 @@ mod tests {
     fn a_trailing_slash_on_the_base_url_does_not_double() {
         let s = step(Dialect::OpenAi, "https://api.example.com/");
         assert_eq!(
-            build_url(&s, None).as_deref(),
+            build_url(
+                &s,
+                UpstreamPath::Dialect(default_path(Dialect::OpenAi, RouteKind::ChatCompletions))
+            )
+            .as_deref(),
             Some("https://api.example.com/v1/chat/completions")
         );
     }
@@ -2981,7 +3210,13 @@ mod tests {
     fn an_empty_base_url_builds_no_url() {
         // The step is skipped rather than sent to a nonsense URL.
         let s = step(Dialect::OpenAi, "");
-        assert_eq!(build_url(&s, None), None);
+        assert_eq!(
+            build_url(
+                &s,
+                UpstreamPath::Dialect(default_path(Dialect::OpenAi, RouteKind::ChatCompletions))
+            ),
+            None
+        );
     }
 
     #[test]
@@ -2993,7 +3228,7 @@ mod tests {
         let s = step(Dialect::CommandCodeGo, "https://api.commandcode.ai");
         let over = mr_dialects::commandcode::GENERATE_PATH.to_string();
         assert_eq!(
-            build_url(&s, Some(&over)).as_deref(),
+            build_url(&s, UpstreamPath::Operator(&over)).as_deref(),
             Some("https://api.commandcode.ai/alpha/generate")
         );
     }
@@ -3003,7 +3238,7 @@ mod tests {
         let s = step(Dialect::OpenAi, "https://example.com");
         let over = "v1/other".to_string();
         assert_eq!(
-            build_url(&s, Some(&over)).as_deref(),
+            build_url(&s, UpstreamPath::Operator(&over)).as_deref(),
             Some("https://example.com/v1/other")
         );
     }
@@ -3013,8 +3248,376 @@ mod tests {
         let s = step(Dialect::OpenAi, "https://example.com/");
         let over = "/v1/other".to_string();
         assert_eq!(
-            build_url(&s, Some(&over)).as_deref(),
+            build_url(&s, UpstreamPath::Operator(&over)).as_deref(),
             Some("https://example.com/v1/other")
+        );
+    }
+
+    /// Where a path in the URL table comes from.
+    #[derive(Clone, Copy, Debug)]
+    enum PathSource {
+        /// The dialect's own default path.
+        DialectDefault,
+        /// A path the translator produced for the upstream dialect.
+        Translator(&'static str),
+        /// An operator's explicit `route_overrides` path.
+        Operator(&'static str),
+    }
+
+    impl PathSource {
+        fn path(self, dialect: Dialect, route: RouteKind) -> UpstreamPath<'static> {
+            match self {
+                PathSource::DialectDefault => UpstreamPath::Dialect(default_path(dialect, route)),
+                PathSource::Translator(path) => UpstreamPath::Dialect(path),
+                PathSource::Operator(path) => UpstreamPath::Operator(path),
+            }
+        }
+    }
+
+    /// The version segment appears exactly once, whatever the base URL and the path carry.
+    ///
+    /// The base URLs are the ones the catalogue ships, and the paths are the ones the dialects and
+    /// the translators produce, so this is the table that says which upstream is called where.
+    #[test]
+    fn the_version_segment_appears_exactly_once() {
+        let cases: &[(Dialect, RouteKind, &str, PathSource, &str)] = &[
+            // A base that already ends in the version, and a path that starts with it.
+            (
+                Dialect::OpenAi,
+                RouteKind::ChatCompletions,
+                "https://api.openai.com/v1",
+                PathSource::DialectDefault,
+                "https://api.openai.com/v1/chat/completions",
+            ),
+            // A base with no version, and a path that carries it.
+            (
+                Dialect::OpenAi,
+                RouteKind::ChatCompletions,
+                "https://api.deepseek.com",
+                PathSource::DialectDefault,
+                "https://api.deepseek.com/v1/chat/completions",
+            ),
+            // A base that already ends in the version, and a path that does not.
+            (
+                Dialect::OpenAi,
+                RouteKind::ChatCompletions,
+                "https://api.openai.com/v1",
+                PathSource::Translator("chat/completions"),
+                "https://api.openai.com/v1/chat/completions",
+            ),
+            // A base with no version, and a path that does not: the version is added.
+            (
+                Dialect::OpenAi,
+                RouteKind::ChatCompletions,
+                "https://api.deepseek.com",
+                PathSource::Translator("chat/completions"),
+                "https://api.deepseek.com/v1/chat/completions",
+            ),
+            // A base whose version is not its last segment: the version is still found, so the
+            // path's own version is dropped rather than repeated.
+            (
+                Dialect::OpenAi,
+                RouteKind::ChatCompletions,
+                "https://api.deepinfra.com/v1/openai",
+                PathSource::DialectDefault,
+                "https://api.deepinfra.com/v1/openai/chat/completions",
+            ),
+            (
+                Dialect::OpenAi,
+                RouteKind::ChatCompletions,
+                "https://api.deepinfra.com/v1/openai",
+                PathSource::Translator("chat/completions"),
+                "https://api.deepinfra.com/v1/openai/chat/completions",
+            ),
+            // A base whose version is a different version from the path's: the base's version is
+            // the one the URL carries, and the path's gives way to it.
+            (
+                Dialect::OpenAi,
+                RouteKind::ChatCompletions,
+                "https://api.z.ai/api/coding/paas/v4",
+                PathSource::DialectDefault,
+                "https://api.z.ai/api/coding/paas/v4/chat/completions",
+            ),
+            (
+                Dialect::Anthropic,
+                RouteKind::Messages,
+                "https://api.anthropic.com/v1",
+                PathSource::DialectDefault,
+                "https://api.anthropic.com/v1/messages",
+            ),
+            (
+                Dialect::Anthropic,
+                RouteKind::Messages,
+                "https://api.anthropic.com",
+                PathSource::Translator("messages"),
+                "https://api.anthropic.com/v1/messages",
+            ),
+            (
+                Dialect::Google,
+                RouteKind::ChatCompletions,
+                "https://generativelanguage.googleapis.com/v1beta",
+                PathSource::Translator("models/gemini-2.5-pro:generateContent"),
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
+            ),
+            // Antigravity's version and its action share one segment, so the segment is left
+            // alone rather than being taken for a version to strip or to add.
+            (
+                Dialect::Antigravity,
+                RouteKind::ChatCompletions,
+                "https://cloudcode-pa.googleapis.com",
+                PathSource::Translator("v1internal:generateContent"),
+                "https://cloudcode-pa.googleapis.com/v1internal:generateContent",
+            ),
+            (
+                Dialect::Codex,
+                RouteKind::ChatCompletions,
+                "https://chatgpt.com/backend-api/codex",
+                PathSource::DialectDefault,
+                "https://chatgpt.com/backend-api/codex/responses",
+            ),
+            (
+                Dialect::Copilot,
+                RouteKind::ChatCompletions,
+                "https://api.githubcopilot.com",
+                PathSource::DialectDefault,
+                "https://api.githubcopilot.com/chat/completions",
+            ),
+            (
+                Dialect::CommandCodeGo,
+                RouteKind::ChatCompletions,
+                "https://api.commandcode.ai",
+                PathSource::Translator("alpha/generate"),
+                "https://api.commandcode.ai/alpha/generate",
+            ),
+            // An operator's path is theirs: it is used exactly as written, and no version is
+            // added to it or taken from it.
+            (
+                Dialect::OpenAi,
+                RouteKind::ChatCompletions,
+                "https://api.openai.com/v1",
+                PathSource::Operator("ai/v1/chat/completions"),
+                "https://api.openai.com/v1/ai/v1/chat/completions",
+            ),
+            // The Cloudflare entry: the base's "v4" is a version-like segment, and it must not
+            // take anything off the operator's path.
+            (
+                Dialect::OpenAi,
+                RouteKind::ChatCompletions,
+                "https://api.cloudflare.com/client/v4/accounts/{account_id}",
+                PathSource::Operator("ai/v1/chat/completions"),
+                "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions",
+            ),
+            // An operator's path that names the base's own version is de-duplicated, and one
+            // that names a different version is left as the operator wrote it.
+            (
+                Dialect::OpenAi,
+                RouteKind::Responses,
+                "https://api.openai.com/v1",
+                PathSource::Operator("v1/responses"),
+                "https://api.openai.com/v1/responses",
+            ),
+            (
+                Dialect::OpenAi,
+                RouteKind::Responses,
+                "https://api.openai.com/v1",
+                PathSource::Operator("v2/responses"),
+                "https://api.openai.com/v1/v2/responses",
+            ),
+        ];
+        for (dialect, route, base, source, expected) in cases {
+            let s = step(*dialect, base);
+            assert_eq!(
+                build_url(&s, source.path(*dialect, *route)).as_deref(),
+                Some(*expected),
+                "{base} with {dialect:?} and {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_google_path_without_a_version_gets_the_dialects_version() {
+        // Google's translator writes the model into the path, so the path has no version of its
+        // own; the base URL decides whether one is needed.
+        let s = step(Dialect::Google, "https://generativelanguage.googleapis.com");
+        assert_eq!(
+            build_url(
+                &s,
+                UpstreamPath::Dialect("models/gemini-2.5-pro:generateContent")
+            )
+            .as_deref(),
+            Some("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent")
+        );
+    }
+
+    #[test]
+    fn a_provider_override_wins_over_a_translator_path() {
+        // The override is the operator's explicit statement of where this provider serves this
+        // route; a path the translator derived from a dialect convention is less specific, so it
+        // does not shadow the override.
+        let over = "ai/v1/chat/completions".to_string();
+        let s = step(Dialect::OpenAi, "https://api.openai.com/v1");
+        let path = upstream_path(
+            Dialect::OpenAi,
+            RouteKind::ChatCompletions,
+            Some("chat/completions"),
+            Some(&over),
+        );
+        assert_eq!(path, UpstreamPath::Operator("ai/v1/chat/completions"));
+        assert_eq!(
+            build_url(&s, path).as_deref(),
+            Some("https://api.openai.com/v1/ai/v1/chat/completions")
+        );
+    }
+
+    #[test]
+    fn a_translator_path_wins_when_the_provider_has_no_override() {
+        let s = step(Dialect::OpenAi, "https://api.openai.com/v1");
+        let path = upstream_path(
+            Dialect::OpenAi,
+            RouteKind::ChatCompletions,
+            Some("chat/completions"),
+            None,
+        );
+        assert_eq!(path, UpstreamPath::Dialect("chat/completions"));
+        assert_eq!(
+            build_url(&s, path).as_deref(),
+            Some("https://api.openai.com/v1/chat/completions")
+        );
+    }
+
+    #[test]
+    fn the_dialect_default_applies_when_there_is_neither() {
+        let s = step(Dialect::OpenAi, "https://api.deepseek.com");
+        let path = upstream_path(Dialect::OpenAi, RouteKind::ChatCompletions, None, None);
+        assert_eq!(
+            path,
+            UpstreamPath::Dialect(default_path(Dialect::OpenAi, RouteKind::ChatCompletions))
+        );
+        assert_eq!(
+            build_url(&s, path).as_deref(),
+            Some("https://api.deepseek.com/v1/chat/completions")
+        );
+    }
+
+    #[test]
+    fn copilot_ignores_a_provider_override() {
+        // Copilot's base host comes from its OAuth token, and it has no upstream path of its own
+        // for an override to replace, so the Copilot default is used.
+        let over = "ai/v1/chat/completions".to_string();
+        let s = step(Dialect::Copilot, "https://api.githubcopilot.com");
+        let path = upstream_path(
+            Dialect::Copilot,
+            RouteKind::ChatCompletions,
+            None,
+            Some(&over),
+        );
+        assert_eq!(
+            path,
+            UpstreamPath::Dialect(default_path(Dialect::Copilot, RouteKind::ChatCompletions))
+        );
+        assert_eq!(
+            build_url(&s, path).as_deref(),
+            Some("https://api.githubcopilot.com/chat/completions")
+        );
+    }
+
+    /// The OpenAI convention puts each of its routes on its own path.
+    ///
+    /// A dialect default that ignored the route sent every request to the chat-completions path,
+    /// so an embeddings request reached the provider's chat endpoint.
+    #[test]
+    fn the_openai_dialects_default_path_is_the_one_for_the_route() {
+        let cases = [
+            (RouteKind::ChatCompletions, "/v1/chat/completions"),
+            (RouteKind::Responses, "/v1/responses"),
+            (RouteKind::Embeddings, "/v1/embeddings"),
+            (RouteKind::AudioTranscription, "/v1/audio/transcriptions"),
+            (RouteKind::AudioSpeech, "/v1/audio/speech"),
+            (RouteKind::ImagesGenerations, "/v1/images/generations"),
+            (RouteKind::Models, "/v1/models"),
+            // An Anthropic client is translated, so the translator names the path; the default
+            // is only the fallback.
+            (RouteKind::Messages, "/v1/chat/completions"),
+            (RouteKind::CountTokens, "/v1/chat/completions"),
+        ];
+        for (route, expected) in cases {
+            assert_eq!(default_path(Dialect::OpenAi, route), expected, "{route:?}");
+        }
+    }
+
+    #[test]
+    fn the_anthropic_dialects_default_path_is_the_one_for_the_route() {
+        assert_eq!(
+            default_path(Dialect::Anthropic, RouteKind::Messages),
+            "/v1/messages"
+        );
+        assert_eq!(
+            default_path(Dialect::Anthropic, RouteKind::CountTokens),
+            "/v1/messages/count_tokens"
+        );
+        // Every other route falls back to the messages path.
+        assert_eq!(
+            default_path(Dialect::Anthropic, RouteKind::ChatCompletions),
+            "/v1/messages"
+        );
+        assert_eq!(
+            default_path(Dialect::Anthropic, RouteKind::Embeddings),
+            "/v1/messages"
+        );
+    }
+
+    #[test]
+    fn the_other_dialects_default_path_does_not_depend_on_the_route() {
+        // These dialects serve one route each; the translator always names their path.
+        let cases = [
+            (Dialect::Google, "/v1beta/models:generateContent"),
+            (Dialect::Antigravity, "/v1internal:generateContent"),
+            (Dialect::Codex, "/responses"),
+            (Dialect::Copilot, "/chat/completions"),
+            (Dialect::CommandCodeGo, "/alpha/generate"),
+        ];
+        for (dialect, expected) in cases {
+            assert_eq!(
+                default_path(dialect, RouteKind::ChatCompletions),
+                expected,
+                "{dialect:?}"
+            );
+            assert_eq!(
+                default_path(dialect, RouteKind::Embeddings),
+                expected,
+                "{dialect:?}"
+            );
+            assert_eq!(
+                default_path(dialect, RouteKind::Responses),
+                expected,
+                "{dialect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_provider_override_still_wins_over_the_route_aware_default() {
+        // The route-aware default is the fallback; the operator's statement about one route is
+        // still the last word.
+        let over = "embeddings".to_string();
+        let s = step(Dialect::OpenAi, "https://api.openai.com/v1");
+        let path = upstream_path(Dialect::OpenAi, RouteKind::Embeddings, None, Some(&over));
+        assert_eq!(path, UpstreamPath::Operator("embeddings"));
+        assert_eq!(
+            build_url(&s, path).as_deref(),
+            Some("https://api.openai.com/v1/embeddings")
+        );
+    }
+
+    #[test]
+    fn the_embeddings_route_reaches_the_embeddings_path() {
+        // The defect the route-aware default fixes: an embeddings request must not be sent to
+        // the provider's chat-completions endpoint.
+        let s = step(Dialect::OpenAi, "https://api.openai.com/v1");
+        let path = upstream_path(Dialect::OpenAi, RouteKind::Embeddings, None, None);
+        assert_eq!(
+            build_url(&s, path).as_deref(),
+            Some("https://api.openai.com/v1/embeddings")
         );
     }
 
@@ -3039,7 +3642,7 @@ mod tests {
         let path = translated.path_override.expect("a path is declared");
         let s = step(Dialect::CommandCodeGo, "https://api.commandcode.ai");
         assert_eq!(
-            build_url(&s, Some(&path)).as_deref(),
+            build_url(&s, UpstreamPath::Dialect(&path)).as_deref(),
             Some("https://api.commandcode.ai/alpha/generate")
         );
     }
@@ -3378,9 +3981,92 @@ mod tests {
     }
 
     #[test]
-    fn a_route_key_is_the_request_path() {
-        let uri: Uri = "/v1/images/generations".parse().unwrap();
-        assert_eq!(route_key(&uri), "/v1/images/generations");
+    fn a_route_override_is_found_by_its_canonical_key() {
+        // The catalogue and the configuration documentation key `route_overrides` by the route's
+        // configuration spelling, so a client on "/v1/chat/completions" must find the entry
+        // "chat-completions".
+        let mut provider = provider_plan();
+        provider
+            .route_overrides
+            .insert("chat-completions".into(), "ai/v1/chat/completions".into());
+        let found = route_override_for(
+            &provider,
+            RouteKind::ChatCompletions,
+            "/v1/chat/completions",
+        );
+        assert_eq!(found.map(String::as_str), Some("ai/v1/chat/completions"));
+    }
+
+    #[test]
+    fn a_route_override_keyed_by_a_raw_request_path_no_longer_matches() {
+        // The old spelling. It can never match a route, so the override would silently never
+        // fire; the lookup must not find it.
+        let mut provider = provider_plan();
+        provider.route_overrides.insert(
+            "/v1/chat/completions".into(),
+            "ai/v1/chat/completions".into(),
+        );
+        let found = route_override_for(
+            &provider,
+            RouteKind::ChatCompletions,
+            "/v1/chat/completions",
+        );
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn a_canonical_override_is_used_even_when_a_legacy_key_is_present() {
+        // The stray raw-path key is reported, but it is a report and not a fallback: the
+        // canonical key is the one that decides.
+        let mut provider = provider_plan();
+        provider
+            .route_overrides
+            .insert("chat-completions".into(), "ai/v1/chat/completions".into());
+        provider
+            .route_overrides
+            .insert("/v1/chat/completions".into(), "legacy".into());
+        let found = route_override_for(
+            &provider,
+            RouteKind::ChatCompletions,
+            "/v1/chat/completions",
+        );
+        assert_eq!(found.map(String::as_str), Some("ai/v1/chat/completions"));
+    }
+
+    #[test]
+    fn a_provider_without_route_overrides_has_no_override() {
+        let provider = provider_plan();
+        assert_eq!(
+            route_override_for(
+                &provider,
+                RouteKind::ChatCompletions,
+                "/v1/chat/completions"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_route_override_is_looked_up_by_the_route_it_was_called_on() {
+        // The override belongs to the client's route, not to the provider's dialect: a provider
+        // serving "/v1/responses" has its own key.
+        let mut provider = provider_plan();
+        provider
+            .route_overrides
+            .insert("responses".into(), "v1/responses".into());
+        assert_eq!(
+            route_override_for(&provider, RouteKind::Responses, "/v1/responses")
+                .map(String::as_str),
+            Some("v1/responses")
+        );
+        assert_eq!(
+            route_override_for(
+                &provider,
+                RouteKind::ChatCompletions,
+                "/v1/chat/completions"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -4283,5 +4969,240 @@ mod tests {
             second_seen.lock().unwrap().is_empty(),
             "the second step was called without a hedge"
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The token-counting route
+    // -----------------------------------------------------------------------------------------
+
+    /// A count-tokens request body, in the shape an Anthropic client sends it.
+    fn count_tokens_body(model: &str) -> String {
+        serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        .to_string()
+    }
+
+    /// A fake upstream that records the path and the body of every request it receives, and
+    /// answers with a canned status and body.
+    async fn counting_upstream(
+        status: StatusCode,
+        answer: &'static str,
+    ) -> (String, Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+        let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(move |uri: Uri, body: Bytes| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push((
+                    uri.path().to_string(),
+                    String::from_utf8_lossy(&body).to_string(),
+                ));
+                (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    answer,
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// A relay with one provider, in the dialect under test, pointing at `base_url`.
+    ///
+    /// The provider serves one model, `m`, so a client asks for it as `p/m`.
+    fn count_tokens_state(dialect: Dialect, base_url: &str) -> AppState {
+        let mut provider = provider_serving("p", base_url, "m", &[InputModality::Text]);
+        provider.dialect = dialect;
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+
+        // A vault in a private temporary directory, holding the one credential the account names.
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let vault = Arc::new(opened);
+
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: store,
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+        }
+    }
+
+    /// An Anthropic step's count goes to the upstream's own count-tokens endpoint.
+    ///
+    /// The path comes from the dialect, because the route is the one that names it: a count asked
+    /// on `/v1/messages` would be a generation.
+    #[test]
+    fn a_count_tokens_request_for_an_anthropic_step_goes_to_the_count_tokens_path() {
+        let path = upstream_path(Dialect::Anthropic, RouteKind::CountTokens, None, None);
+        assert_eq!(path, UpstreamPath::Dialect("/v1/messages/count_tokens"));
+        assert_eq!(
+            build_url(&step(Dialect::Anthropic, "https://api.anthropic.com"), path).as_deref(),
+            Some("https://api.anthropic.com/v1/messages/count_tokens")
+        );
+    }
+
+    /// A translator's path names a generation endpoint, so it cannot be allowed to redirect a count.
+    #[test]
+    fn a_translator_path_cannot_redirect_a_count_to_a_generation_endpoint() {
+        let path = upstream_path(
+            Dialect::Anthropic,
+            RouteKind::CountTokens,
+            Some("messages"),
+            None,
+        );
+        assert_eq!(path, UpstreamPath::Dialect("/v1/messages/count_tokens"));
+    }
+
+    /// An Anthropic client talking to an Anthropic upstream is a passthrough, so nothing turns the
+    /// count into a translated body, a translated path, or a stream.
+    #[test]
+    fn a_count_tokens_request_is_neither_translated_nor_streamed() {
+        let ctx = TranslateCtx {
+            route: RouteKind::CountTokens,
+            client_dialect: Dialect::Anthropic,
+            upstream_dialect: Dialect::Anthropic,
+            upstream_model: "m",
+            client_streaming: false,
+            session_id: None,
+        };
+        let body = br#"{"model":"m","messages":[{"role":"user","content":"hello"}]}"#;
+        // No translation at all: the body goes upstream as the client wrote it, so there is no
+        // translator path to override the count-tokens path and no `force_stream` to apply.
+        assert!(translate_request(&ctx, body).unwrap().is_none());
+        // And the client did not ask for a stream, so the relay does not either.
+        assert!(!scan_request_head(body).wants_stream());
+    }
+
+    /// The upstream counts the tokens, and its answer is the client's answer.
+    #[tokio::test]
+    async fn an_anthropic_upstream_is_asked_to_count_the_tokens() {
+        let (base_url, seen) = counting_upstream(StatusCode::OK, r#"{"input_tokens":42}"#).await;
+        let state = count_tokens_state(Dialect::Anthropic, &base_url);
+        let response = dispatch(
+            state,
+            Dialect::Anthropic,
+            Method::POST,
+            Uri::from_static("/v1/messages/count_tokens"),
+            headers(&[]),
+            AxumBody::from(count_tokens_body("p/m")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        // A count that came from the provider is not an estimate, and does not say it is.
+        assert!(response
+            .headers()
+            .get(crate::count_tokens::ESTIMATE_HEADER)
+            .is_none());
+        // The upstream's answer is returned as it arrived.
+        assert_eq!(body_text(response).await, r#"{"input_tokens":42}"#);
+
+        // It was asked on the count-tokens path, with the client's own content.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one upstream call");
+        assert_eq!(seen[0].0, "/v1/messages/count_tokens");
+        let body: serde_json::Value = serde_json::from_str(&seen[0].1).unwrap();
+        assert_eq!(body["messages"][0]["content"], "hello");
+        // The upstream sees its own model id, not the client-facing one.
+        assert_eq!(body["model"], "m");
+        // A count is not a generation: nothing asked for a stream.
+        assert!(
+            body.get("stream").is_none(),
+            "the count was turned into a stream"
+        );
+    }
+
+    /// A non-Anthropic upstream cannot count, so it is not asked at all.
+    ///
+    /// A generation would have been billed, and its answer would have been the wrong shape.
+    #[tokio::test]
+    async fn a_non_anthropic_upstream_is_not_called_and_the_count_is_estimated() {
+        let (base_url, seen) = counting_upstream(StatusCode::OK, r#"{"input_tokens":42}"#).await;
+        let state = count_tokens_state(Dialect::OpenAi, &base_url);
+        let response = dispatch(
+            state,
+            Dialect::Anthropic,
+            Method::POST,
+            Uri::from_static("/v1/messages/count_tokens"),
+            headers(&[]),
+            AxumBody::from(count_tokens_body("p/m")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(crate::count_tokens::ESTIMATE_HEADER)
+                .expect("the estimate marker was missing")
+                .to_str()
+                .unwrap(),
+            "true"
+        );
+        // The body is exactly the Anthropic count shape: one field, no more.
+        let text = body_text(response).await;
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 1);
+        // "user" (4 bytes) and "hello" (5 bytes) are the input: 9 / 4 rounds up to 3.
+        assert_eq!(value["input_tokens"], 3);
+
+        // Nothing was sent upstream.
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the count was asked of an upstream that cannot count it"
+        );
+    }
+
+    /// An upstream that cannot count is one thing; an upstream that *fails* is another.
+    ///
+    /// The failure is reported as it happened — the upstream's own status and body — because
+    /// replacing it with an estimate would hide a broken route behind a plausible answer.
+    #[tokio::test]
+    async fn an_anthropic_upstream_that_fails_is_reported_as_a_failure() {
+        let (base_url, seen) =
+            counting_upstream(StatusCode::NOT_FOUND, r#"{"error":"no such endpoint"}"#).await;
+        let state = count_tokens_state(Dialect::Anthropic, &base_url);
+        let response = dispatch(
+            state,
+            Dialect::Anthropic,
+            Method::POST,
+            Uri::from_static("/v1/messages/count_tokens"),
+            headers(&[]),
+            AxumBody::from(count_tokens_body("p/m")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        // The failure was not dressed up as an estimate.
+        assert!(response
+            .headers()
+            .get(crate::count_tokens::ESTIMATE_HEADER)
+            .is_none());
+        assert_eq!(body_text(response).await, r#"{"error":"no such endpoint"}"#);
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 }

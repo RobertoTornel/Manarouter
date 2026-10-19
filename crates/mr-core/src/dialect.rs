@@ -329,6 +329,26 @@ impl RouteKind {
         }
     }
 
+    /// The configuration key for this route, as `route_overrides` is keyed.
+    ///
+    /// Kebab-case, matching this enum's serde representation: "chat-completions",
+    /// "responses", "embeddings", "audio-transcription", "audio-speech",
+    /// "images-generations", "models", "messages", "count-tokens". `as_str` is the
+    /// display spelling and is dotted; this one is the configuration spelling.
+    pub fn as_config_key(&self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat-completions",
+            Self::Responses => "responses",
+            Self::Embeddings => "embeddings",
+            Self::AudioTranscription => "audio-transcription",
+            Self::AudioSpeech => "audio-speech",
+            Self::ImagesGenerations => "images-generations",
+            Self::Models => "models",
+            Self::Messages => "messages",
+            Self::CountTokens => "count-tokens",
+        }
+    }
+
     /// Every route, for exhaustive tests and the panel's routing table.
     pub const ALL: [RouteKind; 9] = [
         Self::ChatCompletions,
@@ -1357,5 +1377,45 @@ mod tests {
         }
         assert_eq!(InputModality::from_u8(6), None);
         assert_eq!(InputModality::parse("hologram"), None);
+    }
+
+    #[test]
+    fn route_config_key_matches_the_serde_spelling_for_every_variant() {
+        // `route_overrides` is keyed by the route's configuration spelling. If the serde rename
+        // ever changes, this accessor must change with it — otherwise the two drift apart and a
+        // configured override silently stops matching.
+        for route in RouteKind::ALL {
+            let serde_name = serde_json::to_value(route).expect("serialize route");
+            assert_eq!(
+                serde_name,
+                serde_json::Value::String(route.as_config_key().to_string()),
+                "{route:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_config_key_spellings_are_pinned() {
+        // The literal spellings, so a wholesale rename of the serde attribute is caught here
+        // rather than only showing up as a broken configuration file in the field.
+        let expected = [
+            (RouteKind::ChatCompletions, "chat-completions"),
+            (RouteKind::Responses, "responses"),
+            (RouteKind::Embeddings, "embeddings"),
+            (RouteKind::AudioTranscription, "audio-transcription"),
+            (RouteKind::AudioSpeech, "audio-speech"),
+            (RouteKind::ImagesGenerations, "images-generations"),
+            (RouteKind::Models, "models"),
+            (RouteKind::Messages, "messages"),
+            (RouteKind::CountTokens, "count-tokens"),
+        ];
+        assert_eq!(
+            expected.len(),
+            RouteKind::ALL.len(),
+            "every variant must be listed"
+        );
+        for (route, key) in expected {
+            assert_eq!(route.as_config_key(), key, "{route:?}");
+        }
     }
 }
