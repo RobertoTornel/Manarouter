@@ -371,7 +371,7 @@ Two things are still not done, and are worth knowing before relying on this for 
   connector that opened the connection, and a tunnel is opened by this crate's own connector, which
   cannot say whether the pool handed it an old connection. A `false` there means "not known".
 
-### P1 — The hedged race runner: implemented; the winner's recovery is not
+### P1 — The hedged race runner and the winner's recovery: both implemented
 
 **The runner is implemented.** `select::hedge_decide` (`crates/manarouter-relay/src/select.rs`) is now
 called from the request path. `crates/manarouter-relay/src/server.rs` holds:
@@ -413,24 +413,54 @@ participants all fail, and a combo without the hedge calling only its first step
    streamed to the client as it arrives. Choosing `first_complete_token` therefore changes nothing
    today; the doc says so.
 
-**Still open, and it is the remaining half of the feature.**
+**The recovery half is implemented now** (the 2026-10-21 revision, this session). The relay wraps the
+committed winner's body in `crates/manarouter-relay/src/recovery.rs`:
 
-- **The four `WinnerFailMode`s are unreachable.** The winner is committed before its body streams, so
-  the relay never discovers that the committed winner has died. `on_winner_fail` describes exactly
-  that case, and there is no code path that evaluates it.
-- **The mid-stream splice is not implemented.** A step that dies after bytes are on the wire ends
-  the client stream as-is, with no second attempt, no `manarouter.retry` boundary and no tool-call
-  guard. `MidstreamPolicy::Restart` must refuse to splice once any `tool_calls` delta has been
-  emitted; the guard is documented, and the splice site that would enforce it does not exist yet.
+- `run_hedge` keeps the participants that **passed** the eligibility gate instead of discarding them,
+  in priority order, with their client-facing bodies;
+- `RecoveryBody` forwards every chunk, counts the bytes that reached the client, watches for the
+  upstream body erroring, and runs a byte-level **tool-call guard** over the winner's own bytes
+  (`tool_calls`, `tool_use`) — a false positive costs a retry, a false negative costs the caller a
+  function call that may be valid and wrong;
+- `recovery::decide` is the whole policy as a pure function: a tool-call delta stops the splice under
+  both policies; no replacement means the error is the answer; nothing written yet means an invisible
+  switch; otherwise `restart` emits the `manarouter.retry` boundary and continues, and `terminate`
+  ends the stream with an error;
+- the boundary is written in the **client's** dialect (the OpenAI `finish_reason` frame or the
+  Anthropic `message_stop` frame) using the existing `mr_dialects::RETRY_EVENT` and
+  `mr_dialects::sse::named_frame` helpers;
+- the ordinary request path is untouched: the wrapper is installed only inside the race's `Resolved`
+  branch, so a request that is not hedged pays nothing for the guard.
+
+**The operator's rule, as implemented:** the winner is the highest-priority participant that fits the
+latency requirement — the highest-priority one that replied inside the combo's `hedge.window_ms`.
+The same rule decides the replacement after a death. `WinnerFailMode::PickHighestPassed` is now the
+**default**; the other three modes are accepted configuration that the relay **ignores for now**,
+with a `tracing::warn!` naming the configured mode.
+
+**Still open:**
+
+- **The recovery pool is narrow.** The replacement is a participant that had already answered when
+  the winner was committed. In the common shape of a race — the preferred model answers first and
+  alone — there is nobody to fall back to, so the recovery has no material and the stream ends with
+  an error exactly as before. It has material when a lower-priority participant answered first and
+  the preferred one answered too. `hedge.cancel_losers` and `hedge.loser_grace_ms` are options the
+  relay ignores for now; honouring them is what would widen the pool.
 - **A loser's cancellation is local.** Dropping the loser closes this relay's connection to the
   provider, but the provider may keep generating and keep billing. A hedge can therefore cost a full
   completion on every participant it dispatched.
+- **The other three `WinnerFailMode`s are unimplemented.** `rerun-excluding`,
+  `pick-highest-passed-different-provider` and `stable-fallback` would each need their own
+  re-dispatch or selection logic; the operator's rule is `pick-highest-passed`, so they stay as
+  options.
+- **`winner_metric` still does not distinguish its two values**, for the reason above.
 - **An estimate can win a race.** The token-counting route answers locally and instantly for a
   non-Anthropic provider (`crates/manarouter-relay/src/count_tokens.rs`), so inside a race such a
   participant can beat an Anthropic participant that would have counted exactly. The race's own
   rule decides. Making an estimate lose would need a new `Attempt` variant and a change to the
   winner rule — the same decision as the `winner_metric` question above, so it was not made
-  unilaterally.
+  unilaterally. (The estimate itself changed in this revision: it is now the request body's byte
+  length over four rather than a JSON walk, so the router does no parsing to answer it.)
 
 **Interaction with the latency constraint.** The standing requirement is that the relay is optimised
 obsessively for latency and combo logic lives outside it. Concurrent dispatch adds a join and
@@ -621,7 +651,7 @@ tree; this is the disposition, so nobody redoes finished work:
 | Previous item | Now | Evidence |
 |---|---|---|
 | P0 Panel never seen in a browser | **Closed** | `panel/test/browser.e2e.mjs` exists and **passes on Firefox and Chromium** (run in this session). The blank-page defect is also fixed: `boot()` wraps everything in try/catch and calls `showBootError` (`panel/app.js:354`). |
-| P1 Hedged race runner | **Closed** (runner) / **Open** (winner recovery) | §4. `hedge_decide` is called from `server.rs`; the participants race. The four `WinnerFailMode`s and the mid-stream splice are still unreachable. |
+| P1 Hedged race runner | **Closed** (runner and recovery) | §4. `hedge_decide` is called from `server.rs`; the participants race, and the winner's body is watched so a death after the commit is recovered from a participant that passed the same window. `pick-highest-passed` (the default) is the implemented mode; the other three are accepted and ignored. |
 | P1 `responses.rs` 0 tests | **Closed** | Five reachability tests added in the 2026-10-20 revision; the crate runs 147 tests. |
 | P1 Antigravity OAuth incomplete | **Closed** | `antigravity.rs` is 742 lines with `authorization_url` (`:266`), `exchange_code` (`:300`), `refresh` (`:339`), `refresh_with_context` (`:344`), `complete_login` (`:374`) and Google identity parsing (`:114`). The relay injects the project (`server.rs:222`, called at `:511`). |
 | P2 `tools/bench/` empty | **Closed** | The harness exists and measures the relay's added overhead: 14.6 µs p50, 110.5 µs p99 on an idle machine. |
@@ -634,6 +664,23 @@ tree; this is the disposition, so nobody redoes finished work:
 
 The old document's advice still holds verbatim and is worth repeating: **green tests are not the same
 as a reachable feature**, and two prior bugs were exactly "arm present, never taken".
+
+### The 2026-10-21 revision — three operator decisions
+
+The operator settled three questions that had been open, and they are now ratified:
+
+- **The winner rule.** "Highest in priority list that fit the latency requirement of the user" — the
+  highest-priority participant that replied inside the combo's `hedge.window_ms`. That is the rule
+  the race already used, and it is now also the rule the recovery uses. `WinnerFailMode::PickHighestPassed`
+  is the implemented mode and the default.
+- **The token count is reported by the provider or by the router, and the router pays nothing.** The
+  provider's counts win when it sends them. When it sends none, the panel process estimates from the
+  byte counts the relay measured and marks the row as an estimate; the relay does no token
+  arithmetic on its request path, and the count route's fallback estimate is a byte length over four
+  rather than a JSON walk.
+- **The remaining knobs stay options.** The global `latency.hedge_width`, `hedge_window_ms` and
+  `hedge_max_requests` are accepted, validated, hashed — and ignored. So are the three unimplemented
+  `WinnerFailMode`s, with a warning in the log rather than a silent pretence.
 
 ---
 

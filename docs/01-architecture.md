@@ -171,10 +171,10 @@ frames when it has to rewrite their payloads.
 | Reading the routing table | `manarouter-relay` | `ArcSwap` load; no locks. |
 | Dialect detection and passthrough | `mr-core::dialect` | A `const fn` on two enums. |
 | Dialect translation | `mr-dialects` | Not on the path when dialects match. |
-| Hedged race execution | `manarouter-relay` | `hedge_decide` is called from the request path: the participants are dispatched at once, the highest-priority one that answers inside the window wins, and the losers are dropped. Winner recovery is not implemented. |
+| Hedged race execution | `manarouter-relay` | `hedge_decide` is called from the request path: the participants are dispatched at once, the highest-priority one that answers inside the window wins, and the losers are dropped. The winner's body is watched, and a death after the commit is recovered from a participant that passed the same window. |
 | Combo and key-strategy compilation | `manarouter-conductor` | Resolved into ordered steps and account orders once per config change, not per request. |
 | Request-time step and account choice | `manarouter-relay` | `select.rs` walks the compiled steps, applies the key strategy and advances the rotation counters. |
-| Quota accounting | `manarouter-conductor` | `/api/quota` reads usage rows from `Store`, but nothing writes them yet; the relay applies transient cooldowns from its own in-memory health state. |
+| Quota accounting | `manarouter-conductor` | `/api/quota` reads usage rows from `Store`, but nothing writes them yet; the relay applies transient cooldowns from its own in-memory health state. The per-key ledger that *is* written is served at `/api/usage`, with the token estimate computed in the conductor rather than on the relay's request path. |
 | OAuth authorization (login) | `manarouter-conductor` | The relay holds a `Refresher` per platform and refreshes an expiring token in front of a request. |
 | The web panel | `manarouter-conductor` | Same process, but a separate task and a separate port. |
 | Credential storage | `mr-core::secret` | Encrypted at rest; the vault is opened once at startup and an account's secret is decrypted when a request tries that account (step 5b). |

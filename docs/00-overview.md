@@ -59,7 +59,7 @@ configuration parsing are not on the request path at all.
 | Process | Crate | Default port | Responsibility |
 |---|---|---|---|
 | `manarouter-relay` — the **data plane** | `crates/manarouter-relay` | 20900 | Accept, look up a compiled route, select an account, apply client auth/reasoning and forward. Per-key quota caps are enforced, and traffic egresses through a configured proxy when one applies. |
-| `manarouter-conductor` — the **control plane** | `crates/manarouter-conductor` | 20901 | Configuration, snapshot compilation, cached provider-quota refresh APIs, OAuth, the web panel. Request-usage ledger recording is not wired. |
+| `manarouter-conductor` — the **control plane** | `crates/manarouter-conductor` | 20901 | Configuration, snapshot compilation, cached provider-quota refresh APIs, OAuth, the web panel. Serves the per-request usage ledger at `GET /api/usage`, with the token count reported by the provider or estimated by the router — the estimate is computed here, in the panel process. |
 
 The conductor compiles the authored `config.json` into the routing snapshot and publishes it; the
 relay holds a `SnapshotHandle` over an `ArcSwap` and hot-swaps it without dropping a request. There
@@ -104,7 +104,7 @@ The full request path, step by step, is in [architecture](01-architecture.md).
 | Per-account health states and provider rollup | implemented | [key selection](05-key-selection.md) §6 |
 | Key strategies: `priority`, `round-robin`, `random`, `least-used` | implemented (config, compile and relay selection) | [key selection](05-key-selection.md) |
 | Combos and the three combo strategies | implemented (schema, compile and relay execution) | [combos](06-combos.md) |
-| Hedged race with four winner-fail modes | the race is implemented and unit-tested; the four winner-fail modes are not, because the winner is committed before its body streams | [the hedged race](07-hedged-race.md) |
+| Hedged race with four winner-fail modes | the race is implemented and unit-tested, and so is the winner's recovery; `pick-highest-passed` (the default) runs, the other three modes are accepted and ignored for now | [the hedged race](07-hedged-race.md) |
 | Reset-aware priority | implemented (the selector demotes an exhausted step and restores it once its reset passes) | [combos](06-combos.md) §3 |
 | Session affinity for a combo winner | implemented (combo-wide, process-local, default 1800 s window) | [the hedged race](07-hedged-race.md) |
 | Quota windows, live signals, cooldowns | cooldowns and live signals implemented in the relay; `/api/quota` reads a `usage` table that nothing writes yet, so it reports nothing | [configuration](03-configuration.md) §3 |

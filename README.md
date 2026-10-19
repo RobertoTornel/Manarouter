@@ -65,18 +65,24 @@ A combo can send one prompt to several models at once. The winner is **not** whi
 eligibility gate, not a stopwatch: if your preferred model answers at 600 ms and a lower-ranked one at
 200 ms, you get your preferred model. The race exists to bound the *worst* case, not to chase the best
 case. If your preferred model is healthy, the race resolves the moment it replies and costs you
-nothing. Four modes decide what happens when the winner dies — re-race without it, take the best that
-passed, take the best that passed *on a different provider*, or fall back to a model you nominate.
+nothing. When the winner then dies, the relay falls back to the highest-priority participant that
+passed the same window — silently if the client has not seen a byte yet, and behind an explicit
+`manarouter.retry` boundary if it has. Four modes describe that fallback; the one that runs is
+"take the best that passed".
 
 This surprises people, so it is documented in full, with worked timelines:
 [`docs/07-hedged-race.md`](docs/07-hedged-race.md).
 
-**What runs today:** the race itself. A combo with `hedge.enabled` dispatches every participant at
-once, the highest-priority one that replied inside the window is committed, and the losers are
-dropped; the sequential and concurrent paths share one attempt implementation, so they cannot
-drift. **What does not run yet:** the four `on_winner_fail` modes and the mid-stream switch — the
-winner is committed when its response arrives, so a winner that dies afterwards cannot be replaced
-mid-body. [`docs/23-implementation-status.md`](docs/23-implementation-status.md) is the
+**What runs today:** the race itself and the winner's recovery. A combo with `hedge.enabled`
+dispatches every participant at once, the highest-priority one that replied inside the window is
+committed, and the losers are dropped; the sequential and concurrent paths share one attempt
+implementation, so they cannot drift. If the committed winner's body then fails, the relay recovers
+from a participant that passed the same window — invisibly before anything reached the client, with
+a `manarouter.retry` boundary after, and never once a tool call is on the wire. **What does not run
+yet:** the other three `on_winner_fail` modes (re-race without it, take the best that passed *on a
+different provider*, or fall back to a model you nominate); they are accepted configuration that the
+relay ignores, with a warning in the log.
+[`docs/23-implementation-status.md`](docs/23-implementation-status.md) is the
 authoritative list. Priority combos *do* remember the last successful step for a configurable
 window (`sticky_success_window_secs`, default 1800 s).
 

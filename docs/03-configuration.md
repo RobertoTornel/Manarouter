@@ -99,9 +99,9 @@ health, never configuration. Putting the snapshot and the database in a separate
     "pool_idle_secs": 90,
     "pool_max_idle_per_host": 4,
     "tcp_nodelay": true,
-    "hedge_width": 3,                   // validated but inert: a combo's own hedge block wins
+    "hedge_width": 3,                   // an option the relay ignores for now: see the note below
     "hedge_window_ms": 400,             // ditto
-    "hedge_max_requests": 4,            // ditto: nothing is capped by it today
+    "hedge_max_requests": 4,            // ditto
     "snapshot_swap_budget_ms": 50,
     "upstream_http2": true
   },
@@ -278,7 +278,7 @@ A combo is a **named model**: clients call it exactly like a model name.
     "count": 2,
     "window_ms": 800,
     "winner_metric": "first-response-byte",
-    "on_winner_fail": { "mode": "rerun-excluding", "max_rounds": 2 },
+    "on_winner_fail": { "mode": "pick-highest-passed" },
     "cancel_losers": true,
     "loser_grace_ms": 0
   },
@@ -306,9 +306,28 @@ recompiling a snapshot when nothing that affects routing changed.
 The full semantics — including the eligibility gate and the four `on_winner_fail` modes — are in
 `docs/07-hedged-race.md`. Note that `on_winner_fail` is internally tagged: the mode name goes in
 `mode`, and `rerun-excluding` carries `max_rounds` while `stable-fallback` carries `step`, an index
-into the combo's own step list. `sticky_success_window_secs` is the separate, already-implemented
+into the combo's own step list. **`pick-highest-passed` is the mode that runs** — it is the default,
+and it is what the relay serves when the winner dies. The other three are accepted configuration that
+the relay ignores for now, with a warning in the log. `sticky_success_window_secs` is the separate, already-implemented
 preference for the last successful step; it applies only to `priority` combos with `hedge.enabled`,
 and `0` disables it.
+
+### The global hedge knobs are options, not switches
+
+`latency.hedge_width`, `latency.hedge_window_ms` and `latency.hedge_max_requests` are **options the
+relay ignores for now**. They are part of the configuration schema, they are validated (a zero is
+refused) and they are hashed into the snapshot's signature, so a change to one is a change to the
+snapshot — but no combo inherits them, and nothing is capped by them.
+
+The options that actually govern a race are the combo's own `hedge` block, and they are per combo:
+`participants` (who competes, in priority order), `count` (how many of the first steps compete when
+`participants` is empty), `window_ms` (the latency window), `winner_metric`, `on_winner_fail`,
+`cancel_losers` and `loser_grace_ms`. Two of the global knobs have a natural home there already —
+the width is `count` and the window is `window_ms` — and the third, `hedge_max_requests`, has no
+home at all yet, because a race is bounded by how many steps a combo has.
+
+That is a deliberate state rather than an oversight: the options exist, they are accepted, they
+change nothing, and the effective behaviour lives in one place.
 
 ---
 

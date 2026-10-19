@@ -531,10 +531,12 @@ else — so:
   an estimate and marks it: `200 OK`, the body exactly `{"input_tokens": N}`, and the header
   `x-manarouter-count-tokens-estimate: true`.
 
-The estimate is a character-based approximation, not a tokenizer: the UTF-8 byte length of every
-string value in the body, top-level `model` excluded, divided by four and rounded up, never less
-than one. A body that is not JSON falls back to its raw length the same way. It is deliberately
-coarse — an estimate presented as an authoritative count would be worse than no endpoint at all.
+The estimate is a byte-based approximation, not a tokenizer: the request body's length in bytes,
+divided by four and rounded up, never less than one. It is the same four-bytes-per-token rule the
+relay uses to size a quota reservation, and it counts the JSON shell as well as the text — a
+percentage or two on a long prompt, several times the text-only count on a small or schema-heavy
+body. It is deliberately coarse — an estimate presented as an authoritative count would be worse than
+no endpoint at all.
 
 Two consequences worth knowing. The estimate is produced **before an account is chosen**, so it
 costs nothing: no credential is read, no upstream is billed, and the request is counted with zero

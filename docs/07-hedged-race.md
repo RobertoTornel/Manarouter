@@ -242,18 +242,21 @@ Ties are always broken by the operator's step order. Never by arrival order, and
 
 ## 5. When the chosen model dies: four modes
 
-> **Status.** These four modes are **not implemented**, and they are unreachable in the current
-> runner rather than merely unused: the race commits its winner when the upstream *response*
-> arrives, which is before the body is streamed, so there is no point at which the relay can discover
-> that the committed winner has died. A participant that fails *before* answering is not a failed
-> winner — it simply loses the race, and the race continues. The modes below describe what should
-> happen when the winner dies, and the runner that could evaluate them is the missing piece.
+> **Status.** One of these four modes is implemented: **`pick-highest-passed`**, which is also the
+> default, so a combo that says nothing about `on_winner_fail` gets it. The other three —
+> `rerun-excluding`, `pick-highest-passed-different-provider` and `stable-fallback` — are accepted
+> configuration that the relay **ignores for now**: it logs a warning naming the configured mode and
+> serves the request as `pick-highest-passed`. They are options, not errors, and they are not
+> silently pretended to work.
+>
+> The machinery they need does exist: the relay now watches the committed winner's body (§6), and
+> the participants that passed the race are kept for it to fall back on.
 
 `on_winner_fail` is evaluated when the committed winner fails — either before delivering anything, or
 mid-stream. It has four values because there are four genuinely different things an operator might
 want, and guessing between them would be wrong in at least three cases.
 
-### `rerun-excluding`
+### `rerun-excluding` — not implemented yet
 
 Re-run the whole competition over the remaining participants, **excluding every model that has
 already failed**, up to `max_rounds`.
@@ -262,16 +265,19 @@ This is the "run it again" behaviour. It is the most expensive mode and the most
 fresh race can find a winner that was not even a participant the first time. `max_rounds` bounds it
 so that a systemic outage cannot turn one client request into an unbounded number of upstream calls.
 
-### `pick-highest-passed`
+### `pick-highest-passed` — implemented, and the default
 
 Do **not** re-dispatch. Take the highest-priority participant that already **passed** the
-eligibility gate in the first competition — its result is either already in the race's result set or
-still in flight.
+eligibility gate in the first competition.
 
 **Zero added latency.** This is the right mode when the operator's goal is a fast, safe answer and
-they do not want the router to spend more upstream requests on recovery.
+they do not want the router to spend more upstream requests on recovery. It is also the mode the
+relay implements: a combo that names no mode gets this one.
 
-### `pick-highest-passed-different-provider`
+The "passed" participants are kept when the winner is committed, so the replacement is already
+there — its response is read when the failure happens, not re-requested.
+
+### `pick-highest-passed-different-provider` — not implemented yet
 
 As above, restricted to participants on a **different provider** than the one that died.
 
@@ -280,7 +286,7 @@ outage, a revoked credential, or a provider-wide quota reset. In that case the s
 same provider will fail in exactly the same way, and picking it wastes the entire retry. Requiring a
 different provider turns a provider outage from a stalled request into a fast, correct fallback.
 
-### `stable-fallback`
+### `stable-fallback` — not implemented yet
 
 Jump straight to a fixed `step`, given as an index into the combo's **own** step list (the wire form is
 `{"mode": "stable-fallback", "step": N}`). The step is renumbered by the compiler onto the surviving
@@ -304,13 +310,19 @@ models" behaviour, expressed as a default rather than a separate mechanism.
 
 ## 6. When the winner dies *mid-stream*
 
-> **Status.** This section is the design. `midstream_policy` is compiled into the plan, but nothing in
-> the relay reads it: a step that dies after bytes are on the wire currently ends the client stream
-> as-is, with no second attempt, no `manarouter.retry` boundary and no tool-call guard.
+> **Status.** Implemented. The relay wraps the committed winner's body, so a failure *after* the
+> commit is now visible to it, and the combo's `midstream_policy` decides what happens. The rule
+> itself is a pure function (`recovery::decide`), so it is tested as one rather than only through a
+> live request.
 
 The ratified decision is that the prompt is retried with the next best model according to the mode
 and rules inside the combo. That is a strong behaviour, and it is only safe in two shapes, so
 `midstream_policy` makes the choice explicit rather than implicit.
+
+**The replacement is a participant that passed.** The race keeps the participants that cleared the
+eligibility gate instead of discarding them when the winner is committed, and the replacement is
+the highest-priority one of them — the same rule the race itself used to pick the winner, applied
+again. Nothing is re-dispatched: a recovery costs no extra upstream request.
 
 ### `restart` (default)
 
@@ -334,6 +346,10 @@ The retry proceeds.
   specification, they must — therefore still receive a structurally valid, terminated response
   rather than a truncated one.
 
+  The terminating frame is written in the **client's** dialect: an OpenAI-shaped client gets the
+  `finish_reason` frame above, an Anthropic-shaped client gets `event: message_stop` with
+  `data: {"type":"message_stop"}`.
+
 ### `terminate`
 
 Never retry once bytes are on the wire. Close the stream with an error and let the client decide
@@ -342,6 +358,10 @@ whether to retry.
 Choose this when duplicated or merged text in one message would be worse than a clear failure — for
 example when the client is itself an agent that will retry, or when the response is being piped into
 something that cannot tolerate two answers concatenated.
+
+`terminate` governs the *announced* switch. A failure before anything reached the client is still
+replaced silently under both policies: the client never saw the dead model's answer, so there is
+nothing to un-send and nothing to announce.
 
 ### The hard guard
 
@@ -355,7 +375,29 @@ a duplicate execution or a malformed argument string, and the client cannot tell
 failure is strictly better than a corrupted tool call, because a clean failure is recoverable.
 
 The relay therefore tracks whether any tool-call delta has been written and consults that flag
-before every splice attempt.
+before every splice attempt. The check is a **byte scan** for the OpenAI spelling (`tool_calls`) and
+the Anthropic one (`tool_use`), not a JSON parse: a false positive costs a retry, a false negative
+costs the caller a function call that may be valid and wrong. It looks only at the winner's own
+bytes, and it runs only inside a race — an ordinary request pays nothing for it.
+
+### What the recovery can and cannot do
+
+- **The pool is the participants that had already answered** when the winner was committed. In the
+  common shape of a race — the preferred model answers first and alone — there is nobody else to
+  fall back to, and the recovery has no material. It has material when a *lower*-priority model
+  answered first and the preferred one answered too: then the lower-priority participant is a
+  legitimate replacement.
+- **The replacement's body may still be arriving.** The relay reads it when the failure happens, so
+  the client waits for the rest of that answer. Nothing is truncated by the wait: the bytes were
+  never read, so they are still in flight.
+- **The winner's headers stay the winner's.** They were already on the wire before the body
+  streamed, and a replacement cannot change them.
+- **A body that is not an event stream cannot be spliced.** If the client is receiving JSON rather
+  than SSE and bytes are already on the wire, the relay refuses rather than emit half an SSE
+  boundary into a JSON document, and the stream ends with an error.
+- **`cancel_losers` and `loser_grace_ms` are options the relay ignores for now.** The pending
+  participants are dropped when the winner is committed, exactly as before, so a participant that had
+  not answered by then cannot become the replacement.
 
 ---
 
@@ -410,8 +452,9 @@ It applies to the race as well: a sticky step is still a participant, and it is 
 it answers inside the window.
 
 Where a paragraph in this document reads as present-tense behaviour that the relay does not perform —
-the retry pass, the mid-stream boundary, the four `on_winner_fail` modes — the implementation status
-is the note above it, not the tense.
+the retry pass, and the three `on_winner_fail` modes other than `pick-highest-passed` — the
+implementation status is the note above it, not the tense. The mid-stream boundary in §6 **is**
+implemented.
 
 ---
 

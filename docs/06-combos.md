@@ -278,8 +278,8 @@ start over. `midstream_policy` is the explicit switch for it, so there is no hid
 
 | Value | Meaning |
 |---|---|
-| `restart` (default) | Retry with the next best step according to the combo's rules. |
-| `terminate` | Never retry once bytes are on the wire. Close the stream with an error. |
+| `restart` (default) | Continue with the next best participant according to the combo's rules. |
+| `terminate` | Never continue once bytes are on the wire. Close the stream with an error. |
 
 Under `restart`, if nothing has been flushed to the client the switch is invisible. If bytes are
 already on the wire, the relay emits an explicit `manarouter.retry` SSE boundary and then continues
@@ -297,10 +297,14 @@ unrecognised SSE event as a protocol error — or when a stitched answer is wors
 with structured output. Otherwise `restart` is the better default: it converts a mid-stream provider
 failure into a completed request.
 
-> **Status.** `midstream_policy` is compiled into the plan and accepted by `mr combo add
-> --midstream-policy`, but nothing in the relay reads it. A step that dies after bytes are on the wire
-> currently ends the client stream as-is: there is no second step, no `manarouter.retry` boundary, and
-> no tool-call guard. The policy above is the design, not live behaviour.
+> **Status.** Implemented. `midstream_policy` is read by the relay, and the policy above is live
+> behaviour: the winner's body is watched, and a death after the commit is recovered from a
+> participant that passed the race's eligibility gate. Nothing is re-dispatched — a recovery costs no
+> extra upstream request.
+>
+> One limit is worth knowing: the replacement is a participant that had **already answered** when the
+> winner was committed. In the common shape of a race — the preferred model answers first and alone —
+> there is nobody to fall back to, and the stream ends with an error as it always did.
 
 ---
 

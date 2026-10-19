@@ -257,13 +257,18 @@ data: [DONE]
   not generate its own, so a long gap in a stream it is translating is a long gap on the wire.
 - **`data: [DONE]`** terminates a completed translated stream. It is not appended after an error: a
   stream that breaks mid-body simply ends.
-- **`manarouter.retry`** is the router-specific event that is *intended* to be emitted when the winning
-  model failed mid-stream and the policy is `restart`:
+- **`manarouter.retry`** is the router-specific event emitted when the winning model failed
+  mid-stream, bytes were already on the wire, and the combo's policy is `restart`:
 
   ```
   event: manarouter.retry
-  data: {"from":"anthropic/claude-sonnet-4-5","to":"openai/gpt-5","reason":"upstream_disconnect"}
+  data: {"reason":"upstream_failed","from":"anthropic/claude-sonnet-4-5","to":"openai/gpt-5"}
   ```
+
+  It is followed by a terminator in the client's dialect — `data: {"choices":[{"delta":{},
+  "finish_reason":"stop"}]}` for an OpenAI-shaped client, `event: message_stop` with
+  `data: {"type":"message_stop"}` for an Anthropic-shaped one — and then the replacement model's
+  frames.
 
   **A client that ignores unknown SSE events — as the specification requires — still receives a
   valid, terminated response.** The retry event is informational. This is a compatibility
@@ -272,23 +277,25 @@ data: [DONE]
 
 ### Mid-stream failure
 
-> **Status.** The behaviour in this section is the design. `midstream_policy` is compiled into the plan
-> and accepted by `mr combo add --midstream-policy`, but the relay never reads it and never emits
-> `manarouter.retry`: a step that dies after bytes are on the wire currently ends the client stream
-> as-is, and there is no tool-call guard.
+> **Status.** Implemented. The relay wraps the committed winner's body, so it sees the failure, and
+> the combo's `midstream_policy` decides what happens. The replacement is a participant that
+> **passed** the race's eligibility gate — nothing is re-dispatched.
 
 Once bytes have reached the client, the router cannot pretend the request did not happen.
 `midstream_policy` decides ([Combos §midstream policy](06-combos.md#7-midstream_policy)):
 
 | Policy | What the client sees |
 |---|---|
-| `restart` (default) | One coherent response, from the replacement model |
-| `terminate` | A truncated stream, ended cleanly with `[DONE]` |
+| `restart` (default) | The `manarouter.retry` boundary, then the replacement model's frames |
+| `terminate` | The partial stream, ended with an error |
 
 **Hard guard under both:** once any `tool_calls` delta has been emitted, the relay refuses to splice.
 A tool call is a structured object the client is already assembling; half of one model's call plus
 half of another's produces a call that is either invalid or, worse, valid and wrong. A truncated
 stream is the honest outcome.
+
+Before anything has reached the client, both policies switch silently: the client never saw the dead
+model's answer, so there is nothing to un-send and nothing to announce.
 
 ### The Anthropic surface
 
@@ -473,6 +480,7 @@ later request. **No other endpoint returns a credential value** — not `/api/co
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/api/quota` | Aggregates the `usage` table per account. **Nothing writes that table today**, so it returns empty regardless of traffic — see [Quota tracking](08-quota-tracking.md). |
+| `GET` | `/api/usage` | The per-request usage ledger, with the token count reported by the provider or estimated by the router — see below. |
 | `GET` | `/api/oauth` | The OAuth platforms this build supports. |
 | `POST` | `/api/oauth/{platform}/authorize` | Starts an interactive login. |
 | `POST` | `/api/oauth/{platform}/device-code` | Starts a device-code login. |
@@ -481,6 +489,47 @@ later request. **No other endpoint returns a credential value** — not `/api/co
 
 The four OAuth `POST`s are how a credential enters the vault without ever passing through
 `config.json`; they are documented in [OAuth overview](10-oauth-overview.md).
+
+### `GET /api/usage` — the token count, by the provider or by the router
+
+The ledger of what the keys spent, one row per request, newest first. `?limit=` (default 50, max 500)
+and `?key=<client-key-id>` narrow it.
+
+```json
+{
+  "rows": [
+    {
+      "id": "0193f0c2-8a71-7c3e-9b02-5f1c6d4e7a10",
+      "client_key_id": "key-a",
+      "occurred_at": 1760000000000,
+      "prompt_tokens": 120,
+      "completion_tokens": 45,
+      "provider_prompt_tokens": null,
+      "provider_completion_tokens": null,
+      "provider_reported": false,
+      "estimated": true,
+      "request_bytes": 480,
+      "response_bytes": 180
+    }
+  ],
+  "totals": {
+    "requests": 1,
+    "prompt_tokens": 120,
+    "completion_tokens": 45,
+    "estimated_requests": 1
+  }
+}
+```
+
+The token count of a request is reported **either by the provider** — the upstream sent a `usage`
+block, and those numbers are in `provider_prompt_tokens` / `provider_completion_tokens` — **or by the
+router**, in which case `estimated` is `true` and the numbers were derived from the byte counts the
+relay measured (`request_bytes`, `response_bytes`) with the project's four-bytes-per-token rule.
+
+**The estimate is computed in the panel process, not on the router's request path.** The relay only
+counts bytes as they stream past; the arithmetic happens here, in the conductor. A row with neither
+provider counts nor measured bytes keeps `null` numbers and `estimated: false` — unknown stays
+unknown, and never becomes zero.
 
 ### The error envelope
 

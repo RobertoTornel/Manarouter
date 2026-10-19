@@ -9,9 +9,10 @@ given so you can re-run it.
 > workspace tests (1 172 passed, 1 ignored), the release-profile test run, `cargo fmt --all -- --check`,
 > strict workspace Clippy, strict Clippy and tests in `tools/mock-upstream` and `tools/bench`, the
 > panel Node tests, the secret scan, the isolated installer test, and the isolated
-> relay/conductor/mock-upstream smoke. The store schema is at **v3** — unchanged, because the quota
-> work needed no migration: `key_usage` and `provider_quota_state` (v2) and `usage_tokens` (v3) are
-> present and tested.
+> relay/conductor/mock-upstream smoke. The store schema is at **v4**: `key_usage` and
+> `provider_quota_state` (v2), `usage_tokens` (v3) and `key_usage_bytes` (v4) are present and
+> tested. The v4 migration is additive — a side table for the byte counts the relay measures — and
+> is idempotent, so a crash-and-retry of the migration cannot fail.
 > **D2 is now implemented**: the relay admits a request against the key's caps before any upstream
 > side effect and settles it afterwards, in `crates/manarouter-relay/src/quota.rs` — a refused request
 > is HTTP 429 and writes nothing, and a token cap can be overshot by the request that crosses it
@@ -27,10 +28,14 @@ given so you can re-run it.
 > **The hedged race runner is implemented**: a combo with `hedge.enabled` dispatches every
 > participant at once, `hedge_decide` is called from the request path, and the
 > highest-priority participant that answers inside the eligibility window is committed while the
-> losers are dropped. The mid-stream splice and the four `WinnerFailMode`s are still unreachable,
-> because the winner is committed before its body streams. `tools/bench` measures the relay's own
-> added latency; the hedge's own overhead — one extra upstream request per participant — is not
-> measured separately.
+> losers are dropped. **The winner's recovery is implemented too**: the relay wraps the committed
+> winner's body (`crates/manarouter-relay/src/recovery.rs`), so a death after the commit is
+> recovered from a participant that passed the eligibility gate — silently before any byte reached
+> the client, with the `manarouter.retry` boundary after, and never after a tool-call delta. Of the
+> four `WinnerFailMode`s only `pick-highest-passed` is implemented (and it is the default); the
+> other three are accepted configuration that the relay ignores for now, with a warning in the log.
+> `tools/bench` measures the relay's own added latency; the hedge's own overhead — one extra
+> upstream request per participant — is not measured separately.
 > Re-run before release and inspect `git status`.
 
 
@@ -40,8 +45,8 @@ given so you can re-run it.
 |---|---|---|
 | `mr-core` — config, snapshot compiler, vault, usage store, OAuth | **Substantial, not complete** | Codex, Copilot, and Antigravity OAuth authorization/token exchange/refresh/Google userinfo identity code is wired; Antigravity IDE client details remain reverse-engineered and unverified. |
 | `mr-dialects` — OpenAI, Anthropic, Responses, Google, Command Code translation | **Reachable, test coverage uneven** | Relay dispatches request and response translation per selected step. The Responses implementation now has five reachability tests for the arms that are only reachable in combination; the other dialects are better covered than it is. `docs/24-provider-dialects.md` documents the seven dialects. |
-| `manarouter-relay` — HTTP API, auth, snapshot, account selection, translation | **Runs; the hedged race runs, winner recovery does not** | Startup, flag/config precedence, listener bind selection and the 2 s `config.json` reload poller live in `crates/manarouter-relay/src/startup.rs` (declared at `crates/manarouter-relay/src/lib.rs:47`; 17 tests). The step loop and the race share one attempt implementation (`attempt_step` in `crates/manarouter-relay/src/server.rs`), so the sequential and concurrent paths cannot drift; `hedge_decide` decides the race and the losers are dropped when a winner is committed. Winner recovery (`on_winner_fail`) and the mid-stream switch are not implemented, because the winner is committed before its body streams. Priority combos with `hedge.enabled` now remember the successful provider/model for a configurable inactivity window (default 1800s), combo-wide across callers; the preference is process-local and rechecked against current eligibility on each request. Client-key scan exits at first match (a deliberate latency tradeoff that reveals configured match position to a local timing observer). |
-| `manarouter-conductor` — auth, API, state, serving, provider quota refresh | **Partial** | `/api/quota` returns cached provider/account quota snapshots and declares refresh routes. Provider-specific OAuth refresh is reported unsupported. Historical request-usage rows are a separate Store ledger and relay currently does not write them. No live/provider refresh was exercised in this audit. |
+| `manarouter-relay` — HTTP API, auth, snapshot, account selection, translation | **Runs; the hedged race runs and the winner's recovery works** | Startup, flag/config precedence, listener bind selection and the 2 s `config.json` reload poller live in `crates/manarouter-relay/src/startup.rs` (declared at `crates/manarouter-relay/src/lib.rs:47`; 17 tests). The step loop and the race share one attempt implementation (`attempt_step` in `crates/manarouter-relay/src/server.rs`), so the sequential and concurrent paths cannot drift; `hedge_decide` decides the race and the losers are dropped when a winner is committed; the participants that passed the race are kept for the recovery to use. Winner recovery is implemented in `crates/manarouter-relay/src/recovery.rs` (`pick-highest-passed`, the default): the winner's body is watched, and a failure is recovered from the highest-priority participant that passed — silently before any byte reached the client, with the `manarouter.retry` boundary after, refused after a tool-call delta. The other three `WinnerFailMode`s are accepted and ignored, with a warning. Priority combos with `hedge.enabled` now remember the successful provider/model for a configurable inactivity window (default 1800s), combo-wide across callers; the preference is process-local and rechecked against current eligibility on each request. Client-key scan exits at first match (a deliberate latency tradeoff that reveals configured match position to a local timing observer). |
+| `manarouter-conductor` — auth, API, state, serving, provider quota refresh | **Partial** | `/api/quota` returns cached provider/account quota snapshots and declares refresh routes. Provider-specific OAuth refresh is reported unsupported. `GET /api/usage` serves the per-request usage ledger, with the token count reported by the provider or estimated by the router — the estimate is computed in the panel process, never on the relay's request path. The older per-account `usage` table is still never written. No live/provider refresh was exercised in this audit. |
 | `mr-cli` | **Partial** | Account/provider/combo/key/model families dispatch; `mr key rotate` is supported; `mr doctor` performs read-only config, vault metadata, snapshot freshness, and listener exposure checks; it fails if no enabled client key is present while relay bind is not confirmed loopback-only. `mr migrate omniroute` imports OAuth grants (by one refresh), model lists and effort-variant aliases — dry run by default, `--apply` to write, reading a copy of the reference database. `mr serve` runs both service binaries as child processes for a foreground session (`crates/mr-cli/src/serve.rs`, 6 tests, committed as `65f543d`; one Ctrl-C stops both, either child exiting stops the other, and the failure message names the child and its status — `mr serve` itself exits 1, it does not forward the child's code); `config` and `vault` remain unimplemented (`crates/mr-cli/src/config.rs:46`, `crates/mr-cli/src/vault.rs:24`). |
 | `panel/` | **Implemented; critical browser workflow verified** | Firefox E2E covers panel login, client-key creation, and rotation against an isolated mock API; other routes remain unverified. |
 | OAuth | **Partial; flows wired, migration verified live** | Conductor OAuth routes cover Codex (browser **and** device-code flows), Copilot, and Antigravity authorization code flows. Config changes written by the CLI are adopted without a restart by both the conductor (on the next authenticated `GET`) and the relay (2 s poll of `config.json`); tokens are vault-backed, metadata lives in SQLite, and relay resolves/refreshes credentials. Antigravity's interactive loopback OAuth exchange/refresh, v2 userinfo identity, free-tier Cloud Code onboarding with bounded LRO polling, encrypted token context persistence, and account-bound relay project injection are implemented. Paid-tier onboarding remains fail-closed without explicit project input. `mr migrate omniroute` transfers Codex and Antigravity grants by one refresh each, using the client identities in `mr-core/src/published.rs`; this was exercised against a live installation (10 grants imported, all re-refreshed with the reference stopped, and a real completion served through the relay). Copilot tokens issued as `ghu_` GitHub App tokens are refused by GitHub's mint endpoint and are reported as needing a fresh login. T2 client metadata and PKCE remain reverse-engineered/unverified. Cline remains unavailable. |
@@ -117,19 +122,27 @@ snapshot without contacting a provider, `--host 0.0.0.0` refused, `--host ::1` b
 
 ## 3. The honest gap in the headline feature
 
-**The hedged race runs; the recovery of a dead winner does not.**
+**The hedged race runs, and so does the recovery of a dead winner.**
 
 `select::hedge_decide` implements and tests the entire *decision* policy — eligibility window,
-priority winner, immediate resolution when the top participant replies in window. The relay now calls
+priority winner, immediate resolution when the top participant replies in window. The relay calls
 it: a combo with `hedge.enabled` dispatches every participant at once, the highest-priority
 participant that answers inside the window is committed, and the losers are dropped. The step loop
 and the race share one attempt implementation, so the two paths cannot drift.
 
-What is still missing is the *recovery* half. The winner is committed when the upstream response
-arrives, before its body streams, so a winner that dies mid-stream is not replaced, and the four
-`WinnerFailMode`s — which describe exactly that case — are unreachable. `winner_metric` also does
-not yet distinguish `first_response_byte` from `first_complete_token`: both resolve at the response
-arrival.
+The *recovery* half runs too. The relay wraps the committed winner's body
+(`crates/manarouter-relay/src/recovery.rs`), so a death after the commit is visible to it, and the
+participants that passed the race are kept for it to fall back on. The replacement is the
+highest-priority participant that passed the eligibility gate; the switch is invisible before any
+byte reached the client, and after that it follows the combo's `midstream_policy` — the
+`manarouter.retry` boundary for `restart`, an error for `terminate`. A tool-call delta on the wire
+stops the splice under both policies.
+
+What is still missing is narrower. `pick-highest-passed` is the only implemented `WinnerFailMode`
+and the default; `rerun-excluding`, `pick-highest-passed-different-provider` and `stable-fallback`
+are accepted configuration that the relay ignores for now, with a warning in the log.
+`winner_metric` also does not yet distinguish `first_response_byte` from `first_complete_token`:
+both resolve at the response arrival.
 
 A loser's cancellation is local. Dropping the loser closes this relay's connection to the provider,
 but a provider may keep generating and keep billing, so a hedge can cost a full completion on every

@@ -57,9 +57,18 @@ Two things to keep in mind:
 
 - **It costs quota.** Every participant that was dispatched consumes provider quota, including the
   losers. A loser that had begun generating is billed.
-- **A winner that dies mid-stream is not replaced.** The winner is committed when the upstream
-  response arrives, before the body is streamed, so a stream that breaks afterwards ends the client
-  stream as-is. The `on_winner_fail` modes that would describe a replacement are not implemented.
+- **A winner that dies mid-stream is replaced only if somebody is left to replace it.** When the
+  committed winner's body fails, the relay falls back to the highest-priority participant that had
+  *passed* the same window. If the client has not seen a byte yet the switch is invisible; if it has,
+  the relay announces it with a `manarouter.retry` event so the client can tell the two answers
+  apart. A stream that breaks after a tool call was already emitted is never spliced — it ends with
+  an error, because a half-emitted tool call is worse than a clean failure.
+
+  The replacement is a participant that had already answered when the winner was committed. In the
+  usual shape of a race — the preferred model answers first and alone — there is nobody else to fall
+  back to, and the stream ends with an error as it always did. `on_winner_fail` has four modes; the
+  one that runs is "pick the highest-priority that passed" (`pick-highest-passed`), which is also
+  the default. The other three are accepted configuration that the relay ignores for now.
 
 With a priority combo, enabling the hedge setting can also activate a process-local preference for
 the last successful step.

@@ -206,16 +206,23 @@ unoptimised `rustls` or `hyper` makes local profiling meaningless.
 
 ### 3.9 Fire-and-forget usage accounting
 
-> **Status.** This is the design, not live behaviour. No usage record is written anywhere today: the
-> relay does not mention usage, and the `usage` table's writer has no caller outside `store.rs` tests.
+> **Status.** Partly live. The **per-key usage ledger** is written: the relay settles each request
+> into `key_usage` with the token counts the provider reported, and the byte counts it measured.
+> The older per-request `usage` table — the one with the account, the model and the race's
+> `winner_step`/`loser_steps` — still has no writer outside `store.rs` tests.
 
-Usage data — tokens, latency, which participant won — is intended to be recorded, but never
-synchronously. The relay would push a record onto a bounded channel and a writer would batch to SQLite.
-If the channel is full the record is **dropped and counted**, not retried.
+Usage data — tokens, latency, which participant won — is recorded, never synchronously. The relay
+pushes a record onto a bounded channel and a writer batches to SQLite. If the channel is full the
+record is **dropped and counted**, not retried.
 
 That is a deliberate choice: an observability feature must never be able to apply backpressure to the
 thing it observes. The panel is meant to surface the dropped-record count so the loss is visible rather
 than silent.
+
+**The token arithmetic is not on the request path either.** The relay counts bytes — one addition per
+chunk — and leaves the division to the panel process, which computes the estimate for a request whose
+provider reported no counts and marks it as an estimate. A provider's numbers are never overwritten
+by an estimate; the ledger keeps saying what the provider said.
 
 ---
 

@@ -117,15 +117,17 @@ and says so in the response header:
 x-manarouter-count-tokens-estimate: true
 ```
 
-The number is a **character-based approximation, not the provider's tokenizer**: the UTF-8 byte
-length of every string value in the request body, the top-level `model` excluded, divided by four
-and rounded up, never less than one. A body that is not JSON falls back to its raw length the same
-way. An estimate presented as an authoritative count would be worse than no endpoint at all, which
-is why the header is there: a client that needs the provider's exact number can tell the two apart,
-and can point itself at an Anthropic upstream when the difference matters.
+The number is a **byte-based approximation, not the provider's tokenizer**: the request body's length
+in bytes, divided by four and rounded up, never less than one. It is the same four-bytes-per-token
+rule the relay already uses to size a quota reservation, so the answer counts the JSON shell —
+braces, quotes, field names, schema keys — as well as the text. On a long prompt that is a
+percentage or two; on a small or schema-heavy body it can be several times the text-only count.
+An estimate presented as an authoritative count would be worse than no endpoint at all, which is why
+the header is there: a client that needs the provider's exact number can tell the two apart, and can
+point itself at an Anthropic upstream when the difference matters.
 
-The local answer costs nothing — no account is selected, no credential is read, and no upstream is
-billed.
+The local answer costs nothing — no account is selected, no credential is read, no upstream is
+billed, and the body is never parsed: a length and a division are all it takes.
 
 ## See also
 

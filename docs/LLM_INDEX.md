@@ -31,7 +31,7 @@ inside the eligibility window).
 | Process | Crate | Default port | Responsibility |
 |---|---|---|---|
 | `manarouter-relay` — the **data plane** | `crates/manarouter-relay` | 20900 | Accept a request, look up a compiled route, select an account, translate/forward. Applies relay auth and reasoning policy, enforces per-key quota caps, and egresses through a configured proxy when one applies. A combo with the hedge enabled races its participants: the highest-priority one that answers inside the eligibility window wins, and the losers are dropped. |
-| `manarouter-conductor` — the **control plane** | `crates/manarouter-conductor` | 20901 | Configuration, snapshot compilation, quota snapshot refresh APIs, OAuth, and the web panel. Request-usage ledger recording is not wired. |
+| `manarouter-conductor` — the **control plane** | `crates/manarouter-conductor` | 20901 | Configuration, snapshot compilation, quota snapshot refresh APIs, OAuth, and the web panel. Serves the per-request usage ledger at `GET /api/usage`; the token estimate for a provider that reported nothing is computed here, in the panel process. |
 
 `mr serve` runs both binaries as supervised child processes for a foreground session; for an
 unattended setup the README documents starting them separately.
@@ -156,7 +156,7 @@ client ──► relay :20900
              └─ 9. emit usage              fire-and-forget; dropped rather than backpressured
 ```
 
-Dialect translation is reachable per selected step when the client and upstream shapes differ; translated requests may override the path or force streaming. Matching dialects keep the original bytes. The hedged race runs: participants are dispatched concurrently and the highest-priority one that answers inside the eligibility window wins. Winner recovery is not implemented, because the winner is committed before its body streams. `docs/16-latency-engineering.md` §6 states the per-step budget.
+Dialect translation is reachable per selected step when the client and upstream shapes differ; translated requests may override the path or force streaming. Matching dialects keep the original bytes. The hedged race runs: participants are dispatched concurrently and the highest-priority one that answers inside the eligibility window wins. The winner's recovery runs too: the relay watches the winner's body and falls back to a participant that passed the same window — silently before any byte reached the client, with the `manarouter.retry` boundary after, and never after a tool-call delta. `docs/16-latency-engineering.md` §6 states the per-step budget.
 
 ---
 
