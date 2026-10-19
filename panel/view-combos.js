@@ -33,10 +33,10 @@ const WINNER_METRICS = [
 ];
 
 const FAIL_MODES = [
-  ['rerun-excluding', 're-run excluding failed', 'Re-run the whole competition over the remaining participants, excluding every model that already failed, up to max_rounds. The most robust mode and the most expensive; max_rounds exists so a systemic outage cannot turn one client request into unbounded upstream calls.'],
-  ['pick-highest-passed', 'use highest-priority that passed', 'Do not re-dispatch: answer with the highest-priority participant that already passed the eligibility gate in the first competition. Zero added latency; the right mode when a fast, safe answer matters more than spending more upstream requests on recovery.'],
-  ['pick-highest-passed-different-provider', 'highest passed, different provider', 'As above, but the replacement must come from a different provider than the one that died. Exists because the most common real failure is not a bad model but a bad provider: an outage, a revoked credential, a provider-wide quota.'],
-  ['stable-fallback', 'jump to stable step', 'Skip the race entirely and go to the chosen stable step — it need not be a race participant. Its model is the dedicated on-fail model.'],
+  ['pick-highest-passed', 'use highest-priority that passed', 'Implemented. Do not re-dispatch: answer with the highest-priority participant that already passed the eligibility gate in the first competition. Zero added latency; the right mode when a fast, safe answer matters more than spending more upstream requests on recovery.'],
+  ['rerun-excluding', 're-run excluding failed (not implemented yet)', 'Not implemented yet: the relay accepts this mode, logs that it is unimplemented, and behaves as pick-highest-passed. It is meant to re-run the whole competition over the remaining participants, excluding every model that already failed, up to max_rounds.'],
+  ['pick-highest-passed-different-provider', 'highest passed, different provider (not implemented yet)', 'Not implemented yet: the relay accepts this mode, logs that it is unimplemented, and behaves as pick-highest-passed. It is meant to answer with the highest-priority participant that passed, but only if it comes from a different provider than the one that died.'],
+  ['stable-fallback', 'jump to stable step (not implemented yet)', 'Not implemented yet: the relay accepts this mode, logs that it is unimplemented, and behaves as pick-highest-passed. It is meant to skip the race entirely and go to the chosen stable step.'],
 ];
 
 export async function renderCombos(mount, ctx, selectedId) {
@@ -182,7 +182,7 @@ export async function renderCombos(mount, ctx, selectedId) {
       count: draft.hedge?.count ?? 3,
       window_ms: draft.hedge?.window_ms ?? 800,
       winner_metric: draft.hedge?.winner_metric ?? 'first-response-byte',
-      on_winner_fail: draft.hedge?.on_winner_fail ?? { 'rerun-excluding': { max_rounds: 2 } },
+      on_winner_fail: draft.hedge?.on_winner_fail ?? { 'pick-highest-passed': null },
       cancel_losers: draft.hedge?.cancel_losers ?? true,
       loser_grace_ms: draft.hedge?.loser_grace_ms ?? 0,
     };
@@ -556,7 +556,7 @@ export async function renderCombos(mount, ctx, selectedId) {
         count: 3,
         window_ms: 800,
         winner_metric: 'first-response-byte',
-        on_winner_fail: { 'rerun-excluding': { max_rounds: 2 } },
+        on_winner_fail: { 'pick-highest-passed': null },
         cancel_losers: true,
         loser_grace_ms: 0,
       },

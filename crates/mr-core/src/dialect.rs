@@ -605,10 +605,16 @@ fn default_max_rounds() -> u8 {
 }
 
 impl Default for WinnerFailMode {
+    /// The operator's rule: **the winner is the highest-priority participant that passed.**
+    ///
+    /// The other three modes stay accepted configuration options, but the one that is *not*
+    /// implemented — `rerun-excluding` spends more upstream requests to find a winner that a fresh
+    /// race might have found, which is the expensive answer to a question the operator did not ask.
+    /// A combo that says nothing about `on_winner_fail` therefore gets the rule the operator
+    /// actually stated, and a combo that asks for `rerun-excluding` is told (in the relay's log)
+    /// that the request is being served as `pick-highest-passed` instead.
     fn default() -> Self {
-        Self::RerunExcluding {
-            max_rounds: default_max_rounds(),
-        }
+        Self::PickHighestPassed
     }
 }
 
@@ -1099,6 +1105,29 @@ mod tests {
             serde_json::json!({ "rerun-excluding": { "max_rounds": 3 } })
         )
         .is_err());
+    }
+
+    #[test]
+    fn the_default_winner_fail_mode_is_the_operator_s_rule() {
+        // The operator's rule: the winner is the highest-priority participant that passed. A combo
+        // that says nothing about `on_winner_fail` gets that rule, not the expensive one.
+        assert_eq!(WinnerFailMode::default(), WinnerFailMode::PickHighestPassed);
+        assert_eq!(WinnerFailMode::default().as_str(), "pick-highest-passed");
+
+        // The other three remain accepted configuration options — they deserialize, they keep
+        // their wire shape, and they are simply not implemented yet.
+        for mode in [
+            WinnerFailMode::RerunExcluding { max_rounds: 2 },
+            WinnerFailMode::PickHighestPassed,
+            WinnerFailMode::PickHighestPassedDifferentProvider,
+            WinnerFailMode::StableFallback { step: 1 },
+        ] {
+            let json = serde_json::to_value(&mode).expect("serialize");
+            assert_eq!(
+                serde_json::from_value::<WinnerFailMode>(json).expect("deserialize"),
+                mode
+            );
+        }
     }
 
     #[test]

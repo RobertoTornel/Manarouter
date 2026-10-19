@@ -69,7 +69,7 @@ export async function renderKeys(mount, ctx) {
     }
     tableWrap.replaceChildren(
       h('p', { class: 'hint' },
-        'Edit a key to change its rolling caps. Per-key usage and counters are not reported by this API, so they are not shown as zero. Enforcement is not confirmed.'),
+        'Edit a key to change its rolling caps. This API does not carry per-key usage, so it is not shown as zero — the Quota page lists the recorded request usage. Enforcement is not confirmed.'),
       h('table', { class: 'tbl' },
         h('thead', {}, h('tr', {},
           h('th', { scope: 'col' }, 'Label'),

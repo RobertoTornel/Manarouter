@@ -110,8 +110,10 @@ pub const SNAPSHOT_VERSION: u32 = 6;
 /// repository root is not used; there are no `.sql` files to apply.
 ///
 /// Version 3 added the `usage_tokens` side table (cached tokens, cache-write tokens, and the
-/// generation window that tokens-per-second divides by). The store currently has three migrations;
-/// per-key rolling admission is not yet implemented. Keep this version aligned with `MIGRATIONS`
-/// until the complete, tested admission migration is added. The compile-time assert below enforces
-/// that invariant.
-pub const SCHEMA_VERSION: u32 = 3;
+/// generation window that tokens-per-second divides by). Version 4 added the `key_usage_bytes`
+/// side table: the request and response byte counts the relay observes, which the panel process
+/// turns into a token estimate when the provider reported no counts of its own. The store
+/// currently has four migrations; per-key rolling admission is not yet implemented. Keep this
+/// version aligned with `MIGRATIONS` until the complete, tested admission migration is added. The
+/// compile-time assert below enforces that invariant.
+pub const SCHEMA_VERSION: u32 = 4;

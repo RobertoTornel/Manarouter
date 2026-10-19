@@ -18,10 +18,12 @@
 //! window wins. The policy — who wins, and when — lives in [`crate::select::hedge_decide`]; the
 //! runner that dispatches the participants and commits the winner lives here.
 //!
-//! What the race does **not** do is replace a winner that dies mid-stream. The commit happens when
-//! the upstream response arrives, before the body streams, so the four `WinnerFailMode`s — which
-//! all describe what to do in exactly that case — are unreachable. A reader who assumes a failed
-//! winner is being replaced will misread what the relay does with a dead upstream.
+//! What the race does with a winner that dies mid-stream lives in [`crate::recovery`]. The commit
+//! happens when the upstream response arrives, before the body streams, so the relay wraps the
+//! winner's body: a failure after that point is recovered from a participant that already passed
+//! the race, under the combo's `midstream_policy`. Of the four `WinnerFailMode`s only
+//! `pick-highest-passed` is implemented; the others are accepted configuration and are reported in
+//! the log.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -1606,6 +1608,44 @@ enum HedgeOutcome {
     Fatal(Response),
 }
 
+/// How a race participant is named in the recovery boundary.
+///
+/// `provider/model`, which is what the client asked for and what the operator wrote in the combo.
+fn participant_id(step: &StepPlan) -> String {
+    format!("{}/{}", step.provider_id, step.model)
+}
+
+/// The participants that passed the race, in priority order, ready to answer in the winner's place.
+///
+/// "Passed" is the eligibility gate, not "answered eventually": a participant that replied after
+/// the window keeps no priority protection, and the operator's rule is about the ones that fit the
+/// latency requirement. The winner itself is not in the list — it is the one that died.
+fn passed_replacements(
+    outcomes: &mut [Option<Attempt>],
+    states: &[select::Participant],
+    winner: usize,
+    window_ms: u64,
+    participants: &[&StepPlan],
+) -> Vec<crate::recovery::Replacement> {
+    let mut passed = Vec::new();
+    for (index, outcome) in outcomes.iter_mut().enumerate() {
+        if index == winner {
+            continue;
+        }
+        if !states[index].replied_in_window(window_ms) {
+            continue;
+        }
+        // The answer is already in the race's result set; only its body has not been read.
+        if let Some(Attempt::Answer(response)) = outcome.take() {
+            passed.push(crate::recovery::Replacement {
+                id: participant_id(participants[index]),
+                body: response.into_body(),
+            });
+        }
+    }
+    passed
+}
+
 /// Run a hedged race over a combo's participants.
 ///
 /// Every participant is dispatched at once. The winner is the **highest-priority** participant that
@@ -1616,10 +1656,12 @@ enum HedgeOutcome {
 /// The window is an **eligibility gate, not a timeout**: it never fails a request, and a
 /// participant that answers after it is still an answer.
 ///
-/// What is *not* implemented here is the mid-stream half of the feature: a winner that dies while
-/// its body is streaming is not replaced, and the four `WinnerFailMode`s — which all describe
-/// what to do in exactly that case — are unreachable. The commit below happens when the upstream
-/// response arrives, which is before the body streams.
+/// The commit below happens when the upstream response arrives, which is before the body streams.
+/// The winner's body is therefore wrapped by [`crate::recovery`], so that a winner which dies
+/// while its body streams can be replaced by a participant that passed the race — the
+/// highest-priority one, which is the operator's rule. Of the four `WinnerFailMode`s only
+/// `pick-highest-passed` is implemented; the others are accepted configuration and are reported in
+/// the log.
 async fn run_hedge(
     actx: &AttemptContext<'_>,
     participants: &[&StepPlan],
@@ -1708,11 +1750,39 @@ async fn run_hedge(
                     continue;
                 }
             };
-            // The losers are dropped here. Their futures are still pending, and dropping a
-            // pending attempt drops the upstream response with it, which closes that connection
-            // rather than leaking it. The upstream may still be generating — that is the
-            // documented cost of a hedge — but this relay does not hold the socket open.
-            return HedgeOutcome::Won(response);
+
+            // The participants that passed the race are kept: their answers are the fallback for a
+            // winner that dies while its body streams. The participants that are still pending are
+            // dropped with the race, exactly as before — their upstream connections are closed,
+            // which is the documented cost of a hedge and does not change.
+            let replacements =
+                passed_replacements(&mut outcomes, &states, winner, window_ms, participants);
+
+            // Only one winner-fail mode is implemented. The other three stay accepted
+            // configuration, and the relay says so rather than pretending.
+            let mode = &hedge.on_winner_fail;
+            if !matches!(mode, mr_core::dialect::WinnerFailMode::PickHighestPassed) {
+                tracing::warn!(
+                    mode = mode.as_str(),
+                    "the configured winner-fail mode is not implemented yet; the race is served as \
+                     pick-highest-passed, which takes the highest-priority participant that passed"
+                );
+            }
+
+            let policy = actx
+                .combo
+                .map(|combo| combo.midstream_policy)
+                .unwrap_or_default();
+            let winner_id = participant_id(participants[winner]);
+            // The winner's body is wrapped so that the relay owns the stream: a failure after the
+            // response arrived can then be recovered instead of ending the client's answer.
+            return HedgeOutcome::Won(crate::recovery::wrap(
+                response,
+                replacements,
+                policy,
+                actx.client_dialect,
+                winner_id,
+            ));
         }
     }
 
@@ -5167,8 +5237,9 @@ mod tests {
         let text = body_text(response).await;
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value.as_object().unwrap().len(), 1);
-        // "user" (4 bytes) and "hello" (5 bytes) are the input: 9 / 4 rounds up to 3.
-        assert_eq!(value["input_tokens"], 3);
+        // The whole body is counted — the container around the text is bytes too. The body is 62
+        // bytes, and 62 / 4 rounds up to 16.
+        assert_eq!(value["input_tokens"], 16);
 
         // Nothing was sent upstream.
         assert!(
@@ -5204,5 +5275,477 @@ mod tests {
             .is_none());
         assert_eq!(body_text(response).await, r#"{"error":"no such endpoint"}"#);
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Winner recovery
+    // -----------------------------------------------------------------------------------------
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use mr_core::dialect::{MidstreamPolicy, WinnerFailMode};
+
+    /// A fake upstream that writes part of a body and then dies.
+    ///
+    /// The socket is closed without the rest of the declared body, which is what an upstream that
+    /// dies mid-stream looks like from the relay's side: the bytes it did send arrive, and then
+    /// the body errors. A raw socket is used rather than an axum handler because the point of the
+    /// fixture is *where* the stream stops, and an axum handler cannot stop in the middle of a
+    /// chunked body.
+    async fn dying_upstream(
+        delay_ms: u64,
+        body: String,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                read_request(&mut socket, &mut request).await;
+                sink.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request).to_string());
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                // The declared length is longer than what is sent, so the body ends in an error
+                // rather than in an end-of-stream.
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len() + 64,
+                    body
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.flush().await;
+                // Close without the rest of the body: the client's body errors.
+                drop(socket);
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// Read one HTTP request: the headers, and then as many body bytes as they declare.
+    async fn read_request(socket: &mut tokio::net::TcpStream, request: &mut Vec<u8>) {
+        let mut chunk = [0u8; 4096];
+        loop {
+            let Ok(read) = socket.read(&mut chunk).await else {
+                return;
+            };
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            let text = String::from_utf8_lossy(request);
+            let Some(split) = text.find("\r\n\r\n") else {
+                continue;
+            };
+            let length = text[..split]
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            if request.len() >= split + 4 + length {
+                return;
+            }
+        }
+    }
+
+    /// A fake upstream that answers with an OpenAI event stream.
+    async fn sse_upstream(
+        delay_ms: u64,
+        content: &'static str,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(move |body: Bytes| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push(String::from_utf8_lossy(&body).to_string());
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                let chunk = format!(
+                    "data: {{\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":\
+                     [{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"{content}\"}}}}]}}\n\n"
+                );
+                let stream = futures_util::stream::iter(vec![
+                    Ok::<Bytes, std::io::Error>(Bytes::from(chunk)),
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n")),
+                ]);
+                (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    AxumBody::from_stream(stream),
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// A provider that speaks a particular dialect.
+    fn provider_speaking(
+        id: &str,
+        dialect: Dialect,
+        base_url: &str,
+        model: &str,
+        modalities: &[InputModality],
+    ) -> mr_core::model::Provider {
+        let mut provider = mr_core::model::Provider::new(id, dialect, base_url);
+        let mut account = mr_core::model::Account::new(id);
+        account.secret_ref = Some("test-credential".to_owned());
+        provider.accounts = vec![account];
+        let mut entry = dm();
+        entry.id = model.to_owned();
+        entry.input_modalities = modalities.to_vec();
+        provider.models = vec![entry];
+        provider
+    }
+
+    /// What the recovery fixture should look like.
+    #[derive(Clone)]
+    struct RecoverySpec {
+        /// How long the winner (the higher-priority participant) takes to answer.
+        winner_delay_ms: u64,
+        /// What the winner writes before it dies.
+        winner_body: String,
+        /// The dialect the winner's provider speaks.
+        winner_dialect: Dialect,
+        /// How long the replacement (the lower-priority participant) takes to answer.
+        replacement_delay_ms: u64,
+        /// The dialect the replacement's provider speaks.
+        replacement_dialect: Dialect,
+        /// The combo's mid-stream policy.
+        policy: MidstreamPolicy,
+        /// The configured winner-fail mode.
+        on_winner_fail: WinnerFailMode,
+    }
+
+    impl Default for RecoverySpec {
+        fn default() -> Self {
+            Self {
+                winner_delay_ms: 120,
+                winner_body:
+                    "data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":\
+                     [{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"winner\"}}]}\n\n"
+                        .to_owned(),
+                winner_dialect: Dialect::OpenAi,
+                replacement_delay_ms: 40,
+                replacement_dialect: Dialect::OpenAi,
+                policy: MidstreamPolicy::Restart,
+                on_winner_fail: WinnerFailMode::PickHighestPassed,
+            }
+        }
+    }
+
+    /// A relay whose only route is a two-step combo whose winner dies mid-stream.
+    ///
+    /// The replacement answers *before* the winner does, and the winner is the higher-priority
+    /// participant, so the winner is committed on priority and the replacement is already in the
+    /// race's result set when it is. That is the situation `pick-highest-passed` is for.
+    async fn recovery_state(spec: RecoverySpec) -> (AppState, Arc<std::sync::Mutex<Vec<String>>>) {
+        let (winner_url, winner_seen) =
+            dying_upstream(spec.winner_delay_ms, spec.winner_body.clone()).await;
+        let (replacement_url, _replacement_seen) =
+            sse_upstream(spec.replacement_delay_ms, "second").await;
+
+        let mut combo = mr_core::model::Combo::new(
+            "race",
+            mr_core::model::ComboStep::new("first", "race-model"),
+        );
+        combo
+            .steps
+            .push(mr_core::model::ComboStep::new("second", "race-model"));
+        combo.hedge = mr_core::model::HedgeSpec {
+            enabled: true,
+            participants: vec![0, 1],
+            window_ms: 2_000,
+            on_winner_fail: spec.on_winner_fail,
+            ..Default::default()
+        };
+        combo.midstream_policy = spec.policy;
+
+        let config = mr_core::config::Config {
+            providers: vec![
+                provider_speaking(
+                    "first",
+                    spec.winner_dialect,
+                    &winner_url,
+                    "race-model",
+                    &[InputModality::Text],
+                ),
+                provider_speaking(
+                    "second",
+                    spec.replacement_dialect,
+                    &replacement_url,
+                    "race-model",
+                    &[InputModality::Text],
+                ),
+            ],
+            combos: vec![combo],
+            ..Default::default()
+        };
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let vault = Arc::new(opened);
+
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: store,
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+        };
+        (state, winner_seen)
+    }
+
+    /// A streaming request for the combo the recovery fixture serves.
+    fn streaming_body() -> String {
+        serde_json::json!({
+            "model": "race",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+        })
+        .to_string()
+    }
+
+    /// Every frame the client received, and the error that ended the stream.
+    async fn drain(response: Response) -> (String, Option<String>) {
+        let mut body = response.into_body();
+        let mut text = String::new();
+        loop {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        text.push_str(&String::from_utf8_lossy(data));
+                    }
+                }
+                Some(Err(err)) => return (text, Some(err.to_string())),
+                None => return (text, None),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_winner_that_dies_before_anything_reaches_the_client_is_replaced_silently() {
+        // The winner's provider speaks another dialect, so the relay translates its frames — and
+        // the frame it sent is a partial line, which the translator is still holding. Nothing
+        // reaches the client, so the switch is invisible.
+        let spec = RecoverySpec {
+            winner_dialect: Dialect::Anthropic,
+            winner_body: "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":\
+                          {\"type\":\"text_delta\",\"text\":\"partial\"}}"
+                .to_owned(),
+            ..RecoverySpec::default()
+        };
+        let (state, _seen) = recovery_state(spec).await;
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(streaming_body()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let (text, error) = drain(response).await;
+        assert_eq!(error, None, "the stream ended in an error: {text}");
+        assert!(
+            text.contains("second"),
+            "the client did not receive the replacement's answer: {text}"
+        );
+        assert!(
+            !text.contains("manarouter.retry"),
+            "the switch was announced, but nothing had reached the client yet: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_winner_that_dies_mid_stream_is_announced_and_replaced() {
+        let (state, _seen) = recovery_state(RecoverySpec::default()).await;
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(streaming_body()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let (text, error) = drain(response).await;
+        assert_eq!(error, None, "the stream ended in an error: {text}");
+
+        // The dead model's own bytes are still there: the client was already reading them.
+        assert!(text.contains("winner"), "{text}");
+        // The boundary says which model died and which one takes over.
+        assert!(text.contains("event: manarouter.retry"), "{text}");
+        assert!(text.contains(r#""reason":"upstream_failed""#), "{text}");
+        assert!(text.contains(r#""from":"first/race-model""#), "{text}");
+        assert!(text.contains(r#""to":"second/race-model""#), "{text}");
+        // The dead model's turn is closed, in the client's dialect.
+        assert!(
+            text.contains(r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+            "{text}"
+        );
+        // And the replacement's answer follows it.
+        assert!(text.contains("second"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_terminate_policy_ends_the_stream_with_an_error() {
+        let spec = RecoverySpec {
+            policy: MidstreamPolicy::Terminate,
+            ..RecoverySpec::default()
+        };
+        let (state, _seen) = recovery_state(spec).await;
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(streaming_body()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let (text, error) = drain(response).await;
+        let error = error.expect("the stream should have ended in an error");
+        assert!(error.contains("could not be recovered"), "{error}");
+        // What the client had already received is still there; the replacement is not.
+        assert!(text.contains("winner"), "{text}");
+        assert!(!text.contains("second"), "{text}");
+        assert!(!text.contains("manarouter.retry"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_delta_stops_the_splice_under_both_policies() {
+        for policy in [MidstreamPolicy::Restart, MidstreamPolicy::Terminate] {
+            let spec = RecoverySpec {
+                policy,
+                winner_body: "data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\
+                              \"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\
+                              \"call_1\",\"function\":{\"name\":\"do_it\",\"arguments\":\"{\"}]}}]}}\n\n"
+                    .to_owned(),
+                ..RecoverySpec::default()
+            };
+            let (state, _seen) = recovery_state(spec).await;
+
+            let response = dispatch(
+                state,
+                Dialect::OpenAi,
+                Method::POST,
+                Uri::from_static("/v1/chat/completions"),
+                headers(&[]),
+                AxumBody::from(streaming_body()),
+            )
+            .await;
+
+            let (text, error) = drain(response).await;
+            let error = error.expect("the stream should have ended in an error");
+            assert!(error.contains("could not be recovered"), "{error}");
+            // The tool call that was already emitted is still on the wire, and nothing was
+            // spliced onto it.
+            assert!(text.contains("tool_calls"), "{text}");
+            assert!(!text.contains("second"), "{text}");
+            assert!(!text.contains("manarouter.retry"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unimplemented_winner_fail_mode_still_answers_and_is_reported() {
+        let spec = RecoverySpec {
+            on_winner_fail: WinnerFailMode::RerunExcluding { max_rounds: 2 },
+            ..RecoverySpec::default()
+        };
+        let (state, _seen) = recovery_state(spec).await;
+
+        // The log is captured for the duration of the request: the mode is not implemented, and the
+        // operator has to be told that the request was served as `pick-highest-passed`.
+        let log = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(LogWriter(Arc::clone(&log)))
+            .finish();
+
+        let response = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            dispatch(
+                state,
+                Dialect::OpenAi,
+                Method::POST,
+                Uri::from_static("/v1/chat/completions"),
+                headers(&[]),
+                AxumBody::from(streaming_body()),
+            )
+            .await
+        };
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let (text, error) = drain(response).await;
+        assert_eq!(error, None, "the stream ended in an error: {text}");
+        assert!(text.contains("second"), "{text}");
+
+        let logged = String::from_utf8_lossy(&log.lock().unwrap()).to_string();
+        assert!(
+            logged.contains("rerun-excluding"),
+            "the unimplemented mode was not reported: {logged}"
+        );
+        assert!(
+            logged.contains("not implemented yet"),
+            "the unimplemented mode was not reported: {logged}"
+        );
+    }
+
+    /// A tracing writer that keeps what it is given, so a test can read the log.
+    #[derive(Clone)]
+    struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 }

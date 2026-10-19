@@ -32,6 +32,26 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The bytes-per-token approximation this project uses wherever it must guess a token count.
+///
+/// Four bytes per token is the usual approximation for English text. It is an **estimate** and is
+/// treated as one: it sizes a quota reservation before the provider has said anything, and it is
+/// what the panel process turns observed byte counts into when the provider reported nothing. It
+/// is never written over a provider's own count.
+pub const CHARS_PER_TOKEN: u64 = 4;
+
+/// Estimate a token count from a byte count, with the one rule the whole project shares.
+///
+/// The relay uses it to size a quota reservation, and the panel process uses it to turn the byte
+/// counts the relay observed into an estimate. Both read it from here, so the number the router
+/// reserves against and the number the panel shows cannot drift apart.
+///
+/// This is arithmetic, not measurement: it is deliberately **not** on the router's request path.
+/// The relay only ever counts bytes; the division happens in the panel process, off the path.
+pub fn estimate_tokens_from_bytes(bytes: u64) -> u64 {
+    bytes / CHARS_PER_TOKEN
+}
+
 /// Token counts as one upstream reported them, in a provider-neutral shape.
 ///
 /// Every field is optional and means exactly what it says: `None` is "the upstream did not tell

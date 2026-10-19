@@ -18,6 +18,8 @@ export async function renderQuota(mount, ctx) {
   let display = { ...DEFAULT_DISPLAY };
   let quotaError = null;
   let configError = null;
+  let usage = null;
+  let usageError = null;
   let records = new Map();
   let refreshAllBusy = false;
   const busyAccounts = new Set();
@@ -25,11 +27,15 @@ export async function renderQuota(mount, ctx) {
   const localErrors = new Map();
 
   mount.replaceChildren(h('div', { class: 'card' }, 'Loading provider quota…'));
-  const [providerResult, configResult, quotaResult] = await Promise.allSettled([
+  const [providerResult, configResult, quotaResult, usageResult] = await Promise.allSettled([
     ctx.loadProviders(),
     api.get('/api/config'),
     api.get('/api/quota'),
+    api.get('/api/usage?limit=20'),
   ]);
+
+  if (usageResult.status === 'fulfilled') usage = usageResult.value ?? null;
+  else usageError = `Could not load request usage: ${usageResult.reason?.message || 'request failed'}`;
 
   if (providerResult.status === 'fulfilled') providers = providerResult.value ?? [];
   else quotaError = `Could not load accounts: ${providerResult.reason?.message || 'request failed'}`;
@@ -92,6 +98,8 @@ export async function renderQuota(mount, ctx) {
     children.push(h('p', { class: 'quota-legend' },
       h('span', { class: 'swatch', 'aria-hidden': 'true' }), ' remaining', ' · gray = used'));
 
+    children.push(renderUsage());
+
     if (!accountRows.length) {
       children.push(emptyState('No provider accounts found.',
         'Add an account before fetching provider quota.'));
@@ -99,6 +107,49 @@ export async function renderQuota(mount, ctx) {
       for (const row of accountRows) children.push(renderAccount(row));
     }
     mount.replaceChildren(...children);
+  }
+
+  // The request ledger: what the client keys spent, with the token count reported by the provider
+  // or estimated by the router. The estimate is computed in the panel process, so this page never
+  // has to ask the relay for a number it does not have.
+  function renderUsage() {
+    const card = h('section', { class: 'card' });
+    card.append(h('h2', {}, 'Recent request usage'));
+    if (usageError) {
+      card.append(errorBlock({ message: usageError }));
+      return card;
+    }
+    const rows = Array.isArray(usage?.rows) ? usage.rows : [];
+    if (!rows.length) {
+      card.append(h('p', { class: 'hint' },
+        'No request usage recorded yet. A request that carries a client key is recorded once it settles.'));
+      return card;
+    }
+    const table = h('table', { class: 'tbl' },
+      h('thead', {}, h('tr', {},
+        h('th', { scope: 'col' }, 'When'),
+        h('th', { scope: 'col' }, 'Key'),
+        h('th', { scope: 'col' }, 'Prompt'),
+        h('th', { scope: 'col' }, 'Completion'),
+        h('th', { scope: 'col' }, 'Source'))));
+    const body = h('tbody');
+    for (const row of rows) {
+      body.append(h('tr', {},
+        h('td', { class: 'mono' }, formatUsageTime(row?.occurred_at)),
+        h('td', { class: 'mono' }, row?.client_key_id ?? '(unknown)'),
+        h('td', { class: 'num' }, formatTokens(row?.prompt_tokens)),
+        h('td', { class: 'num' }, formatTokens(row?.completion_tokens)),
+        h('td', {}, row?.estimated ? 'estimated by the router' : 'reported by the provider')));
+    }
+    table.append(body);
+    card.append(table);
+    const totals = usage?.totals ?? {};
+    card.append(h('p', { class: 'hint' },
+      `${totals.requests ?? rows.length} request(s), `
+      + `${formatTokens(totals.prompt_tokens)} prompt tokens, `
+      + `${formatTokens(totals.completion_tokens)} completion tokens`
+      + (totals.estimated_requests ? `, ${totals.estimated_requests} estimated` : '')));
+    return card;
   }
 
   function renderAccount(row) {
@@ -273,6 +324,19 @@ export async function renderQuota(mount, ctx) {
     }
     render();
   }
+}
+
+// A token count that is not known is not zero: it is shown as a dash.
+function formatTokens(value) {
+  return value == null ? '—' : String(value);
+}
+
+// The ledger stores milliseconds since the epoch; the panel shows it in the local timezone.
+function formatUsageTime(millis) {
+  if (millis == null) return '—';
+  const date = new Date(Number(millis));
+  if (Number.isNaN(date.getTime())) return String(millis);
+  return date.toLocaleString();
 }
 
 function recordsFrom(data) {

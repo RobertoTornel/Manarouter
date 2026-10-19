@@ -84,7 +84,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// transaction as the migration it names, but if a future edit ever splits them, a re-run after a
 /// crash must not fail — a migration that errors on its second attempt bricks `open` for a
 /// database whose contents are actually fine.
-const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3];
+const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4];
 
 /// Schema v1: four tables, their indexes, and the revision/tombstone columns every row carries
 /// for v2 sync (see the module docs).
@@ -239,6 +239,30 @@ CREATE TABLE IF NOT EXISTS usage_tokens (
 );
 
 CREATE INDEX IF NOT EXISTS usage_tokens_by_usage ON usage_tokens(usage_id);
+"#;
+
+/// Schema v4: the byte counts of one request, beside its usage row.
+///
+/// The relay observes two facts about every metered request without doing any arithmetic: how
+/// many bytes the request body was, and how many bytes the response was. Those two numbers are
+/// what the *panel* process turns into a token estimate when the provider reported no counts of
+/// its own — the division happens there, off the router's request path, and the rule both sides
+/// share lives in `mr_core::usage`.
+///
+/// The counts are kept in a **side table** rather than as two more columns on `key_usage` for the
+/// same reason v2 used new tables instead of `ALTER TABLE ... ADD COLUMN`: the migration runner's
+/// invariant is that a re-run after a crash must not fail, and adding a column is not idempotent.
+///
+/// A missing column is `NULL` here, which means "the relay did not observe it" — never "zero".
+const MIGRATION_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS key_usage_bytes (
+    usage_id       TEXT PRIMARY KEY,
+    request_bytes  INTEGER,
+    response_bytes INTEGER,
+    created_at     INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS key_usage_bytes_by_usage ON key_usage_bytes(usage_id);
 "#;
 
 /// Compile-time guarantee that every migration has a schema version and vice versa.
@@ -646,6 +670,17 @@ pub struct KeyUsageRecord {
     pub occurred_at: Millis,
     /// When the row was written, in milliseconds since the epoch.
     pub created_at: Millis,
+    /// How many bytes the request body was, when the relay observed it.
+    ///
+    /// This is a *measurement*, not a token count: the relay counts bytes on the request path
+    /// because counting bytes is not arithmetic, and the panel process turns it into an estimate
+    /// later. `None` means "not observed" — never zero.
+    pub request_bytes: Option<u64>,
+    /// How many bytes the response was, when the relay observed it.
+    ///
+    /// `None` means "not observed" — a request that failed before the response body existed has no
+    /// response size, and saying "0 bytes" would be a claim about a response that never came.
+    pub response_bytes: Option<u64>,
 }
 
 impl KeyUsageRecord {
@@ -660,6 +695,8 @@ impl KeyUsageRecord {
             completion_tokens: None,
             occurred_at: now,
             created_at: now,
+            request_bytes: None,
+            response_bytes: None,
         }
     }
 
@@ -670,11 +707,59 @@ impl KeyUsageRecord {
         self
     }
 
+    /// Attach the byte counts the relay observed.
+    ///
+    /// These are the raw measurements; the token estimate they imply is the panel's business, and
+    /// the ledger keeps saying only what was actually observed.
+    pub fn with_bytes(mut self, request: Option<u64>, response: Option<u64>) -> Self {
+        self.request_bytes = request;
+        self.response_bytes = response;
+        self
+    }
+
     /// Move the occurrence time, for a caller that already knows when the request happened.
     pub fn at(mut self, at: Millis) -> Self {
         self.occurred_at = at;
         self
     }
+}
+
+/// The byte counts the relay observed for one request.
+///
+/// Both fields are optional and mean exactly what they say: `None` is "the relay did not observe
+/// it", never "zero". A request that never reached the upstream has no response size, and a
+/// response of no bytes at all is a different fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyUsageBytes {
+    /// How many bytes the request body was.
+    pub request_bytes: Option<u64>,
+    /// How many bytes the response was.
+    pub response_bytes: Option<u64>,
+}
+
+/// One row of the per-key ledger, as the panel reads it.
+///
+/// The token columns are what the provider reported and nothing else: `NULL` means the provider
+/// said nothing. The byte columns are what the relay measured. Turning the second into the first
+/// is the panel's job, and the panel marks the result as an estimate when it does it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyUsageRow {
+    /// The row id (a UUIDv7 string).
+    pub id: String,
+    /// The client key that made the request.
+    pub client_key_id: String,
+    /// Prompt tokens the upstream reported, if it reported any.
+    pub prompt_tokens: Option<u64>,
+    /// Completion tokens the upstream reported, if it reported any.
+    pub completion_tokens: Option<u64>,
+    /// When the request happened, in milliseconds since the epoch.
+    pub occurred_at: Millis,
+    /// When the row was written, in milliseconds since the epoch.
+    pub created_at: Millis,
+    /// How many bytes the request body was, when the relay observed it.
+    pub request_bytes: Option<u64>,
+    /// How many bytes the response was, when the relay observed it.
+    pub response_bytes: Option<u64>,
 }
 
 /// The token totals of one key over one window.
@@ -2037,9 +2122,13 @@ impl Store {
     /// The row is written once and never updated: the ledger is the history that rolling windows
     /// are computed from, so a corrected row would change what a window meant after the fact.
     /// Re-recording the same id is a no-op (`ON CONFLICT DO NOTHING`), which makes a retry safe.
+    ///
+    /// The byte counts, when the record carries them, are written in the same transaction as the
+    /// ledger row: a request must not end up with tokens but no size, or the other way round.
     pub fn record_key_usage(&self, record: &KeyUsageRecord) -> Result<()> {
-        let guard = self.guard()?;
-        guard.execute(
+        let mut guard = self.guard()?;
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "INSERT INTO key_usage (id, client_key_id, prompt_tokens, completion_tokens, \
              occurred_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT(id) DO NOTHING",
@@ -2052,7 +2141,82 @@ impl Store {
                 record.created_at.as_millis(),
             ],
         )?;
+        if record.request_bytes.is_some() || record.response_bytes.is_some() {
+            tx.execute(
+                "INSERT INTO key_usage_bytes (usage_id, request_bytes, response_bytes, created_at) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(usage_id) DO NOTHING",
+                params![
+                    record.id,
+                    record.request_bytes,
+                    record.response_bytes,
+                    record.created_at.as_millis(),
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// The byte counts observed for one usage row, if any were recorded.
+    ///
+    /// `None` means "this request's size was never observed" — the ledger row still stands on its
+    /// own, and the panel simply has nothing to estimate from.
+    pub fn key_usage_bytes(&self, usage_id: &str) -> Result<Option<KeyUsageBytes>> {
+        let guard = self.guard()?;
+        let row = guard
+            .query_row(
+                "SELECT request_bytes, response_bytes FROM key_usage_bytes WHERE usage_id = ?1",
+                params![usage_id],
+                |row| {
+                    Ok(KeyUsageBytes {
+                        request_bytes: row.get(0)?,
+                        response_bytes: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// The most recent usage rows, newest first, with the byte counts beside them.
+    ///
+    /// This is what the panel reads: the token columns are exactly what the provider reported
+    /// (`NULL` when it reported nothing) and the byte columns are what the relay measured. The
+    /// estimate that turns one into the other is the panel's business, not the store's.
+    ///
+    /// `client_key_id` narrows the rows to one key. The filter is part of the query, not a filter
+    /// applied afterwards: a caller that asked for fifty rows of one key must get fifty of *that
+    /// key*, not the last fifty rows of the ledger with the mismatches dropped.
+    pub fn recent_key_usage(
+        &self,
+        limit: u32,
+        client_key_id: Option<&str>,
+    ) -> Result<Vec<KeyUsageRow>> {
+        let guard = self.guard()?;
+        let mut stmt = guard.prepare(
+            "SELECT k.id, k.client_key_id, k.prompt_tokens, k.completion_tokens, k.occurred_at, \
+             k.created_at, b.request_bytes, b.response_bytes FROM key_usage k \
+             LEFT JOIN key_usage_bytes b ON b.usage_id = k.id \
+             WHERE (?2 IS NULL OR k.client_key_id = ?2) \
+             ORDER BY k.occurred_at DESC, k.created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit, client_key_id], |row| {
+            Ok(KeyUsageRow {
+                id: row.get(0)?,
+                client_key_id: row.get(1)?,
+                prompt_tokens: row.get(2)?,
+                completion_tokens: row.get(3)?,
+                occurred_at: Millis::from_millis(row.get(4)?),
+                created_at: Millis::from_millis(row.get(5)?),
+                request_bytes: row.get(6)?,
+                response_bytes: row.get(7)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// The usage of one key since `since`, in milliseconds since the epoch.
@@ -2129,12 +2293,22 @@ impl Store {
     ///
     /// The ledger grows with traffic, so it needs a retention policy. Pruning is by occurrence
     /// time, not write time: a row written late about an old request is still old.
+    ///
+    /// The byte counts go with the row they belong to: a size that outlived its ledger row would
+    /// be a number about a request nobody can find any more.
     pub fn prune_key_usage(&self, before: Millis) -> Result<u64> {
-        let guard = self.guard()?;
-        let removed = guard.execute(
+        let mut guard = self.guard()?;
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM key_usage_bytes WHERE usage_id IN \
+             (SELECT id FROM key_usage WHERE occurred_at < ?1)",
+            params![before.as_millis()],
+        )?;
+        let removed = tx.execute(
             "DELETE FROM key_usage WHERE occurred_at < ?1",
             params![before.as_millis()],
         )?;
+        tx.commit()?;
         Ok(u64::try_from(removed).unwrap_or(0))
     }
 
@@ -2584,6 +2758,128 @@ mod tests {
         let later = store.key_window_usage("key-a", t(1_500)).expect("query");
         assert_eq!(later.requests, 1);
         assert_eq!(later.prompt_tokens, 20);
+    }
+
+    /// The migration that adds the byte side table must leave the table there, and a usage row
+    /// written with byte counts must read back with them.
+    #[test]
+    fn the_byte_counts_are_stored_beside_the_usage_row() {
+        let store = Store::open_in_memory().expect("open");
+
+        // The side table exists: the migration ran.
+        {
+            let guard = store.guard().expect("guard");
+            let name: String = guard
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'key_usage_bytes'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("the byte side table must exist after the migration");
+            assert_eq!(name, "key_usage_bytes");
+        }
+
+        let record = KeyUsageRecord::new("key-a", t(10)).with_bytes(Some(480), Some(180));
+        store.record_key_usage(&record).expect("record");
+
+        let bytes = store
+            .key_usage_bytes(&record.id)
+            .expect("query")
+            .expect("the byte row must exist");
+        assert_eq!(bytes.request_bytes, Some(480));
+        assert_eq!(bytes.response_bytes, Some(180));
+
+        // The ledger row itself still says only what the provider said: nothing.
+        let window = store.key_window_usage("key-a", t(0)).expect("query");
+        assert_eq!(window.requests, 1);
+        assert_eq!(window.prompt_tokens, 0);
+        assert_eq!(window.completion_tokens, 0);
+
+        // And the panel can read the row and its bytes together.
+        let rows = store.recent_key_usage(10, None).expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, record.id);
+        assert_eq!(rows[0].prompt_tokens, None);
+        assert_eq!(rows[0].completion_tokens, None);
+        assert_eq!(rows[0].request_bytes, Some(480));
+        assert_eq!(rows[0].response_bytes, Some(180));
+    }
+
+    /// A usage row that was never measured has no byte row at all — "not observed" is not zero.
+    #[test]
+    fn a_request_with_no_observed_bytes_has_no_byte_row() {
+        let store = Store::open_in_memory().expect("open");
+        let record = KeyUsageRecord::new("key-a", t(10)).with_tokens(Some(4), Some(6));
+        store.record_key_usage(&record).expect("record");
+
+        assert_eq!(
+            store.key_usage_bytes(&record.id).expect("query"),
+            None,
+            "a row with no byte counts must not invent a zero-sized one"
+        );
+        let rows = store.recent_key_usage(10, None).expect("query");
+        assert_eq!(rows[0].request_bytes, None);
+        assert_eq!(rows[0].response_bytes, None);
+    }
+
+    /// Narrowing to one key is part of the query, not a filter applied afterwards.
+    ///
+    /// A caller that asked for ten rows of `key-b` must get ten of `key-b` — not the last ten rows
+    /// of the ledger with the mismatches dropped, which is what a post-filter would return.
+    #[test]
+    fn the_key_filter_narrows_the_rows_the_query_returns() {
+        let store = Store::open_in_memory().expect("open");
+        for (key, at) in [("key-a", 10), ("key-b", 20), ("key-a", 30), ("key-b", 40)] {
+            store
+                .record_key_usage(&KeyUsageRecord::new(key, t(at)))
+                .expect("record");
+        }
+
+        let all = store.recent_key_usage(10, None).expect("query");
+        assert_eq!(all.len(), 4);
+
+        let only_b = store.recent_key_usage(10, Some("key-b")).expect("query");
+        assert_eq!(only_b.len(), 2);
+        assert!(only_b.iter().all(|row| row.client_key_id == "key-b"));
+
+        // The limit applies to the narrowed rows, not to the rows that were scanned.
+        let one_b = store.recent_key_usage(1, Some("key-b")).expect("query");
+        assert_eq!(one_b.len(), 1);
+        assert_eq!(one_b[0].client_key_id, "key-b");
+        assert_eq!(one_b[0].occurred_at, t(40));
+    }
+
+    /// The migration runner's invariant: a re-run after a crash must not fail.
+    ///
+    /// The crash is simulated by rewinding `user_version` behind the migration that was already
+    /// applied, which is exactly the state a crash between "the table was created" and "the
+    /// version bump reached disk" leaves behind.
+    #[test]
+    fn a_migration_re_run_after_a_crash_does_not_fail() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+
+        let store = Store::open(&path).expect("open");
+        let record = KeyUsageRecord::new("key-a", t(10)).with_bytes(Some(480), Some(180));
+        store.record_key_usage(&record).expect("record");
+        drop(store);
+
+        {
+            let conn = Connection::open(&path).expect("open raw");
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+                .expect("rewind the version");
+            conn.close().expect("close");
+        }
+
+        // The re-run must succeed, and the data must be untouched.
+        let store = Store::open(&path).expect("the migration must survive a re-run");
+        assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
+        let bytes = store
+            .key_usage_bytes(&record.id)
+            .expect("query")
+            .expect("the byte row must survive the re-run");
+        assert_eq!(bytes.request_bytes, Some(480));
+        assert_eq!(bytes.response_bytes, Some(180));
     }
 
     #[test]

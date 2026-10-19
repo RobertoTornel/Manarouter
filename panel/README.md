@@ -26,7 +26,7 @@ All requests are **relative** (`/api/…`); the panel talks only to the origin t
 | `view-keys.js` | Client keys, allow-lists (one per line), create flow with the show-once plaintext dialog. |
 | `view-aliases.js` | Alias table editor (add + delete; the API has no alias PUT). |
 | `view-models.js` | All models across providers, filtered by provider/source/text/hidden, with hide/show toggles. |
-| `view-quota.js` | Declared windows from the config (real data) + `GET /api/quota`, which exists and renders the **honest empty state** because nothing writes usage rows yet. |
+| `view-quota.js` | Declared windows from the config (real data) + `GET /api/quota`, which exists and renders the **honest empty state** because nothing writes usage rows yet, plus the request ledger from `GET /api/usage` — the per-request token count, reported by the provider or estimated by the router. |
 | `view-settings.js` | Port editor with apply-on-restart warning, panel password, raw config editor with Validate/Save. |
 | `view-docs.js` | Documentation browser; renders doc text verbatim (`textContent`) — markdown shown as source, zero XSS surface. |
 

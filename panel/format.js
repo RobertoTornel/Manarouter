@@ -255,7 +255,7 @@ export function parseWinnerFail(v) {
     if (mode === 'stable-fallback') return { mode, maxRounds: null, step: Number(inner?.step ?? 0) };
     return { mode, maxRounds: null, step: null };
   }
-  return { mode: 'rerun-excluding', maxRounds: 2, step: null };
+  return { mode: 'pick-highest-passed', maxRounds: null, step: null };
 }
 
 /** Inverse of parseWinnerFail — canonical wire shape. */
@@ -265,7 +265,7 @@ export function buildWinnerFail(mode, { maxRounds = 2, step = 0 } = {}) {
     case 'stable-fallback': return { 'stable-fallback': { step: Math.max(0, Math.floor(Number(step) || 0)) } };
     case 'pick-highest-passed': return { 'pick-highest-passed': null };
     case 'pick-highest-passed-different-provider': return { 'pick-highest-passed-different-provider': null };
-    default: return { 'rerun-excluding': { max_rounds: 2 } };
+    default: return { 'pick-highest-passed': null };
   }
 }
 

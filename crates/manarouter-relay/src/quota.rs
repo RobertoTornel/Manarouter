@@ -79,7 +79,11 @@ const MONTHLY_30D_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 ///
 /// Four is the usual approximation for English text. It is an estimate and is treated as one: it
 /// sizes a reservation, and it is replaced by the upstream's own count when the request settles.
-pub const CHARS_PER_TOKEN: u64 = 4;
+///
+/// The number itself lives in [`mr_core::usage::CHARS_PER_TOKEN`], so the panel process — which is
+/// where observed byte counts become an estimate — cannot drift from the number the router
+/// reserved against.
+pub const CHARS_PER_TOKEN: u64 = mr_core::usage::CHARS_PER_TOKEN;
 
 /// One request's place in the in-flight ledger.
 #[derive(Debug, Clone)]
@@ -185,15 +189,20 @@ impl QuotaManager {
     /// The whole decision happens under one lock: the ledger is read, the caps are compared and the
     /// reservation is written before any other admission can look at the same key. That is what
     /// makes the check atomic against concurrent requests.
+    ///
+    /// `prompt` carries the size of the request: a bare token count when only that is known, or
+    /// the measured body size as well. The byte count is not used for the decision — it is carried
+    /// on the ticket so the usage row can record what was actually sent.
     pub fn admit(
         self: &Arc<Self>,
         key_id: &str,
         limits: &KeyLimits,
         flat_requests: u64,
         request_id: &str,
-        prompt_estimate: u64,
+        prompt: impl Into<PromptSize>,
         now: Millis,
     ) -> Admission {
+        let prompt = prompt.into();
         if !Self::is_metered(limits, flat_requests) {
             return Admission::Unmetered;
         }
@@ -268,7 +277,7 @@ impl QuotaManager {
 
         reservations.push(Reservation {
             request_id: request_id.to_owned(),
-            reserved_prompt_tokens: prompt_estimate,
+            reserved_prompt_tokens: prompt.tokens,
         });
 
         Admission::Allowed(Arc::new(QuotaTicket {
@@ -277,17 +286,25 @@ impl QuotaManager {
             request_id: request_id.to_owned(),
             occurred_at: now,
             usage: Arc::new(Mutex::new(None)),
+            request_bytes: prompt.bytes,
+            response_bytes: Mutex::new(None),
             settled: AtomicBool::new(false),
         }))
     }
 
     /// Write a request's actual spend and release its reservation.
+    ///
+    /// The byte counts ride along with the token counts. They are measurements, not estimates: the
+    /// ledger says what was sent and received, and the *panel* is what turns them into a token
+    /// count when the provider reported none.
     fn settle(
         &self,
         key_id: &str,
         request_id: &str,
         usage: Option<TokenUsage>,
         occurred_at: Millis,
+        request_bytes: Option<u64>,
+        response_bytes: Option<u64>,
     ) {
         // The row is written **before** the reservation is released. The other order would open a
         // window in which the request is neither in flight nor in the ledger, and a request that
@@ -297,6 +314,8 @@ impl QuotaManager {
             record.prompt_tokens = usage.input_tokens;
             record.completion_tokens = usage.output_tokens;
         }
+        record.request_bytes = request_bytes;
+        record.response_bytes = response_bytes;
         if let Err(e) = self.store.record_key_usage(&record) {
             // The usage is lost, and the count is one short. There is nothing better to do here:
             // the request has already been answered, and refusing to answer it now would be
@@ -343,6 +362,16 @@ pub struct QuotaTicket {
     occurred_at: Millis,
     /// The usage observed on the wire, filled in by the tap as the response arrives.
     usage: Arc<Mutex<Option<TokenUsage>>>,
+    /// How many bytes the request body was, when the caller measured it.
+    ///
+    /// Known at admission and never changed: it is a fact about the request, not a measurement that
+    /// happens later.
+    request_bytes: Option<u64>,
+    /// How many bytes the response was, filled in by the tap as the bytes go past.
+    ///
+    /// `None` until the body has been seen at all, so "the response was empty" and "there was no
+    /// response" stay different facts.
+    response_bytes: Mutex<Option<u64>>,
     /// Whether the ticket has already settled.
     settled: AtomicBool,
 }
@@ -352,6 +381,16 @@ impl QuotaTicket {
     pub fn usage_slot(&self) -> Arc<Mutex<Option<TokenUsage>>> {
         Arc::clone(&self.usage)
     }
+
+    /// How many bytes the request body was, when the caller measured it.
+    pub fn request_bytes(&self) -> Option<u64> {
+        self.request_bytes
+    }
+
+    /// How many bytes the response was, when the body has been seen.
+    pub fn response_bytes(&self) -> Option<u64> {
+        self.response_bytes.lock().ok().and_then(|slot| *slot)
+    }
 }
 
 impl Drop for QuotaTicket {
@@ -360,8 +399,15 @@ impl Drop for QuotaTicket {
             return;
         }
         let usage = self.usage.lock().ok().and_then(|slot| *slot);
-        self.manager
-            .settle(&self.key_id, &self.request_id, usage, self.occurred_at);
+        let response_bytes = self.response_bytes.lock().ok().and_then(|slot| *slot);
+        self.manager.settle(
+            &self.key_id,
+            &self.request_id,
+            usage,
+            self.occurred_at,
+            self.request_bytes,
+            response_bytes,
+        );
     }
 }
 
@@ -381,6 +427,11 @@ pub struct TapBody<B> {
     /// The body holds the ticket, not just its slot, because the settlement has to wait for the
     /// body: a stream that is still being sent has not finished spending the request's budget.
     ticket: Arc<QuotaTicket>,
+    /// How many bytes of the response have gone past.
+    ///
+    /// A counter, not a parse: the raw size of what the upstream sent is the fact the panel needs,
+    /// and adding up the lengths of the frames is all it costs.
+    response_bytes: u64,
     /// Whether the tap has been finished, so the usage is published exactly once.
     finished: bool,
 }
@@ -392,6 +443,7 @@ impl<B> TapBody<B> {
             inner,
             tap: UsageTap::new(),
             ticket,
+            response_bytes: 0,
             finished: false,
         }
     }
@@ -402,6 +454,11 @@ impl<B> TapBody<B> {
             return;
         }
         self.finished = true;
+        // The byte count is published whatever the usage says: a response that carried no usage
+        // still carried bytes, and their size is what the panel estimates from.
+        if let Ok(mut slot) = self.ticket.response_bytes.lock() {
+            *slot = Some(self.response_bytes);
+        }
         // `finish` consumes the tap and drains the partial tail it was holding, which is where a
         // final fragment — often the usage report — ends up.
         let tap = std::mem::replace(&mut self.tap, UsageTap::new());
@@ -438,6 +495,10 @@ where
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
+                    // One addition per chunk: the raw size of the response, counted as it goes
+                    // past. This is the whole of the relay's share of the estimate — no arithmetic,
+                    // no parsing, nothing that could slow the request down.
+                    this.response_bytes += data.len() as u64;
                     this.tap.observe_chunk(data);
                 }
                 Poll::Ready(Some(Ok(frame)))
@@ -455,13 +516,93 @@ where
 ///
 /// Four characters per token is the usual approximation for English text. It sizes a reservation,
 /// and the upstream's own count replaces it when the request settles.
-pub fn estimate_prompt_tokens(body_bytes: usize) -> u64 {
-    (body_bytes as u64) / CHARS_PER_TOKEN
+///
+/// The estimate and the measurement it came from travel together: the byte count is what the
+/// panel process later turns into an estimate of its own, and the rule both sides use is
+/// [`mr_core::usage::estimate_tokens_from_bytes`]. **No token arithmetic happens here** — the
+/// relay counts bytes, and the division is a presentation the panel computes.
+pub fn estimate_prompt_tokens(body_bytes: usize) -> PromptEstimate {
+    PromptEstimate {
+        tokens: mr_core::usage::estimate_tokens_from_bytes(body_bytes as u64),
+        bytes: body_bytes as u64,
+    }
+}
+
+/// What the relay knows about the size of a request's prompt when it admits the request.
+///
+/// Two facts, kept apart on purpose: the *measurement* (how many bytes the body was) and the
+/// *estimate* the measurement implies. The reservation is sized with the estimate; the byte count
+/// is recorded with the usage row and is what the panel process turns into a number of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptEstimate {
+    /// The estimated token count, from [`CHARS_PER_TOKEN`].
+    pub tokens: u64,
+    /// The request body's size in bytes — the measurement the estimate came from.
+    pub bytes: u64,
+}
+
+/// The estimate serializes as the token count it is, the way the plain number it replaced did.
+impl serde::Serialize for PromptEstimate {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(self.tokens)
+    }
+}
+
+impl From<PromptEstimate> for u64 {
+    fn from(estimate: PromptEstimate) -> Self {
+        estimate.tokens
+    }
+}
+
+/// The estimate compares as the token count it is, so a caller that only wants the number does not
+/// have to know that the measurement travels with it.
+impl PartialEq<u64> for PromptEstimate {
+    fn eq(&self, other: &u64) -> bool {
+        self.tokens == *other
+    }
+}
+
+impl PartialEq<PromptEstimate> for u64 {
+    fn eq(&self, other: &PromptEstimate) -> bool {
+        *self == other.tokens
+    }
+}
+
+/// The prompt size an admission was told about.
+///
+/// A caller that knows only a token count (a test, or a path that never saw the body) passes a
+/// bare `u64`; a caller that measured the body passes the [`PromptEstimate`] and the byte count
+/// comes along with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptSize {
+    /// The token estimate the reservation is sized with.
+    pub tokens: u64,
+    /// The request body's size in bytes, when it was measured.
+    pub bytes: Option<u64>,
+}
+
+impl From<u64> for PromptSize {
+    fn from(tokens: u64) -> Self {
+        Self {
+            tokens,
+            bytes: None,
+        }
+    }
+}
+
+impl From<PromptEstimate> for PromptSize {
+    fn from(estimate: PromptEstimate) -> Self {
+        Self {
+            tokens: estimate.tokens,
+            bytes: Some(estimate.bytes),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body::Body;
     use mr_core::model::KeyLimit;
 
     fn manager() -> (Arc<QuotaManager>, Arc<Store>) {
@@ -686,5 +827,90 @@ mod tests {
         // The estimate is only ever a size, and a body of nothing is a body of no tokens.
         assert_eq!(estimate_prompt_tokens(0), 0);
         assert_eq!(estimate_prompt_tokens(40), 10);
+    }
+
+    /// Drive a body to its end, synchronously.
+    fn drain(body: &mut TapBody<http_body_util::Full<Bytes>>) {
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            match std::pin::Pin::new(&mut *body).poll_frame(&mut cx) {
+                Poll::Ready(Some(Ok(_))) => continue,
+                Poll::Ready(None) => return,
+                Poll::Ready(Some(Err(e))) => panic!("the body failed: {e:?}"),
+                Poll::Pending => panic!("a whole body must never be pending"),
+            }
+        }
+    }
+
+    /// A settled request records the bytes it sent and the bytes it received.
+    ///
+    /// The relay counts bytes and nothing else: the row says what went over the wire, and the
+    /// panel process is what turns those two numbers into a token estimate.
+    #[test]
+    fn a_settled_request_writes_the_request_and_response_byte_counts() {
+        let (manager, store) = manager();
+        let limits = request_caps(10);
+        let request_body = b"{\"model\":\"example\",\"messages\":[{\"role\":\"user\"}]}";
+        let response_body = b"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}";
+
+        let admission = manager.admit(
+            "k",
+            &limits,
+            0,
+            "req-bytes",
+            estimate_prompt_tokens(request_body.len()),
+            Millis::now(),
+        );
+        let Admission::Allowed(ticket) = admission else {
+            panic!("expected the request to be admitted");
+        };
+        assert_eq!(ticket.request_bytes(), Some(request_body.len() as u64));
+
+        // The response goes past the tap, and the tap counts it.
+        let mut body = TapBody::new(
+            http_body_util::Full::new(Bytes::from_static(response_body)),
+            Arc::clone(&ticket),
+        );
+        drain(&mut body);
+        drop(body);
+        assert_eq!(ticket.response_bytes(), Some(response_body.len() as u64));
+
+        // Dropping the ticket settles the request into the ledger.
+        drop(ticket);
+        let rows = store.recent_key_usage(10, None).expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_bytes, Some(request_body.len() as u64));
+        assert_eq!(rows[0].response_bytes, Some(response_body.len() as u64));
+        // The provider reported no usage here, so the ledger says nothing about tokens: the
+        // estimate is the panel's to make, and it is marked as an estimate when it does.
+        assert_eq!(rows[0].prompt_tokens, None);
+        assert_eq!(rows[0].completion_tokens, None);
+    }
+
+    /// A request that never reached a response has no response size — not a size of zero.
+    #[test]
+    fn a_request_that_never_got_a_response_records_no_response_bytes() {
+        let (manager, store) = manager();
+        let limits = request_caps(10);
+        let admission = manager.admit(
+            "k",
+            &limits,
+            0,
+            "req-no-response",
+            estimate_prompt_tokens(120),
+            Millis::now(),
+        );
+        let Admission::Allowed(ticket) = admission else {
+            panic!("expected the request to be admitted");
+        };
+        assert_eq!(ticket.request_bytes(), Some(120));
+        assert_eq!(ticket.response_bytes(), None);
+        drop(ticket);
+
+        let rows = store.recent_key_usage(10, None).expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_bytes, Some(120));
+        assert_eq!(rows[0].response_bytes, None);
     }
 }
