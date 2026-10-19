@@ -24,7 +24,7 @@ This revision is the Feature Round 2 close-out. What it contains, and what it de
 | Per-key usage ledger | **Stored, not enforced** | `record_key_usage`, `key_window_usage`, `key_window_usage_many`, `prune_key_usage` exist and are tested (rolling-window maths, dense many-key map, prune, idempotent re-record). **The relay does not write to it and does not enforce any cap** — see §4. |
 | Automatic modality fallback | **Implemented, bounded to one hop** | A request whose modality the selected route cannot carry is retried against the configured `routing.defaults` entry, as a complete reroute against the same pinned snapshot — its own provider, account, credential, URL and dialect. A target that also lacks the modality, or names no known model, fails with HTTP 501. Five tests; see §4. |
 | Provider quota cache | **Wired to the panel** | `put_provider_quota_state` / `provider_quota_state` / `all_provider_quota_state` / `delete_provider_quota_state` back the conductor's `/api/quota` routes. |
-| CI | **Green, and wider than before** | `.github/workflows/ci.yml` runs fmt, strict Clippy, the secret scan, build, workspace tests, release tests, the isolated installer test, the isolated mock-upstream smoke, and the panel Node tests. The standalone `tools/mock-upstream` job passes strict Clippy again (three lints fixed). |
+| CI | **Green on `main`, on both runners** | `.github/workflows/ci.yml` runs fmt, strict Clippy, the secret scan, build, workspace tests, release tests, the isolated installer test, the isolated mock-upstream smoke, and the panel Node tests. The standalone `tools/mock-upstream` job passes strict Clippy again (three lints fixed). Two portability bugs in the CI scripts were found and fixed — see below. The run on `aee4dd8` is **green on ubuntu-latest, macos-latest, the tools job and the docs job**. |
 | Test files | **Tracked again** | The earlier session's staged deletions of `tests/smoke_e2e.py`, `tests/local_latency_bench.py`, `panel/test/browser.e2e.mjs` and `scripts/test-installer-systemd.sh` were reverted: CI now *runs* them, so removing them from the repository would have removed the checks rather than protected them. `.gitignore` no longer ignores `/tests/`, `/panel/test/` or `/scripts/test-*.sh`. |
 | Documentation | **Reconciled with the code** | `plan.md`, `docs/23-implementation-status.md`, `docs/user/08-proxies.md` and this file now say the same thing about what is and is not implemented. A broken relative link in `docs/user/08-proxies.md` was fixed. |
 
@@ -68,6 +68,29 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check && bash scripts/check-secrets.sh
 python3 tests/smoke_e2e.py && bash scripts/test-installer-systemd.sh
 ```
+
+### The two CI failures this revision fixed
+
+Both were environment assumptions in the CI scripts, not defects in the code under test, and
+neither could be seen on the machine that wrote them:
+
+| Runner | Step | Cause | Fix |
+|---|---|---|---|
+| macos-latest | "No committed credentials" | `scripts/check-secrets.sh` used `mapfile`, a **bash 4 builtin**; macOS ships bash 3.2, so the script died before it scanned anything. It also used `grep -Iq .`, and BSD grep has no `-I`. | The file list is read with a plain loop; binary files are detected by looking for a NUL byte (`tr` + `cmp`), which every system has. |
+| ubuntu-latest | "Installer systemd behavior" | The installer writes its units under `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user`, while the test looked in `$HOME/.config/systemd/user`. A runner that exports `XDG_CONFIG_HOME` put the units outside the tree the test inspects. | The test pins `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_DATA_HOME` to its disposable HOME, and adds `/usr/local/bin` to the restricted PATH (that is where macOS keeps `python3`, which the ordering-cycle check needs). |
+
+The local reproduction of the second one is worth remembering, because it is the kind of thing
+that is invisible until it is looked for:
+
+```bash
+env XDG_CONFIG_HOME=/tmp/probe bash scripts/test-installer-systemd.sh
+# before the fix: installer test: expected file: /tmp/…/home/.config/systemd/user/manarouter-conductor.service
+# after the fix:  installer systemd tests: passed (isolated HOME; install, update, --no-start)
+```
+
+**A green local run is not a green CI run.** The Linux machine had bash 5 and no `XDG_CONFIG_HOME`;
+the runners did not. The lesson for the next change: run the shell scripts the way a runner would,
+with a deliberately hostile environment, before believing they are portable.
 
 Test distribution, so a failure points somewhere. These are the counts from the fresh
 `cargo test --workspace --all-targets` run in this revision, not from counting attributes:
