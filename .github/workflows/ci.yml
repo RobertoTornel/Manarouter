@@ -94,10 +94,18 @@ jobs:
       fail-fast: false
       matrix:
         # Named explicitly rather than globbed: a glob that silently matches nothing is the same
-        # failure mode as the one this job exists to fix. `bench` is deliberately absent — it is an
-        # empty directory today, and a matrix entry for a crate with no manifest is a red job that
-        # says nothing. Add it here in the commit that creates it.
-        tool: [mock-upstream]
+        # failure mode as the one this job exists to fix. `bench` is the latency harness; it is
+        # built and tested here, but its *threshold* is deliberately not a gate — a microsecond
+        # measurement on a shared runner is dominated by the runner's own load, so a red job on
+        # that basis would be noise. The threshold is for a quiet machine, by hand.
+        include:
+          - tool: mock-upstream
+            fmt: cargo fmt --all --check
+          - tool: bench
+            # The bench crate has path dependencies on the relay, and `cargo fmt --all` in a
+            # detached crate formats every local path package in the dependency graph — so it would
+            # check `crates/` too. The root job checks that tree already; this job checks its own.
+            fmt: cargo fmt -p manarouter-bench --check
     steps:
       - uses: actions/checkout@v4
         with:
@@ -114,7 +122,7 @@ jobs:
 
       - name: Format
         working-directory: tools/${{ matrix.tool }}
-        run: cargo fmt --all --check
+        run: ${{ matrix.fmt }}
 
       - name: Clippy
         working-directory: tools/${{ matrix.tool }}

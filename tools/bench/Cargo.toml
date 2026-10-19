@@ -1,0 +1,49 @@
+[workspace]
+
+[package]
+name = "manarouter-bench"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+publish = false
+description = "Measures the relay's own added latency overhead against the budget in docs/16-latency-engineering.md, using a local fake upstream and no network, credentials or cost."
+
+[[bin]]
+name = "manarouter-bench"
+path = "src/main.rs"
+
+# Every dependency is pinned to an exact version instead of inheriting the root workspace's
+# `[workspace.dependencies]`, because this crate is deliberately detached (see the `[workspace]`
+# table above and the module docs in `src/main.rs`). The versions are the same ones the root
+# workspace resolves to, so a change there can be mirrored here by hand rather than silently
+# inherited.
+[dependencies]
+axum = { version = "=0.8.9", default-features = false, features = ["json", "tokio", "http1"] }
+bytes = { version = "=1.12.1" }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
+http = { version = "=1.5.0", default-features = false }
+http-body-util = { version = "=0.1.5" }
+hyper = { version = "=1.12.0", default-features = false, features = ["client", "http1", "server"] }
+hyper-util = { version = "=0.1.21", default-features = false, features = ["client", "client-legacy", "tokio", "http1"] }
+serde_json = { version = "=1.0.154", features = ["preserve_order"] }
+tempfile = { version = "=3.27.0" }
+tokio = { version = "=1.53.2", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+tower = { version = "=0.5.2", features = ["util"] }
+
+# The relay itself, and the shared types it is built from, as path dependencies. These live in the
+# root workspace, but they are pulled in as ordinary path dependencies: the bench measures the
+# shipping relay's own code, not a copy of it.
+manarouter-relay = { path = "../../crates/manarouter-relay" }
+mr-core = { path = "../../crates/mr-core" }
+
+# The release profile mirrors the root workspace's, because a benchmark that links a differently
+# optimised relay is measuring a different program. See `docs/16-latency-engineering.md` §3.8.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+incremental = false
+debug = false

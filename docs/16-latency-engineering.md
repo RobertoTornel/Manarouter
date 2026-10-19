@@ -277,8 +277,28 @@ would be misleading, so the two are never mixed.
 If a proposed change cannot be accounted for within one of these rows, it does not belong on the
 request path.
 
-Every row is a **target**. None of them is currently measured or asserted anywhere in this repository
-— see §5 — so they are the design's budget, not a result.
+Every row is a **target**. The per-stage rows are still unmeasured — see §5 — so they remain the
+design's budget rather than a result.
+
+The **Total added** row is now measured, by `tools/bench` (`manarouter-bench`). The tool starts a
+fake upstream on loopback, sends the same request twice — once straight to the upstream, once
+through the relay's own router, in-process so no client-side TCP hop is counted — and reports the
+difference. A measurement on an idle machine, release build, 300 samples:
+
+| | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| Baseline (direct to the upstream) | 54.4 µs | — | 109.8 µs | 235.4 µs |
+| Through the relay | 70.4 µs | — | 169.6 µs | 270.2 µs |
+| **Added by the relay** | **14.6 µs** | **41.8 µs** | **110.5 µs** | **209.9 µs** |
+
+That is inside the budget on every percentile, with room to spare at p50. The measurement is
+noisy — a run taken while the machine was compiling reported a p99 of 1040 µs, and another run
+minutes later reported 96 µs — so the tool is **report-or-threshold, run by hand on a quiet
+machine**, and deliberately not a CI gate. A breach is a reason to re-run, not a verdict.
+
+```
+cd tools/bench && cargo run --release -- --warmups 20 --samples 300
+```
 
 ---
 
