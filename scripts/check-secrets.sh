@@ -89,7 +89,14 @@ EXCLUDE_PATHS=(
 if [ "$#" -gt 0 ]; then
   FILES=("$@")
 else
-  mapfile -t FILES < <(git ls-files 2>/dev/null || find . -type f -not -path './.git/*')
+  # The file list is read with a plain loop rather than `mapfile`: `mapfile` is a bash 4 builtin,
+  # and macOS still ships bash 3.2, where the script would die before it scanned anything.
+  # `git ls-files` covers the tracked files of a checkout; the `find` is the fallback for a tree
+  # that is not a checkout at all.
+  FILES=()
+  while IFS= read -r f; do
+    FILES+=("$f")
+  done < <(git ls-files 2>/dev/null || find . -type f -not -path './.git/*')
 fi
 
 if [ "${#FILES[@]}" -eq 0 ]; then
@@ -117,6 +124,14 @@ is_allowlisted() {
   return 1
 }
 
+# Whether a file holds a NUL byte, which is how this scan tells text from binary.
+#
+# `grep -I` would answer the same question, but BSD grep on macOS does not have it. Comparing a
+# NUL-stripped copy of the file with the file itself uses tools that every system has.
+has_nul_byte() {
+  ! LC_ALL=C tr -d '\000' <"$1" | LC_ALL=C cmp -s - "$1"
+}
+
 findings=0
 scanned=0
 
@@ -124,7 +139,7 @@ for f in "${FILES[@]}"; do
   [ -f "$f" ] || continue
   is_excluded "$f" && continue
   # Binary files are skipped rather than scanned as text.
-  if ! grep -Iq . "$f" 2>/dev/null; then
+  if has_nul_byte "$f"; then
     continue
   fi
   scanned=$((scanned + 1))

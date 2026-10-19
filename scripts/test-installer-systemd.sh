@@ -9,7 +9,17 @@ trap 'rm -rf "$TMP"' EXIT
 
 HOME="$TMP/home"
 mkdir -p "$HOME" "$TMP/bin" "$TMP/log"
-export HOME PATH="$TMP/bin:/usr/bin:/bin" MOCK_LOG="$TMP/log/calls"
+# The PATH is restricted so the host's git, cargo and systemctl cannot be reached by accident, and
+# `/usr/local/bin` is included because that is where macOS keeps `python3`, which the ordering-cycle
+# check needs.
+export HOME PATH="$TMP/bin:/usr/bin:/bin:/usr/local/bin" MOCK_LOG="$TMP/log/calls"
+# The XDG directories are pinned to the disposable HOME. The installer writes its units under
+# `${XDG_CONFIG_HOME:-$HOME/.config}`, so a runner that exports XDG_CONFIG_HOME would otherwise
+# put them outside the tree this test looks at — a failure that has nothing to do with the
+# installer.
+export XDG_CONFIG_HOME="$HOME/.config"
+export XDG_STATE_HOME="$HOME/.local/state"
+export XDG_DATA_HOME="$HOME/.local/share"
 
 fail() { printf 'installer test: %s\n' "$*" >&2; exit 1; }
 assert_file() { [[ -f "$1" ]] || fail "expected file: $1"; }
