@@ -697,3 +697,28 @@ running since before the database moved.
 
 The database was not touched: it is still at `user_version = 3`, and the v2/v3 migrations are no-ops
 against it. Nothing under `~/.config/manarouter` or `~/.local/state/manarouter` was edited.
+
+### Third deployment (2026-10-20, `d516efc`)
+
+The discrepancy round was deployed the same way:
+
+| Step | Result |
+|---|---|
+| `cargo build --release -p manarouter-relay -p manarouter-conductor -p mr-cli` | Finished in 1 m 10 s. |
+| `systemctl --user restart manarouter-relay.service manarouter-conductor.service` | Both units **active**. |
+| `curl http://127.0.0.1:20900/healthz` | `{"status":"ok"}`. |
+| `curl http://127.0.0.1:20901/api/health` | `{"version":"0.1.0","uptime_secs":18,"snapshot":{"digest":"8e088c7662c05ee9",...},"counts":{"providers":3,"combos":0,"aliases":0,"keys":4,"accounts":11},"password_set":false}` — the same snapshot digest as before, so the live configuration was not disturbed. |
+| `curl http://127.0.0.1:20901/` | HTTP 200 — the panel is serving. |
+| `curl http://127.0.0.1:20900/v1/models` | HTTP 401 without a client key, which is the correct answer. |
+
+The relay's startup log shows `routing table loaded keys=4 combos=0 providers=3` and
+`relay listening addr=127.0.0.1:20900`, with no errors.
+
+**The three live providers are unaffected by the new URL rules**, which is worth stating because
+the rules changed how a base URL's version segment is treated. All three of the configured
+providers carry a base URL with no version segment — `https://api.commandcode.ai`,
+`https://cloudcode-pa.googleapis.com`, `https://chatgpt.com/backend-api/codex` — so the dialect's
+version is either absent (Command Code, Codex) or already in the translator's own path
+(Antigravity's `v1internal:generateContent`), and the URLs they were reaching before the change
+are the URLs they reach now. No billable call was made to verify this; the check was made against
+the URL rules themselves, which the relay's own tests cover row for row.
