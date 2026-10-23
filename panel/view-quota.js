@@ -131,6 +131,9 @@ export async function renderQuota(mount, ctx) {
         h('th', { scope: 'col' }, 'Key'),
         h('th', { scope: 'col' }, 'Prompt'),
         h('th', { scope: 'col' }, 'Completion'),
+        h('th', { scope: 'col' }, 'Cached'),
+        h('th', { scope: 'col' }, 'Cache write'),
+        h('th', { scope: 'col' }, 'tokens/s'),
         h('th', { scope: 'col' }, 'Source'))));
     const body = h('tbody');
     for (const row of rows) {
@@ -139,6 +142,12 @@ export async function renderQuota(mount, ctx) {
         h('td', { class: 'mono' }, row?.client_key_id ?? '(unknown)'),
         h('td', { class: 'num' }, formatTokens(row?.prompt_tokens)),
         h('td', { class: 'num' }, formatTokens(row?.completion_tokens)),
+        // The cache split and the rate are shown as em dashes when the provider did not report
+        // them. A zero would claim the provider said "no cache", which is a different fact from
+        // silence, and the distinction is the whole reason these columns are nullable.
+        h('td', { class: 'num' }, formatTokens(row?.cached_tokens)),
+        h('td', { class: 'num' }, formatTokens(row?.cache_write_tokens)),
+        h('td', { class: 'num' }, formatRate(row?.tokens_per_second)),
         h('td', {}, row?.estimated ? 'estimated by the router' : 'reported by the provider')));
     }
     table.append(body);
@@ -148,6 +157,8 @@ export async function renderQuota(mount, ctx) {
       `${totals.requests ?? rows.length} request(s), `
       + `${formatTokens(totals.prompt_tokens)} prompt tokens, `
       + `${formatTokens(totals.completion_tokens)} completion tokens`
+      + (totals.cached_tokens ? `, ${formatTokens(totals.cached_tokens)} from cache` : '')
+      + (totals.cache_write_tokens ? `, ${formatTokens(totals.cache_write_tokens)} written to cache` : '')
       + (totals.estimated_requests ? `, ${totals.estimated_requests} estimated` : '')));
     return card;
   }
@@ -329,6 +340,13 @@ export async function renderQuota(mount, ctx) {
 // A token count that is not known is not zero: it is shown as a dash.
 function formatTokens(value) {
   return value == null ? '—' : String(value);
+}
+
+// A rate is reported to one decimal place; `null` means the provider gave no timing, so there is
+// no rate to state and the cell says so rather than showing a zero.
+function formatRate(value) {
+  if (value == null || !Number.isFinite(Number(value))) return '—';
+  return Number(value).toFixed(1);
 }
 
 // The ledger stores milliseconds since the epoch; the panel shows it in the local timezone.

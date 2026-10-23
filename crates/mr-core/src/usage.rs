@@ -195,6 +195,10 @@ impl TokenUsage {
                     &["cachedContentTokenCount"],
                     &["cacheReadInputTokens"],
                     &["cached_tokens"],
+                    // Command Code / the Vercel AI SDK put the split one level down, under a
+                    // camelCase `inputTokenDetails`. Without these two paths a cached turn records
+                    // a cache miss, which overstates its cost.
+                    &["inputTokenDetails", "cacheReadTokens"],
                 ],
             ),
             cache_write_tokens: count_at(
@@ -203,6 +207,7 @@ impl TokenUsage {
                     &["cache_creation_input_tokens"],
                     &["cacheCreationInputTokens"],
                     &["prompt_tokens_details", "cache_creation_tokens"],
+                    &["inputTokenDetails", "cacheWriteTokens"],
                 ],
             ),
         }
@@ -298,6 +303,34 @@ pub fn tokens_per_second(output_tokens: Option<u64>, generation_ms: Option<u64>)
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The live Command Code shape: camelCase `totalUsage`, with the cache split nested one level
+    /// further down under `inputTokenDetails`.
+    ///
+    /// This is a verbatim `finish` event from the real endpoint. The nesting is the part that
+    /// matters: a reader that only looks at the top level records a cache miss for every cached
+    /// turn, which overstates what that turn cost.
+    #[test]
+    fn a_command_code_finish_event_yields_counts_and_a_cache_split() {
+        let body = br#"{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":44,"inputTokenDetails":{"noCacheTokens":44,"cacheReadTokens":0},"outputTokens":19,"totalTokens":63,"cachedInputTokens":0}}"#;
+        let usage = TokenUsage::from_body(body);
+        assert_eq!(usage.input_tokens, Some(44));
+        assert_eq!(usage.output_tokens, Some(19));
+        assert_eq!(usage.cache_read_tokens, Some(0));
+
+        // `noCacheTokens` is the *uncached* share and must never be mistaken for a cache read.
+        let cached = br#"{"type":"finish","totalUsage":{"inputTokens":100,"inputTokenDetails":{"noCacheTokens":20,"cacheReadTokens":80,"cacheWriteTokens":15},"outputTokens":25}}"#;
+        let usage = TokenUsage::from_body(cached);
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(25));
+        assert_eq!(
+            usage.cache_read_tokens,
+            Some(80),
+            "the cache read is the nested figure, not the uncached share"
+        );
+        assert_eq!(usage.cache_write_tokens, Some(15));
+        assert_eq!(usage.cache_hit_rate(), Some(0.8));
+    }
 
     #[test]
     fn every_dialects_spelling_of_input_and_output_is_read() {

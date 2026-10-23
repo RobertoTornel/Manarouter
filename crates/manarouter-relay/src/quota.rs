@@ -64,9 +64,8 @@ use http_body::Frame;
 use mr_core::ids::Millis;
 use mr_core::model::KeyLimits;
 use mr_core::store::{KeyUsageRecord, Store};
-use mr_core::usage::TokenUsage;
 
-use crate::usage_tap::UsageTap;
+use crate::usage_tap::{GenerationUsage, UsageTap};
 
 /// The rolling five-hour window, in milliseconds.
 const SESSION_5H_MS: i64 = 5 * 60 * 60 * 1000;
@@ -193,6 +192,34 @@ impl QuotaManager {
     /// `prompt` carries the size of the request: a bare token count when only that is known, or
     /// the measured body size as well. The byte count is not used for the decision — it is carried
     /// on the ticket so the usage row can record what was actually sent.
+    /// A ticket that records a request without reserving anything.
+    ///
+    /// Usage is a fact about a request, not a consequence of having a cap. A key with no caps still
+    /// spends real tokens, and an operator asking "what is this key costing me, and how fast" needs
+    /// that answer whether or not they set a budget. Reserving is what a cap buys; *recording* is
+    /// always worth doing, and it is the only thing this ticket does.
+    ///
+    /// It deliberately registers no reservation: nothing is held against a budget that does not
+    /// exist, and [`QuotaTicket`]'s release is a no-op for a request the in-flight map never held.
+    pub fn observe(
+        self: &Arc<Self>,
+        key_id: &str,
+        request_id: &str,
+        now: Millis,
+        request_bytes: Option<u64>,
+    ) -> Arc<QuotaTicket> {
+        Arc::new(QuotaTicket {
+            manager: Arc::clone(self),
+            key_id: key_id.to_owned(),
+            request_id: request_id.to_owned(),
+            occurred_at: now,
+            usage: Arc::new(Mutex::new(None)),
+            request_bytes,
+            response_bytes: Mutex::new(None),
+            settled: AtomicBool::new(false),
+        })
+    }
+
     pub fn admit(
         self: &Arc<Self>,
         key_id: &str,
@@ -301,7 +328,7 @@ impl QuotaManager {
         &self,
         key_id: &str,
         request_id: &str,
-        usage: Option<TokenUsage>,
+        usage: Option<GenerationUsage>,
         occurred_at: Millis,
         request_bytes: Option<u64>,
         response_bytes: Option<u64>,
@@ -310,9 +337,16 @@ impl QuotaManager {
         // window in which the request is neither in flight nor in the ledger, and a request that
         // fell into that window would be counted by neither.
         let mut record = KeyUsageRecord::new(key_id, occurred_at);
-        if let Some(usage) = usage {
+        if let Some(observed) = usage {
+            let usage = observed.usage;
             record.prompt_tokens = usage.input_tokens;
             record.completion_tokens = usage.output_tokens;
+            // The cache split and the generation window are recorded as reported. They are what
+            // make a row say "this answer cost this much, at this rate" instead of only "this many
+            // tokens went past".
+            record.cached_tokens = usage.cache_read_tokens;
+            record.cache_write_tokens = usage.cache_write_tokens;
+            record.generation_ms = observed.generation_ms;
         }
         record.request_bytes = request_bytes;
         record.response_bytes = response_bytes;
@@ -361,7 +395,10 @@ pub struct QuotaTicket {
     /// When the request was admitted, in milliseconds since the epoch.
     occurred_at: Millis,
     /// The usage observed on the wire, filled in by the tap as the response arrives.
-    usage: Arc<Mutex<Option<TokenUsage>>>,
+    ///
+    /// This carries the generation window as well as the counts: tokens-per-second needs both, and
+    /// a count without its window can only state a rate by guessing one.
+    usage: Arc<Mutex<Option<GenerationUsage>>>,
     /// How many bytes the request body was, when the caller measured it.
     ///
     /// Known at admission and never changed: it is a fact about the request, not a measurement that
@@ -378,7 +415,7 @@ pub struct QuotaTicket {
 
 impl QuotaTicket {
     /// The slot the tap writes the observed usage into.
-    pub fn usage_slot(&self) -> Arc<Mutex<Option<TokenUsage>>> {
+    pub fn usage_slot(&self) -> Arc<Mutex<Option<GenerationUsage>>> {
         Arc::clone(&self.usage)
     }
 
@@ -462,12 +499,12 @@ impl<B> TapBody<B> {
         // `finish` consumes the tap and drains the partial tail it was holding, which is where a
         // final fragment — often the usage report — ends up.
         let tap = std::mem::replace(&mut self.tap, UsageTap::new());
-        let usage = tap.finish().usage;
-        if usage.is_empty() {
+        let observed = tap.finish();
+        if observed.is_empty() {
             return;
         }
         if let Ok(mut slot) = self.ticket.usage.lock() {
-            *slot = Some(usage);
+            *slot = Some(observed);
         }
     }
 }
@@ -604,6 +641,7 @@ mod tests {
     use super::*;
     use http_body::Body;
     use mr_core::model::KeyLimit;
+    use mr_core::usage::TokenUsage;
 
     fn manager() -> (Arc<QuotaManager>, Arc<Store>) {
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -655,7 +693,10 @@ mod tests {
                 ..Default::default()
             };
             if let Ok(mut slot) = ticket.usage_slot().lock() {
-                *slot = Some(usage);
+                *slot = Some(GenerationUsage {
+                    usage,
+                    generation_ms: None,
+                });
             }
         }
         admission

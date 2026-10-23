@@ -133,6 +133,8 @@ async fn get_usage(
     let mut requests = 0u64;
     let mut prompt_tokens = 0u64;
     let mut completion_tokens = 0u64;
+    let mut cached_tokens = 0u64;
+    let mut cache_write_tokens = 0u64;
     let mut estimated_requests = 0u64;
 
     for row in rows {
@@ -140,6 +142,8 @@ async fn get_usage(
         requests += 1;
         prompt_tokens += view.prompt_tokens.unwrap_or(0);
         completion_tokens += view.completion_tokens.unwrap_or(0);
+        cached_tokens += view.cached_tokens.unwrap_or(0);
+        cache_write_tokens += view.cache_write_tokens.unwrap_or(0);
         if view.estimated {
             estimated_requests += 1;
         }
@@ -152,6 +156,8 @@ async fn get_usage(
             "requests": requests,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
+            "cached_tokens": cached_tokens,
+            "cache_write_tokens": cache_write_tokens,
             "estimated_requests": estimated_requests,
         }
     })))
@@ -181,6 +187,17 @@ struct UsageView {
     request_bytes: Option<u64>,
     /// How many bytes the response was, when the relay measured it.
     response_bytes: Option<u64>,
+    /// Prompt tokens the provider served from its cache, if it said so.
+    cached_tokens: Option<u64>,
+    /// Prompt tokens the provider wrote into its cache, if it said so.
+    cache_write_tokens: Option<u64>,
+    /// How long the provider spent generating, if the stream revealed it.
+    generation_ms: Option<u64>,
+    /// Output tokens per second, derived from the two facts above.
+    ///
+    /// `None` when either is missing: a rate needs a count *and* a window, and stating one from a
+    /// guess is worse than stating nothing.
+    tokens_per_second: Option<f64>,
 }
 
 impl UsageView {
@@ -198,6 +215,10 @@ impl UsageView {
             "estimated": self.estimated,
             "request_bytes": self.request_bytes,
             "response_bytes": self.response_bytes,
+            "cached_tokens": self.cached_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "generation_ms": self.generation_ms,
+            "tokens_per_second": self.tokens_per_second,
         })
     }
 }
@@ -239,6 +260,16 @@ fn usage_row(row: &KeyUsageRow) -> UsageView {
         provider_reported: provider_prompt.is_some() || provider_completion.is_some(),
         request_bytes: row.request_bytes,
         response_bytes: row.response_bytes,
+        cached_tokens: row.cached_tokens,
+        cache_write_tokens: row.cache_write_tokens,
+        generation_ms: row.generation_ms,
+        // The rate is computed from what the provider reported, never from the byte estimate: an
+        // estimate has no timing, and dividing an estimate by a real window would look like a
+        // measurement while being nothing of the kind.
+        tokens_per_second: mr_core::usage::tokens_per_second(
+            row.completion_tokens,
+            row.generation_ms,
+        ),
     }
 }
 
@@ -442,6 +473,61 @@ fn account_row(
 
 #[cfg(test)]
 mod tests {
+    /// A reported row with a real window yields a rate; without one it yields nothing, because a
+    /// rate needs both a count and the time the count took.
+    #[test]
+    fn a_reported_row_yields_its_cache_split_and_rate() {
+        let row = KeyUsageRow {
+            id: "row-1".to_owned(),
+            client_key_id: "key-1".to_owned(),
+            prompt_tokens: Some(100),
+            completion_tokens: Some(50),
+            occurred_at: mr_core::ids::Millis(0),
+            created_at: mr_core::ids::Millis(0),
+            request_bytes: Some(400),
+            response_bytes: Some(800),
+            cached_tokens: Some(80),
+            cache_write_tokens: Some(15),
+            generation_ms: Some(2000),
+        };
+        let view = usage_row(&row);
+        assert_eq!(view.cached_tokens, Some(80));
+        assert_eq!(view.cache_write_tokens, Some(15));
+        assert_eq!(view.generation_ms, Some(2000));
+        // 50 tokens in 2 seconds is 25 per second.
+        assert_eq!(view.tokens_per_second, Some(25.0));
+        // The provider reported both counts, so nothing is estimated.
+        assert!(!view.estimated);
+        assert!(view.provider_reported);
+
+        let json = view.json();
+        assert_eq!(json["cached_tokens"], 80);
+        assert_eq!(json["cache_write_tokens"], 15);
+        assert_eq!(json["tokens_per_second"], 25.0);
+    }
+
+    /// No window means no rate — not a zero, and not a number derived from the byte estimate.
+    #[test]
+    fn a_row_without_a_window_states_no_rate() {
+        let row = KeyUsageRow {
+            id: "row-2".to_owned(),
+            client_key_id: "key-1".to_owned(),
+            prompt_tokens: Some(10),
+            completion_tokens: Some(4),
+            occurred_at: mr_core::ids::Millis(0),
+            created_at: mr_core::ids::Millis(0),
+            request_bytes: None,
+            response_bytes: Some(16),
+            cached_tokens: None,
+            cache_write_tokens: None,
+            generation_ms: None,
+        };
+        let view = usage_row(&row);
+        assert_eq!(view.tokens_per_second, None);
+        assert_eq!(view.cached_tokens, None);
+        assert_eq!(view.json()["tokens_per_second"], serde_json::Value::Null);
+    }
+
     use super::*;
     use crate::auth::PanelAuth;
     use crate::state::{ServeDirs, StateFiles};

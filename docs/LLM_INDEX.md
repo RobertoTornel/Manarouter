@@ -119,7 +119,11 @@ Router/
     │       ├── anthropic.rs        pivot → Anthropic Messages request direction
     │       ├── responses.rs        OpenAI Responses API (Codex)
     │       ├── google.rs           Gemini generateContent
-    │       ├── commandcode.rs      Command Code alpha/generate
+    │       ├── commandcode.rs      Command Code alpha/generate. Its stream state is **owned per
+    │       │                       stream** (`commandcode::Translator`), not a thread-local: two
+    │       │                       concurrent answers on one worker used to splice tool calls
+    │       │                       together. `translate(translator, ctx, data)` is the entry point
+    │       │                       the relay uses; `sse_to_pivot` is the legacy per-thread shim.
     │       └── sse.rs              ★ text/event-stream framing (Framer, Frame, data_frame)
     ├── manarouter-relay/           the data plane (lib + bin)
     │   └── src/

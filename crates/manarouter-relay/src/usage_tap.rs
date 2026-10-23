@@ -240,7 +240,13 @@ impl UsageTap {
                 (Some(first), Some(last)) => {
                     // `duration_since` saturates at zero rather than panicking on a clock that
                     // moved backwards; the clamp keeps the conversion into `u64` honest.
-                    Some(last.duration_since(first).as_millis().min(u64::MAX as u128) as u64)
+                    let millis =
+                        last.duration_since(first).as_millis().min(u64::MAX as u128) as u64;
+                    // A zero window means every output byte arrived in one read, so the tap
+                    // measured arrival, not generation. Reporting `0` would let a rate be computed
+                    // from it — an infinite one — so this is "not measurable", the same as never
+                    // having seen the window at all.
+                    (millis > 0).then_some(millis)
                 }
                 // No output was seen, so no window can be claimed. Zero would be a lie.
                 _ => None,
@@ -253,7 +259,9 @@ impl UsageTap {
             usage: self.usage,
             generation_ms: match (self.first_output_at, self.last_output_at) {
                 (Some(first), Some(last)) => {
-                    Some(last.duration_since(first).as_millis().min(u64::MAX as u128) as u64)
+                    let millis =
+                        last.duration_since(first).as_millis().min(u64::MAX as u128) as u64;
+                    (millis > 0).then_some(millis)
                 }
                 _ => None,
             },
@@ -869,10 +877,12 @@ mod tests {
         );
         let out = tap.finish();
         assert_eq!(out.usage.input_tokens, Some(7));
+        // One output frame means first and last are the same instant: the tap measured arrival,
+        // not generation. A zero-length window cannot support a rate, so it is reported as
+        // not-measured rather than as `0` — the same "zero would be a lie" rule the module states.
         assert_eq!(
-            out.generation_ms,
-            Some(0),
-            "one output frame, so a zero-length window"
+            out.generation_ms, None,
+            "one frame is not a measurable window"
         );
         assert_eq!(
             out.tokens_per_second(),
@@ -970,8 +980,8 @@ mod tests {
         assert_eq!(out.usage.input_tokens, Some(21));
         assert_eq!(out.usage.output_tokens, Some(8));
         assert!(
-            out.generation_ms.is_some(),
-            "one output frame starts a window"
+            out.generation_ms.is_none(),
+            "one output frame is the same instant twice: no window, so no rate"
         );
         assert!(
             !out.is_empty(),

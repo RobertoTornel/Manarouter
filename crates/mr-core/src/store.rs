@@ -681,6 +681,15 @@ pub struct KeyUsageRecord {
     /// `None` means "not observed" — a request that failed before the response body existed has no
     /// response size, and saying "0 bytes" would be a claim about a response that never came.
     pub response_bytes: Option<u64>,
+    /// Prompt tokens the provider served from its cache, if it reported any.
+    pub cached_tokens: Option<u64>,
+    /// Prompt tokens the provider wrote into its cache, if it reported any.
+    pub cache_write_tokens: Option<u64>,
+    /// How long the provider spent generating, if the stream revealed it.
+    ///
+    /// This is what tokens-per-second divides by. `None` means "the window was never observed", and
+    /// [`crate::usage::tokens_per_second`] then declines to state a rate rather than inventing one.
+    pub generation_ms: Option<u64>,
 }
 
 impl KeyUsageRecord {
@@ -697,6 +706,9 @@ impl KeyUsageRecord {
             created_at: now,
             request_bytes: None,
             response_bytes: None,
+            cached_tokens: None,
+            cache_write_tokens: None,
+            generation_ms: None,
         }
     }
 
@@ -704,6 +716,22 @@ impl KeyUsageRecord {
     pub fn with_tokens(mut self, prompt: Option<u64>, completion: Option<u64>) -> Self {
         self.prompt_tokens = prompt;
         self.completion_tokens = completion;
+        self
+    }
+
+    /// Attach the provider's cache split and the generation window, when it reported them.
+    ///
+    /// Each is independently optional: a provider that reports cached tokens but no timing leaves
+    /// `generation_ms` `None`, so a rate is declined rather than computed from a guess.
+    pub fn with_token_breakdown(
+        mut self,
+        cached: Option<u64>,
+        cache_write: Option<u64>,
+        generation_ms: Option<u64>,
+    ) -> Self {
+        self.cached_tokens = cached;
+        self.cache_write_tokens = cache_write;
+        self.generation_ms = generation_ms;
         self
     }
 
@@ -760,6 +788,12 @@ pub struct KeyUsageRow {
     pub request_bytes: Option<u64>,
     /// How many bytes the response was, when the relay observed it.
     pub response_bytes: Option<u64>,
+    /// Prompt tokens served from the provider's cache, if reported.
+    pub cached_tokens: Option<u64>,
+    /// Prompt tokens written into the provider's cache, if reported.
+    pub cache_write_tokens: Option<u64>,
+    /// How long the provider spent generating, if observed.
+    pub generation_ms: Option<u64>,
 }
 
 /// The token totals of one key over one window.
@@ -2153,6 +2187,32 @@ impl Store {
                 ],
             )?;
         }
+        // The cache split and the generation window ride the `usage_tokens` side table introduced
+        // in v3, keyed by this row's id. They are written in the *same* transaction as the row
+        // itself: a row whose breakdown landed later would, in the window between, claim a cache
+        // miss it did not have and a rate it cannot support.
+        //
+        // Every field is written as reported, including `NULL` for "not reported" — a zero here
+        // would be a claim that the provider said zero, which is a different fact from silence.
+        if record.cached_tokens.is_some()
+            || record.cache_write_tokens.is_some()
+            || record.generation_ms.is_some()
+        {
+            tx.execute(
+                "INSERT INTO usage_tokens (usage_id, cached_tokens, cache_write_tokens, \
+                 generation_ms, created_at) VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(usage_id) DO UPDATE SET cached_tokens = excluded.cached_tokens, \
+                 cache_write_tokens = excluded.cache_write_tokens, \
+                 generation_ms = excluded.generation_ms",
+                params![
+                    record.id,
+                    record.cached_tokens,
+                    record.cache_write_tokens,
+                    record.generation_ms,
+                    record.created_at.as_millis(),
+                ],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -2195,8 +2255,10 @@ impl Store {
         let guard = self.guard()?;
         let mut stmt = guard.prepare(
             "SELECT k.id, k.client_key_id, k.prompt_tokens, k.completion_tokens, k.occurred_at, \
-             k.created_at, b.request_bytes, b.response_bytes FROM key_usage k \
+             k.created_at, b.request_bytes, b.response_bytes, t.cached_tokens, \
+             t.cache_write_tokens, t.generation_ms FROM key_usage k \
              LEFT JOIN key_usage_bytes b ON b.usage_id = k.id \
+             LEFT JOIN usage_tokens t ON t.usage_id = k.id \
              WHERE (?2 IS NULL OR k.client_key_id = ?2) \
              ORDER BY k.occurred_at DESC, k.created_at DESC LIMIT ?1",
         )?;
@@ -2210,6 +2272,9 @@ impl Store {
                 created_at: Millis::from_millis(row.get(5)?),
                 request_bytes: row.get(6)?,
                 response_bytes: row.get(7)?,
+                cached_tokens: row.get(8)?,
+                cache_write_tokens: row.get(9)?,
+                generation_ms: row.get(10)?,
             })
         })?;
         let mut out = Vec::new();

@@ -381,6 +381,9 @@ pub(crate) struct StreamState {
     /// and the cost of every cached turn was overstated.
     cache_read_tokens: u64,
     cache_write_tokens: u64,
+    /// A later `cache-write-tokens` report, held until the stream ends so it can fill in a write
+    /// count the terminal usage left at zero.
+    cache_write_tokens_fallback: Option<u64>,
     usage_seen: bool,
     /// `role: "assistant"` rides the first delta of any kind, and is never repeated.
     sent_role: bool,
@@ -401,6 +404,7 @@ impl StreamState {
             completion_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            cache_write_tokens_fallback: None,
             usage_seen: false,
             sent_role: false,
             done: false,
@@ -620,8 +624,20 @@ fn classify(state: &mut StreamState, v: &Value) -> Step {
             Step::Error(err)
         }
 
+        // A dedicated cache-write report, sent *instead of* the counts on `finish-step`/`finish`
+        // when the provider only learns the figure later. The vendor CLI treats it as a fallback
+        // that applies only when the terminal usage did not already report a non-zero write count,
+        // so it is held rather than applied, and resolved when the stream finishes.
+        "cache-write-tokens" => {
+            if let Some(n) = v.get("cacheWriteTokens").and_then(Value::as_u64) {
+                state.cache_write_tokens_fallback = Some(n);
+            }
+            Step::Ignored
+        }
+
         // `message-start`, `text-start`/`text-end`, `reasoning`, `thinking`, `step-*`, `usage`,
-        // `tool-result` and any Anthropic-shaped event carry nothing this dialect can forward.
+        // `provider-metadata`, `tool-result` and any Anthropic-shaped event carry nothing this
+        // dialect can forward.
         _ => Step::Ignored,
     }
 }
@@ -761,6 +777,15 @@ pub fn to_pivot_response(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Bytes> {
 
     if let Some(err) = error {
         return to_bytes(error_to_client(ctx, &err));
+    }
+
+    // A deferred `cache-write-tokens` figure fills in only what the terminal usage left at zero —
+    // the same precedence the streaming path applies.
+    if let Some(n) = state.cache_write_tokens_fallback {
+        if state.cache_write_tokens == 0 {
+            state.cache_write_tokens = n;
+            state.usage_seen = true;
+        }
     }
 
     let pivot = match existing {
@@ -995,6 +1020,14 @@ pub fn translate(
                 let delta = with_role(state, json!({}));
                 chunks.push(chunk(state, delta));
             }
+            // A deferred `cache-write-tokens` figure fills in only what the terminal usage left at
+            // zero — the same precedence the vendor CLI applies.
+            if let Some(n) = state.cache_write_tokens_fallback {
+                if state.cache_write_tokens == 0 {
+                    state.cache_write_tokens = n;
+                    state.usage_seen = true;
+                }
+            }
             state.done = true;
             chunks.push(final_chunk(state));
             terminate = true;
@@ -1097,13 +1130,30 @@ fn chunk(state: &StreamState, delta: Value) -> Value {
 /// Usage is deliberately absent, matching both the upstream and the reference bridge — this hop
 /// never receives a `stream_options.include_usage` usage frame, and inventing one would lie.
 fn final_chunk(state: &StreamState) -> Value {
-    json!({
+    let mut out = json!({
         "id": state.id,
         "object": "chat.completion.chunk",
         "created": mr_core::ids::now_millis() / 1000,
         "model": state.model,
         "choices": [{"index": 0, "delta": {}, "finish_reason": state.finish_reason}],
-    })
+    });
+    // Command Code reports usage on its `finish` event, which is the frame this chunk is built
+    // from. Emitting it here is what makes a *streamed* answer's token counts observable at all:
+    // without it the client — and this gateway's own usage tap — sees a stream that ends with no
+    // usage, which is indistinguishable from an upstream that never reported any, and that is why
+    // tokens-per-second could never be computed. The key is attached only when counts were really
+    // sent, so an unreported stream still records nothing instead of a row of zeroes.
+    if state.usage_seen {
+        out["usage"] = json!({
+            "prompt_tokens": state.prompt_tokens,
+            "completion_tokens": state.completion_tokens,
+            "total_tokens": state.prompt_tokens + state.completion_tokens,
+            "prompt_tokens_details": {"cached_tokens": state.cache_read_tokens},
+            "cache_read_input_tokens": state.cache_read_tokens,
+            "cache_write_input_tokens": state.cache_write_tokens,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1170,6 +1220,137 @@ mod tests {
     fn data_json(frame: &str) -> Value {
         let frame = sse::parse_frame(frame);
         serde_json::from_str(&frame.data).unwrap()
+    }
+
+    /// The real `/alpha/generate` capture: one tool call, reported usage, and a cache split that
+    /// lives one level down under `inputTokenDetails`.
+    ///
+    /// This fixture is a verbatim stream from the live endpoint, so it pins the *actual* protocol
+    /// rather than our reading of it. The cache fields matter because they were previously dropped
+    /// entirely — every turn recorded a cache miss and an overstated cost.
+    #[test]
+    fn a_real_captured_stream_yields_one_call_and_its_cache_split() {
+        let raw = include_str!("../tests/fixtures/real_tool_call.ndjson");
+        let mut t = Translator::new();
+        let mut frames = Vec::new();
+        for line in raw.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            frames.extend(translate(&mut t, &ctx(), line).unwrap());
+        }
+
+        // Exactly one tool call, with the id and name the upstream sent.
+        let calls = tool_deltas(&frames);
+        let opened: Vec<_> = calls.iter().filter(|(_, id, _)| id.is_some()).collect();
+        assert_eq!(opened.len(), 1, "one call open, not a second phantom one");
+        assert_eq!(
+            opened[0].1.as_deref(),
+            Some("call_00_ekv1zojub493u1e7i93fuaar")
+        );
+        assert_eq!(opened[0].2.as_deref(), Some("get_weather"));
+        // Every emitted id/name is non-empty: no phantom block can be assembled from these frames.
+        for (_, id, name) in &calls {
+            if let Some(id) = id {
+                assert!(!id.is_empty(), "no empty id may reach the client");
+            }
+            if let Some(name) = name {
+                assert!(!name.is_empty(), "no empty name may reach the client");
+            }
+        }
+
+        // The terminal chunk carries the usage the `finish` event reported.
+        let usage = frames
+            .iter()
+            .map(|f| sse::parse_frame(f))
+            .filter(|p| p.data != crate::SSE_DONE)
+            .filter_map(|p| serde_json::from_str::<Value>(&p.data).ok())
+            .find_map(|v| v.get("usage").cloned())
+            .expect("the streamed answer must report usage");
+        assert_eq!(usage["prompt_tokens"], 307);
+        assert_eq!(usage["completion_tokens"], 40);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 0);
+
+        // The accumulated state agrees, and the finish reason came from the upstream's spelling.
+        assert!(t.is_finished());
+        let state = t.state.as_ref().unwrap();
+        assert_eq!(state.tool_calls.len(), 1);
+        assert_eq!(state.tool_calls[0].name, "get_weather");
+        assert_eq!(state.prompt_tokens, 307);
+        assert_eq!(state.completion_tokens, 40);
+    }
+
+    /// Usage that reports a cache split must surface it, not discard it.
+    #[test]
+    fn a_cache_split_in_the_terminal_usage_reaches_the_client() {
+        let mut t = Translator::new();
+        translate(&mut t, &ctx(), r#"{"type":"text-delta","text":"hi"}"#).unwrap();
+        let frames = translate(
+            &mut t,
+            &ctx(),
+            r#"{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":100,"outputTokens":20,"inputTokenDetails":{"cacheReadTokens":80,"cacheWriteTokens":15}}}"#,
+        )
+        .unwrap();
+        let usage = frames
+            .iter()
+            .map(|f| sse::parse_frame(f))
+            .filter(|p| p.data != crate::SSE_DONE)
+            .filter_map(|p| serde_json::from_str::<Value>(&p.data).ok())
+            .find_map(|v| v.get("usage").cloned())
+            .expect("usage");
+        assert_eq!(usage["prompt_tokens"], 100);
+        assert_eq!(usage["completion_tokens"], 20);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 80);
+        assert_eq!(usage["cache_read_input_tokens"], 80);
+        assert_eq!(usage["cache_write_input_tokens"], 15);
+    }
+
+    /// A late `cache-write-tokens` event supplies the write count only when the terminal usage left
+    /// it at zero — the precedence the vendor CLI applies.
+    #[test]
+    fn a_late_cache_write_event_fills_in_only_a_zero() {
+        // Zero at finish: the event's value is adopted.
+        let mut t = Translator::new();
+        translate(
+            &mut t,
+            &ctx(),
+            r#"{"type":"finish-step","usage":{"inputTokens":10,"outputTokens":2,"inputTokenDetails":{"cacheReadTokens":0,"cacheWriteTokens":0}}}"#,
+        )
+        .unwrap();
+        translate(
+            &mut t,
+            &ctx(),
+            r#"{"type":"cache-write-tokens","cacheWriteTokens":42}"#,
+        )
+        .unwrap();
+        let frames =
+            translate(&mut t, &ctx(), r#"{"type":"finish","finishReason":"stop"}"#).unwrap();
+        let state = frames_state(&frames);
+        assert_eq!(state["cache_write_input_tokens"], 42);
+
+        // Non-zero at finish: the event must not overwrite the real figure.
+        let mut t = Translator::new();
+        translate(
+            &mut t,
+            &ctx(),
+            r#"{"type":"cache-write-tokens","cacheWriteTokens":42}"#,
+        )
+        .unwrap();
+        let frames = translate(
+            &mut t,
+            &ctx(),
+            r#"{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":10,"outputTokens":2,"inputTokenDetails":{"cacheReadTokens":0,"cacheWriteTokens":7}}}"#,
+        )
+        .unwrap();
+        assert_eq!(frames_state(&frames)["cache_write_input_tokens"], 7);
+    }
+
+    /// The usage object of the last non-`[DONE]` frame that carries one.
+    fn frames_state(frames: &[String]) -> Value {
+        frames
+            .iter()
+            .map(|f| sse::parse_frame(f))
+            .filter(|p| p.data != crate::SSE_DONE)
+            .filter_map(|p| serde_json::from_str::<Value>(&p.data).ok())
+            .find_map(|v| v.get("usage").cloned())
+            .expect("a usage object")
     }
 
     #[test]
@@ -1662,9 +1843,24 @@ mod tests {
         let v = data_json(&frames[0]);
         assert_eq!(v["choices"][0]["delta"], json!({}));
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
-        // No usage frame is fabricated: this upstream never sends one.
-        assert!(v.get("usage").is_none());
+        // The terminal chunk carries the usage reported on this very event. It used to be dropped
+        // here, which made a streamed answer's token counts — and so its tokens per second —
+        // unobservable. The real captured stream shows `totalUsage` on `finish`, so the counts
+        // belong on the frame the client sees last.
+        assert_eq!(v["usage"]["prompt_tokens"], 3);
+        assert_eq!(v["usage"]["completion_tokens"], 1);
+        assert_eq!(v["usage"]["total_tokens"], 4);
         assert_eq!(frames[1], "data: [DONE]\n\n");
+    }
+
+    /// A stream that reports no usage must not fabricate one: "no counts" and "zero counts" are
+    /// different facts, and a row of zeroes would understate a real answer's cost.
+    #[test]
+    fn a_finish_without_usage_fabricates_none() {
+        reset_all();
+        sse_to_pivot(&ctx(), r#"{"type":"text-delta","text":"hi"}"#).unwrap();
+        let frames = sse_to_pivot(&ctx(), r#"{"type":"finish","finishReason":"stop"}"#).unwrap();
+        assert!(data_json(&frames[0]).get("usage").is_none());
     }
 
     #[test]

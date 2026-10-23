@@ -701,12 +701,28 @@ async fn dispatch_routed(
                     mr_core::ids::Millis::now(),
                 ) {
                     crate::quota::Admission::Allowed(ticket) => Some(ticket),
-                    crate::quota::Admission::Unmetered => None,
+                    // Caps are configured but none of them binds, so nothing is reserved. The
+                    // request is still recorded: token counts, the cache split and the rate are
+                    // facts about what was spent, and reporting them cannot depend on whether the
+                    // operator happened to set a budget.
+                    crate::quota::Admission::Unmetered => Some(app.quota.observe(
+                        &entry.id,
+                        &request_id,
+                        mr_core::ids::Millis::now(),
+                        Some(bytes.len() as u64),
+                    )),
                     crate::quota::Admission::Denied(denial) => {
                         return quota_error(&denial, client_dialect);
                     }
                 }
             }
+            // An authenticated key with no caps at all: nothing to enforce, everything to report.
+            AuthOutcome::Ok(entry) => Some(app.quota.observe(
+                &entry.id,
+                &mr_core::ids::new_id(),
+                mr_core::ids::Millis::now(),
+                Some(bytes.len() as u64),
+            )),
             _ => None,
         }
     } else {
@@ -3263,6 +3279,154 @@ mod tests {
         assert!(text.contains("[DONE]"), "{text:?}");
     }
 
+    /// Two Command Code answers in flight on the gateway at once must not share translation state.
+    ///
+    /// This drives the relay's own entry point — [`translate_stream_chunk`], the function the
+    /// response-body `scan` calls — with two independent [`mr_dialects::commandcode::Translator`]s,
+    /// interleaving the byte chunks exactly as a busy runtime does. Before the translator was owned
+    /// per stream it was a `thread_local`, so these two would have written into one cell: the second
+    /// stream's argument fragments landed in the first stream's tool call and the client received a
+    /// nameless, id-less `tool-call` block that it could neither dispatch nor match, which is what
+    /// killed the turn with `requires toolCallId matching its tool source`.
+    #[test]
+    fn two_concurrent_commandcode_streams_do_not_share_translation_state() {
+        let ctx = TranslateCtx {
+            route: RouteKind::ChatCompletions,
+            client_dialect: Dialect::OpenAi,
+            upstream_dialect: Dialect::CommandCodeGo,
+            upstream_model: "deepseek/deepseek-v4-flash",
+            client_streaming: true,
+            session_id: None,
+        };
+        let mut a = mr_dialects::commandcode::Translator::new();
+        let mut b = mr_dialects::commandcode::Translator::new();
+        let (mut pa, mut pb) = (String::new(), String::new());
+
+        let run = |t: &mut mr_dialects::commandcode::Translator,
+                   pending: &mut String,
+                   frame: &'static str|
+         -> String {
+            let out =
+                translate_stream_chunk(&ctx, t, pending, &Bytes::from_static(frame.as_bytes()));
+            out.into_iter()
+                .map(Result::unwrap)
+                .map(|b| String::from_utf8(b.to_vec()).unwrap())
+                .collect()
+        };
+
+        // Open a call on each stream, then interleave the opening and the fragments.
+        let a_open = run(
+            &mut a,
+            &mut pa,
+            "{\"type\":\"tool-input-start\",\"id\":\"call_A\",\"toolName\":\"alpha\"}\n",
+        );
+        let b_open = run(
+            &mut b,
+            &mut pb,
+            "{\"type\":\"tool-input-start\",\"id\":\"call_B\",\"toolName\":\"beta\"}\n",
+        );
+        let a_frag = run(
+            &mut a,
+            &mut pa,
+            "{\"type\":\"tool-input-delta\",\"id\":\"call_A\",\"delta\":\"A-ARGS\"}\n",
+        );
+        let b_frag = run(
+            &mut b,
+            &mut pb,
+            "{\"type\":\"tool-input-delta\",\"id\":\"call_B\",\"delta\":\"B-ARGS\"}\n",
+        );
+
+        // Each open names its own call, and neither fragment carries the other's name.
+        assert!(
+            a_open.contains("call_A") && a_open.contains("alpha"),
+            "{a_open:?}"
+        );
+        assert!(
+            b_open.contains("call_B") && b_open.contains("beta"),
+            "{b_open:?}"
+        );
+        assert!(
+            !a_open.contains("call_B"),
+            "A must not see B's call: {a_open:?}"
+        );
+        assert!(
+            !b_open.contains("call_A"),
+            "B must not see A's call: {b_open:?}"
+        );
+        // A fragment delta never repeats an id or a name, and never invents an empty one.
+        for frag in [&a_frag, &b_frag] {
+            assert!(
+                !frag.contains("\"id\":\"\""),
+                "no empty id may be emitted: {frag:?}"
+            );
+            assert!(
+                !frag.contains("\"name\":\"\""),
+                "no empty name may be emitted: {frag:?}"
+            );
+        }
+
+        // Each stream folds its own arguments into its own single call.
+        let a_end = run(
+            &mut a,
+            &mut pa,
+            "{\"type\":\"finish\",\"finishReason\":\"tool-calls\"}\n",
+        );
+        let b_end = run(
+            &mut b,
+            &mut pb,
+            "{\"type\":\"finish\",\"finishReason\":\"tool-calls\"}\n",
+        );
+        assert!(a_end.contains("[DONE]"), "{a_end:?}");
+        assert!(b_end.contains("[DONE]"), "{b_end:?}");
+
+        // Nothing either stream emitted may contain an empty tool-call id or name anywhere.
+        for (label, all) in [
+            ("A", [a_open, a_frag, a_end].concat()),
+            ("B", [b_open, b_frag, b_end].concat()),
+        ] {
+            assert!(
+                !all.contains("\"id\":\"\""),
+                "{label} emitted an empty id: {all}"
+            );
+            assert!(
+                !all.contains("\"name\":\"\""),
+                "{label} emitted an empty name: {all}"
+            );
+        }
+    }
+
+    /// The translator the relay holds must forget a finished stream, so the next request that
+    /// happens to reuse the same owned value cannot inherit a completed call.
+    #[test]
+    fn a_finished_commandcode_stream_leaves_nothing_for_the_next() {
+        let ctx = TranslateCtx {
+            route: RouteKind::ChatCompletions,
+            client_dialect: Dialect::OpenAi,
+            upstream_dialect: Dialect::CommandCodeGo,
+            upstream_model: "deepseek/deepseek-v4-flash",
+            client_streaming: true,
+            session_id: None,
+        };
+        let mut t = mr_dialects::commandcode::Translator::new();
+        let mut pending = String::new();
+        for frame in [
+            "{\"type\":\"tool-input-start\",\"id\":\"c1\",\"toolName\":\"f\"}\n",
+            "{\"type\":\"finish\",\"finishReason\":\"tool-calls\"}\n",
+        ] {
+            let _ = translate_stream_chunk(
+                &ctx,
+                &mut t,
+                &mut pending,
+                &Bytes::from_static(frame.as_bytes()),
+            );
+        }
+        assert!(t.is_finished(), "the finish was seen");
+
+        // A fresh translator starts empty: no inherited call, no inherited id.
+        let fresh = mr_dialects::commandcode::Translator::new();
+        assert!(!fresh.is_finished());
+    }
+
     #[test]
     fn a_trailing_slash_on_the_base_url_does_not_double() {
         let s = step(Dialect::OpenAi, "https://api.example.com/");
@@ -4929,6 +5093,373 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}],
         })
         .to_string()
+    }
+
+    /// A Command Code upstream that gives every request its *own* tool call and interleaves slowly
+    /// enough that two answers are genuinely in flight at once.
+    ///
+    /// The nonce is taken from the request's own text, so the call a response carries can only be
+    /// right if that response's translation state was private to it.
+    async fn commandcode_tool_upstream() -> String {
+        let app = Router::new().fallback(any(|body: Bytes| async move {
+            let value: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            let text = value
+                .get("params")
+                .and_then(|p| p.get("messages"))
+                .and_then(|m| m.as_array())
+                .and_then(|a| a.first())
+                .and_then(|m| m.get("content"))
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            let nonce: String = text
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .chars()
+                .rev()
+                .take(6)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            let call = format!("call_{nonce}");
+            let name = format!("tool_{nonce}");
+            // Stream `alpha` is deliberately *long*: its fragments must still be arriving when
+            // the other stream begins, so a fragment lands after that stream boundary. That is the
+            // exact instant the shared per-thread state used to hand the fragment to the wrong
+            // call, because an id it no longer held fell back to "the most recently opened call".
+            let mut lines =
+                vec![format!(
+                    r#"{{"type":"tool-input-start","id":"{call}","toolName":"{name}"}}"#
+                )];
+            let fragments = if nonce.contains("alpha") { 10 } else { 2 };
+            for n in 0..fragments {
+                lines.push(format!(
+                    r#"{{"type":"tool-input-delta","id":"{call}","delta":"{nonce}-{n}"}}"#
+                ));
+            }
+            lines.push(format!(r#"{{"type":"tool-input-end","id":"{call}"}}"#));
+            lines.push(format!(
+                r#"{{"type":"tool-call","toolCallId":"{call}","toolName":"{name}","input":{{"n":"{nonce}"}}}}"#
+            ));
+            lines.push(r#"{"type":"finish","finishReason":"tool-calls","rawFinishReason":"tool_calls","totalUsage":{"inputTokens":100,"inputTokenDetails":{"cacheReadTokens":80,"cacheWriteTokens":15},"outputTokens":25}}"#.to_owned());
+            // The two streams are deliberately *staggered*, because simultaneity is not the
+            // condition that broke: the corruption needed the **second** stream to begin while the
+            // first was already mid-flight, so that a stream boundary fell between the first
+            // stream's open and its own argument fragments. A per-thread reset at that boundary is
+            // what erased the live stream's state and sent its fragments to whatever call the cell
+            // happened to hold last.
+            //
+            // `beta` therefore starts late and then runs at the normal tick.
+            let tick = if nonce.contains("beta") {
+                std::time::Duration::from_millis(130)
+            } else {
+                std::time::Duration::from_millis(25)
+            };
+            let stream = futures_util::stream::unfold(0usize, move |i| {
+                let lines = lines.clone();
+                async move {
+                    if i >= lines.len() {
+                        return None;
+                    }
+                    tokio::time::sleep(tick).await;
+                    Some((
+                        Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!(
+                            "{}\n",
+                            lines[i]
+                        ))),
+                        i + 1,
+                    ))
+                }
+            });
+            let mut response = Response::new(AxumBody::from_stream(stream));
+            response
+                .headers_mut()
+                .insert("content-type", "text/event-stream".parse().unwrap());
+            response
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// The whole point, through the real router: two Command Code answers served concurrently must
+    /// each carry exactly their own tool call, with no empty id or name anywhere.
+    ///
+    /// This is the failure the sessions died of — `format v4 tool/result at seq N requires
+    /// toolCallId matching its tool source` — reproduced as the condition that caused it: two
+    /// streams in flight at once on one gateway.
+    #[tokio::test]
+    async fn two_concurrent_commandcode_requests_through_the_router_keep_their_own_tool_calls() {
+        let base_url = commandcode_tool_upstream().await;
+        let mut provider = mr_core::model::Provider::new("cmd", Dialect::CommandCodeGo, &base_url);
+        let mut account = mr_core::model::Account::new("cmd");
+        account.secret_ref = Some("test-credential".to_owned());
+        provider.accounts = vec![account];
+        let mut entry = dm();
+        entry.id = "m".to_owned();
+        provider.models = vec![entry];
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = mr_core::secret::Vault::open(dir.path()).unwrap();
+        vault.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(vault),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: store,
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+        };
+
+        // Two requests, each baking its own nonce into the prompt, dispatched together.
+        let body_for = |nonce: &str| {
+            serde_json::json!({
+                "model": "cmd/m",
+                "stream": true,
+                "messages": [{"role": "user", "content": nonce}],
+            })
+            .to_string()
+        };
+        let (first, second) = tokio::join!(
+            dispatch(
+                state.clone(),
+                Dialect::OpenAi,
+                Method::POST,
+                Uri::from_static("/v1/chat/completions"),
+                headers(&[]),
+                AxumBody::from(body_for("alpha1")),
+            ),
+            dispatch(
+                state.clone(),
+                Dialect::OpenAi,
+                Method::POST,
+                Uri::from_static("/v1/chat/completions"),
+                headers(&[]),
+                AxumBody::from(body_for("beta2x")),
+            )
+        );
+        let (first_status, second_status) = (first.status(), second.status());
+        let (first, second) = (body_text(first).await, body_text(second).await);
+        assert_eq!(
+            first_status,
+            StatusCode::OK,
+            "first request failed: {first}"
+        );
+        assert_eq!(
+            second_status,
+            StatusCode::OK,
+            "second request failed: {second}"
+        );
+
+        // The invariant a client assembler actually depends on: a tool-call delta may only refer
+        // to an index that this same response already opened with an id and a name, and no opened
+        // block may ever carry an empty id or name. A fragment emitted under some other index is
+        // how the phantom block appeared — `{"type":"tool-call","id":"","name":"","arguments":"{}"}`
+        // — and it is why the client could neither dispatch the call nor match its result.
+        for (label, body) in [("first", &first), ("second", &second)] {
+            let mut opened: std::collections::HashMap<u64, (String, String)> =
+                std::collections::HashMap::new();
+            for line in body.lines() {
+                let Some(data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
+                if data.trim() == "[DONE]" {
+                    continue;
+                }
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                    continue;
+                };
+                let Some(calls) = value["choices"][0]["delta"].get("tool_calls") else {
+                    continue;
+                };
+                for call in calls.as_array().unwrap() {
+                    let index = call["index"].as_u64().unwrap_or(0);
+                    match call.get("id").and_then(|v| v.as_str()) {
+                        // An open: it must name the call, and it registers the index.
+                        Some(id) => {
+                            assert!(!id.is_empty(), "{label}: opened a block with an empty id");
+                            let name = call["function"]["name"].as_str().unwrap_or("");
+                            assert!(
+                                !name.is_empty(),
+                                "{label}: opened a block with an empty name"
+                            );
+                            opened.insert(index, (id.to_owned(), name.to_owned()));
+                        }
+                        // A fragment: its index must be one this response already opened, or the
+                        // client is being handed arguments for a call it never saw named.
+                        None => assert!(
+                            opened.contains_key(&index),
+                            "{label}: a fragment referred to index {index}, which this response \
+                             never opened (opened: {opened:?}) — body: {body}"
+                        ),
+                    }
+                }
+            }
+            assert_eq!(
+                opened.len(),
+                1,
+                "{label} must present exactly one tool call, saw {opened:?}"
+            );
+        }
+
+        for (label, body, mine, theirs) in [
+            ("first", &first, "alpha1", "beta2x"),
+            ("second", &second, "beta2x", "alpha1"),
+        ] {
+            assert!(
+                body.contains(&format!("call_{mine}")),
+                "{label} did not carry its own call id: {body}"
+            );
+            assert!(
+                body.contains(&format!("tool_{mine}")),
+                "{label} did not carry its own tool name: {body}"
+            );
+            assert!(
+                !body.contains(&format!("call_{theirs}")),
+                "{label} carried the OTHER request's call id: {body}"
+            );
+            // The exact signature of the corruption: a tool call the client can neither dispatch
+            // nor match, because it arrived with no id and no name.
+            assert!(
+                !body.contains(r#""id":"""#),
+                "{label} emitted an empty tool-call id: {body}"
+            );
+            assert!(
+                !body.contains(r#""name":"""#),
+                "{label} emitted an empty tool-call name: {body}"
+            );
+        }
+
+        // And each stream reports the usage and cache split the upstream sent, which is what makes
+        // a streamed answer's cost and rate observable at all.
+        for (label, body) in [("first", &first), ("second", &second)] {
+            assert!(body.contains(r#""prompt_tokens":100"#), "{label}: {body}");
+            assert!(
+                body.contains(r#""completion_tokens":25"#),
+                "{label}: {body}"
+            );
+            assert!(
+                body.contains(r#""cached_tokens":80"#),
+                "{label} lost the cache read split: {body}"
+            );
+            assert!(
+                body.contains(r#""cache_write_input_tokens":15"#),
+                "{label} lost the cache write split: {body}"
+            );
+        }
+    }
+
+    /// A streaming answer's usage must land in the ledger with its cache split and its window.
+    ///
+    /// This is the token-reporting path end to end: the provider reports counts on its `finish`
+    /// event, the tap folds them (with the generation window) out of the stream, the ticket records
+    /// them when the body ends, and the ledger row carries them back out. Before this, the counts
+    /// were dropped, the window was discarded, and tokens-per-second was therefore never computable
+    /// at all.
+    #[tokio::test]
+    async fn a_streamed_answer_records_its_tokens_cache_split_and_rate() {
+        let base_url = commandcode_tool_upstream().await;
+        let mut provider = mr_core::model::Provider::new("cmd", Dialect::CommandCodeGo, &base_url);
+        let mut account = mr_core::model::Account::new("cmd");
+        account.secret_ref = Some("test-credential".to_owned());
+        provider.accounts = vec![account];
+        let mut entry = dm();
+        entry.id = "m".to_owned();
+        provider.models = vec![entry];
+
+        let presented = "mr-test-key";
+        let key_hash: String = RelayState::hash_presented(presented)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            client_keys: vec![mr_core::model::ClientKey {
+                id: mr_core::ids::ClientKeyId::from_raw("key-1"),
+                label: "usage-test".to_owned(),
+                key_hash,
+                prefix: Some("mr-test".to_owned()),
+                enabled: true,
+                allow_models: Vec::new(),
+                allow_routes: Vec::new(),
+                // No caps: the point is that usage is recorded even when nothing is enforced.
+                limit_requests: 0,
+                limits: Default::default(),
+                note: None,
+            }],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = mr_core::secret::Vault::open(dir.path()).unwrap();
+        vault.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: false,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(vault),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+        };
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[("authorization", "Bearer mr-test-key")]),
+            AxumBody::from(
+                serde_json::json!({
+                    "model": "cmd/m",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "alpha1"}],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Draining the body is what lets the tap finish and the ticket settle.
+        let _ = body_text(response).await;
+
+        let rows = store.recent_key_usage(10, None).unwrap();
+        assert_eq!(rows.len(), 1, "the request was not recorded: {rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.client_key_id, "key-1");
+        assert_eq!(row.prompt_tokens, Some(100), "input tokens lost");
+        assert_eq!(row.completion_tokens, Some(25), "output tokens lost");
+        assert_eq!(row.cached_tokens, Some(80), "cache read lost");
+        assert_eq!(row.cache_write_tokens, Some(15), "cache write lost");
+        // The window is recorded when the tap could measure one. A body that arrived in a single
+        // read has no measurable window, and then the column stays `NULL` — which is correct, and
+        // is why the assertion is "never a fabricated zero" rather than "always present".
+        assert!(
+            row.generation_ms != Some(0),
+            "a zero window was recorded, which would make a rate infinite"
+        );
     }
 
     /// The text of a response body, as a string.
