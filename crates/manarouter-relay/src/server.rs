@@ -5462,6 +5462,128 @@ mod tests {
         );
     }
 
+    /// A stream whose frames genuinely arrive apart must produce a real generation window.
+    ///
+    /// This is the counterpart to the test above: that one showed a coalesced body has no window to
+    /// report, and this one shows the window *is* reported when the bytes really do arrive
+    /// separately. Without both, "tokens per second is blank" would be indistinguishable from a
+    /// tap that never measures at all — which was the original complaint.
+    #[tokio::test]
+    async fn a_slow_stream_records_a_real_generation_window_and_rate() {
+        // Four frames, 200 ms apart, so a whole-stream read is impossible.
+        let app = Router::new().fallback(any(|_body: Bytes| async move {
+            let frames = [
+                r#"data: {"choices":[{"delta":{"content":"one"}}]}"#,
+                r#"data: {"choices":[{"delta":{"content":"two"}}]}"#,
+                r#"data: {"choices":[{"delta":{"content":"three"}}]}"#,
+                r#"data: {"choices":[{"delta":{"content":"four"}}],"usage":{"prompt_tokens":40,"completion_tokens":8}}"#,
+                "data: [DONE]",
+            ];
+            let stream = futures_util::stream::unfold(0usize, move |i| async move {
+                if i >= frames.len() {
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Some((
+                    Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("{}\n\n", frames[i]))),
+                    i + 1,
+                ))
+            });
+            let mut response = Response::new(AxumBody::from_stream(stream));
+            response
+                .headers_mut()
+                .insert("content-type", "text/event-stream".parse().unwrap());
+            response
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut provider =
+            mr_core::model::Provider::new("p", Dialect::OpenAi, format!("http://{addr}"));
+        let mut account = mr_core::model::Account::new("p");
+        account.secret_ref = Some("test-credential".to_owned());
+        provider.accounts = vec![account];
+        let mut entry = dm();
+        entry.id = "m".to_owned();
+        provider.models = vec![entry];
+
+        let key_hash: String = RelayState::hash_presented("mr-test-key")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            client_keys: vec![mr_core::model::ClientKey {
+                id: mr_core::ids::ClientKeyId::from_raw("key-1"),
+                label: "window-test".to_owned(),
+                key_hash,
+                prefix: Some("mr-test".to_owned()),
+                enabled: true,
+                allow_models: Vec::new(),
+                allow_routes: Vec::new(),
+                limit_requests: 0,
+                limits: Default::default(),
+                note: None,
+            }],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = mr_core::secret::Vault::open(dir.path()).unwrap();
+        vault.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: false,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(vault),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+        };
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[("authorization", "Bearer mr-test-key")]),
+            AxumBody::from(
+                serde_json::json!({
+                    "model": "p/m",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "hello"}],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = body_text(response).await;
+
+        let rows = store.recent_key_usage(10, None).unwrap();
+        let row = rows.first().expect("no row was recorded");
+        assert_eq!(row.prompt_tokens, Some(40));
+        assert_eq!(row.completion_tokens, Some(8));
+        let window = row
+            .generation_ms
+            .expect("a slow stream has a measurable window");
+        assert!(
+            window >= 500,
+            "four frames 200 ms apart must span at least 500 ms, got {window}"
+        );
+        let rate = mr_core::usage::tokens_per_second(row.completion_tokens, row.generation_ms)
+            .expect("a measured window must yield a rate");
+        assert!((rate - 8.0 / (window as f64 / 1000.0)).abs() < 1e-6);
+    }
+
     /// The text of a response body, as a string.
     async fn body_text(response: Response) -> String {
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
