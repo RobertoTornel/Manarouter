@@ -5,7 +5,7 @@ exists because the shape cannot be expressed by translation alone, and because s
 behaviours are actively hostile to a naive client.
 
 Ground truth for this document: `.research/commandcode-bridge.md` and the reference implementation
-in `fornai/commandcode-bridge`.
+in the sibling `fornai/commandcode-bridge` checkout, outside this repository.
 
 ## The endpoint
 
@@ -58,7 +58,7 @@ to stream from.
 
 Five fields are not what an OpenAI-shaped request would suggest:
 
-- **`config`** carries the CLI's own settings. The 10 fields are the first-party client's; the adapter
+- **`config`** carries the CLI's own settings. The 9 fields are the first-party client's; the adapter
   populates the ones that are required and leaves the rest at the defaults the CLI uses.
 - **`memory`, `taste`, `skills`** are personalisation slots. They are sent empty, because inventing
   content for them would put words in the operator's mouth.
@@ -110,8 +110,10 @@ Each of these will produce a bug that looks like something else.
 ### There is no upstream timeout
 
 The provider will hold a connection open indefinitely. A request that stalls stalls forever unless the
-relay imposes its own deadline — which is why the per-provider timeouts exist and why this entry needs
-them more than most. Without them, one dead request occupies a connection until the process restarts.
+relay imposes its own deadline. The per-provider fields are `ttfb_timeout_ms` and `total_timeout_ms`,
+and **both default to zero, which disables them**; the catalogue entry sets neither. Set
+`total_timeout_ms` explicitly on this provider (for example `300000` for five minutes) or one dead
+request occupies a connection until the process restarts. The provider loader flags a config where both are zero.
 
 ### `stream: true` is forced
 
@@ -127,22 +129,22 @@ measurement it never received; the honest thing is to record that usage was not 
 ### `content` is `null` when tool calls are present
 
 A response containing tool calls carries `"content": null`, not `""`. A client that does `content.length`
-crashes. The adapter normalises this — which is exactly the kind of small translation that justifies
-an adapter rather than a config entry.
+crashes. The adapter **preserves** the null (an OpenAI-shaped response with tool calls also carries
+`content: null`), so clients must read it defensively rather than assume a string.
 
 ### An unknown-id `tool-delta` falls back to the last tool call
 
 **This is a real correctness hazard, and the most dangerous item on this list.**
 
-When a `tool-delta` arrives with an id the adapter has not seen, the provider's behaviour — and the
-reference bridge's — is to attach it to the **last** tool call rather than failing. With parallel tool
-calls, a fragment intended for the first call can therefore be merged into the second, producing a
-tool call with arguments from two different calls.
+When a `tool-delta` arrives with an id the adapter has not seen (or with no id at all), the adapter
+does what the reference bridge does: it attaches the fragment to the **most recently opened** tool
+call rather than failing. With parallel tool calls, a fragment intended for the first call can
+therefore be merged into the second, producing a tool call with arguments from two different calls.
+The fragment is ignored only when no tool call is open at all.
 
 That is a malformed result at best and a valid-but-wrong function invocation at worst. The adapter
-bounds this: fragments are only attached to a known id, and one that cannot be matched is dropped and
-counted rather than guessed at. Dropping a fragment produces a visible, diagnosable failure; guessing
-produces a plausible-looking call that does the wrong thing.
+cannot detect the mis-attribution, because it has no way to recover the intended id: treat parallel
+tool calls on this provider as suspect when the arguments look stitched together.
 
 ### `role: "assistant"` is emitted exactly once
 
@@ -162,7 +164,8 @@ makes the provider carry context the client never sent.
 
 A client expecting OpenAI's `{"error": {"message", "type", "code"}}` will not find the message where
 it looks. **The adapter translates this envelope**, including the `docs` link, which is often the only
-thing that explains the failure.
+thing that explains the failure. Anthropic-shaped clients receive only `type` and `message`; `code`,
+`status` and `docs` are preserved on the OpenAI-compatible surface only.
 
 ## The GO plan
 

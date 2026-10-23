@@ -69,7 +69,7 @@ type OmniCipher = AesGcm<Aes256, U16>;
 /// Kept distinct from the decrypted form so a caller can report "present but undecryptable" (a
 /// changed or missing `STORAGE_ENCRYPTION_KEY`) separately from "absent" — the distinction the
 /// reference application itself makes, and the one that tells an operator which action to take.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum StoredField {
     /// The column was NULL or an empty string.
     Absent,
@@ -77,6 +77,18 @@ pub enum StoredField {
     Plain(String),
     /// An `enc:v1:...` ciphertext, still opaque.
     Encrypted(String),
+}
+
+impl fmt::Debug for StoredField {
+    /// Hand-written, for the same reason as [`DecryptedToken`]: `Plain` holds a live credential,
+    /// so it is described by length and never by value.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absent => f.write_str("Absent"),
+            Self::Plain(value) => write!(f, "Plain(***(redacted, {} bytes))", value.len()),
+            Self::Encrypted(value) => write!(f, "Encrypted(***(redacted, {} bytes))", value.len()),
+        }
+    }
 }
 
 impl StoredField {
@@ -289,12 +301,12 @@ fn split_ciphertext(value: &str) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
 
 /// Decode hex without pulling in a `hex` dependency for one call site.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(s.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let hi = (pair[0] as char).to_digit(16)?;
         let lo = (pair[1] as char).to_digit(16)?;
         out.push(((hi << 4) | lo) as u8);
@@ -617,7 +629,8 @@ impl ReferenceDb {
                     other => Some(other),
                 });
             let entries: Vec<ReferenceModel> = parsed
-                .and_then(|v| v.as_array().cloned())
+                .as_ref()
+                .and_then(|v| v.as_array())
                 .map(|items| {
                     items
                         .iter()
@@ -693,8 +706,8 @@ fn decrypt_field(context: RowContext<'_>, value: Option<String>) -> Result<Optio
     match StoredField::classify(value.as_deref()) {
         StoredField::Absent => Ok(None),
         StoredField::Plain(plain) => Ok(Some(DecryptedToken::new(plain))),
-        StoredField::Encrypted(_) => match context.key {
-            Some(key) => key.decrypt(&StoredField::classify(value.as_deref())),
+        StoredField::Encrypted(ciphertext) => match context.key {
+            Some(key) => key.decrypt(&StoredField::Encrypted(ciphertext)),
             None => Err(Error::InvalidState(format!(
                 "reference connection {} has an encrypted {} credential but no \
                  STORAGE_ENCRYPTION_KEY was found; add the reference .env or pass --db next to it",

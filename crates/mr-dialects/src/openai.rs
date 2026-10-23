@@ -425,6 +425,21 @@ pub fn pivot_response_to_anthropic(
         if !text.is_empty() {
             content.push(json!({"type": "text", "text": text}));
         }
+    } else if let Some(parts) = message
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+    {
+        // Some OpenAI-compatible providers return `content` as an array of parts rather than a
+        // string. Dropping it silently would yield an empty assistant message with `end_turn`.
+        let mut text = String::new();
+        for part in parts {
+            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                text.push_str(t);
+            }
+        }
+        if !text.is_empty() {
+            content.push(json!({"type": "text", "text": text}));
+        }
     }
 
     if let Some(calls) = message
@@ -543,11 +558,19 @@ pub fn sse_to_anthropic(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<String
     // The state has to persist across frames, so it is kept in a thread-local keyed by nothing more
     // than the fact that one relay task handles one stream end to end. A caller that needs to
     // interleave streams uses `AnthropicStreamState` directly.
-    STREAM_STATE.with(|cell| {
+    let out = STREAM_STATE.with(|cell| {
         let mut slot = cell.borrow_mut();
         let state = slot.get_or_insert_with(|| AnthropicStreamState::new(ctx.upstream_model));
         translate_chunk(ctx, data, state)
-    })
+    });
+    // The stream is over once `[DONE]` has been translated. Dropping the slot here (on success and
+    // on error alike) keeps the next stream this worker thread handles from inheriting
+    // `started = true` — which suppresses its `message_start` — along with the previous stream's
+    // id, model and block bookkeeping.
+    if data.trim() == "[DONE]" {
+        reset_stream_state();
+    }
+    out
 }
 
 thread_local! {
@@ -580,21 +603,29 @@ fn translate_chunk(
 ) -> Result<Vec<String>> {
     if data.trim() == "[DONE]" {
         let mut out = Vec::new();
+        // A still-open block means no `finish_reason` was ever seen, so the terminal
+        // `message_delta` below is the only one the client will get. When the finish handler
+        // already emitted one, emitting a second with a hard-coded `end_turn` would overwrite a
+        // real `tool_use` or `max_tokens` stop and the client would never run the tool it was
+        // just handed.
+        let unfinished = state.open_block.is_some();
         if let Some(idx) = state.open_block.take() {
             out.push(sse::named_frame(
                 "content_block_stop",
                 &json!({"type": "content_block_stop", "index": idx}).to_string(),
             ));
         }
-        out.push(sse::named_frame(
-            "message_delta",
-            &json!({
-                "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": Value::Null},
-                "usage": {"output_tokens": 0}
-            })
-            .to_string(),
-        ));
+        if unfinished {
+            out.push(sse::named_frame(
+                "message_delta",
+                &json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": Value::Null},
+                    "usage": {"output_tokens": 0}
+                })
+                .to_string(),
+            ));
+        }
         out.push(sse::named_frame(
             "message_stop",
             &json!({"type": "message_stop"}).to_string(),

@@ -10,7 +10,7 @@ mr provider add myprov \
   --auth bearer \
   --capability chat --capability tool-calling
 printf '%s' "$MYPROV_KEY" | mr account add myprov --label main --secret-stdin
-mr provider test myprov
+mr provider test myprov        # makes a real request upstream
 ```
 
 ## Does `/v1` belong in the base URL?
@@ -118,17 +118,15 @@ something that fails. Declaring too few is the safer error, because the router s
 
 ## Fingerprint headers
 
-A `[providers.headers]` table sends fixed headers on every request:
+Some providers (OpenRouter is the classic example) want attribution headers. `config.json` is JSON, and `headers` is a map on the provider object itself:
 
-```toml
-[providers.headers]
-"HTTP-Referer" = "https://github.com/your/repo"
-"X-Title" = "Manarouter"
+```json
+"headers": { "HTTP-Referer": "https://github.com/your/repo", "X-Title": "Manarouter" }
 ```
 
 This is how OpenRouter's attribution headers are configured, and it is also how a provider that
 requires a specific `User-Agent` or an organisation header is satisfied. Nothing secret belongs here —
-these are in `config.json` in plaintext.
+header values sit in `config.json` in plaintext.
 
 ## See also
 

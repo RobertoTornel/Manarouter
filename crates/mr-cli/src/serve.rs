@@ -246,13 +246,17 @@ pub async fn run(cmd: ServeCmd, ctx: &Ctx) -> Result<(), CliError> {
         say("both started; Ctrl-C stops both");
     }
 
-    let mut relay_child = Child::spawn("relay", relay.path(), &relay_args, &[])?;
-    let mut conductor_child = Child::spawn("conductor", conductor.path(), &[], &conductor_env)?;
-
+    // Registered *before* anything is spawned. A SIGINT/SIGTERM arriving between the spawns and this
+    // registration would take the default disposition, kill this process without running the shutdown
+    // path below, and leave both children alive holding the relay and control ports — each is in its
+    // own process group, so the terminal's Ctrl-C is not delivered to them.
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|e| CliError::failure(format!("could not listen for SIGINT: {e}")))?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| CliError::failure(format!("could not listen for SIGTERM: {e}")))?;
+
+    let mut relay_child = Child::spawn("relay", relay.path(), &relay_args, &[])?;
+    let mut conductor_child = Child::spawn("conductor", conductor.path(), &[], &conductor_env)?;
 
     // Race a signal against either child exiting. `select!` cancels the losers, which is safe here:
     // `wait()` on a `tokio::process::Child` is cancel-safe, and dropping the signal futures only stops

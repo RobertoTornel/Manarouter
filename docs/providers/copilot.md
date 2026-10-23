@@ -28,7 +28,7 @@ Response fields that matter:
 |---|---|---|
 | `token` | The session token | **Opaque.** See below. |
 | `expires_at` | Expiry | **Unix seconds, not milliseconds.** |
-| `refresh_in` | Seconds until a refresh is advisable (~1500) | Not an expiry. |
+| `refresh_in` | Seconds until a refresh is advisable (~1500) | Fallback expiry when `expires_at` is missing: `now + refresh_in + 60`. |
 | `endpoints.api` | The API host to use | Preferred source for the host. |
 | `sku` | The subscription tier | The basis for a plan label. |
 
@@ -63,8 +63,9 @@ otherwise derive from proxy-ep, replacing a leading "proxy." with "api."
 ```
 
 The fallback exists because `endpoints.api` is not always present. The `proxy.` → `api.` rewrite is
-the documented transformation; note it is a **prefix** replacement, not a substring one, so a host
-that already begins with `api.` is left alone.
+the documented transformation; note it is a **prefix** replacement, not a substring one, so a
+`proxy.` later in the hostname is not rewritten, and a value without that prefix falls back to
+`https://api.githubcopilot.com`.
 
 ## The mandatory headers
 
@@ -75,10 +76,9 @@ Copilot-Integration-Id: <as recorded in the catalogue>
 
 - **`Editor-Version` is mandatory.** Omitting it is a hard 400 with no useful explanation. This is the
   single most likely reason a hand-rolled integration fails.
-- **`Copilot-Integration-Id` selects the model policy.** Critically, it must **not** be
-  `copilot-language-server`: that value is associated with a policy that does not grant the intended
-  model access. The wrong value produces a working connection with the wrong models available, which
-  is far harder to diagnose than a refusal.
+- **`Copilot-Integration-Id` selects the model policy.** The catalogue records `vscode-chat`. The
+  wrong value produces a working connection with the wrong models available, which is far harder to
+  diagnose than a refusal.
 
 Both are fingerprint headers, declared as data in the catalogue rather than buried in code, because
 they are version-dependent and are the first thing to check when Copilot breaks.
@@ -119,7 +119,7 @@ should stake an account on.
 
 ## Capabilities
 
-`chat`, `responses`, `messages`, `tool-calling`, `vision`, `models`.
+`chat`, `responses`, `messages`, `embeddings`, `models`, `tool-calling`, `reasoning`, `vision`.
 
 ## See also
 

@@ -82,6 +82,9 @@ function nextNonBlank(lines, from) {
 // 3. Block scanning
 // ---------------------------------------------------------------------------
 
+// Hard cap on structural nesting: document text is untrusted and parseBlocks recurses.
+const MAX_BLOCK_DEPTH = 16;
+
 const RE = {
   heading: /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$/,
   fenceOpen: /^ {0,3}(`{3,}|~{3,})[ \t]*([^\s]*)[ \t]*$/,
@@ -158,7 +161,8 @@ function startsBlock(lines, i) {
  * Scan escaped lines into block objects. Pure; nested structures (quotes, list items) recurse
  * through here, which is what makes one level of nesting (and more) fall out for free.
  */
-function parseBlocks(lines) {
+function parseBlocks(lines, depth = 0) {
+  if (depth > MAX_BLOCK_DEPTH) return [{ type: 'paragraph', lines }];
   const blocks = [];
   let i = 0;
   while (i < lines.length) {
@@ -229,7 +233,7 @@ function parseBlocks(lines) {
         }
         break;
       }
-      blocks.push({ type: 'blockquote', blocks: parseBlocks(quoted) });
+      blocks.push({ type: 'blockquote', blocks: parseBlocks(quoted, depth + 1) });
       continue;
     }
 
@@ -278,7 +282,7 @@ function collectList(lines, start) {
   const first = matchListItem(lines[start]);
   const base = first.indent;
   const ordered = first.ordered;
-  const startNumber = first.number || 1;
+  const startNumber = first.number ?? 1;
   const items = [];
   let i = start;
 
@@ -474,7 +478,7 @@ export function renderInline(text) {
 
     // Autolink: `<https://…>` — in escaped text, `&lt;…&gt;`.
     if (text.startsWith('&lt;', i)) {
-      const m = /^&lt;([^\s]+?)&gt;/.exec(rest);
+      const m = /^&lt;([^\s]{1,2048}?)&gt;/.exec(rest);
       if (m) {
         const href = sanitizeUrl(m[1]);
         if (href && /^(?:https?|mailto):/i.test(href)) {
@@ -487,7 +491,7 @@ export function renderInline(text) {
 
     // Inline link: `[text](url)`. Refused URLs fall through as literal text.
     if (ch === '[') {
-      const m = /^\[([^\]]*)\]\(([^)\s]*)\)/.exec(rest);
+      const m = /^\[([^\]]{0,512})\]\(([^)\s]{0,2048})\)/.exec(rest);
       if (m) {
         const href = sanitizeUrl(m[2]);
         if (href) {
@@ -503,7 +507,7 @@ export function renderInline(text) {
 
     // Emphasis: strong / strike / em, longest marker first.
     if (ch === '*' || ch === '_' || ch === '~') {
-      const em = matchEmphasis(rest, out.slice(-1));
+      const em = matchEmphasis(rest, (i > 0 ? text[i - 1] : ''));
       if (em) {
         out += `<${em.tag}>${renderInline(em.inner)}</${em.tag}>`;
         i += em.length;

@@ -34,12 +34,12 @@ export async function renderKeys(mount, ctx) {
       return;
     }
     count.textContent = `${keys.length} key${keys.length === 1 ? '' : 's'}`;
-    if (editingId) {
-      const current = keys.find((k) => k.id === editingId);
-      renderForm(current ?? null);
-    } else {
-      formSlot.replaceChildren();
+    // reload() also runs after rotating or deleting any row, so never rebuild an open form:
+    // that would silently discard caps the operator has typed. Close only a form whose key is gone.
+    if (editingId && editingId !== 'new' && !keys.some((k) => k.id === editingId)) {
+      editingId = null;
     }
+    if (!editingId) formSlot.replaceChildren();
     renderTable();
   }
 

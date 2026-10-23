@@ -281,7 +281,9 @@ const RESET_EPOCH_SECS: u64 = 1_767_225_600;
 /// run and on every machine. See [`RESET_EPOCH_SECS`] for why the mock refuses to use real time
 /// here.
 pub fn reset_at(retry_after_secs: u64) -> String {
-    let secs = RESET_EPOCH_SECS + retry_after_secs;
+    // `retry_after_secs` is untrusted (x-mock-fault header / POST /__control body); saturate so a
+    // value near u64::MAX cannot overflow-panic in debug builds or wrap into a past date in release.
+    let secs = RESET_EPOCH_SECS.saturating_add(retry_after_secs);
     let days = (secs / 86_400) as i64;
     let tod = secs % 86_400;
     let (year, month, day) = civil_from_days(days);

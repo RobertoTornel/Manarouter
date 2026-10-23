@@ -127,7 +127,9 @@ hundreds of milliseconds. That dwarfs everything the router itself does.
 The relay keeps a pool of warm keep-alive connections per upstream authority, with
 `pool_max_idle_per_host` and `pool_idle_secs` set once in the global `latency` block of the
 configuration (they are **not** per-provider; only `prewarm`, `http2` and the four timeouts are).
-`prewarm` opens a connection at startup so the first request does not pay for it.
+`prewarm` opens a connection at startup so the first request does not pay for it; it is opt-in per
+provider (`provider.prewarm` defaults to false) and also requires the global `latency.prewarm`
+master switch.
 
 Care is taken not to confuse *keep-alive* with *connection count*: four idle connections per host is
 the default because a hedge may need three at once, and a fourth concurrent request should not queue
@@ -172,7 +174,7 @@ acceptable here because the relay's work per connection is uniform.
 
 Declared in `lib.rs` rather than `main.rs`, specifically so that any future benchmark binary links the
 same allocator the shipping binary uses. A benchmark that measures a different allocator is measuring
-the wrong program. (There is no such binary yet — `tools/bench` is an empty directory.)
+the wrong program. (The `tools/bench` harness links the same allocator.)
 
 The relay's pattern — many short-lived buffers, allocated and freed on different threads as hyper
 tasks migrate between workers — is where a general-purpose allocator is weakest. mimalloc's
@@ -250,17 +252,16 @@ Two mechanisms, and the distinction between them matters.
 ### `tools/bench` against `tools/mock-upstream`
 
 `tools/mock-upstream` answers with a fixed, tiny payload after a configurable delay, so the time
-measured is the relay's and not the upstream's. It exists and works. `tools/bench`, the harness that
-would assert p50 under 150 µs and p99 under 500 µs, **does not exist**: the directory is empty, there
-is no `mr-bench` package, and CI excludes `bench` from its tool matrix. So there is no pass/fail
-latency assertion anywhere today, and a regression would not fail a test. The mock's determinism —
-identical request bytes produce identical response bytes — is what would make such a comparison
-meaningful once the harness is written.
+measured is the relay's and not the upstream's. It exists and works. `tools/bench`
+(`manarouter-bench`) measures exactly that comparison: it reports p50/p99 against the 150 µs /
+500 µs budget and fails the run on a breach, but CI only formats it and runs no latency
+assertion, so a regression would still not fail a test. The mock's determinism — identical request
+bytes produce identical response bytes — is what makes such a comparison meaningful.
 
 ### Opt-in live comparison
 
-`docs/19-latency-benchmarks.md` records measurements against real providers, taken deliberately with
-real credentials and clearly separated from the controlled numbers above.
+`docs/19-latency-benchmarks.md` is where measurements against real providers belong — taken
+deliberately with real credentials, and kept clearly separate from the controlled numbers above.
 
 Real providers are unsuitable for a pass/fail assertion — their latency varies by orders of magnitude
 with time of day, load and geography — but they are the only honest way to answer "how does this

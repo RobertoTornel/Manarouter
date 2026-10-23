@@ -112,7 +112,9 @@ async fn panel_assets(State(state): State<AppState>, request: Request) -> Respon
     // but an API path must never fall through to `index.html` — the panel's 401-bounce logic
     // parses that body as JSON and would loop on it.
     let path = request.uri().path();
-    if path == "/api" || path.starts_with("/api/") {
+    // Compare the first non-empty segment, not the literal prefix: `//api/...` matches no route
+    // (the router does not fold empty segments), so a literal test would let it reach index.html.
+    if path.split('/').find(|segment| !segment.is_empty()) == Some("api") {
         return api::api_not_found_response();
     }
 

@@ -27,10 +27,10 @@ export async function renderModels(mount, ctx) {
   const tableWrap = h('div', { class: 'table-scroll' });
   const count = h('span', { class: 'count' });
 
-  for (const el of [provSel, sourceSel, search]) {
-    el.addEventListener('change', renderTable);
-    el.addEventListener('input', renderTable);
-  }
+  // A <select> fires both "input" and "change"; binding both rebuilt the table twice per change.
+  provSel.addEventListener('change', renderTable);
+  sourceSel.addEventListener('change', renderTable);
+  search.addEventListener('input', renderTable);
   hiddenOnly.addEventListener('change', renderTable);
 
   mount.replaceChildren(
@@ -50,21 +50,24 @@ export async function renderModels(mount, ctx) {
       tableWrap.replaceChildren(errorBlock(err));
       return;
     }
+    const previousProvider = provSel.value;
     provSel.replaceChildren(
       h('option', { value: '' }, 'all providers'),
       ...providers.map((p) => h('option', { value: p.id }, p.id)),
     );
+    // replaceChildren() resets a <select> to its first option; keep the operator's filter.
+    if (previousProvider && providers.some((p) => p.id === previousProvider)) provSel.value = previousProvider;
     renderTable();
   }
 
   function rows() {
+    const q = search.value.trim().toLowerCase();
     const out = [];
     for (const p of providers) {
       if (provSel.value && p.id !== provSel.value) continue;
       for (const m of p.models ?? []) {
         if (sourceSel.value && (m.source ?? 'synced') !== sourceSel.value) continue;
         if (hiddenOnly.checked && !m.hidden) continue;
-        const q = search.value.trim().toLowerCase();
         if (q && !`${m.id} ${m.label ?? ''}`.toLowerCase().includes(q)) continue;
         out.push({ p, m });
       }
@@ -245,6 +248,7 @@ export async function renderModels(mount, ctx) {
       await api.post(`/api/providers/${encodeURIComponent(p.id)}/models`, { ...m, hidden: !m.hidden });
       await reload();
     } catch (err) {
+      btn.checked = Boolean(m.hidden); // reverted: the POST failed, so the server still has the old value
       btn.disabled = false;
       ctx.toast.error('Could not change visibility', err);
     }
@@ -253,9 +257,9 @@ export async function renderModels(mount, ctx) {
   async function deleteModel(p, m) {
     const ok = await ctx.confirm({
       title: `Delete model “${m.id}”?`,
-      message: m.source === 'synced'
-        ? 'A later sync may re-add it.'
-        : 'It was entered manually and will not come back.',
+      message: m.source === 'manual'
+        ? 'It was entered manually and will not come back.'
+        : 'A later sync may re-add it.',
       confirmLabel: 'Delete model',
     });
     if (!ok) return;

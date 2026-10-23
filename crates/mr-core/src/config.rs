@@ -955,10 +955,14 @@ impl Config {
             .flat_map(|c| [c.id.as_str(), c.name.as_str()])
             .collect();
         let mut seen_aliases: BTreeMap<&str, &str> = BTreeMap::new();
+        // Computed once: `reachable_model_ids` allocates a fresh vector and walks every account's
+        // allow and deny lists, so calling it inside the loop made validating N aliases cost
+        // N full rebuilds of the model list on every panel save and every startup.
+        let reachable_ids = self.reachable_model_ids();
         for a in &self.aliases {
             if !combo_addr.contains(&a.to.as_str())
                 && !provider_ids.iter().any(|p| p.as_str() == a.to.as_str())
-                && !self.reachable_model_ids().iter().any(|m| m == &a.to)
+                && !reachable_ids.iter().any(|m| m == &a.to)
             {
                 problems.push(format!(
                     "alias {} points at {}, which is neither a combo, a provider, nor a model",
@@ -1300,6 +1304,17 @@ impl Config {
         self.latency.hedge_width.hash(&mut hasher);
         self.latency.hedge_window_ms.hash(&mut hasher);
         self.latency.hedge_max_requests.hash(&mut hasher);
+        // The routing defaults are baked into the compiled snapshot
+        // (`default_reasoning_level` and `routing_defaults`), so leaving them out of the digest
+        // let a panel edit to a modality fallback, or to the reasoning default, leave the digest
+        // unchanged. The relay only reloads a snapshot whose digest differs, so the operator's
+        // change would silently never reach the data plane.
+        self.routing.default_reasoning_level.hash(&mut hasher);
+        self.routing.defaults.image.hash(&mut hasher);
+        self.routing.defaults.audio.hash(&mut hasher);
+        self.routing.defaults.video.hash(&mut hasher);
+        self.routing.defaults.pdf.hash(&mut hasher);
+        self.routing.defaults.file.hash(&mut hasher);
         hasher.finish()
     }
 }

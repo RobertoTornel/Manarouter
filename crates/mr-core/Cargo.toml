@@ -27,8 +27,9 @@ base64 = { workspace = true }
 rand = { workspace = true }
 zeroize = { workspace = true }
 aes-gcm = { workspace = true }
-# Only `oauth/migrate.rs` uses this: the reference OmniRoute database derives its field-encryption
-# key with scrypt, so reading those tokens requires it. The runtime never calls into that module.
+# Only `oauth/reference.rs` uses this (entered through `oauth/migrate.rs`): the reference OmniRoute
+# database derives its field-encryption key with scrypt, so reading those tokens requires it. The
+# runtime never calls into that module.
 scrypt = { workspace = true }
 argon2 = { workspace = true }
 password-hash = { workspace = true }
@@ -37,9 +38,10 @@ memchr = { workspace = true }
 http = { workspace = true }
 socket2 = { workspace = true }
 httpdate = { workspace = true }
-# OAuth (crates/mr-core/src/oauth) is the one part of this crate that reaches the network: the
-# authorization-code exchange, refresh and device-code polls all speak HTTPS. These are workspace
-# dependencies, so nothing new enters the tree — the relay already builds on all of them.
+# OAuth (crates/mr-core/src/oauth) and quota probing (crates/mr-core/src/quota/http.rs) are the
+# only parts of this crate that reach the network: the authorization-code exchange, refresh,
+# device-code polls and quota reads all speak HTTPS. These are workspace dependencies, so nothing
+# new enters the tree — the relay already builds on the HTTP/TLS ones.
 async-trait = { workspace = true }
 tokio = { workspace = true }
 hyper = { workspace = true }

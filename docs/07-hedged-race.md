@@ -13,15 +13,16 @@ consequences carefully.
 
 > **Implementation status.** The race runs. A combo with `hedge.enabled` dispatches every
 > participant at once, and the highest-priority participant that produces a usable reply inside the
-> eligibility window is committed as the winner; the losers are dropped when it is. The policy —
+> eligibility window is committed as the winner; participants that have not answered are dropped
+> then (ones that already answered stay available for recovery, §6). The policy —
 > who wins, and when — is [`hedge_decide`](../crates/manarouter-relay/src/select.rs), and the runner
 > that dispatches the participants is
 > [`run_hedge`](../crates/manarouter-relay/src/server.rs).
 >
-> Three things described below are **not** implemented, and the document says so where it describes
-> them: winner recovery when the committed winner dies mid-stream (§5's four `on_winner_fail` modes
-> are unreachable, because the winner is committed before its body streams), the mid-stream switch
-> (§6), and session affinity (§8). `hedge.enabled` also opts a `priority` combo into the separate
+> Of the four `on_winner_fail` modes described in §5, only `pick-highest-passed` is implemented;
+> the other three are parsed, warned about, and fall back to it. Winner recovery (§5) and the
+> mid-stream switch (§6) **are** implemented, because the relay wraps the committed winner's body;
+> only session affinity (§8) is not wired. `hedge.enabled` also opts a `priority` combo into the separate
 > sticky-success preference: after a successful call the relay prefers that provider/model for the
 > configured inactivity window (default 1800 seconds), subject to current eligibility. This
 > preference is combo-wide across callers, process-local, bounded, and makes no inference or keepalive

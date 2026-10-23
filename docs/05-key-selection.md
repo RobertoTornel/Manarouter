@@ -7,9 +7,9 @@ it reads is the order the compiler already resolved.
 
 > **Status.** The strategy vocabulary, the `AccountPlan` fields, the `AccountState` set and the
 > `ProviderHealth` rollup are implemented in `mr-core` and tested. All four `KeyStrategy` values are
-> also executed by the relay (`manarouter-relay/src/select.rs`), which binds its listener and serves
-> `/v1`; the account selection described below is live behaviour. What is not yet wired is account
-> *health as persisted state*: the relay's live view is in memory and nothing writes the
+> also executed by the relay (`manarouter-relay/src/select.rs`, a pure decision module called from
+> its HTTP layer); the account selection described below is live behaviour. What is not yet wired is
+> account *health as persisted state*: the relay's live view is in memory and nothing writes the
 > `account_health` table.
 
 ---
@@ -43,7 +43,7 @@ account they pick.
 | `priority` | `priority` (also `first`, `fill-first`) | the first usable account in ascending `priority` | one scan to the first usable entry; keeps prompt caches warm |
 | `round-robin` | `round-robin` (also `roundrobin`, `rr`, `rotate`) | the next usable account after the last one chosen | a rotation cursor, which is mutable state |
 | `random` | `random` (also `rand`) | a uniformly random usable account | nothing to store; no fairness guarantee |
-| `least-used` | `least-used` (also `leastused`) | the usable account with the fewest requests so far | a per-account request counter |
+| `least-used` | `least-used` (also `leastused`) | the usable account with the largest `max_concurrent` | a sort of the eligible set; nothing stored |
 
 `KeyStrategy::parse` normalises case, underscores and spaces to hyphens, and accepts the aliases in
 the table. `fill-first` is OmniRoute's spelling for priority, kept so a migrated configuration does
@@ -163,14 +163,14 @@ position rather than at the front.
 **`random` and `least-used` need the same filter as the other two.** A is excluded from the draw, not
 merely deprioritised — "pick at random, then fall back if it is unusable" and "pick at random among
 usable accounts" are different algorithms, and only the second is correct. The same applies to
-`least-used`: the minimum is taken over eligible accounts, or an account that is out for an hour would
-keep winning a comparison it cannot serve.
+`least-used`: the ranking is taken over eligible accounts, or an account that is out for an hour would
+keep winning a slot it cannot serve.
 
-**A failed request is still a request.** `least-used` counts the 429 against A, because the request
-was issued; the count reflects load, not successes. An account in a long backoff therefore accumulates
-no new counts and looks *less* used when it returns. That is one more reason it is a load spreader and
-not a health signal, and it is why the strategy must never be used as a proxy for "which account is
-best right now" — that question belongs to `AccountState`, not to a counter.
+**`least-used` is a capacity ranking, not a load measurement.** The relay sorts the eligible
+accounts by `max_concurrent` and takes the first, so the strategy reflects the capacity the operator
+declared, not the traffic each account has actually seen. It is a load spreader and not a health
+signal, and it is why the strategy must never be used as a proxy for "which account is best right
+now" — that question belongs to `AccountState`, not to a static number.
 
 The four strategies differ in which usable account they pick. They do not differ in whether an
 unusable account can be picked, and there is no strategy — including `random` — for which that is a
@@ -383,7 +383,7 @@ Account state is **observed, not authored**, and it is stored accordingly:
 |---|---|---|
 | `enabled`, `priority`, `weight`, `models_allow`, `models_deny` | `config.json`, per account | the operator, the panel, or `mr` |
 | Live account health (cooldown, reset time, failure count) | the relay process's memory (`manarouter-relay/src/select.rs`), keyed by account id | the relay, from the `429`/`401` it observes |
-| Round-robin cursor, least-used counters | the relay's own `RouteTable` runtime state, not the snapshot | the relay, per request |
+| Round-robin cursor | the relay's in-memory selection state, not the snapshot | the relay, per request |
 
 The schema has four tables — `account_health`, `usage`, `oauth_credential` and `oplog` — and the
 `usage` table exists with `usage_by_account()` reading it while `account_health` has its own read path,
@@ -405,9 +405,10 @@ Observe it in two places:
   actually show today is the authored account list, not live cooldowns; the relay-local view is not
   exposed over HTTP.
 - **Restarting the relay**, which is the only supported way to clear a stuck cooldown today: the
-  in-memory map is rebuilt empty and every account is eligible again. Deleting `state.sqlite` is still
-  always safe and loses nothing authored, but it does *not* clear cooldowns — they were never in the
-  file.
+  in-memory map is rebuilt empty and every account is eligible again. Deleting `state.sqlite` is safe
+  for authored configuration — nothing in it is hand-written — but stop the relay first, and note that
+  recorded usage and oplog history are lost with the file; it does *not* clear cooldowns, which were
+  never in the file.
 
 ---
 

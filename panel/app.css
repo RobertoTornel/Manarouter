@@ -335,7 +335,7 @@ table.tbl {
 .btn:hover { background: var(--bg3); }
 .btn:disabled { opacity: 0.55; cursor: default; }
 
-/* Primary action: pink fill, dark text — the strongest accent on any screen. */
+/* Primary action: pink fill, white text — the strongest accent on any screen. */
 .btn-primary { background: var(--pink-deep); border-color: var(--pink-deep); color: #fff; font-weight: 600; }
 .btn-primary:hover { background: var(--pink); border-color: var(--pink); }
 
@@ -944,7 +944,8 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 .docs-nav .dtitle { font-weight: 600; font-size: 12.5px; }
 .docs-nav .dpurpose { color: var(--tx3); font-size: 11.5px; margin-top: 1px; }
 
-/* Docs are rendered as verbatim plain text (textContent) — markdown source, zero-risk. */
+/* Legacy, unused: view-docs.js renders documents as markdown via markdown.js
+   (HTML-escaped, fixed tag set) into .md-body. This block only suits verbatim text. */
 .doc-text {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -959,7 +960,8 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 
 /* ---------- narrow screens ---------- */
 
-/* The panel targets 1280×720 with no page scroll; below that, panes stack. */
+/* The panel targets 1280×720 with no page-level horizontal scroll; below 1100px the
+   sidebar narrows and the combo/docs panes stack. */
 @media (max-width: 1100px) {
   #shell { grid-template-columns: 170px minmax(0, 1fr); }
   .combo-layout, .docs-layout { grid-template-columns: minmax(0, 1fr); }

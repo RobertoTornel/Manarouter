@@ -11,7 +11,7 @@ implements it.
 > `crates/mr-core/src/oauth/` — `mod.rs` (trait, registry), `flow.rs`, `refresh.rs`, `session.rs`,
 > `codex.rs`, `copilot.rs`, `antigravity.rs`. They are **not** in the conductor:
 > `crates/manarouter-conductor/src/` has no `oauth/` directory and drives the trait through `api.rs`.
-> `crates/mr-core/src/store.rs` is fully implemented. Sections §2 and §3 use a fictional `halcyon`
+> `crates/mr-core/src/store.rs` is fully implemented. Section §3 uses a fictional `halcyon`
 > platform to show the shape of a new adapter; a real adapter goes in
 > `crates/mr-core/src/oauth/<platform>.rs` and is registered in `PLATFORMS` in
 > `crates/mr-core/src/oauth/mod.rs`. The catalogue and test sections are real —
@@ -33,7 +33,7 @@ crates/mr-core/src/oauth/
 ├── codex.rs        openai-codex (loopback, plus a device-code fallback)
 ├── antigravity.rs  antigravity (both Google tiers)
 ├── copilot.rs      github-copilot (device code)
-└── halcyon.rs      the worked example below (fictional)
+└── (halcyon.rs)    not in the tree; the worked example below is fictional
 ```
 
 The registry is a static array of trait objects, and lookup is a linear scan by id. There are three
@@ -41,7 +41,7 @@ shipped platforms, plus the fictional Halcyon below; a hash map would be slower 
 faster to search.
 
 ```rust
-// crates/mr-core/src/oauth/mod.rs
+// crates/mr-core/src/oauth/mod.rs, with the fictional Halcyon added
 mod antigravity;
 mod codex;
 mod copilot;
@@ -351,7 +351,7 @@ that is the normal state after `mr provider add` and before the first login.
    `platform("halcyon")`, drives the flow from `begins_with_loopback()`/`supports_device_flow()`, and
    on success:
    - extracts the identity with `account_identity()`;
-   - writes the credential to the vault at `provider/halcyon/account/<tenant-id>` using
+   - writes the credential to the vault at `provider/halcyon/account/<account-id>` using
      `mr_core::secret::account_secret_id` (never into `config.json`, never into the database — see
      `docs/10-oauth-overview.md` §6);
    - appends an account to the provider in `config.json` holding the **reference** to that vault id,
@@ -484,7 +484,7 @@ fn the_authorize_url_uses_s256_and_the_registered_redirect() {
 ```
 
 The fourth is the behavioural one and it needs a mock upstream that rejects a request without
-`Halcyon-Tenant` and `originator` (§7). `tools/mock-upstream` does not do that yet, so until the route
+`Halcyon-Tenant` and `originator` (§8). `tools/mock-upstream` does not do that yet, so until the route
 exists this test runs against the fixture server and is what actually proves the fingerprint reaches
 the wire; the catalogue test only proves the data is recorded.
 
@@ -534,7 +534,7 @@ review:
   header is as identifying as a missing one.
 - **Read the encoding off the first-party source, not off the shape of the last platform you
   implemented.** Codex's exchange is form and its refresh is JSON; Halcyon's is the same asymmetry
-  for the same reason. Copilot has no refresh at all.
+  for the same reason. Copilot's refresh re-mints from the long-lived GitHub token instead of using the OAuth grant.
 
 ---
 

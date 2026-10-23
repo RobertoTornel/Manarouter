@@ -218,7 +218,7 @@ pub fn parse_gateway_response(response: &QuotaResponse) -> Result<Value> {
         )));
     }
     let value: Value = serde_json::from_slice(&response.body)
-        .map_err(|_| Error::NotFound("qwen token-plan gateway returned invalid JSON".into()))?;
+        .map_err(|_| Error::InvalidState("qwen token-plan gateway returned invalid JSON".into()))?;
     parse_gateway_envelope(&value).cloned().ok_or_else(|| {
         Error::InvalidState("qwen token-plan gateway envelope was not successful".into())
     })

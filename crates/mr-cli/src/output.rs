@@ -184,6 +184,21 @@ pub fn confirm_secret(secret: &str, _label: &str) -> String {
 /// guarantee, and is documented as such.
 pub fn redact_text(text: &str) -> String {
     const DELIMS: [char; 9] = [' ', '\t', '\n', '\r', '"', '\'', '=', ',', ';'];
+    // Untrusted bodies reach a terminal through here: strip ANSI/C0/C1 control characters first,
+    // so an upstream cannot emit escape sequences (cursor moves, OSC 52 clipboard writes) or hide
+    // a credential behind one. Tabs, newlines and carriage returns are layout and are kept.
+    let text: std::borrow::Cow<'_, str> = if text
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+    {
+        std::borrow::Cow::Owned(
+            text.chars()
+                .filter(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
     let mut out = String::with_capacity(text.len());
     for chunk in text.split_inclusive(|c: char| DELIMS.contains(&c)) {
         // Separate trailing delimiters from the token core so `"sk-…"` yields `sk-…`.
@@ -238,7 +253,13 @@ impl Table {
 
     /// Render with box-drawing characters, header underlined by `├─┼─┤`.
     pub fn render(&self) -> String {
-        let cols = self.headers.len().max(1);
+        // Extra cells in a row must widen the table rather than vanish: a silently dropped
+        // column is data loss the operator cannot see.
+        let cols = self
+            .headers
+            .len()
+            .max(self.rows.iter().map(Vec::len).max().unwrap_or(0))
+            .max(1);
         let mut widths: Vec<usize> = self.headers.iter().map(|h| h.chars().count()).collect();
         widths.resize(cols, 6);
         for row in &self.rows {
@@ -266,7 +287,7 @@ impl Table {
                 let cell = cells.get(i).map(String::as_str).unwrap_or("");
                 s.push(' ');
                 s.push_str(cell);
-                for _ in cell.chars().count()..*w {
+                for _ in 0..w.saturating_sub(cell.chars().count()) {
                     s.push(' ');
                 }
                 s.push(' ');
@@ -317,8 +338,13 @@ where
     F: FnOnce(&str) -> Option<T>,
 {
     let norm = raw.trim().to_ascii_lowercase().replace(['_', ' '], "-");
-    if let Ok(v) = serde_json::from_str::<T>(&format!("\"{norm}\"")) {
-        return Ok(v);
+    // Serialise the value through serde instead of interpolating it into quotes: the old
+    // `format!("\"{norm}\"")` interpreted backslash escapes, so `--strategy 'round\u002drobin'`
+    // was accepted as a spelling and values containing `"` silently fell through.
+    if let Ok(quoted) = serde_json::to_string(&norm) {
+        if let Ok(v) = serde_json::from_str::<T>(&quoted) {
+            return Ok(v);
+        }
     }
     if let Some(v) = permissive(&norm) {
         return Ok(v);

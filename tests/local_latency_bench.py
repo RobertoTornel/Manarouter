@@ -59,6 +59,11 @@ def build(command: list[str], env: dict[str, str]) -> None:
     subprocess.run(command, cwd=ROOT, env=env, check=True)
 
 
+# Health checks must not follow `http_proxy`/`HTTP_PROXY` from the environment: every listener here is
+# loopback, and a configured proxy would turn a healthy local process into a startup timeout.
+_LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def wait_http(url: str, process: subprocess.Popen[bytes], log_path: Path, timeout: float = 20) -> None:
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None
@@ -66,10 +71,10 @@ def wait_http(url: str, process: subprocess.Popen[bytes], log_path: Path, timeou
         if process.poll() is not None:
             raise RuntimeError(f"process exited {process.returncode}: {log_path.read_text(errors='replace')}")
         try:
-            with urllib.request.urlopen(url, timeout=0.5) as response:
+            with _LOOPBACK_OPENER.open(url, timeout=0.5) as response:
                 response.read()
                 return
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
             last_error = exc
             time.sleep(0.05)
     raise RuntimeError(f"timed out waiting for {url}: {last_error}; see {log_path}")
@@ -77,14 +82,19 @@ def wait_http(url: str, process: subprocess.Popen[bytes], log_path: Path, timeou
 
 def stop_children(children: list[tuple[subprocess.Popen[bytes], object]]) -> None:
     for process, log_file in reversed(children):
-        if process.poll() is None:
-            process.send_signal(signal.SIGTERM)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-        log_file.close()
+        try:
+            if process.poll() is None:
+                process.send_signal(signal.SIGTERM)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+        finally:
+            log_file.close()
 
 
 def request(connection: http.client.HTTPConnection, path: str, body: dict) -> tuple[float, str | None]:
@@ -101,6 +111,8 @@ def request(connection: http.client.HTTPConnection, path: str, body: dict) -> tu
             payload = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             return elapsed_ms, f"invalid JSON response: {exc}"
+        if not isinstance(payload, dict):
+            return elapsed_ms, "response was not a JSON object"
         choices = payload.get("choices")
         if not isinstance(choices, list) or not choices:
             return elapsed_ms, "response did not contain choices"

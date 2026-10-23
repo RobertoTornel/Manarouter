@@ -157,6 +157,13 @@ export async function renderSettings(mount, ctx) {
         ctx.toast.success('Password updated.');
         current.value = next.value = confirmIn.value = '';
         ctx.state.session && (ctx.state.session.password_required = true);
+        if (!passwordSet) {
+          // A password exists now, so the form must switch to change mode: the next submit has
+          // to send the current password, which this form does not ask for yet.
+          if (ctx.state.health) ctx.state.health.password_set = true;
+          await renderPassword();
+          return;
+        }
       } catch (err) {
         applyFieldErrors(form, err);
         if (!err.details?.length) ctx.toast.error('Could not change the password', err);
@@ -458,8 +465,8 @@ export async function renderSettings(mount, ctx) {
         return null;
       });
       if (!latest) return;
-      const quota = latest.quota && typeof latest.quota === 'object' ? latest.quota : {};
-      const oldDisplay = quota.display && typeof quota.display === 'object' ? quota.display : {};
+      const quota = latest.quota && typeof latest.quota === 'object' && !Array.isArray(latest.quota) ? latest.quota : {};
+      const oldDisplay = quota.display && typeof quota.display === 'object' && !Array.isArray(quota.display) ? quota.display : {};
       quota.display = { ...oldDisplay, mode: mode.value, chunks: count, reset_on_load: refreshOnLoad.input.checked };
       latest.quota = quota;
       try {
@@ -525,7 +532,7 @@ export async function renderSettings(mount, ctx) {
     }
     target.replaceChildren(h('div', { class: 'form-errors', role: 'alert' },
       h('strong', {}, `${problems.length} configuration problem${problems.length === 1 ? '' : 's'} found:`),
-      h('ul', {}, ...problems.map((problem) => h('li', {}, typeof problem === 'string' ? problem : (problem.message ?? JSON.stringify(problem)))))));
+      h('ul', {}, ...problems.map((problem) => h('li', {}, typeof problem === 'string' ? problem : (problem?.message ?? JSON.stringify(problem)))))));
     return false;
   }
 
@@ -569,7 +576,7 @@ export async function renderSettings(mount, ctx) {
           // The backend reports every problem at once; the list must keep them all.
           result.append(h('div', { class: 'form-errors', role: 'alert' },
             h('strong', {}, `${problems.length} problem${problems.length === 1 ? '' : 's'} found:`),
-            h('ul', {}, ...problems.map((p) => h('li', {}, typeof p === 'string' ? p : (p.message ?? JSON.stringify(p)))))));
+            h('ul', {}, ...problems.map((p) => h('li', {}, typeof p === 'string' ? p : (p?.message ?? JSON.stringify(p)))))));
         }
       } catch (err) {
         result.replaceChildren(errorBlock(err));
@@ -592,7 +599,7 @@ export async function renderSettings(mount, ctx) {
         await api.putRaw('/api/config/raw', ta.value);
         ctx.toast.success('Configuration saved.');
         result.replaceChildren();
-        await Promise.all([ctx.refreshPorts(), ctx.loadProviders(true), ctx.refreshHealth()]);
+        await Promise.all([ctx.refreshPorts(), ctx.loadProviders(true), ctx.refreshHealth()]).catch(() => { /* refresh is cosmetic; the save already succeeded */ });
       } catch (err) {
         result.replaceChildren(errorBlock(err));
         ctx.toast.error('Save failed', err);

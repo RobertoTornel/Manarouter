@@ -48,13 +48,15 @@ and the **first match wins** (the rank numbers are the snapshot's own `RANK_*` c
 | 1 | Combo id | `01924f3a-...` |
 | 2 | Combo name, with or without a level suffix | `coding`, `coding-high` |
 | 3 | `provider/<exact model id>` | `anthropic/claude-sonnet-4-5` |
-| 4 | Bare model id | `gpt-5`, if a visible model has exactly that id |
 | 5 | `provider/<base model>-<level>` | `anthropic/claude-sonnet-4-5-high` |
+
+Rank 4 is unused: the bare-model fallback is gone, so an unqualified id such as `gpt-5` is not an
+address and answers 404.
 
 A level-suffixed combo name shares rank 2 with the plain combo name, which is what makes
 `coding-high` a way to pin an existing route to a tier without editing it. A rank-5 key, by contrast,
 is derived by appending a suffix to a model id, so it is deliberately the **lowest** precedence there
-is: an exact model id (rank 3) and even a bare id (rank 4) outrank it. Requesting a level is therefore
+is: an exact model id (rank 3) outranks it. Requesting a level is therefore
 always possible, but a derived name can never shadow a model that genuinely exists under that name.
 
 Two properties worth knowing before you debug a 404:
@@ -160,14 +162,11 @@ not a silent fallback to "some model". The three cases need different fixes, so 
 On `/v1/messages` the same failure arrives in the Anthropic envelope with type `not_found_error`; see
 [Error envelopes](#error-envelopes).
 
-> **Status.** Bare model ids still resolve at rank 4 above when a visible model has exactly that id,
-> so a name like `gpt-5` does **not** fail as long as one enabled provider offers it.
-> Feature 3's design intended the bare fallback to be removed, and the generated-alias migration
-> (`generated: true` aliases are deleted on config load, with `config.json.pre-migration.bak` written
-> as a backup) is written on that assumption — but the bare index pass is still compiled, so the
-> fallback remains. Treat a bare model id as *working but shadowed by design*: a combo or alias of the
-> same name wins. The replacement the design intends is for the operator to create a combo named after
-> the bare id.
+> **Status.** Bare model ids do **not** resolve: there is no bare-model pass in the index, rank 4 is
+> unassigned, and a name like `gpt-5` fails with the actionable 404 above. Address a model as
+> `provider/model`. The generated-alias migration (`generated: true` aliases are deleted on config
+> load, with `config.json.pre-migration.bak` written as a backup) is written on that assumption, and
+> it now matches the code.
 
 ### The `/v1/models` listing
 
@@ -479,15 +478,16 @@ later request. **No other endpoint returns a credential value** — not `/api/co
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/api/quota` | Aggregates the `usage` table per account. **Nothing writes that table today**, so it returns empty regardless of traffic — see [Quota tracking](08-quota-tracking.md). |
+| `GET` | `/api/quota` | Cached provider quota state for every account, plus its declared windows; `POST /api/quota/refresh` refreshes it. It does not read the request ledger — that is `/api/usage` below. See [Quota tracking](08-quota-tracking.md). |
 | `GET` | `/api/usage` | The per-request usage ledger, with the token count reported by the provider or estimated by the router — see below. |
 | `GET` | `/api/oauth` | The OAuth platforms this build supports. |
 | `POST` | `/api/oauth/{platform}/authorize` | Starts an interactive login. |
 | `POST` | `/api/oauth/{platform}/device-code` | Starts a device-code login. |
 | `POST` | `/api/oauth/sessions/{id}/poll` | Polls a device-code session. |
-| `POST` | `/api/oauth/sessions/{id}/complete` | Completes an interactive login. |
+| `POST` | `/api/oauth/sessions/{id}/complete` | Completes an interactive login; blocks until the browser reaches the loopback redirect. |
+| `POST` | `/api/oauth/sessions/{id}/redirect` | Hands a pasted redirect URL (or its `code`/`state` query, or `code#state`) to a login that is already waiting. Answers `202`; the exchange still happens in the waiting `complete` call. |
 
-The four OAuth `POST`s are how a credential enters the vault without ever passing through
+The five OAuth `POST`s are how a credential enters the vault without ever passing through
 `config.json`; they are documented in [OAuth overview](10-oauth-overview.md).
 
 ### `GET /api/usage` — the token count, by the provider or by the router

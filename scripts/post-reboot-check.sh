@@ -17,6 +17,11 @@ set -Eeuo pipefail
 RELAY_PORT="${MANAROUTER_RELAY_PORT:-20900}"
 CONTROL_PORT="${MANAROUTER_CONTROL_PORT:-20901}"
 FAILED=0
+# The ports are interpolated into a regex below, so a non-numeric value would match the wrong
+# listener and turn a broken boot into a PASS. Reject it instead of checking the wrong thing.
+for port_value in "$RELAY_PORT" "$CONTROL_PORT"; do
+  [[ "$port_value" =~ ^[0-9]{1,5}$ ]] || { printf 'invalid port: %q\n' "$port_value" >&2; exit 1; }
+done
 
 pass() { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILED=1; }
@@ -42,9 +47,13 @@ head_ "2. No ordering cycle in the current boot"
 # this script reported a failure against its own log entry. That false positive was worth fixing
 # rather than tolerating: a check that cries wolf on a healthy boot is worse than no check.
 CYCLE_RE='systemd\[[0-9]+\]: [A-Za-z0-9@._-]+: Found ordering cycle'
-if journalctl --user -b --no-pager 2>/dev/null | grep -qE "$CYCLE_RE"; then
+# Read the journal once, and never with `grep -q`: it exits on the first match, journalctl then
+# dies of SIGPIPE, and `set -o pipefail` turns that into a non-zero pipeline — so the check would
+# report *no* cycle on exactly the boot it exists to detect. Only the matching lines are kept.
+cycles="$(journalctl --user -b --no-pager 2>/dev/null | grep -E "$CYCLE_RE" || true)"
+if [[ -n "$cycles" ]]; then
   fail "an ordering cycle was logged this boot:"
-  journalctl --user -b --no-pager 2>/dev/null | grep -E "$CYCLE_RE" | tail -3 | sed 's/^/       /'
+  printf '%s\n' "$cycles" | tail -3 | sed 's/^/       /'
   printf '       Check the units with: python3 scripts/check-systemd-cycle.py ~/.config/systemd/user\n'
 else
   pass "no ordering cycle logged this boot"
@@ -53,7 +62,10 @@ fi
 head_ "3. Listeners are bound"
 for entry in "relay:$RELAY_PORT" "conductor:$CONTROL_PORT"; do
   name="${entry%%:*}"; port="${entry##*:}"
-  if ss -ltn 2>/dev/null | grep -qE "127\.0\.0\.1:$port|\[::1\]:$port"; then
+  if ! command -v ss >/dev/null 2>&1; then
+    # Same pipefail/SIGPIPE trap as above: drain grep's input instead of using -q.
+    skip "$name: 'ss' is not installed, cannot check the listener"
+  elif ss -ltn 2>/dev/null | grep -E "127\.0\.0\.1:$port|\[::1\]:$port" >/dev/null; then
     pass "$name is listening on $port"
   else
     fail "$name is not listening on $port"
@@ -102,7 +114,16 @@ print(f"{len(data)} providers, {models} models, {accounts} accounts")
     pass "$summary"
   fi
 else
-  fail "could not read /api/providers"
+  # /api/providers sits behind the panel's session guard, so a 401 means the control plane is up
+  # and only this check lacks a session. Failing the whole run for that is a false alarm on any
+  # install with a panel password set.
+  api_code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 \
+    "http://127.0.0.1:$CONTROL_PORT/api/providers" 2>/dev/null || true)"
+  if [[ "$api_code" == "401" || "$api_code" == "403" ]]; then
+    skip "the panel requires a session, so provider state was not checked"
+  else
+    fail "could not read /api/providers (HTTP ${api_code:-no response})"
+  fi
 fi
 
 head_ "7. Optional: a real completion"
@@ -113,10 +134,10 @@ if [[ -n "${MANAROUTER_TEST_KEY:-}" && -n "${MANAROUTER_TEST_MODEL:-}" ]]; then
     -H "Authorization: Bearer $MANAROUTER_TEST_KEY" -H 'Content-Type: application/json' \
     -d "{\"model\":\"$MANAROUTER_TEST_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: OK\"}],\"max_tokens\":16}" \
     2>/dev/null || true)"
-  if printf '%s' "$body" | grep -q '"choices"'; then
+  if [[ "$body" == *'"choices"'* ]]; then
     pass "a completion succeeded through $MANAROUTER_TEST_MODEL"
   else
-    fail "the completion failed: $(printf '%s' "$body" | head -c 200)"
+    fail "the completion failed: ${body:0:200}"
   fi
 else
   skip "set MANAROUTER_TEST_KEY and MANAROUTER_TEST_MODEL to include a real completion"

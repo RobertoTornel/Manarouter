@@ -32,7 +32,7 @@ Microsecond-scale measurements on a shared machine are dominated by whatever els
 doing. A background build or a thermal excursion moves the numbers more than the relay does.
 This is a **local, report-or-threshold** tool: run it on a quiet machine, read the numbers, and
 treat a breach as a reason to re-run rather than as a verdict on the relay. It is deliberately
-not wired into any workflow.
+not a CI gate: CI formats, builds and tests it, but asserts nothing about the numbers.
 
 ## Usage
 

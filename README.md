@@ -128,7 +128,7 @@ or on boot without a login session, enable user lingering with `loginctl enable-
 For example, to connect an OpenAI-compatible provider:
 
 ```bash
-mr provider add openai --dialect open-ai --base-url https://api.openai.com/v1
+mr provider add openai --dialect openai-compatible --base-url https://api.openai.com/v1
 mr account add openai --label personal --secret-stdin
 ```
 
@@ -259,8 +259,9 @@ a proxy is not a use the provider has licensed. Both are explained in
 
 Working and tested: the schema, the compiled snapshot format, both dialect layers, the provider
 catalogue, the data plane (relay), the control plane (conductor) and the panel. The known gaps are
-the concurrent hedged race, the fire-and-forget usage writer, and the `mr config` / `mr vault`
-bodies. [`docs/23-implementation-status.md`](docs/23-implementation-status.md) is the audited list,
+the three unimplemented `on_winner_fail` modes, the fire-and-forget usage writer, and the
+`mr config` / `mr vault` bodies. [`docs/23-implementation-status.md`](docs/23-implementation-status.md)
+is the audited list,
 with the command that checks each row.
 
 The design decisions in this repository are recorded, not folklore. [`docs/LLM_INDEX.md`](docs/LLM_INDEX.md)

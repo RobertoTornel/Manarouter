@@ -327,9 +327,19 @@ pub fn origin_is_acceptable(origin: Option<&str>, referer: Option<&str>, port: u
         // token explicitly and are not subject to a confused-deputy attack.
         return true;
     };
-    let rest = match value.split_once("://") {
-        Some((_, rest)) => rest,
+    let (scheme, rest) = match value.split_once("://") {
+        Some((scheme, rest)) => (scheme, rest),
         None => return false,
+    };
+    // An origin that omits its port is on its scheme's default port. Resolve that before
+    // comparing, or `http://127.0.0.1` (port 80) would be accepted for a panel on any port,
+    // which is a different origin.
+    let default_port = if scheme.eq_ignore_ascii_case("http") {
+        80
+    } else if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        return false;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     // Strip a userinfo component, which must not influence the decision.
@@ -342,7 +352,7 @@ pub fn origin_is_acceptable(origin: Option<&str>, referer: Option<&str>, port: u
         return false;
     }
     match port_part {
-        None => true,
+        None => default_port == port,
         Some(p) => p.parse::<u16>().map(|p| p == port).unwrap_or(false),
     }
 }

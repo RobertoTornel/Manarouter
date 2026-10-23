@@ -129,6 +129,27 @@ impl Vault {
             }
             raw
         } else {
+            // A key is minted only for a vault that does not exist yet. If a vault file with content
+            // is already there and the key is not, the key was lost or removed: generating a new one
+            // would start up "successfully" with every stored credential undecryptable, which is
+            // exactly the silent rekeying the wrong-length branch above refuses to do.
+            if path.exists() {
+                let existing = std::fs::read_to_string(&path)
+                    .map_err(|e| Error::Secret(format!("cannot read {}: {e}", path.display())))?;
+                let has_content = match serde_json::from_str::<VaultFile>(&existing) {
+                    Ok(f) => !f.entries.is_empty(),
+                    Err(_) => !existing.trim().is_empty(),
+                };
+                if has_content {
+                    return Err(Error::Secret(format!(
+                        "vault at {} still holds credentials but {} is missing; refusing to start \
+                         rather than generating a new key and losing every stored credential. \
+                         Restore the key file, or move the vault aside to start empty",
+                        path.display(),
+                        key_path.display()
+                    )));
+                }
+            }
             let mut b = vec![0u8; KEY_LEN];
             rand::rngs::OsRng.fill_bytes(&mut b);
             write_private(&key_path, &b)?;
@@ -150,9 +171,18 @@ impl Vault {
                     entries: BTreeMap::new(),
                 }
             } else {
-                serde_json::from_str(&raw).map_err(|e| {
+                let parsed: VaultFile = serde_json::from_str(&raw).map_err(|e| {
                     Error::Secret(format!("vault at {} is corrupt: {e}", path.display()))
-                })?
+                })?;
+                if parsed.version > 1 {
+                    return Err(Error::Secret(format!(
+                        "vault at {} has container version {}, newer than this build reads (1); \
+                         upgrade Manarouter rather than risk misreading it",
+                        path.display(),
+                        parsed.version
+                    )));
+                }
+                parsed
             }
         } else {
             VaultFile {
@@ -271,14 +301,27 @@ impl Vault {
                 "refusing to reload a vault with unflushed changes".into(),
             ));
         }
-        self.file = if self.path.exists() {
+        let file: VaultFile = if self.path.exists() {
             let text = std::fs::read_to_string(&self.path)
                 .map_err(|e| Error::Secret(format!("cannot read {}: {e}", self.path.display())))?;
             serde_json::from_str(&text)
                 .map_err(|e| Error::Secret(format!("cannot parse {}: {e}", self.path.display())))?
         } else {
-            VaultFile::default()
+            // The version `open` writes: `VaultFile::default()` is version 0, and flushing that
+            // back would persist a container version no other path in this module produces.
+            VaultFile {
+                version: 1,
+                entries: BTreeMap::new(),
+            }
         };
+        if file.version > 1 {
+            return Err(Error::Secret(format!(
+                "vault at {} has container version {}, newer than this build reads (1)",
+                self.path.display(),
+                file.version
+            )));
+        }
+        self.file = file;
         Ok(())
     }
 
@@ -320,7 +363,14 @@ impl Vault {
         let text = serde_json::to_string_pretty(&self.file)
             .map_err(|e| Error::Secret(format!("cannot serialise vault: {e}")))?;
 
-        let tmp = self.path.with_extension("enc.tmp");
+        // A per-write temporary name: the relay and the conductor each open this vault, and a shared
+        // `vault.enc.tmp` would let one process truncate the file the other is writing and then
+        // rename the mixture over a good vault.
+        let mut tmp_suffix = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut tmp_suffix);
+        let tmp = self
+            .path
+            .with_extension(format!("enc.{:016x}.tmp", u64::from_le_bytes(tmp_suffix)));
         write_private(&tmp, text.as_bytes())?;
         std::fs::rename(&tmp, &self.path)
             .map_err(|e| Error::Secret(format!("cannot replace vault: {e}")))?;
@@ -334,19 +384,25 @@ impl Vault {
     /// the old key and written under a fresh nonce with the new one, so a previously captured vault
     /// file is useless afterwards.
     pub fn rekey(&mut self, new_key: &[u8; KEY_LEN]) -> Result<()> {
-        let old = std::mem::replace(
-            &mut self.cipher,
-            Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(new_key)),
-        );
+        // Every entry must come back under the old key before the handle moves to the new one:
+        // swapping the cipher first and then failing would leave a live vault whose cipher no longer
+        // matches its entries, and `Drop` would flush that mixture to disk.
         let mut plain: Vec<(String, String)> = Vec::with_capacity(self.file.entries.len());
         for id in self.file.entries.keys() {
+            let entry = &self.file.entries[id];
             let nonce_bytes = B64
-                .decode(&self.file.entries[id].nonce)
+                .decode(&entry.nonce)
                 .map_err(|e| Error::Secret(format!("entry {id} has a malformed nonce: {e}")))?;
+            if nonce_bytes.len() != NONCE_LEN {
+                return Err(Error::Secret(format!(
+                    "entry {id} has a wrong-length nonce"
+                )));
+            }
             let ct = B64
-                .decode(&self.file.entries[id].ct)
+                .decode(&entry.ct)
                 .map_err(|e| Error::Secret(format!("entry {id} has malformed ciphertext: {e}")))?;
-            let value = old
+            let value = self
+                .cipher
                 .decrypt(
                     Nonce::from_slice(&nonce_bytes),
                     Payload {
@@ -362,10 +418,15 @@ impl Vault {
             ));
         }
 
-        for (id, value) in plain {
-            self.put(&id, &value)?;
-        }
+        self.cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(new_key));
+        // The handle is authoritative from here on: `put` must not reload the file underneath the
+        // rewrite, and a later failure must not be mistaken for "nothing to flush".
         self.dirty = true;
+        for (id, mut value) in plain {
+            let put = self.put(&id, &value);
+            value.zeroize();
+            put?;
+        }
         Ok(())
     }
 

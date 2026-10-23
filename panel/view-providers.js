@@ -16,6 +16,99 @@ import {
   deriveProviderHealth, accountState, formatAge, formatCompact,
 } from './format.js';
 
+// Server- and catalogue-supplied OAuth URLs are bound to an href and to window.open. Only http(s)
+// is safe there: a javascript: or data: URL would execute in the panel's own origin. Anything that
+// is not a well-formed http(s) URL is treated as unusable and is not offered as a link.
+function httpUrl(value) {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+// --------------------------------------------------------------------------- OAuth redirect paste
+//
+// The manual fallback for the browser flow. The loopback capture can fail without telling anyone:
+// the browser may be on another host, the port may be busy, or the tab may be closed after
+// approval. The address bar still holds `?code=…&state=…`, so this block hands that URL to the
+// waiting session. It is revealed the moment the tab opens rather than after a timeout — someone
+// who already knows the capture failed should not sit through the ten-minute wait.
+//
+// `session.id` is a shared box the caller fills in once /authorize answers. The blocking /complete
+// call stays in flight; this block only delivers the pasted URL and reports whether the server
+// accepted it. It deliberately never calls /complete a second time: two completions would race for
+// one callback.
+export function buildRedirectPaste(p, ctx, session) {
+  const input = h('input', {
+    class: 'input mono',
+    type: 'text',
+    autocomplete: 'off',
+    spellcheck: 'false',
+    placeholder: 'http://127.0.0.1:1455/auth/callback?code=…&state=…',
+  });
+  const submit = h('button', { class: 'btn', type: 'button' }, 'Use this URL');
+  const status = h('div', { class: 'muted' });
+  const block = h('div', { hidden: true },
+    field('If the browser did not come back, paste the URL you were redirected to', input, {
+      hint: 'The address-bar URL works, and so does just the code. It is sent exactly as pasted.',
+    }),
+    h('div', { class: 'toolbar', style: 'padding:0;border:0;background:none;' }, submit),
+    status);
+
+  function show() {
+    input.value = '';
+    submit.disabled = false;
+    status.replaceChildren();
+    block.hidden = false;
+  }
+
+  function hide() {
+    block.hidden = true;
+    submit.disabled = false;
+    // The pasted URL carries a one-time code; drop it from the DOM as soon as the flow is over.
+    input.value = '';
+    status.replaceChildren();
+  }
+
+  async function send() {
+    if (submit.disabled) return;
+    const url = input.value.trim();
+    if (!url) {
+      ctx.toast.warning('Paste the URL you were redirected to first.');
+      input.focus();
+      return;
+    }
+    if (!session.id) return; // the flow already ended; there is nothing left to hand this to
+    const sessionId = session.id;
+    submit.disabled = true;
+    status.replaceChildren(h('p', { class: 'muted' }, 'Checking the pasted URL…'));
+    try {
+      await api.post(`/api/oauth/sessions/${encodeURIComponent(sessionId)}/redirect`, {
+        provider_id: p.id,
+        url,
+      });
+      // /complete is already waiting on this session and resolves on its own once the server
+      // accepts the URL; the existing flow then reloads the drawer and hides this block.
+      status.replaceChildren(h('p', { class: 'muted' }, 'Checking… the sign-in should finish on its own.'));
+    } catch (err) {
+      // Server message in the form's own error style, plus the retryable input left enabled.
+      status.replaceChildren(errorBlock(err));
+      ctx.toast.error('Could not use the pasted URL', err);
+      submit.disabled = false;
+      input.focus();
+    }
+  }
+
+  submit.addEventListener('click', () => { send(); });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); send(); }
+  });
+
+  return { block, input, submit, send, show, hide };
+}
+
 // Must list exactly the spellings `Dialect::parse` accepts (mr-core `dialect.rs`). A value here
 // that the backend rejects turns "Add provider" into a save-time error, which is how the
 // pre-rename `command-code` spelling was caught.
@@ -661,7 +754,11 @@ export async function renderProviders(mount, ctx) {
     const status = h('p', { class: 'muted' }, 'OAuth credentials are stored only in the encrypted local vault.');
     const progress = h('p', { class: 'muted' });
     const actions = h('div', { class: 'toolbar', style: 'padding:0;border:0;background:none;' });
-    const form = h('div', {}, status, actions, progress);
+    // /authorize fills the session id in here; the paste block below reads the same box, so it can
+    // exist (hidden) before a session does and appear the instant the browser tab opens.
+    const session = { id: null };
+    const redirectPaste = buildRedirectPaste(p, ctx, session);
+    const form = h('div', {}, status, actions, progress, redirectPaste.block);
 
     let details = null;
 
@@ -717,28 +814,42 @@ export async function renderProviders(mount, ctx) {
     /// as a popup triggered by nothing.
     async function runBrowser() {
       const start = await api.post(`/api/oauth/${encodeURIComponent(details.id)}/authorize`, { provider_id: p.id });
-      window.open(start.authorization_url, '_blank', 'noopener,noreferrer');
+      session.id = start.session_id;
+      const authorizeUrl = httpUrl(start.authorization_url);
+      if (authorizeUrl) window.open(authorizeUrl, '_blank', 'noopener,noreferrer');
+      // Immediate, not after a timeout: the person who knows the capture failed can act now. The
+      // /complete call below is already queued and will resolve once the pasted URL is accepted.
+      redirectPaste.show();
       progress.replaceChildren(
         h('span', {}, 'Waiting for you to finish signing in… '),
-        h('a', { href: start.authorization_url, target: '_blank', rel: 'noopener noreferrer' }, 'Reopen the page'),
+        h('a', { href: httpUrl(start.authorization_url) ?? '#', target: '_blank', rel: 'noopener noreferrer' }, 'Reopen the page'),
       );
-      const done = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/complete`, { provider_id: p.id });
-      progress.replaceChildren(h('span', {}, 'Connected.'));
-      ctx.toast.success(`Connected ${done.account?.label || 'OAuth account'}.`);
-      await reload(true);
+      try {
+        const done = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/complete`, { provider_id: p.id });
+        progress.replaceChildren(h('span', {}, 'Connected.'));
+        ctx.toast.success(`Connected ${done.account?.label || 'OAuth account'}.`);
+        await reload(true);
+      } finally {
+        // Success, failure or a flow abandoned by closing the drawer: no stale paste form is left
+        // behind, and a later attempt starts from a clean block.
+        session.id = null;
+        redirectPaste.hide();
+      }
     }
 
     async function runDevice() {
       const start = await api.post(`/api/oauth/${encodeURIComponent(details.id)}/device-code`, { provider_id: p.id });
       progress.replaceChildren(
         h('span', {}, 'Open '),
-        h('a', { href: start.verification_uri, target: '_blank', rel: 'noopener noreferrer' }, start.verification_uri),
+        h('a', { href: httpUrl(start.verification_uri) ?? '#', target: '_blank', rel: 'noopener noreferrer' }, start.verification_uri),
         h('span', {}, ' and enter this code: '),
         h('strong', { class: 'mono', style: 'letter-spacing:2px;font-size:15px;' }, start.user_code),
       );
-      window.open(start.verification_uri, '_blank', 'noopener,noreferrer');
-      const deadline = Date.now() + start.expires_in_seconds * 1000;
-      let intervalMs = Math.max(1000, start.interval_seconds * 1000);
+      const verificationUrl = httpUrl(start.verification_uri);
+      if (verificationUrl) window.open(verificationUrl, '_blank', 'noopener,noreferrer');
+      const ttl = Number(start.expires_in_seconds);
+      const deadline = Date.now() + (Number.isFinite(ttl) && ttl > 0 ? ttl * 1000 : 300000);
+      let intervalMs = Math.max(1000, Number(start.interval_seconds) * 1000 || 1000);
       while (Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, intervalMs));
         const result = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/poll`, { provider_id: p.id });
@@ -749,8 +860,8 @@ export async function renderProviders(mount, ctx) {
           return;
         }
         if (result.status === 'failed') throw new Error(result.message);
-        if (result.interval_seconds) intervalMs = Math.max(intervalMs, result.interval_seconds * 1000);
-        if (result.retry_after_seconds) intervalMs = Math.max(intervalMs, result.retry_after_seconds * 1000);
+        if (result.interval_seconds) intervalMs = Math.max(intervalMs, Number(result.interval_seconds) * 1000 || 0);
+        if (result.retry_after_seconds) intervalMs = Math.max(intervalMs, Number(result.retry_after_seconds) * 1000 || 0);
       }
       throw new Error('The device code expired before it was approved. Start again.');
     }

@@ -177,6 +177,11 @@ impl OAuthPlatform for Codex {
         url.push_str("&id_token_add_organizations=true");
         url.push_str("&codex_cli_simplified_flow=true");
         url.push_str("&originator=codex_cli_rs");
+        // Force the account picker. Without it OpenAI silently reuses whichever ChatGPT session the
+        // browser already has, and refreshing that token later can invalidate the other account's
+        // refresh-token family — which matters here, where several accounts of one provider are
+        // the normal case rather than the exception.
+        url.push_str("&prompt=login");
         Ok(url)
     }
 
@@ -394,7 +399,7 @@ impl OAuthPlatform for Codex {
             Ok(reply) => reply,
         };
 
-        if reply.status == 403 || reply.status == 404 {
+        if reply.status == 403 {
             return Ok(DevicePoll::Pending);
         }
         if !(200..300).contains(&reply.status) {
@@ -460,6 +465,11 @@ impl OAuthPlatform for Codex {
             });
         };
         extra.insert("chatgpt_account_id".into(), Value::String(account_id));
+        // The browser path (`token_set_from`) persists the id_token too; `migrate` reads the
+        // stored credential back expecting that shape.
+        if let Some(id_token) = id_token {
+            extra.insert("id_token".into(), Value::String(id_token));
+        }
 
         let expires_in = value
             .get("expires_in")
@@ -567,7 +577,9 @@ mod tests {
                 "scope",
                 "id_token_add_organizations",
                 "codex_cli_simplified_flow",
+                // Appended last, matching the reference implementation's extra-parameter order.
                 "originator",
+                "prompt",
             ]
         );
     }

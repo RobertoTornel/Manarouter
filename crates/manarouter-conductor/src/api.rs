@@ -132,6 +132,10 @@ pub(crate) fn guarded_router(state: AppState) -> Router<AppState> {
         .route("/api/oauth/{platform}/device-code", post(oauth_device_code))
         .route("/api/oauth/sessions/{id}/poll", post(oauth_poll))
         .route("/api/oauth/sessions/{id}/complete", post(oauth_complete))
+        .route(
+            "/api/oauth/sessions/{id}/redirect",
+            post(oauth_submit_redirect),
+        )
         // --- configuration ---
         .route("/api/config", get(get_config).put(put_config))
         .route("/api/config/validate", get(config_validate))
@@ -1414,6 +1418,56 @@ struct OAuthFinish {
     provider_id: String,
 }
 
+#[derive(serde::Deserialize)]
+struct OAuthRedirect {
+    provider_id: String,
+    /// The redirect URL (or bare code) the operator pasted when the browser did not come back.
+    url: String,
+}
+
+/// Accept a pasted redirect for a sign-in that is already waiting for its browser callback.
+///
+/// This deliberately does **not** complete the login. `/complete` is already blocked waiting, and
+/// it does the exchange; this endpoint only hands it the code. Answering `202` says "accepted and
+/// being redeemed", which is the truth — the result arrives through the request that is waiting.
+async fn oauth_submit_redirect(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let body: OAuthRedirect = serde_json::from_value(body).map_err(|e| {
+        ApiError::bad(
+            "invalid_request",
+            format!("invalid OAuth redirect submission: {e}"),
+        )
+    })?;
+    let config = state.current_config().await;
+    let configured = config
+        .providers
+        .iter()
+        .find(|p| p.id.as_str() == body.provider_id)
+        .ok_or_else(|| ApiError::not_found("OAuth provider not found"))?;
+    let AuthKind::OAuth { platform } = &configured.auth else {
+        return Err(ApiError::bad(
+            "not_oauth_provider",
+            "provider does not have an available OAuth platform",
+        ));
+    };
+    if oauth_platform(platform).is_none() {
+        return Err(ApiError::bad(
+            "oauth_unavailable",
+            "provider OAuth platform is unavailable",
+        ));
+    }
+    drop(config);
+    state
+        .oauth_sessions
+        .submit_redirect(&id, &body.provider_id, &body.url)
+        .await
+        .map_err(|message| ApiError::bad("oauth_redirect_rejected", message))?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "accepted": true }))))
+}
+
 async fn oauth_complete(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2340,8 +2394,10 @@ async fn fetch_model_list(
     let bytes = collected.to_bytes();
 
     if !status.is_success() {
-        let body = String::from_utf8_lossy(&bytes);
-        let snippet: String = body.chars().take(512).collect();
+        // An upstream body is untrusted: decode a bounded prefix instead of the whole payload
+        // just to print a 512-character excerpt of it.
+        let head = &bytes[..bytes.len().min(2048)];
+        let snippet: String = String::from_utf8_lossy(head).chars().take(512).collect();
         return Err(ApiError::upstream(
             StatusCode::BAD_GATEWAY,
             format!("the model list request failed with {status}: {snippet}"),

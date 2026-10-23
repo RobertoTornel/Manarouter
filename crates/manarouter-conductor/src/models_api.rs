@@ -11,13 +11,17 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::Request;
 use mr_core::model::{PricingPlan, PricingSource};
 use serde_json::{json, Value};
 
 use crate::api::{sync_client, ApiError, ApiResult};
 use crate::state::AppState;
+
+/// Cap on the upstream body read by `/api/models/test`, so a broken or hostile provider cannot
+/// exhaust conductor memory by answering with an enormous (or endless) body.
+const MAX_TEST_RESPONSE_BYTES: usize = 1 << 20;
 
 /// The routes this module contributes, merged into the authenticated API surface.
 pub fn routes() -> Router<AppState> {
@@ -156,7 +160,7 @@ async fn send_json(
     let status = response.status();
     let body = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        response.into_body().collect(),
+        Limited::new(response.into_body(), MAX_TEST_RESPONSE_BYTES).collect(),
     )
     .await
     .map_err(|_| ApiError::bad_gateway("model-test response timed out"))?
@@ -166,6 +170,9 @@ async fn send_json(
 }
 
 async fn sync_pricing(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    // `commit` replaces the whole config, so hold the mutation lock across the read-modify-write;
+    // otherwise a concurrent panel edit landing between the read and the commit is reverted.
+    let _mutation = state.mutation_lock.lock().await;
     let mut config = state.current_config().await;
     let bundled: Value = serde_json::from_str(include_str!("../../../catalog/pricing.json"))
         .map_err(|e| ApiError::internal(format!("bundled pricing table is invalid: {e}")))?;

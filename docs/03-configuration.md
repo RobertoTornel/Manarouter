@@ -40,9 +40,12 @@ downgrade into data loss.
 | State database | `~/.local/state/manarouter/state.sqlite` | `MANAROUTER_STATE_DIR` |
 
 The two directories are split on purpose. Configuration is small, human-edited, and worth backing up.
-State is large, machine-written, and **safe to delete** — losing it costs usage history and cached
-health, never configuration. Putting the snapshot and the database in a separate directory makes
-"just delete the state and restart" a safe instruction to give someone.
+The state directory is machine-written and the snapshot is safe to delete, but the database is **not
+all disposable**: besides usage history and cached health, `state.sqlite` holds the `oauth_credential`
+records that point at credentials in the vault and the `key_usage` ledger the rolling quota windows
+are computed from. Delete it and OAuth-backed accounts need re-authorising, and quota spend resets
+to zero — which can hand back budget already used. Back it up before deleting; "just delete the
+state and restart" is only safe when neither of those matters to you.
 
 `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honoured when set.
 
@@ -50,7 +53,7 @@ health, never configuration. Putting the snapshot and the database in a separate
 
 | Variable | Effect |
 |---|---|
-| `MANAROUTER_CONFIG_DIR` | Configuration and vault directory. Wins over `XDG_CONFIG_HOME`. `mr --config-dir` and `manarouter-relay --config-dir` set the same variable, so a second instance can be pointed elsewhere without touching your real configuration. |
+| `MANAROUTER_CONFIG_DIR` | Configuration and vault directory. Wins over `XDG_CONFIG_HOME`. `mr --config-dir` and `manarouter-relay --config-dir` set the same variable, so a second instance can be pointed elsewhere without touching your real configuration. Neither flag moves the state directory; set `MANAROUTER_STATE_DIR` for that. |
 | `MANAROUTER_STATE_DIR` | Snapshot and database directory. Wins over `XDG_STATE_HOME`. |
 | `XDG_CONFIG_HOME`, `XDG_STATE_HOME` | Standard XDG bases; `manarouter` is appended to each. |
 | `MANAROUTER_CONTROL_PORT` | One-run override of `control.port`. The conductor parses no command-line arguments, so this is the only way to move the panel for a single run; `mr serve --control-port` sets it for the child. An unparseable value is a startup error, never a silent fallback. |
@@ -176,7 +179,7 @@ operating system's default. Neither field is wrong to set, and neither does anyt
   "idle_timeout_ms": 120000,
   "total_timeout_ms": 0,               // 0 disables
 
-  "prewarm": true,
+  "prewarm": true,                     // opt-in: per-provider default is false, and latency.prewarm must also be true
   "http2": "auto",                     // auto | required | disabled
   "note": null,
   "extra": {}

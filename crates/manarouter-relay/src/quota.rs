@@ -107,11 +107,20 @@ impl InFlight {
     /// the key it was admitted under — the two are the same in practice, and searching by request
     /// id keeps the release correct even if that ever changes.
     fn release(&mut self, request_id: &str) {
-        for reservations in self.by_key.values_mut() {
+        let mut emptied = None;
+        for (key, reservations) in self.by_key.iter_mut() {
             if let Some(at) = reservations.iter().position(|r| r.request_id == request_id) {
                 reservations.remove(at);
-                return;
+                if reservations.is_empty() {
+                    // An entry with no reservations holds no budget, and leaving it behind would
+                    // retain (and re-scan) every key the process has ever admitted.
+                    emptied = Some(key.clone());
+                }
+                break;
             }
+        }
+        if let Some(key) = emptied {
+            self.by_key.remove(&key);
         }
     }
 }
@@ -242,9 +251,15 @@ impl QuotaManager {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        let reservations = in_flight.by_key.entry(key_id.to_owned()).or_default();
-        let reserved_requests = reservations.len() as u64;
-        let reserved_tokens: u64 = reservations.iter().map(|r| r.reserved_prompt_tokens).sum();
+        // Read the counts without materializing an entry: a refusal must not leave an empty
+        // vector behind for a key that may never be admitted.
+        let (reserved_requests, reserved_tokens): (u64, u64) = match in_flight.by_key.get(key_id) {
+            Some(reservations) => (
+                reservations.len() as u64,
+                reservations.iter().map(|r| r.reserved_prompt_tokens).sum(),
+            ),
+            None => (0, 0),
+        };
 
         // The flat budget counts every request the key has ever been admitted for, so it reads the
         // whole ledger rather than a window.
@@ -278,8 +293,13 @@ impl QuotaManager {
                 Ok(used) => used,
                 Err(e) => return ledger_unavailable(e),
             };
-            let requests = used.requests + reserved_requests;
-            let tokens = used.prompt_tokens + used.completion_tokens + reserved_tokens;
+            // Saturating: the counts come from the upstream's own usage report, and a wrapped
+            // sum would read as a small spend and let a cap be bypassed.
+            let requests = used.requests.saturating_add(reserved_requests);
+            let tokens = used
+                .prompt_tokens
+                .saturating_add(used.completion_tokens)
+                .saturating_add(reserved_tokens);
             if limit.requests > 0 && requests >= limit.requests {
                 return Admission::Denied(Denial {
                     reason: DenialReason::Requests,
@@ -302,10 +322,14 @@ impl QuotaManager {
             }
         }
 
-        reservations.push(Reservation {
-            request_id: request_id.to_owned(),
-            reserved_prompt_tokens: prompt.tokens,
-        });
+        in_flight
+            .by_key
+            .entry(key_id.to_owned())
+            .or_default()
+            .push(Reservation {
+                request_id: request_id.to_owned(),
+                reserved_prompt_tokens: prompt.tokens,
+            });
 
         Admission::Allowed(Arc::new(QuotaTicket {
             manager: Arc::clone(self),

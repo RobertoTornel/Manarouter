@@ -166,7 +166,7 @@ impl Millis {
 
     /// How many milliseconds until `self`, or zero if it is already in the past.
     pub fn remaining_ms_until(self, now: Millis) -> i64 {
-        (self.0 - now.0).max(0)
+        self.0.saturating_sub(now.0).max(0)
     }
 
     /// Render as an RFC 3339 timestamp for the panel and logs.

@@ -20,8 +20,8 @@ deliberate authentication and network setup.
 
 1. Ask what provider they want to use and whether they already have its API credential. Never ask
 them to paste a secret into the conversation. Direct them to enter it in their own terminal.
-2. Explain that the documented installer fetches source and compiles it; Rust (`rustup`) and Git are
-required. The copy-paste command and steps are in `README.md`.
+2. Explain that the documented installer fetches source and compiles it; Git, `curl`, and Rust
+(`rustup`) are required. The copy-paste command and steps are in `README.md`.
 3. Help them add a provider, enter its secret using `mr account add <provider> --secret-stdin`, and
 sync/list models. They paste the key in their terminal and send EOF (Ctrl-D). The encrypted vault
 requires a local `vault.key` file, so remind them to protect their user account and backups. Do not recommend
@@ -56,6 +56,9 @@ curl http://127.0.0.1:20900/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"PROVIDER/MODEL","messages":[{"role":"user","content":"Hello"}]}'
 ```
+
+Substituting a real client key here writes it into your shell history and exposes it in `ps`. If
+that matters, keep the header in a 0600 curl config file and pass it with `curl -K <file>`.
 
 Replace `PROVIDER/MODEL` with a model name that the user's configuration actually provides (or a
 combo they created). Do not assume a specific provider, model, combo, account, or local port override.

@@ -164,8 +164,10 @@ LEVEL_ALIASES = {
     "none": "none",
     "off": "none",
     "minimal": "minimal",
+    "min": "minimal",
     "low": "low",
     "medium": "medium",
+    "mid": "medium",
     "high": "high",
     "default": "high",
     "xhigh": "xhigh",
@@ -305,10 +307,20 @@ class Accumulator:
         return {key: value[key] for key in VALUE_KEY_ORDER if key in value}
 
 
+def capability_map(entry: dict) -> dict:
+    """``capabilities`` when it is a JSON object, else an empty mapping.
+
+    Upstream sometimes sends a non-object here (``true``, a string); calling ``.get`` on
+    that aborts the whole run, so treat anything else as "no capabilities".
+    """
+    capabilities = entry.get("capabilities")
+    return capabilities if isinstance(capabilities, dict) else {}
+
+
 def declared_tiers(entry: dict) -> list[str]:
     """Union of the top-level and ``capabilities.effort_tiers`` lists, normalised."""
     tiers: list[str] = []
-    for raw in (entry.get("effort_tiers"), (entry.get("capabilities") or {}).get("effort_tiers")):
+    for raw in (entry.get("effort_tiers"), capability_map(entry).get("effort_tiers")):
         if isinstance(raw, list):
             tiers.extend(t for t in raw if isinstance(t, str))
     levels = {lvl for lvl in (normalise_level(t) for t in tiers) if lvl is not None}
@@ -366,7 +378,7 @@ def build_document(models: list[dict]) -> tuple[dict, dict]:
         levels = entry_levels(entry)
         modalities = entry_modalities(entry)
 
-        for field in ("effort_tiers", (entry.get("capabilities") or {}).get("effort_tiers")):
+        for field in ("effort_tiers", capability_map(entry).get("effort_tiers")):
             if isinstance(field, list):
                 for tier in field:
                     if isinstance(tier, str) and normalise_level(tier) is None:

@@ -114,7 +114,15 @@ where
 
         match flag.as_str() {
             "-h" | "--help" => return Ok(Request::Help),
-            "--report-only" => options.report_only = true,
+            "--report-only" => {
+                if let Some(value) = inline {
+                    return Err(format!(
+                        "--report-only takes no value, got {value:?}\n\nRun \
+                         `manarouter-bench --help` for the options."
+                    ));
+                }
+                options.report_only = true;
+            }
             "--warmups" => {
                 let value = take_value(&flag, inline, &mut args)?;
                 options.warmups = parse_count(&value, "--warmups", MAX_WARMUPS, 0)?;

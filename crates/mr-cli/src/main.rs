@@ -293,6 +293,14 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Some(dir) = &cli.config_dir {
         std::env::set_var("MANAROUTER_CONFIG_DIR", dir);
+        // `Ctx::save` also writes the compiled routing snapshot, which mr-core keeps under its
+        // *state* directory, and `--config-dir` does not move that one. Bound here to the same
+        // directory, a second instance (or a test run) can no longer overwrite the default
+        // installation's routes.snapshot with a snapshot compiled from its own configuration.
+        // An explicit MANAROUTER_STATE_DIR still wins.
+        if std::env::var_os("MANAROUTER_STATE_DIR").is_none() {
+            std::env::set_var("MANAROUTER_STATE_DIR", dir);
+        }
     }
     // Logging goes to stderr and never replaces a command's own output on stdout.
     tracing_subscriber::fmt()

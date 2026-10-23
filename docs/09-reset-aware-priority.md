@@ -2,20 +2,20 @@
 
 `reset-aware-priority` is `priority` with one change, and the change is the whole feature:
 
-> **A step with no available account is demoted below every healthy step — never removed.**
+> **Steps with no usable account stay in the chain, at the back of the order, sorted by earliest
+> reset. `priority` also leaves them at the back, but in the operator's authored order.**
 
-If everything is healthy, it is indistinguishable from `priority`. It only behaves differently when
-something is cooling down, which is exactly when an operator needs it to.
+If everything is healthy the two are indistinguishable. They differ only in how the demoted tail is
+ordered, and only when something is cooling down — which is exactly when an operator needs it to.
 
 ## Why demotion rather than removal
 
 The obvious implementation is to drop a step from the candidate list when its accounts are all rate
 limited. It is simpler, and it is wrong in a way that is hard to notice.
 
-Removing the step means the operator's preferred model **silently stops being preferred**. It does not
-come back when the quota resets, because nothing re-inserts it — the combination is re-derived from
-the authored list on each request, and the authored list is unchanged. So the operator must edit the
-configuration, or wait for something to reload it, to get their preference back.
+Dropping the step also throws away the fallback: once every healthy step has failed, the request has
+nothing left to try, even though the cooling-down step may be usable again by the time it is reached.
+The step is still the operator's preference, just not available yet.
 
 And because nothing in the panel would say *why* the model was being skipped, the symptom is "the
 router is using the wrong model" with no visible cause. An operator who has deliberately ordered
@@ -55,21 +55,21 @@ This is the property that makes the strategy safe to enable by default:
 
 | Situation | `priority` | `reset-aware-priority` |
 |---|---|---|
-| All steps healthy | Step 1, then 2, then 3 | Step 1, then 2, then 3 |
-| Step 1 cooling down | Step 2, then 3, then **fail** | Step 2, then 3, then **step 1** |
-| Step 1 and 2 cooling down | Step 3, then fail | Step 3, then step 1, then step 2 |
+| All steps healthy | 1, then 2, then 3 | 1, then 2, then 3 |
+| Step 1 cooling down | 2, then 3, then **1** | 2, then 3, then **1** |
+| Steps 1 and 2 cooling down, 2 resets first | 3, then 1, then 2 | 3, then **2**, then 1 |
 
-The middle row is the point. Under plain `priority`, a combo whose first step is temporarily
-unavailable will not try it again even after a lower step has failed — the request just fails. Under
-`reset-aware-priority`, the demoted step is still in the chain and gets its chance.
+The last row is the point. Both strategies keep demoted steps in the chain; `priority` leaves them
+in authored order, so a step that has been down longest can be tried last. `reset-aware-priority`
+reorders only the demoted tail by earliest reset, so the step most likely to work comes first.
 
 ## Finding the earliest known reset
 
-Each account cooling down carries a `reset_at` instant. It comes from, in order of trustworthiness:
+Each account cooling down carries an `until_ms` instant. It comes from, in order of trustworthiness:
 
 1. A `retry-after` header, in either form.
 2. A `reset`/`reset_at` field in the response body, parsed per provider family.
-3. `default_cooldown_secs` from now — **a guess**, and marked as such in the panel.
+3. `default_cooldown_secs` from now — **a guess**, used when the provider gives no hint.
 
 A step's earliest reset is the **minimum** over its accounts, because any one account becoming usable
 makes the step usable again.
@@ -118,7 +118,7 @@ badly throttled preferred step can still be retried on a fixed schedule.
 The reset is applied in the **relay**, on the selection that observes it. The relay keeps account health
 in memory (`manarouter-relay/src/select.rs`): a `HashMap` of account id to `Cooldown { until_ms,
 reason, failures }` behind an `ArcSwap`. A selection compares `now` against each entry's `until_ms`
-lazily (`is_over(now)`). There is no timer thread in either process and no wake-up at `reset_at`.
+lazily (`is_over(now)`). There is no timer thread in either process and no wake-up at `until_ms`.
 
 Health is not carried in the compiled snapshot and there is no IPC per request: the snapshot holds the
 authored ordering and each account's scheduling metadata, while the live view is relay-local and
@@ -171,9 +171,10 @@ perfectly good provider.
 - **Consecutive steps on the same provider.** Two steps pointing at the same provider will demote
   together and re-enter together, which adds ordering churn with no benefit. Use `priority` and let
   the account layer handle it.
-- **When a hard failure is wanted.** If the operator needs to know that the preferred model was
-  unavailable — a compliance requirement, or a cost control where falling back silently is
-  unacceptable — then `priority` is honest and `reset-aware-priority` is not.
+- **When a hard failure is wanted.** If the operator needs the request to fail rather than fall back
+  — a compliance requirement, or a cost control where a silent fallback is unacceptable — neither
+  strategy does that: both keep the cooling-down step at the back of the order. Use a single-step
+  combo instead.
 - **A single-step combo.** There is nothing to demote below.
 
 ## See also

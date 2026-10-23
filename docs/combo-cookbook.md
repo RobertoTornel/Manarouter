@@ -66,9 +66,11 @@ mr combo add fast \
 Two caveats before you rely on this. The CLI accepts only `--hedge`, `--participants` and `--window-ms`;
 there is **no** `--winner-metric` and no `--on-winner-fail` flag, so those values are set by editing
 `config.json`. The race itself runs: every participant is dispatched at once, and the
-highest-priority participant that answers inside the window wins — not the fastest one. What the
-relay does not yet do is replace a winner that dies mid-stream, so the `--on-winner-fail` modes are
-not implemented. See [the hedged race](07-hedged-race.md) §5.
+highest-priority participant that answers inside the window wins — not the fastest one. A winner
+that dies mid-stream is recovered from a participant that already passed the race, under the combo's
+`midstream_policy`; only the `pick-highest-passed` winner-fail mode is implemented, and the other
+three are accepted configuration that the relay logs a warning about. See
+[the hedged race](07-hedged-race.md) §5.
 
 **Costs quota.** All three legs consume quota; a loser cancelled before its first byte costs little,
 but a loser that had begun generating is billed. See
@@ -94,8 +96,9 @@ mr combo add resilient \
 
 Two participants, not three, and the failure mode is the one that will not hand the retry back to the
 provider that just failed. As in recipe 3, `--on-winner-fail
-pick-highest-passed-different-provider` is not a flag — set `on_winner_fail` in `config.json` — and
-the race itself is not executed yet.
+pick-highest-passed-different-provider` is not a flag — set `on_winner_fail` in `config.json` — but
+only `pick-highest-passed` is implemented today: every other mode is accepted configuration that the
+relay logs a warning about and then serves as `pick-highest-passed`.
 
 ---
 
@@ -154,10 +157,11 @@ mr combo add agent \
 ```
 
 `terminate` rather than `restart`, because an agent has usually already acted on the partial tool
-call. Be aware that `--midstream-policy` only records the choice: the relay does not read
-`midstream_policy` yet, so under **either** value a mid-stream failure currently just ends the stream,
-and the tool-call guard described in [Combos §7](06-combos.md#7-midstream_policy) is part of the same
-unwired path.
+call. The relay honours both: with `restart` a mid-stream failure is retried on the next step
+(behind a `manarouter.retry` SSE boundary once bytes are on the wire), except that a `tool_calls`
+delta already emitted makes the relay end the stream with an error rather than corrupt the client's
+state; with `terminate` it closes the stream with an error straight away. See
+[Combos §7](06-combos.md#7-midstream_policy).
 
 ---
 

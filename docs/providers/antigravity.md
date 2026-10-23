@@ -67,7 +67,7 @@ poll the long-running operation until it completes
 **For a `free-tier` account the `project` field must be omitted.** Sending one — even the account's own
 default project — fails with `Precondition Failed`.
 
-For a paid account the project is sent as normal. The rule is a property of the tier, not of the
+A paid-tier account is not supported by the current onboarding path: it fails closed rather than sending a project. The rule is a property of the tier, not of the
 account, which is why the adapter decides it from the `loadCodeAssist` result rather than from
 configuration. The decision is a pure function and is tested without a network.
 
@@ -94,7 +94,7 @@ https://www.googleapis.com/auth/experimentsandconfigs
 ```
 
 The extra two are what the IDE requests. Requesting more than necessary is visible to the user on the
-consent screen, which is a reason to keep the default tier's smaller set.
+consent screen, which is why the extra two sit on the default T2 client while gemini-cli (T1) keeps the smaller set.
 
 ## PKCE, and a contradiction worth recording
 

@@ -190,12 +190,10 @@ change is pending produces a confusing failure later.
 
 ## A streamed response is truncated after a failover
 
-Working as intended, in one specific case — once mid-stream failover is wired up. In this tree
-`midstream_policy` is compiled into the routing snapshot but the relay does not consult it: failover
-happens only on the upstream response status, before any byte reaches the client. A stream that fails
-after the first byte reaches the client is terminated with a body error; the relay does not restart it
-on another model and does not emit the `manarouter.retry` boundary, so the guard described below is not
-reached. Everything from here to the next section describes the intended design.
+Working as intended, in one specific case. The relay reads `midstream_policy`: when the winning
+model dies after the first byte reaches the client, it either restarts the stream from a participant
+that already passed the race (emitting the `manarouter.retry` boundary) or terminates it with a body
+error, depending on the policy. Both policies share the guard described below.
 
 When the winning model dies mid-stream, `midstream_policy` decides between restarting and terminating.
 But under **both** policies there is a hard guard: **once any `tool_calls` delta has been emitted, the

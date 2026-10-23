@@ -205,8 +205,9 @@ impl Framer {
     pub fn next_frame(&mut self) -> Option<Chunk> {
         let (boundary, sep_len) = find_boundary(&self.buf)?;
         let raw = self.buf.split_to(boundary + sep_len);
-        let text = std::str::from_utf8(&raw[..boundary]).ok()?;
-        let frame = parse_frame(text);
+        // The frame is already consumed from the buffer, so returning `None` (which means
+        // "no complete frame yet") would silently drop a finished frame. Decode lossily instead.
+        let frame = parse_frame(&String::from_utf8_lossy(&raw[..boundary]));
         Some(Chunk {
             frame,
             raw_offset: 0,
@@ -221,8 +222,10 @@ impl Framer {
     pub fn next_raw(&mut self) -> Option<(Frame, Bytes)> {
         let (boundary, sep_len) = find_boundary(&self.buf)?;
         let raw = self.buf.split_to(boundary + sep_len).freeze();
-        let text = std::str::from_utf8(&raw[..boundary]).ok()?;
-        Some((parse_frame(text), raw))
+        // See `next_frame`: a consumed frame must never be dropped for bad bytes. The caller
+        // still forwards `raw` verbatim, so pass-through fidelity is unchanged.
+        let frame = parse_frame(&String::from_utf8_lossy(&raw[..boundary]));
+        Some((frame, raw))
     }
 
     /// Drain any trailing bytes that never terminated with a blank line.
@@ -235,8 +238,7 @@ impl Framer {
             return None;
         }
         let raw = self.buf.split().freeze();
-        let text = std::str::from_utf8(&raw).ok()?;
-        let f = parse_frame(text);
+        let f = parse_frame(&String::from_utf8_lossy(&raw));
         if f.data.is_empty() && f.event.is_none() && f.comments.is_empty() {
             None
         } else {
@@ -273,7 +275,8 @@ fn find_boundary(buf: &[u8]) -> Option<(usize, usize)> {
 /// relay must notice and synthesize a document instead of handing the client raw SSE.
 pub fn looks_like_sse(content_type: Option<&str>, head: &[u8]) -> bool {
     if let Some(ct) = content_type {
-        if ct.contains("text/event-stream") {
+        // Media types are case-insensitive (RFC 9110 §8.3.1).
+        if ct.to_ascii_lowercase().contains("text/event-stream") {
             return true;
         }
     }
@@ -299,7 +302,7 @@ pub fn pick_usage(candidates: &[serde_json::Value]) -> Option<serde_json::Value>
                         u.get("input_tokens").and_then(|t| t.as_u64()),
                         u.get("output_tokens").and_then(|t| t.as_u64()),
                     ) {
-                        (Some(a), Some(b)) => Some(a + b),
+                        (Some(a), Some(b)) => Some(a.saturating_add(b)),
                         (Some(a), None) => Some(a),
                         (None, Some(b)) => Some(b),
                         (None, None) => None,

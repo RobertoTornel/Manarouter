@@ -174,9 +174,10 @@ Each is shipped inside the vendor's own client, and a native OAuth flow cannot w
 public client id is not a credential under OAuth 2.1: for desktop and CLI clients it is *supposed*
 to be public, and the security comes from PKCE and from the provider's own redirect validation.
 
-Most are listed in `ALLOWLIST` in `scripts/check-secrets.sh`, each with a source comment, so that
-the secret scanner does not cry wolf. A real secret must never be added to that list, and the file
-says so.
+The OpenAI, Copilot and Claude constants are listed in `ALLOWLIST` in
+`scripts/check-secrets.sh`, each with a source comment. The four Google constants are deliberately
+not: writing them out would recreate the exact literal GitHub's push protection objects to. A real
+secret must never be added to that list, and the file says so.
 
 ### Why four of them are assembled from fragments
 
@@ -230,11 +231,13 @@ the other. Naming that openly is better than a build that mysteriously cannot be
 Three checks, all in `.github/workflows/ci.yml`:
 
 1. **`scripts/check-secrets.sh`** — fails the build if a credential-shaped string appears in a
-   tracked file. It detects prefixed keys (`sk-`, `ghp_`, `AIza`, `ya29.`, `GOCSPX-` and others) and
-   JWTs, which have no giveaway prefix and are the most likely thing to leak. It has exactly two
-   exemption mechanisms, both explicit and both greppable: an inline `secret-scan: allow` marker,
-   and an `ALLOWLIST` of published constants with a source comment each. A finding is reported with
-   the value **masked**, so the scanner never echoes a secret into a world-readable CI log.
+   tracked file (a short `EXCLUDE_PATHS` list skips research notes such as `plan.md` and
+   `.research/`). It detects prefixed keys (`sk-`, `ghp_`, `gho_`, `github_pat_`, `AIza`, `ya29.`,
+   `xoxb-` and others) and JWTs, which have no giveaway prefix and are the most likely thing to
+   leak. It has exactly two per-finding exemption mechanisms, both explicit and both greppable: an
+   inline `secret-scan: allow` marker, and an `ALLOWLIST` of published constants with a source
+   comment each. A finding is reported with the value **masked**, so the scanner never echoes a
+   secret into a world-readable CI log.
 2. **The catalogue test** asserts no provider uses a cookie-style auth kind and that no entry
    mentions a cookie or a browser session.
 3. **Clippy with `-D warnings`** and `cargo fmt --check`, so the diff that introduces the problem is
@@ -259,14 +262,17 @@ Three checks, all in `.github/workflows/ci.yml`:
 2. Purge it from history. A force-push is not sufficient on its own — anyone who already cloned has
    it, and GitHub retains unreachable objects for a time. Treat the credential as burned regardless.
 3. Remove the provider's stored credential: `mr provider remove <id> --force` drops the provider and
-   its vault entries. There is no `mr provider logout`/`login` pair; an OAuth account is re-authorized
-   through the panel's OAuth flow (`POST /api/oauth/...`), which writes a fresh vault entry.
+   its vault entries irreversibly; `--force` is what allows the removal while combos or other
+   references still point at the provider. There is no `mr provider logout`/`login` pair; an OAuth
+   account is re-authorized through the panel's OAuth flow
+   (`POST /api/oauth/{platform}/authorize`), which writes a fresh vault entry.
 4. If the *vault key* itself leaked, everything in the vault must be treated as compromised. Rekeying
-   (`Vault::rekey`) is not enough by itself — it protects future writes, but you should also rotate
-   every credential, because the attacker may have copied the plaintext before you rekeyed. There is
-   no `mr vault rekey` command yet (`mr vault` is a stub), so until re-encryption under a fresh key is
-   available the operational step is to rotate the credentials themselves at the providers and protect
-   `vault.key` and any backups of it going forward.
+   (`Vault::rekey`) decrypts every entry and re-encrypts it under a new key, so a captured `vault.enc`
+   is worthless afterwards — but it is not enough by itself: an attacker holding the old key may
+   already have copied plaintext, so you should also rotate every credential. There is no
+   `mr vault rekey` command yet (`mr vault` is a stub), so today the operational step is to rotate
+   the credentials themselves at the providers and protect `vault.key` and any backups of it going
+   forward.
 
 ---
 

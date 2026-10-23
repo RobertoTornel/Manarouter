@@ -16,7 +16,7 @@
 #   * `auth` is AuthKind's internally-tagged serde shape, so it is always an inline table:
 #     { type = "bearer" }, { type = "api-key-header", header = "x-api-key" },
 #     { type = "query-param", param = "key" } or { type = "oauth", platform = "openai-codex" }.
-# produces; use the same spelling here and in config.json.
+#     The `platform` id is the one the OAuth registry produces; use the same spelling here and in config.json.
 #   * `base_url` is the prefix the dialect appends its route path to. Where a provider deviates
 #     from the dialect default, the deviation is named in `route_overrides`, keyed by the
 #     kebab-case RouteKind (chat-completions, responses, embeddings, messages, ...) — that is, the

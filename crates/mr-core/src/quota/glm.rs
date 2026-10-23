@@ -374,7 +374,10 @@ fn count_quota(limit: &Value, reset_at: Option<i64>) -> UsageQuota {
     let (used, total) = if window_total > 0.0 {
         // CREDIT_LIMIT (and absolute TOKENS_LIMIT) rows: prefer the real credits so the
         // card renders "24659 / 28000" instead of a percent-only scale.
-        let used = opt_number(limit.get("currentValue")).unwrap_or(percent);
+        // A missing currentValue must not put a 0..=100 percentage on a credit scale;
+        // scale it the way monthly_quota does so "used" stays in the total's unit.
+        let used = opt_number(limit.get("currentValue"))
+            .unwrap_or_else(|| (window_total * percent / 100.0).clamp(0.0, window_total));
         (used, window_total)
     } else {
         (percent, 100.0)

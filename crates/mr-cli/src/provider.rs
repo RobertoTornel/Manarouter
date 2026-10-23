@@ -680,10 +680,24 @@ pub(crate) mod net {
                 b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                     out.push(b as char)
                 }
-                _ => out.push_str(&format!("%{b:02X}")),
+                _ => {
+                    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                    out.push('%');
+                    out.push(HEX[(b >> 4) as usize] as char);
+                    out.push(HEX[(b & 0x0f) as usize] as char);
+                }
             }
         }
         out
+    }
+
+    /// What a URL may be shown as: a query string can carry a credential, so it is cut before
+    /// the URL reaches a message, a table or a log.
+    fn shown(url: &str) -> &str {
+        match url.find(['?', '#']) {
+            Some(cut) => &url[..cut],
+            None => url,
+        }
     }
 
     /// One bounded request. Errors are `CliError`s with the exit code the failure deserves.
@@ -699,7 +713,7 @@ pub(crate) mod net {
 
         let uri: http::Uri = url
             .parse()
-            .map_err(|e| CliError::validation(format!("not a usable URL: {url} ({e})")))?;
+            .map_err(|e| CliError::validation(format!("not a usable URL: {} ({e})", shown(url))))?;
         let mut req = Request::builder().method(method).uri(uri);
         if body.is_some() {
             req = req.header(header::CONTENT_TYPE, "application/json");
@@ -720,25 +734,39 @@ pub(crate) mod net {
             .map_err(|e| CliError::failure(format!("cannot build the request: {e}")))?;
 
         let started = Instant::now();
+        // Query-param credentials ride in the URL, so no message may carry the whole thing.
+        let target = shown(url);
         let resp = tokio::time::timeout(timeout, client.request(req))
             .await
             .map_err(|_| {
                 CliError::failure(format!(
-                    "timed out after {}ms waiting for {url}",
+                    "timed out after {}ms waiting for {target}",
                     timeout.as_millis()
                 ))
             })?
-            .map_err(|e| CliError::failure(format!("cannot reach {url}: {e}")))?;
+            .map_err(|e| CliError::failure(format!("cannot reach {target}: {e}")))?;
         let status = resp.status();
         let mut body = resp.into_body();
 
-        let mut collected: Vec<u8> = Vec::new();
+        let mut collected: Vec<u8> = Vec::with_capacity(1024);
+        // The deadline covers the whole read, not each frame: a hostile upstream that drips one
+        // byte per timeout window must not hold the probe open.
         while collected.len() < MAX_BODY {
-            let frame = tokio::time::timeout(timeout, body.frame())
+            let left = timeout.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Err(CliError::failure(format!(
+                    "timed out reading the body from {target}"
+                )));
+            }
+            let frame = tokio::time::timeout(left, body.frame())
                 .await
-                .map_err(|_| CliError::failure(format!("timed out reading the body from {url}")))?
+                .map_err(|_| {
+                    CliError::failure(format!("timed out reading the body from {target}"))
+                })?
                 .transpose()
-                .map_err(|e| CliError::failure(format!("reading the response from {url}: {e}")))?;
+                .map_err(|e| {
+                    CliError::failure(format!("reading the response from {target}: {e}"))
+                })?;
             let Some(frame) = frame else { break };
             if let Ok(data) = frame.into_data() {
                 let take = (MAX_BODY - collected.len()).min(data.len());
@@ -883,17 +911,28 @@ async fn test(ctx: &Ctx, id: &str, model: Option<&str>) -> Result<(), CliError> 
     // fail for the wrong reason. `--model` escalates to a real one-token conversation.
     let (method, url, body) = match (model, probe_kind(p.dialect)) {
         (None, _) => (Method::GET, join(&p.base_url, "/models"), None),
-        (Some(m), kind) => {
-            let mut url = join(&p.base_url, &probe_path(&kind, m));
-            if let AuthKind::QueryParam { param } = &p.auth {
-                let sep = if url.contains('?') { '&' } else { '?' };
-                url.push(sep);
-                url.push_str(param);
-                url.push('=');
-                url.push_str(&net::url_encode(&secret));
-            }
-            (Method::POST, url, Some(probe_body(&kind, m)))
-        }
+        (Some(m), kind) => (
+            Method::POST,
+            join(&p.base_url, &probe_path(&kind, m)),
+            Some(probe_body(&kind, m)),
+        ),
+    };
+    // A query-param credential has to ride on every probe, the model listing included: without it
+    // the upstream answers 401 and this command blames a key that is perfectly good.
+    let mut url = url;
+    if let AuthKind::QueryParam { param } = &p.auth {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        url.push(sep);
+        url.push_str(param);
+        url.push('=');
+        url.push_str(&net::url_encode(&secret));
+    }
+    // ...and it must never reach the report, which is printed and often pasted into a ticket.
+    let shown_url = if secret.len() >= 6 {
+        url.replace(&net::url_encode(&secret), "REDACTED")
+            .replace(secret.as_str(), "REDACTED")
+    } else {
+        url.clone()
     };
 
     let client = net::client();
@@ -944,7 +983,7 @@ async fn test(ctx: &Ctx, id: &str, model: Option<&str>) -> Result<(), CliError> 
         crate::output::print_json(&serde_json::json!({
             "id": id,
             "method": method.as_str(),
-            "url": url,
+            "url": shown_url,
             "status": reply.status.as_u16(),
             "ok": ok,
             "latency_ms": reply.elapsed.as_millis(),
@@ -956,7 +995,7 @@ async fn test(ctx: &Ctx, id: &str, model: Option<&str>) -> Result<(), CliError> 
         let mut t = Table::new(["FIELD", "VALUE"]);
         t.row(vec![
             "endpoint".to_owned(),
-            format!("{} {url}", method.as_str()),
+            format!("{} {shown_url}", method.as_str()),
         ]);
         t.row(vec![
             "status".to_owned(),

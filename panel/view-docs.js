@@ -21,6 +21,7 @@ export async function renderDocs(mount, ctx, selected) {
     content));
 
   let docs = [];
+  let loadSeq = 0; // last-request-wins: a slow older response must not overwrite a newer one
   try {
     docs = extractList(await api.get('/api/docs'), 'docs');
   } catch (err) {
@@ -35,11 +36,12 @@ export async function renderDocs(mount, ctx, selected) {
     return;
   }
 
-  renderList();
-
   // Selection: URL param, else the first document — the pane is never silently empty.
   const wanted = selected && docs.find((d) => docName(d) === selected) ? selected : docName(docs[0]);
   if (wanted !== selected) history.replaceState(null, '', `#/docs/${encodeURIComponent(wanted)}`);
+  // After `wanted`: renderList() reads it to mark aria-current, and calling it before the
+  // const would throw a ReferenceError (temporal dead zone) and kill the whole docs view.
+  renderList();
   await load(wanted);
 
   function docName(d) {
@@ -64,14 +66,17 @@ export async function renderDocs(mount, ctx, selected) {
   }
 
   async function load(name) {
+    const seq = ++loadSeq;
     content.replaceChildren(h('p', { class: 'hint' }, 'loading…'));
     let text;
     try {
       text = await api.getRaw(`/api/docs/${encodeURIComponent(name)}`);
     } catch (err) {
+      if (seq !== loadSeq) return;
       content.replaceChildren(errorBlock(err));
       return;
     }
+    if (seq !== loadSeq) return;
 
     // Body of rendered markdown. The inline style stands in for a stylesheet rule this file does
     // not own: the existing .doc-text class is pre-wrap monospace (right for a verbatim view)

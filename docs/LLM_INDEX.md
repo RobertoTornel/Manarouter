@@ -24,7 +24,7 @@ Anthropic-compatible API surface in front of many upstream providers, and it add
 is enabled — races the chosen steps at once, committing the highest-priority one that answers
 inside the eligibility window).
 
-**Language:** Rust, edition 2021, MSRV 1.82. Workspace of five crates.
+**Language:** Rust, edition 2021, MSRV 1.88. Workspace of five crates.
 
 **Two processes:**
 
@@ -45,8 +45,8 @@ in the conductor. If it can only be known while bytes are moving, it belongs in 
 else is a design bug. Read `docs/01-architecture.md` for the full argument.
 
 **Primary goal:** latency. The relay's own added latency budget is **p50 < 150 µs, p99 < 500 µs** — a
-target, not a measurement. The `tools/bench` harness that would assert it in CI does not exist yet,
-and nothing has been measured in the relay (`docs/19-latency-benchmarks.md` §3). For contrast, the
+target, not a measurement. The `tools/bench` harness exists, but no relay measurement has been recorded yet
+(`docs/19-latency-benchmarks.md` §3). For contrast, the
 measured baseline of an existing Javascript router on the development machine — serving a purely local
 `/v1/models` with no upstream work at all — was **5.2 – 9.2 seconds**.
 
@@ -68,7 +68,7 @@ measured baseline of an existing Javascript router on the development machine �
 | Add an OAuth platform | `docs/14-oauth-adding-a-platform.md`, `docs/omniroute-reference.md` |
 | Touch credentials or secrets | `docs/21-security.md` — read before writing any code |
 | Change the configuration schema | `docs/03-configuration.md` §1 first — unknown-key preservation is mandatory |
-| Change the snapshot format | `docs/04-routing-snapshot.md` — a format change requires a version bump; the current version is **4** |
+| Change the snapshot format | `docs/04-routing-snapshot.md` — a format change requires a version bump; the current version is **6** |
 | Change model naming, reasoning levels, or `/v1/models` | `docs/18-api-reference.md` §"Model addressing", `docs/04-routing-snapshot.md` §5-§7, `crates/mr-core/src/snapshot.rs` (`compile`, `explain_miss`) |
 | Work on the panel | `docs/15-web-panel.md`, `docs/01-architecture.md` §5 |
 | Migrate from OmniRoute | `docs/17-migrating-from-omniroute.md` |
@@ -386,7 +386,7 @@ wrong, say so explicitly rather than quietly working around it.
 - **Hedge** — sending one prompt to several models at once. The winner is the highest-priority
   participant that replied inside the window.
 - **Passthrough** — forwarding request or response bytes unchanged because the dialects match.
-- **Relay** — the data-plane process. Applies client authentication and reasoning-level behavior, but does not yet enforce per-key quotas or route upstream connections through configured proxies.
+- **Relay** — the data-plane process. Applies client authentication and reasoning-level behavior, admits requests against per-key quotas (`quota.rs`), and connects upstream through a configured proxy when one applies (`proxy.rs`).
 - **Snapshot** — the compiled binary routing table the relay reads.
 - **Step** — one provider/model pair inside a combo, at a fixed position in the operator's order.
 - **TTFB** — time to first byte. The metric the hedged race keys on, and a separate timeout from the
@@ -409,7 +409,7 @@ trigger.
     { "path": "docs/01-architecture.md", "purpose": "Why there are two processes, what the compiled snapshot is, and the full request path", "read_when": "changing anything structural" },
     { "path": "docs/02-quickstart.md", "purpose": "A working configuration in five minutes", "read_when": "installing or writing a test harness" },
     { "path": "docs/03-configuration.md", "purpose": "The complete config.json schema, plus why unknown keys are preserved", "read_when": "changing any config field" },
-    { "path": "docs/04-routing-snapshot.md", "purpose": "The compiled binary table: layout (format version 4), level-aware compilation, index precedence, versioning, hot swap", "read_when": "changing the snapshot format or the relay's lookup" },
+    { "path": "docs/04-routing-snapshot.md", "purpose": "The compiled binary table: layout (format version 6), level-aware compilation, index precedence, versioning, hot swap", "read_when": "changing the snapshot format or the relay's lookup" },
     { "path": "docs/05-key-selection.md", "purpose": "priority, round-robin, random and least-used, and how dead accounts are skipped", "read_when": "touching account selection" },
     { "path": "docs/06-combos.md", "purpose": "The combo reference and worked examples", "read_when": "changing combo semantics" },
     { "path": "docs/07-hedged-race.md", "purpose": "The eligibility gate, the four on-failure modes, midstream policy, session affinity", "read_when": "touching the race — read it all" },

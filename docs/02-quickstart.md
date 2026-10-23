@@ -13,7 +13,7 @@ step. It is written so that every command can be typed in order.
 
 ## 1. Build from source
 
-The workspace pins Rust 1.82 as its MSRV and ships a `rust-toolchain.toml` requesting the stable
+The workspace pins Rust 1.88 as its MSRV and ships a `rust-toolchain.toml` requesting the stable
 channel with `rustfmt` and `clippy`. With `rustup` installed, the toolchain file is honoured
 automatically:
 
@@ -38,7 +38,7 @@ is where the latency target lives, and `[profile.release]` settings — LTO, `co
 
 **If it fails:**
 
-- `error: package ... requires rustc 1.82` — your default toolchain is older. `rustup show` in the
+- `error: package ... requires rustc 1.88` — your default toolchain is older. `rustup show` in the
   repository root should report the pinned stable; `rustup update stable` if not.
 - A compiler or linker error on the SQLite dependency — the workspace builds `rusqlite` through
   `libsqlite3-sys` with the `bundled` feature, so it compiles SQLite from source and needs a working C
@@ -333,6 +333,7 @@ On Linux, the repository installer can instead install both as systemd user serv
 
 # For an installed checkout, update then restart both units:
 ~/.local/share/manarouter/source/installer.sh --systemd-user
+```
 
 The installer builds release binaries, installs the user units, enables them, and starts/restarts
 both. Use `systemctl --user status manarouter-conductor manarouter-relay` and
@@ -344,9 +345,11 @@ the relay loads. The relay's load path, though, recompiles a missing or stale sn
 `config.json` itself rather than treating it as fatal, so the order is a robustness preference rather
 than a hard dependency — the relay does not need the conductor to have published one first.
 
-Open the panel at <http://127.0.0.1:20901>. It is loopback-only: reaching it from another machine
-requires setting a password first, because it can add providers and mint client keys. That rule, and
-the origin check behind it, are in [security](21-security.md) §2.
+Open the panel at <http://127.0.0.1:20901>. It binds loopback by default: a non-loopback
+`control.host` is refused unless a panel password is set (or `allow_remote_without_password` is
+deliberately enabled), because the panel can add providers and mint client keys. A password alone
+does not secure the transport — use TLS behind a reverse proxy and a firewall, or preferably an SSH
+tunnel. That rule, and the origin check behind it, are in [security](21-security.md) §2.
 
 > Both binaries are wired up in this tree — `manarouter-relay` binds the relay port and serves the
 > OpenAI- and Anthropic-shaped API, and `manarouter-conductor` serves the panel and control API. The

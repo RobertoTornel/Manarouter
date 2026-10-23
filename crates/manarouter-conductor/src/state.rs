@@ -356,6 +356,10 @@ impl AppState {
             return false;
         }
 
+        // Capture the fingerprint *before* the read: the bytes installed below must be the ones
+        // remembered, or an edit that lands during the read is recorded as seen while the older
+        // content is what got loaded, and it would never be picked up until the file changes again.
+        let seen = self.config_fingerprint();
         let on_disk = match Config::load(&self.config_path) {
             Ok(config) => config,
             // A missing file is the normal "never edited by hand" case, not an error worth
@@ -376,7 +380,10 @@ impl AppState {
         // Record what we read *before* comparing, so a later edit is still detected even when this
         // one turns out to be a no-op. A hand-edit that reorders keys, or a rewrite with identical
         // content, should not cause the same file to be re-parsed on every subsequent request.
-        self.mark_config_seen();
+        *self
+            .config_seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = seen;
 
         {
             let current = self.config.read().await;
@@ -560,7 +567,9 @@ impl AppState {
     pub async fn delete_secret(&self, id: &str) {
         let mut vault = self.vault.lock().await;
         if vault.delete(id) {
-            let _ = vault.flush();
+            if let Err(e) = vault.flush() {
+                tracing::warn!(secret_id = %id, error = %e, "could not flush the vault after a delete");
+            }
         }
     }
 

@@ -355,25 +355,44 @@ fn remove(ctx: &Ctx, provider_id: &str, account_key: &str, force: bool) -> Resul
         (label, secret_ref)
     };
 
+    // Open the vault before anything is written, so an unreadable vault fails without changing
+    // the configuration.
+    let mut vault = if secret_ref.is_some() {
+        Some(ctx.vault()?)
+    } else {
+        None
+    };
+
+    // The configuration write is what makes the removal real: `ctx.save` validates before it
+    // writes and refuses, for example, a provider that would be left with no accounts at all.
+    // Deleting the credential first would destroy it while the account is still in the config.
+    let out = ctx.save(&cfg)?;
+
     let mut deleted_vault_entry = false;
-    if let Some(sid) = &secret_ref {
-        let mut vault = ctx.vault()?;
-        deleted_vault_entry = vault.delete(sid);
+    if let (Some(sid), Some(v)) = (&secret_ref, vault.as_mut()) {
+        deleted_vault_entry = v.delete(sid);
         if deleted_vault_entry {
-            vault.flush().map_err(CliError::from)?;
+            v.flush().map_err(CliError::from)?;
         }
     }
 
-    let mut human = vec![format!("account `{label}` removed from `{provider_id}`")];
+    // Defensive: someone may have used the secret itself as the label, so the removal message
+    // must not repeat it verbatim.
+    let label_is_secret = looks_like_a_credential(&label);
+    let shown_label = if label_is_secret {
+        "<hidden>"
+    } else {
+        label.as_str()
+    };
+    let mut human = vec![format!(
+        "account `{shown_label}` removed from `{provider_id}`"
+    )];
     if deleted_vault_entry {
         human.push("its vault entry was deleted with it".to_owned());
     }
-    if looks_like_a_credential(&label) {
-        // Defensive: someone used the secret itself as the label. We never echoed it, but say so.
-        human.push("note: the label looked credential-shaped and was never printed".to_owned());
+    if label_is_secret {
+        human.push("note: the label looked credential-shaped and is not repeated here".to_owned());
     }
-
-    let out = ctx.save(&cfg)?;
     let doc = serde_json::json!({
         "provider": provider_id,
         "account": label,

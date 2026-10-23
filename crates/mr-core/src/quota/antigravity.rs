@@ -505,7 +505,12 @@ fn catalog_windows(catalog: &Value, live: Option<&Value>) -> Vec<Window> {
                 continue;
             }
 
-            let live_bucket = live_buckets.get(model_key);
+            // A live bucket with no fraction means "not started", not "empty": it must not
+            // overwrite a reported catalog row, or a healthy account would read as unknown. Same
+            // rule the live-only loop below applies to buckets the catalog never named.
+            let live_bucket = live_buckets
+                .get(model_key)
+                .filter(|bucket| fraction(bucket).is_some());
             let (source, bucket) = match live_bucket {
                 Some(bucket) => (SOURCE_LIVE, bucket),
                 None => (SOURCE_CATALOG, quota_info),

@@ -182,7 +182,11 @@ impl QuotaFetcher for Moonshot {
     }
 
     async fn fetch(&self, ctx: &QuotaFetchContext) -> Result<UsageQuota> {
-        let origin = parse_origin(ctx.base_url.as_deref()).ok_or_else(|| {
+        // `supports` selects on the account's declared base URL (a `kimi` account is the Open
+        // Platform only when that URL is a Moonshot host), so the same source must be preferred
+        // here; `ctx.base_url` is only a fallback for providers that carry it at provider level.
+        let base_url = declared_base_url(&ctx.account).or(ctx.base_url.as_deref());
+        let origin = parse_origin(base_url).ok_or_else(|| {
             Error::Config(format!(
                 "provider {:?} needs an account base URL on one of {OPEN_PLATFORM_HOSTS:?} to read the \
                  Moonshot prepaid balance; there is no cross-region fallback",

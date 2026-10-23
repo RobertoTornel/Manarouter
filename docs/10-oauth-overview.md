@@ -73,6 +73,32 @@ nonce that stops a forged callback from injecting a code.
 This works when a browser exists on the same machine as the router and the provider has registered a
 loopback redirect.
 
+### When the loopback redirect never arrives
+
+That condition fails more often than it looks: the panel may be open through a tunnel or from another
+machine, the redirect port may be taken, the tab may be closed, or a container boundary may simply
+swallow the callback. The browser is then left on an error page — but the address bar still holds
+`?code=…&state=…`, which is the whole of what the router needs.
+
+So the panel offers the paste fallback for both Codex and Antigravity: paste the URL (the full URL,
+just the query string, or `code#state`) and the waiting sign-in completes. Three properties make that
+fallback as safe as the redirect it stands in for:
+
+* **The `state` is still compared.** A pasted URL is attacker-influenced input exactly like a socket
+  callback, so a code from somebody else's flow is refused. A bare code, which carries no state, is
+  refused with an explanation rather than exchanged.
+* **There is only one completion path.** The paste does not exchange anything itself: it hands the
+  code to the wait that is already in progress, so the pasted and automatic routes cannot drift
+  apart.
+* **The listening port is remembered.** The token exchange must repeat the same `redirect_uri` the
+  authorize request published, so the session keeps the port it bound rather than assuming a
+  constant.
+
+Because a waiting `complete` call takes its session *out* of the session registry (one slow browser
+must not hold the map lock), pasted redirects live in a separate slot keyed by session id, and the
+wait races the loopback listener against that slot. A paste that arrives before the wait starts is
+still parked and found, and `Notify` keeps it from being lost in the gap.
+
 ### The device flow
 
 Copilot is the platform whose *default* is the device flow — Codex offers the same fallback on request
@@ -203,7 +229,7 @@ A refresh window is how far *before* expiry the credential is refreshed.
 
 | Platform | Window | Source |
 |---|---|---|
-| Codex | 5 minutes (`CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES = 5`) | primary (`openai/codex`) |
+| Codex | 5 minutes (`Codex::refresh_lead`, 300 s) | primary (`openai/codex`) |
 | Copilot | `refresh_in` from the mint response, ~1500 s; the language server sets `expires_at = now + refresh_in + 60` and VS Code refreshes at `expires_at - 300` | primary/T2 |
 | Antigravity | 60 seconds | T2 — the reverse-engineered IDE client refreshes within 60 s of expiry |
 | Claude Code | **4 hours** | **UNCERTAIN** — not in the research dossier; see below |
@@ -284,13 +310,14 @@ than a credential compromise.
 An access token can expire between the moment a request is built and the moment the upstream reads
 it. The repair is deliberately short:
 
-1. A request returns `401`.
-2. The conductor refreshes the account's credential **once**, through the single-flight guard.
-3. The request is retried **once** with the new credential.
-4. If the retry also returns `401`, that is a failure — not a reason to loop.
+1. Before building a request, the relay checks the account's credential and refreshes it **once**
+   through the single-flight guard if it is inside the refresh window (`Refresher::ensure_fresh`).
+2. The request is sent with the new credential.
+3. If the upstream still returns `401`, that is a failure — not a reason to loop.
 
-The conductor performs this rather than the relay because the vault is on disk and the relay has no
-business touching disk. The relay reports the `401` upstream; the conductor owns the credential.
+The relay performs the refresh because it is the process that holds the parsed credential and the
+refresher; the conductor owns the login. A `401` that survives the pre-flight refresh is recorded as
+`auth-failed` (below) rather than retried in a loop.
 
 ### What happens when the refresh itself fails
 

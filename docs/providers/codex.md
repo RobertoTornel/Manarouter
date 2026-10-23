@@ -70,9 +70,10 @@ item** instead.
 | **Right** (instructions in `input`) | Everything works. |
 | **Wrong** (a top-level field is still required) | The request is rejected, or instructions are silently ignored — which is worse, because the model answers without its system prompt and the output is subtly wrong rather than obviously broken. |
 
-The implementation follows the in-`input` form, because that is what the current client does, and it
-is marked as uncertain in the code so the decision is in one place. A live check against a real
-subscription settles it in one request.
+The implementation here does **not** do that: `mr-dialects/src/responses.rs` folds the system
+message into a top-level `instructions` field and emits no `BaseInstructions` item at all. That is
+what the code sends today, and it is not flagged UNCERTAIN at that site; only a live request against
+a real subscription settles which form the endpoint accepts.
 
 ## Fingerprint headers
 

@@ -191,10 +191,20 @@ impl ToolCallGuard {
             }
         }
 
-        // Keep the tail of this chunk for the next one.
-        let keep = Self::TAIL.min(chunk.len());
-        self.tail[..keep].copy_from_slice(&chunk[chunk.len() - keep..]);
-        self.len = keep;
+        // Keep the tail of this chunk for the next one. When the chunk is shorter than the tail,
+        // the bytes before it are carried forward too: a marker split over three chunks (`tool`,
+        // `_cal`, `ls`) has its first half in an earlier chunk, and dropping it here is exactly the
+        // false negative the guard exists to prevent.
+        if chunk.len() >= Self::TAIL {
+            self.tail
+                .copy_from_slice(&chunk[chunk.len() - Self::TAIL..]);
+            self.len = Self::TAIL;
+        } else {
+            let carry = (Self::TAIL - chunk.len()).min(self.len);
+            self.tail.copy_within(self.len - carry..self.len, 0);
+            self.tail[carry..carry + chunk.len()].copy_from_slice(chunk);
+            self.len = carry + chunk.len();
+        }
         found
     }
 }
