@@ -73,6 +73,32 @@ nonce that stops a forged callback from injecting a code.
 This works when a browser exists on the same machine as the router and the provider has registered a
 loopback redirect.
 
+### When the loopback redirect never arrives
+
+That condition fails more often than it looks: the panel may be open through a tunnel or from another
+machine, the redirect port may be taken, the tab may be closed, or a container boundary may simply
+swallow the callback. The browser is then left on an error page — but the address bar still holds
+`?code=…&state=…`, which is the whole of what the router needs.
+
+So the panel offers the paste fallback for both Codex and Antigravity: paste the URL (the full URL,
+just the query string, or `code#state`) and the waiting sign-in completes. Three properties make that
+fallback as safe as the redirect it stands in for:
+
+* **The `state` is still compared.** A pasted URL is attacker-influenced input exactly like a socket
+  callback, so a code from somebody else's flow is refused. A bare code, which carries no state, is
+  refused with an explanation rather than exchanged.
+* **There is only one completion path.** The paste does not exchange anything itself: it hands the
+  code to the wait that is already in progress, so the pasted and automatic routes cannot drift
+  apart.
+* **The listening port is remembered.** The token exchange must repeat the same `redirect_uri` the
+  authorize request published, so the session keeps the port it bound rather than assuming a
+  constant.
+
+Because a waiting `complete` call takes its session *out* of the session registry (one slow browser
+must not hold the map lock), pasted redirects live in a separate slot keyed by session id, and the
+wait races the loopback listener against that slot. A paste that arrives before the wait starts is
+still parked and found, and `Notify` keeps it from being lost in the gap.
+
 ### The device flow
 
 Copilot is the platform whose *default* is the device flow — Codex offers the same fallback on request

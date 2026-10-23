@@ -485,7 +485,8 @@ later request. **No other endpoint returns a credential value** — not `/api/co
 | `POST` | `/api/oauth/{platform}/authorize` | Starts an interactive login. |
 | `POST` | `/api/oauth/{platform}/device-code` | Starts a device-code login. |
 | `POST` | `/api/oauth/sessions/{id}/poll` | Polls a device-code session. |
-| `POST` | `/api/oauth/sessions/{id}/complete` | Completes an interactive login. |
+| `POST` | `/api/oauth/sessions/{id}/complete` | Completes an interactive login; blocks until the browser reaches the loopback redirect. |
+| `POST` | `/api/oauth/sessions/{id}/redirect` | Hands a pasted redirect URL (or its `code`/`state` query, or `code#state`) to a login that is already waiting. Answers `202`; the exchange still happens in the waiting `complete` call. |
 
 The four OAuth `POST`s are how a credential enters the vault without ever passing through
 `config.json`; they are documented in [OAuth overview](10-oauth-overview.md).

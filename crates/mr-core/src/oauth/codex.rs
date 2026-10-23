@@ -177,6 +177,11 @@ impl OAuthPlatform for Codex {
         url.push_str("&id_token_add_organizations=true");
         url.push_str("&codex_cli_simplified_flow=true");
         url.push_str("&originator=codex_cli_rs");
+        // Force the account picker. Without it OpenAI silently reuses whichever ChatGPT session the
+        // browser already has, and refreshing that token later can invalidate the other account's
+        // refresh-token family — which matters here, where several accounts of one provider are
+        // the normal case rather than the exception.
+        url.push_str("&prompt=login");
         Ok(url)
     }
 
@@ -567,7 +572,9 @@ mod tests {
                 "scope",
                 "id_token_add_organizations",
                 "codex_cli_simplified_flow",
+                // Appended last, matching the reference implementation's extra-parameter order.
                 "originator",
+                "prompt",
             ]
         );
     }

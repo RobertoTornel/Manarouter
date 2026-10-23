@@ -421,6 +421,122 @@ pub fn parse_query(query: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// An authorization code recovered from text the operator pasted, rather than from the socket.
+///
+/// The state travels separately because the caller must still compare it against the session's
+/// own state. A pasted URL is attacker-influenced input exactly like a loopback request: skipping
+/// that comparison would turn "paste your redirect" into a way to redeem a code from somebody
+/// else's flow.
+pub struct PastedRedirect {
+    /// The code to exchange. Never logged; `Debug` reports its length only.
+    pub code: String,
+    /// The `state` the provider echoed back, if the pasted text carried one.
+    pub state: Option<String>,
+}
+
+impl std::fmt::Debug for PastedRedirect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PastedRedirect")
+            .field("code", &format_args!("<{} bytes>", self.code.len()))
+            .field("state_present", &self.state.is_some())
+            .finish()
+    }
+}
+
+/// Recover the authorization code from a redirect the operator pasted by hand.
+///
+/// This is the fallback for a loopback redirect that never arrived — the browser is on another
+/// machine, the port was taken, or the tab was closed. The operator is looking at an address bar
+/// that failed to load, so the input may be the whole URL, the query string alone, or just the
+/// code value; all three are accepted, because the difference between them is an accident of what
+/// they selected, not a different intent.
+///
+/// Refusals are deliberately specific: a bare code is useless without its state (we cannot verify
+/// it), so that case says so instead of failing later with a confusing provider error.
+pub fn parse_pasted_redirect(pasted: &str) -> Result<PastedRedirect, String> {
+    // A redirect URL is short. Anything longer is not one, and parsing arbitrary input as if it
+    // were is how a paste box becomes a denial-of-service.
+    const LIMIT: usize = 8 * 1024;
+
+    let trimmed = pasted.trim();
+    if trimmed.is_empty() {
+        return Err("paste the URL the browser was redirected to, or its code parameter".into());
+    }
+    if trimmed.len() > LIMIT {
+        return Err("that is too long to be a redirect URL".into());
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("the pasted value contains control characters".into());
+    }
+
+    // Strip scheme and path: keep the query when there is one, otherwise treat the whole value as
+    // either a bare query or a bare code.
+    let query = match trimmed.split_once('?') {
+        Some((_, rest)) => rest.split('#').next().unwrap_or(rest),
+        None => trimmed,
+    };
+
+    if !query.contains('=') {
+        // No parameters at all. A URL without a query is a redirect that carried no code; a bare
+        // token is a code the operator copied from somewhere. Distinguish them rather than
+        // exchanging a URL as if it were a code.
+        if trimmed.contains("://") || trimmed.starts_with('/') || trimmed.contains('/') {
+            return Err(
+                "that URL carries no authorization code: the sign-in probably did not finish, \
+                 so run it again and copy the address the browser lands on"
+                    .into(),
+            );
+        }
+        // Some flows report the state in the fragment and are copied as `code#state`, which has no
+        // `=` anywhere. Accept it so a correct paste is not rejected for looking odd.
+        if let Some((code, state)) = trimmed.split_once('#') {
+            if !code.is_empty() && !state.is_empty() {
+                return Ok(PastedRedirect {
+                    code: code.to_owned(),
+                    state: Some(state.to_owned()),
+                });
+            }
+        }
+        return Ok(PastedRedirect {
+            code: trimmed.to_owned(),
+            state: None,
+        });
+    }
+
+    let mut code = None;
+    let mut state = None;
+    let mut error = None;
+    let mut description = None;
+    for (key, value) in parse_query(query) {
+        match key.as_str() {
+            "code" => code = Some(value),
+            "state" => state = Some(value),
+            "error" => error = Some(value),
+            "error_description" => description = Some(value),
+            _ => {}
+        }
+    }
+
+    if let Some(error) = error {
+        // The provider refused: surface its own words (clipped and escaped where rendered) rather
+        // than reporting a missing code, which would send the operator looking in the wrong place.
+        return Err(match description {
+            Some(description) if !description.is_empty() => {
+                format!("the provider refused the sign-in: {error} ({description})")
+            }
+            _ => format!("the provider refused the sign-in: {error}"),
+        });
+    }
+
+    let code = code.filter(|value| !value.is_empty()).ok_or_else(|| {
+        "the pasted URL has a query but no code parameter; copy the address from the browser's \
+         address bar, including everything after the question mark"
+            .to_string()
+    })?;
+
+    Ok(PastedRedirect { code, state })
+}
+
 /// Cap provider-supplied text that will be rendered: 200 characters, on a `char` boundary so
 /// multi-byte input cannot panic the truncation.
 fn clip(value: &str) -> String {
@@ -840,6 +956,111 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
+
+    // ---------------------------------------------------------------- pasted redirects
+
+    /// The whole point of the fallback: the exact text in a browser's address bar, after the
+    /// loopback page failed to load, still yields the code that completes the sign-in.
+    #[test]
+    fn a_full_redirect_url_yields_its_code_and_state() {
+        let pasted = "http://localhost:1455/auth/callback?code=abc123&state=st-9";
+        let parsed = parse_pasted_redirect(pasted).expect("a full URL must parse");
+        assert_eq!(parsed.code, "abc123");
+        assert_eq!(parsed.state.as_deref(), Some("st-9"));
+    }
+
+    /// People select whichever part they can see. The query string alone means the same thing.
+    #[test]
+    fn a_bare_query_string_parses_the_same_way() {
+        let parsed = parse_pasted_redirect("?code=xyz&state=q1").expect("a query must parse");
+        assert_eq!(parsed.code, "xyz");
+        assert_eq!(parsed.state.as_deref(), Some("q1"));
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_ignored() {
+        let parsed =
+            parse_pasted_redirect("  http://127.0.0.1:1455/auth/callback?code=c&state=s\n")
+                .expect("trimmed input must parse");
+        assert_eq!(parsed.code, "c");
+    }
+
+    /// Google and OpenAI both report a refusal in the redirect rather than by failing. Reporting
+    /// the provider's own words sends the operator to the real problem; "no code" would not.
+    #[test]
+    fn a_refusal_reports_the_provider_reason() {
+        let error = parse_pasted_redirect(
+            "http://localhost:1455/auth/callback?error=access_denied&error_description=user+cancelled",
+        )
+        .expect_err("a refusal is an error");
+        assert!(error.contains("access_denied"), "{error}");
+        assert!(error.contains("user cancelled"), "{error}");
+    }
+
+    /// A redirect that carried no code at all is a sign-in that did not finish, and saying so is
+    /// more useful than complaining about a parser.
+    #[test]
+    fn a_url_without_a_query_is_refused_as_incomplete() {
+        let error = parse_pasted_redirect("http://localhost:1455/auth/callback")
+            .expect_err("no code means no redirect to use");
+        assert!(error.contains("did not finish"), "{error}");
+    }
+
+    #[test]
+    fn a_query_without_a_code_is_refused() {
+        let error = parse_pasted_redirect("?state=only").expect_err("no code parameter");
+        assert!(error.contains("no code parameter"), "{error}");
+    }
+
+    /// A bare code cannot be checked against the session's state, so it is *reported* rather than
+    /// silently accepted: the caller decides, and today it refuses.
+    #[test]
+    fn a_bare_code_has_no_state_to_check() {
+        let parsed = parse_pasted_redirect("abc123").expect("a bare token is a code");
+        assert_eq!(parsed.code, "abc123");
+        assert!(parsed.state.is_none());
+    }
+
+    /// `code#state` is what some flows put in the fragment, and it contains no `=`, so it must be
+    /// recognised before the bare-code branch swallows it whole.
+    #[test]
+    fn a_code_and_state_joined_by_a_hash_parse() {
+        let parsed = parse_pasted_redirect("abc#st-1").expect("code#state must parse");
+        assert_eq!(parsed.code, "abc");
+        assert_eq!(parsed.state.as_deref(), Some("st-1"));
+    }
+
+    #[test]
+    fn empty_input_is_refused() {
+        assert!(parse_pasted_redirect("   ").is_err());
+    }
+
+    /// Rendered text is one thing; a paste box must not accept newlines or escapes that could
+    /// reach a header or a log line.
+    #[test]
+    fn control_characters_are_refused() {
+        assert!(parse_pasted_redirect("code=a\u{0}b").is_err());
+        assert!(parse_pasted_redirect("code=a\r\nX-Injected: 1").is_err());
+    }
+
+    #[test]
+    fn an_oversized_paste_is_refused() {
+        let huge = format!("?code={}", "a".repeat(9 * 1024));
+        let error = parse_pasted_redirect(&huge).expect_err("too long");
+        assert!(error.contains("too long"), "{error}");
+    }
+
+    /// A code is a credential for the length of a sign-in, so it must not reach a log line.
+    #[test]
+    fn the_debug_form_does_not_print_the_code() {
+        let parsed = PastedRedirect {
+            code: "super-secret-code".into(),
+            state: Some("s".into()),
+        };
+        let shown = format!("{parsed:?}");
+        assert!(!shown.contains("super-secret-code"), "{shown}");
+        assert!(shown.contains("17 bytes"), "{shown}");
+    }
 
     /// A device authorization for driver tests; only the fields the driver reads matter.
     fn test_authorization() -> DeviceAuthorization {
