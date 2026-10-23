@@ -13,16 +13,27 @@
 export function createPoller({ tick, intervalMs = 5000, doc = document, win = window } = {}) {
   let timer = null;
   let stopped = true;
+  let inFlight = false;
+  let again = false;
 
   async function run() {
     if (stopped) return;
     if (doc.visibilityState !== 'visible') { timer = null; return; } // hidden: stay stopped
+    if (inFlight) { again = true; return; } // a slow tick is still pending: coalesce, never overlap
+    inFlight = true;
     try {
       await tick();
     } catch {
       // tick() reports its own failures to the UI; the poll loop itself never throws.
+    } finally {
+      inFlight = false;
     }
-    if (!stopped) schedule();
+    if (stopped) { again = false; return; }
+    // Hidden while the tick was in flight: stay fully stopped until visibilitychange restarts us,
+    // rather than arming a timer that would only wake up to discover it is hidden.
+    if (doc.visibilityState !== 'visible') { again = false; return; }
+    if (again) { again = false; run(); return; } // refresh asked for mid-tick: serve it now, not in intervalMs
+    schedule();
   }
 
   function schedule() {
@@ -46,6 +57,7 @@ export function createPoller({ tick, intervalMs = 5000, doc = document, win = wi
     },
     stop() {
       stopped = true;
+      again = false;
       clearTimeout(timer);
       timer = null;
       win.removeEventListener('visibilitychange', onVisibility);

@@ -844,7 +844,7 @@ fn completion_object(state: &StreamState) -> Value {
         "usage": {
             "prompt_tokens": state.prompt_tokens,
             "completion_tokens": state.completion_tokens,
-            "total_tokens": state.prompt_tokens + state.completion_tokens,
+            "total_tokens": state.prompt_tokens.saturating_add(state.completion_tokens),
             // OpenAI's own spellings, so an OpenAI-shaped client (and this gateway's own usage tap)
             // sees the cache split without having to know Command Code's nesting.
             "prompt_tokens_details": {
@@ -1147,7 +1147,7 @@ fn final_chunk(state: &StreamState) -> Value {
         out["usage"] = json!({
             "prompt_tokens": state.prompt_tokens,
             "completion_tokens": state.completion_tokens,
-            "total_tokens": state.prompt_tokens + state.completion_tokens,
+            "total_tokens": state.prompt_tokens.saturating_add(state.completion_tokens),
             "prompt_tokens_details": {"cached_tokens": state.cache_read_tokens},
             "cache_read_input_tokens": state.cache_read_tokens,
             "cache_write_input_tokens": state.cache_write_tokens,

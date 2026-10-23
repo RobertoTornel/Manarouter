@@ -124,9 +124,9 @@ impl WindowFamily {
     /// Zero mirrors the JavaScript exactly and yields `0d`; zero is not a window, so callers should
     /// keep it away from here rather than rely on that rendering.
     pub fn format_duration(seconds: u64) -> String {
-        if seconds % 86_400 == 0 {
+        if seconds.is_multiple_of(86_400) {
             format!("{}d", seconds / 86_400)
-        } else if seconds % 3_600 == 0 {
+        } else if seconds.is_multiple_of(3_600) {
             format!("{}h", seconds / 3_600)
         } else {
             format!("{seconds}s")
@@ -136,7 +136,12 @@ impl WindowFamily {
 
 impl std::fmt::Display for WindowFamily {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.label())
+        match self {
+            Self::Session5h => f.write_str("5h"),
+            Self::Weekly1w => f.write_str("1w"),
+            Self::Monthly30d => f.write_str("30d"),
+            Self::Other { secs } => write!(f, "other({secs})"),
+        }
     }
 }
 

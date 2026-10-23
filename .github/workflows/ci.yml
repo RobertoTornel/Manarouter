@@ -65,6 +65,13 @@ jobs:
       - name: Isolated mock-upstream smoke
         run: python3 tests/smoke_e2e.py
 
+      # Nothing declares the panel modules as ESM (there is no `package.json` beside them), so Node
+      # has to classify `panel/*.js` by syntax detection, which exists only from Node 22.7. Pin the
+      # version instead of trusting whatever the runner image happens to ship.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: Panel Node tests
         run: node --test panel/test/*.test.mjs
 
@@ -79,8 +86,9 @@ jobs:
         run: cargo test --workspace --all-targets
 
       - name: Test release profile
-        # The release profile enables LTO, `panic = "abort"` and `strip`. Those settings change
-        # codegen enough that a debug-only test pass is not evidence the shipped binary works.
+        # The release profile enables fat LTO and a high opt-level, which change codegen enough that
+        # a debug-only test pass is not evidence the shipped binary works. `panic = "abort"` and
+        # `strip` are set there too, but Cargo does not apply `panic` to test binaries.
         run: cargo test --workspace --release
 
   # The tools carry their own `[workspace]` tables so they cannot break `cargo check --workspace` —

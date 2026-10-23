@@ -145,7 +145,15 @@ impl Health {
     /// recovery is the honest value: a client that waits that long will not come back before
     /// something can serve it.
     pub fn earliest_reset(&self) -> Option<u64> {
-        self.map.load().values().map(|c| c.until_ms).min()
+        // Only self-healing cooldowns count. An auth failure ends when the operator fixes the
+        // credential, not when the clock passes; advertising its instant as a `Retry-After` would
+        // promise a recovery that waiting cannot deliver.
+        self.map
+            .load()
+            .values()
+            .filter(|c| c.reason.self_healing())
+            .map(|c| c.until_ms)
+            .min()
     }
 }
 
@@ -382,11 +390,15 @@ pub fn account_allows_model(account: &AccountPlan, model: &str) -> bool {
 /// and both readings are meant. Comparing raw strings would make the allow-list silently not match,
 /// which reads as the router ignoring the list rather than as a formatting detail.
 fn eq_model(a: &str, b: &str) -> bool {
-    let strip = |s: &str| match s.rsplit_once('/') {
-        Some((_, tail)) => tail.to_owned(),
-        None => s.to_owned(),
-    };
-    a.eq_ignore_ascii_case(b) || strip(a).eq_ignore_ascii_case(&strip(b))
+    // Borrowed, not owned: this runs once per allow/deny entry for every account considered on the
+    // request path, and looking at the tail of a model id never needed an allocation.
+    fn strip(s: &str) -> &str {
+        match s.rsplit_once('/') {
+            Some((_, tail)) => tail,
+            None => s,
+        }
+    }
+    a.eq_ignore_ascii_case(b) || strip(a).eq_ignore_ascii_case(strip(b))
 }
 
 /// What a hedge should do now.

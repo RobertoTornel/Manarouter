@@ -325,7 +325,7 @@ fn data_url(url: &str) -> Option<(&str, &str)> {
     let mime = header.split(';').next().unwrap_or("");
     // inlineData's `data` field wants base64; a percent-encoded payload is not that, and
     // `data:...` with no comma cannot be split at all — both are dropped rather than sent.
-    if mime.is_empty() || !header.contains("base64") {
+    if mime.is_empty() || payload.is_empty() || !header.contains("base64") {
         return None;
     }
     Some((mime, payload))

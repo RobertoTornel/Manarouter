@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 version = "0.1.1"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/RobertoTornel/Manarouter"
 homepage = "https://github.com/RobertoTornel/Manarouter"
@@ -70,8 +70,9 @@ hmac = "0.12"
 aes-gcm = "0.10"
 # scrypt is needed for exactly one thing: reading the reference OmniRoute database, whose
 # credential columns are AES-256-GCM ciphertext under a scrypt-derived key. Nothing on the runtime
-# request path uses it (`oauth/migrate.rs` is the only caller). Pinned to 0.11 on purpose: 0.12
-# raises the minimum compiler version above this workspace's rust-version.
+# request path uses it (`oauth/reference.rs` is the only caller), and `migrate.rs` reaches it
+# only through that module. Pinned to 0.11 on purpose; before any bump, check the new release's
+# MSRV against this workspace's rust-version.
 scrypt = "0.11"
 rand = "0.8"
 base64 = "0.22"

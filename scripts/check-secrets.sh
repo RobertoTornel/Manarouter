@@ -129,7 +129,7 @@ is_allowlisted() {
 # `grep -I` would answer the same question, but BSD grep on macOS does not have it. Comparing a
 # NUL-stripped copy of the file with the file itself uses tools that every system has.
 has_nul_byte() {
-  ! LC_ALL=C tr -d '\000' <"$1" | LC_ALL=C cmp -s - "$1"
+  ! LC_ALL=C tr -d '\000' <"$1" | LC_ALL=C cmp -s - -- "$1"
 }
 
 findings=0
@@ -153,14 +153,22 @@ for f in "${FILES[@]}"; do
     case "$line" in
       *"secret-scan: allow"*) continue ;;
     esac
-    is_allowlisted "$line" && continue
+    # An allowlisted published constant excuses only its own value, never another credential
+    # that happens to sit on the same line.
+    if is_allowlisted "$line"; then
+      rest="$line"
+      for published in "${ALLOWLIST[@]}"; do
+        rest="${rest//"$published"/}"
+      done
+      printf '%s\n' "$rest" | grep -qE "(${PREFIX_PATTERN}|${JWT_PATTERN})" || continue
+    fi
 
     echo "  ${f}:${lineno}"
     # Print the match with the value masked, so the check does not itself echo the secret into a
     # CI log that is world-readable on a public repository.
     echo "      $(printf '%s' "$line" | sed -E "s/(${PREFIX_PATTERN}|${JWT_PATTERN})/<redacted>/g" | cut -c1-160)"
     findings=$((findings + 1))
-  done < <(grep -nEo ".*(${PREFIX_PATTERN}|${JWT_PATTERN}).*" "$f" 2>/dev/null || true)
+  done < <(grep -nEo ".*(${PREFIX_PATTERN}|${JWT_PATTERN}).*" -- "$f" 2>/dev/null || true)
 done
 
 echo "check-secrets: scanned ${scanned} file(s)"

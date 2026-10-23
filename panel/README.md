@@ -2,7 +2,7 @@
 
 The operator panel served by the conductor (control plane) from this directory — plain HTML,
 CSS and ES modules. No build step, no framework, no CDN, no external fonts: the files are
-served from disk or embedded at compile time and must work on a fully offline install.
+served straight from disk (the `panel/` directory is located at startup — nothing is embedded) and must work on a fully offline install.
 
 All requests are **relative** (`/api/…`); the panel talks only to the origin that served it.
 
@@ -14,7 +14,7 @@ All requests are **relative** (`/api/…`); the panel talks only to the origin t
 | `app.css` | The whole design system. Greys carry structure; pink (`--pink`) marks interaction/emphasis only; green/amber/red are strictly semantic. |
 | `app.js` | Entry point: session gate, hash router (`#/view/param`), health poller wiring, the persistent restart-pending banner, shared `ctx` passed to every view. |
 | `api.js` | Single fetch wrapper. Parses the `{ error: { code, message, details } }` envelope, centralises the 401 → login transition, offers `getRaw`/`putRaw` for the config file. |
-| `dom.js` | `h()` element builder — the only sanctioned DOM construction. **No `innerHTML` anywhere in the panel**: server strings (provider labels, model ids, error messages, doc text) enter the DOM as text nodes or `textContent` only. Also: validation-problem → field mapping, error blocks, chips, form fields. |
+| `dom.js` | `h()` element builder — the only sanctioned DOM construction. **Exactly one deliberate `innerHTML`** — docs markdown in `view-docs.js`, escaped at the door by `markdown.js` — and server strings (provider labels, model ids, error messages, doc text) enter the DOM as text nodes or `textContent` only. Also: validation-problem → field mapping, error blocks, chips, form fields. |
 | `format.js` | Pure, DOM-free helpers (uptime/age, chip-class selection, problem grouping, port diffing, combo step moves, hedge-enum parsing). See “Testing”. The hedge-enum helpers (`parseWinnerFail` / `buildWinnerFail`) carry a known mismatch with the backend — see the “Hedge enum” note under “API contract as understood by this panel”. |
 | `poll.js` | Health poll scheduler. Chained `setTimeout` (never overlapping), **stops entirely while `document.visibilityState !== 'visible'`** — a background tab must not hammer a loopback socket — and fires one immediate tick on return. |
 | `toast.js` | Global notification area. Success/error/warning/info map onto the semantic colours; error toasts render the backend's full `details` list. |
@@ -26,9 +26,9 @@ All requests are **relative** (`/api/…`); the panel talks only to the origin t
 | `view-keys.js` | Client keys, allow-lists (one per line), create flow with the show-once plaintext dialog. |
 | `view-aliases.js` | Alias table editor (add + delete; the API has no alias PUT). |
 | `view-models.js` | All models across providers, filtered by provider/source/text/hidden, with hide/show toggles. |
-| `view-quota.js` | Declared windows from the config (real data) + `GET /api/quota`, which exists and renders the **honest empty state** because nothing writes usage rows yet, plus the request ledger from `GET /api/usage` — the per-request token count, reported by the provider or estimated by the router. |
+| `view-quota.js` | Declared windows from the config (real data) + `GET /api/quota`, which exists and renders the **honest empty state** until provider windows are cached, plus the request ledger from `GET /api/usage` — the per-request token count, reported by the provider or estimated by the router. |
 | `view-settings.js` | Port editor with apply-on-restart warning, panel password, raw config editor with Validate/Save. |
-| `view-docs.js` | Documentation browser; renders doc text verbatim (`textContent`) — markdown shown as source, zero XSS surface. |
+| `view-docs.js` | Documentation browser; renders doc text as markdown into `innerHTML`, through `markdown.js`, which escapes raw HTML (`&`/`<`/`>`/`"`/`'`) first, so a doc cannot inject DOM. |
 
 ## API contract as understood by this panel
 
@@ -48,7 +48,7 @@ Contracts verified against the conductor implementation (still verify interactiv
 3. **Key rotation** — `POST /api/keys/{id}/rotate` replaces a client key's secret in place, preserves its id and policy, invalidates the old secret after commit, and reveals the new plaintext once. The panel asks for confirmation and uses the one-time copy dialog. This rotates Manarouter client credentials, not upstream provider keys.
 4. **Quota usage** — `GET /api/quota` returns persisted per-account usage aggregates (all recorded
    time; it is not a live billing-window quota signal). A failure renders an honest unavailable state.
-   **Caveat:** the endpoint exists, but nothing in either service writes usage rows yet, so in a real
+   **Caveat:** the endpoint exists, but the ledger only reflects traffic that has actually flowed, so in a real
    deployment this view is always empty. That empty state is honest, not a missing route — see
    `docs/08-quota-tracking.md`.
 5. **Hedge enum** — `hedge.on_winner_fail` is parsed/built as the externally tagged serde form

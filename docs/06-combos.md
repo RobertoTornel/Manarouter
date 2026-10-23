@@ -360,7 +360,10 @@ The trigger is a change to `Config::routing_digest()`. For a combo it hashes `id
 `sticky_success_window_secs`, `midstream_policy`, `max_retries`, `retry_delay_ms`, and each step's
 provider, model and enabled flag.
 Everything the compiler does not read is deliberately excluded, so a cosmetic edit — a `label`, a
-`note`, a `sort_order` — does not republish the table. See [the routing snapshot](04-routing-snapshot.md)
+`note`, a `sort_order` — does not republish the table. One exception is worth knowing: `affinity` is
+read by the compiler but is **not** part of `Combo::signature()`, so flipping it alone does not change
+`routing_digest()` and is not guaranteed to take effect until another routing change republishes the
+table. See [the routing snapshot](04-routing-snapshot.md)
 §12 for the full list and the reason it is hashed field by field.
 
 The failure behaviour is chosen, not incidental:

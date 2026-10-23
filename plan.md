@@ -43,7 +43,8 @@ The live environment, for reference only:
 > These are original intended requirements, not a declaration that every feature shipped. Current
 > implementation status is tracked in §5 and the verification log in §7. The modality reroute (D3),
 > per-key cap enforcement (D2) and runtime proxy egress (D4) have all shipped; the hedged race
-> runner (D7) has shipped without the winner-recovery half, which remains open.
+> runner (D7) has shipped, including recovery from a winner that dies mid-body, though only
+> `pick-highest-passed` of the four `WinnerFailMode`s is implemented.
 
 | Area | Decision |
 |---|---|
@@ -75,7 +76,7 @@ The live environment, for reference only:
 |---|---|
 | Domain model / config | `crates/mr-core/src/model.rs`, `config.rs`, `dialect.rs`, `catalog.rs`, `published.rs` |
 | Snapshot compiler | `crates/mr-core/src/snapshot.rs` (2.7 kloc — resolution, aliases, levels) |
-| Store | `crates/mr-core/src/store.rs` (3.0 kloc — usage rows, counters) + `migrations/` |
+| Store | `crates/mr-core/src/store.rs` (~4.0 kloc — usage rows, counters, schema migrations, which live in `store.rs`, not a `migrations/` dir) |
 | Quota (new) | `crates/mr-core/src/quota/*` (new module: types, trait, registry, normalizers, fetchers, MIT-ported) |
 | Dialects | `crates/mr-dialects/src/{lib,openai,anthropic,google,responses,commandcode}.rs` |
 | Relay | `crates/manarouter-relay/src/{server,select,state,upstream,startup,model_scan}.rs` |
@@ -309,7 +310,7 @@ one; do not reorder without recording why in §7.
       `proxies` + `proxy_strategy`, `no_key_required` + `allow_remote_without_key`,
       validation rules, migration hook from B1. Owns `crates/mr-core/src/config.rs`.
 - [x] **B4** Store: `provider_quota_state` table, per-key window counters, migrations.
-      Owns `crates/mr-core/src/store.rs`, `migrations/` (single writer).
+      Owns `crates/mr-core/src/store.rs` (schema migrations live there; single writer).
 - [~] **B5** Snapshot: level-aware resolution, generated-alias deletion, capability/level defaults,
       proxy assignment + per-key limits compiled in, encode/decode version bump.
       Owns `crates/mr-core/src/snapshot.rs`, `crates/mr-core/src/published.rs`.
@@ -352,7 +353,7 @@ one; do not reorder without recording why in §7.
       releases the reservation. A refused request writes nothing, and a ledger that cannot be read
       refuses the request rather than allowing it. Only keys that carry a cap are metered at all: an
       uncapped key pays no ledger I/O and no parsing cost. The live database schema is unchanged
-      (`user_version` stays 3) — no migration was needed, and none was added. Ten unit tests in
+      (`user_version` stayed 3 then) — no migration was needed for D2; `MIGRATION_V4` (`key_usage_bytes`) was added on 2026-10-23 (§7). Ten unit tests in
       `quota.rs` and two end-to-end tests in `server.rs` cover the caps, the flat request budget,
       the refusal path and the ledger write.
 - [x] **D3** **Implemented as a bounded re-dispatch.** When the selected route cannot carry the
@@ -389,7 +390,7 @@ one; do not reorder without recording why in §7.
       that share an upstream model but differ in reasoning level. Proxy eligibility is a seam; proxy
       selection is now integrated (D4), so what remains here is the per-model selection detail, not
       the proxy path.
-- [x] **D7** **The hedged race runner is implemented; the winner's recovery is not.** The body of
+- [x] **D7** **The hedged race runner and winner-body recovery are implemented; three of the four `WinnerFailMode`s are not.** The body of
       the sequential step loop was extracted into `attempt_step`, which returns an `Attempt`
       (`Answer`/`Failed`/`Skip`/`Fatal`), so the sequential chain and the race run the *same* code
       and cannot drift. `run_hedge` dispatches every participant of the combo's `hedge.participants`
@@ -398,9 +399,10 @@ one; do not reorder without recording why in §7.
       eligibility window; the losers' futures are dropped, which closes their connections rather
       than leaking them. `window_ms` remains an eligibility gate, never a timeout. Four tests in
       `server.rs` run two mock upstreams, the higher-priority one deliberately the slower, so a race
-      that rewarded speed would fail them. **Still open:** the four `WinnerFailMode`s and the
-      mid-stream splice, because the winner is committed before its body streams; and
-      `winner_metric` does not yet distinguish `first_response_byte` from `first_complete_token`.
+      that rewarded speed would fail them. **Still open:** three of the four `WinnerFailMode`s — only `pick-highest-passed` is wired in
+      `crates/manarouter-relay/src/server.rs`; `winner_metric` still does not distinguish
+      `first_response_byte` from `first_complete_token`. The mid-stream splice was fixed on
+      2026-10-22 (§7).
 
 ### Phase E — control-plane API
 
@@ -508,12 +510,17 @@ Never: `mr serve`, `systemctl`, `kill <manarouter pid>`, writes under
 | ~~Configured proxy selection is not on the relay upstream request path~~ — **closed**: `crates/manarouter-relay/src/egress.rs` dials through the proxy, each proxy has its own pool, and a failed tunnel ends the request with HTTP 502 `proxy_error` (no direct fallback). | A proxy failure is a request failure, by design: it is not a provider failure and must not silently become a direct request. |
 | ~~Modality fallback helper cannot safely reroute the whole step yet~~ — **closed**: the fallback is a complete reroute against the same pinned snapshot, with a budget of one fallback. | A target that also lacks the modality, or names no known model, fails with HTTP 501. |
 | Any tool/agent accidentally touching the live config would kill this session. | C2; all runs use `MANAROUTER_CONFIG_DIR` temp dirs; the live path is never edited; the final combo is handed to the user to apply. |
-| `snapshot.rs` is 2.7 kloc and the single riskiest file; its encode/decode is versioned. | B5 is a single-writer task with an explicit format version bump and round-trip tests; nobody else edits it. |
+| `snapshot.rs` is ~4.6 kloc and the single riskiest file; its encode/decode is versioned. | B5 is a single-writer task with an explicit format version bump and round-trip tests; nobody else edits it. |
 | Ported quota fetchers target endpoints that may have changed since OmniRoute v16.3.5. | Fetch-from-source, keep parsers tolerant, mark unverifiable fetchers honestly in docs and return a precise "not verified" error rather than numbers. |
 | Model ids that already end in a level word (`antigravity/gemini-3.8-flash-low`) could be mis-split. | Exact-model-id-first rule (B5/D1) with a dedicated test. |
 | Adding crates (`tokio-socks`) needs network; crates.io reachable at plan time. | Verify with `cargo fetch` before writing code that depends on it; if unavailable, implement SOCKS4/5 handshakes by hand (they are small). |
 | Deleting generated aliases rewrites the live config on the next restart. | User-approved; backup written before rewrite; only `generated: true` entries are touched; the bare-id combo is the replacement path. |
 | Reasoning-level wire formats differ per provider and some are guessed. | Per-dialect defaults + per-model override, documented as "verify against the provider"; `none` always safe. |
+
+## 9. Round-2 tail log (2026-10-20 → 2026-10-23)
+
+| Date | Session | Change | Evidence |
+|---|---|---|---|
 | 2026-10-20 00:30 | Round 2 close-out (doc/code discrepancies) | Fixed the five discrepancies the dialects document found, code first: `route_overrides` is now keyed by the route's kebab-case configuration spelling (`RouteKind::as_config_key`) and wins over a translator-supplied path; `build_url` takes the version segment from the base URL so it appears exactly once and a translated and a passed-through request reach the same URL; `default_path` is per dialect **and** per client route (`/v1/embeddings`, `/v1/responses`, `/v1/audio/*`, `/v1/images/generations` now reach their own endpoints); the `count_tokens` route counts upstream for an Anthropic provider and answers a marked local estimate for any other (no upstream call, no bill); the `gemini` catalogue entry authenticates with `x-goog-api-key` instead of a query parameter the relay never sends; and the catalogue records the `COMMAND_CODE_VERSION` the relay actually pins. Docs updated to the fixed behaviour (`docs/03`, `docs/24`, `docs/providers/*`, `docs/18`, `docs/user/03`, `README.md`), the operator series given its own index (`docs/user/INDEX.md`) and every document claimed by the build manifest (51 entries), and OmniRoute reframed as the author's own personal router rather than an implementation to match. Three questions are still open and waiting on the operator's answer: winner recovery, `winner_metric`, and the inert `latency.hedge_*` knobs. | Local gates green: `cargo fmt --all -- --check`, strict Clippy (workspace, mock-upstream, bench), `scripts/check-secrets.sh` (200 files), installer systemd test, `tests/smoke_e2e.py`, panel Node tests 42/42, `cargo test --workspace --all-targets` (280 + 3 + 650 + 147 + 96 + 34) and `cargo test --workspace --release`, plus the CI relative-link check. |
 | 2026-10-21 01:10 | R1/R2/C1 | Implemented the operator's three decisions. **Winner rule:** `WinnerFailMode::PickHighestPassed` is the implemented mode and the default; the relay wraps the committed winner's body (`crates/manarouter-relay/src/recovery.rs`) and recovers from the highest-priority participant that passed the eligibility gate — silently before any byte reached the client, with the `manarouter.retry` boundary after it, and never after a tool-call delta. **Token count:** the relay counts bytes only; the panel process (the conductor) estimates the tokens for a request whose provider reported none and marks the row `estimated: true`; `GET /api/usage` serves the ledger; the count route's fallback estimate is the body's byte length over four, so the router no longer parses JSON. **Options:** the global `latency.hedge_*` knobs and the three unimplemented winner-fail modes stay accepted-and-ignored. | `cargo test --workspace --all-targets` → 1237 passed, 0 failed, 1 ignored; `cargo fmt --all -- --check`, strict workspace clippy, tools clippy, `scripts/check-secrets.sh`, `scripts/test-installer-systemd.sh`, `python3 tests/smoke_e2e.py`, `node --test panel/test/*.test.mjs` → 42 pass, the CI link check → clean |
 | 2026-10-22 01:35 | D-midstream-splice (close-out) | **Root-caused and fixed the mid-stream splice** that had been killing sessions with `format v4 tool/result at seq N requires toolCallId matching its tool source`. The cause was not the duplicate-id guard but *ownership*: every adapter accumulated per-stream state in a `thread_local!`, and a thread is not a stream — the relay polls a response body on whichever runtime worker is free, so two concurrent answers shared one cell and one stream's tool-argument fragments were folded into the other's tool call, emitting a nameless, id-less `tool-call` block. Fixed by giving Command Code an owned `commandcode::Translator` (holding both its event accumulation and the Anthropic framing state), passed as `&mut` to `commandcode::translate` and held by the relay's per-body `scan`; `reset_stream_state` on the first frame is no longer used for this dialect. **Protocol corrected against the vendor CLI** (`command-code@1.82.3`, `dist/cli.mjs`), which is the authoritative spec: the real `/alpha/generate` stream is `start`/`start-step`/`{reasoning,text}-{start,delta,end}`/`tool-input-{start,delta,end}`/`tool-call`/`finish-step`/`finish`/`provider-metadata`/`cache-write-tokens`, and its usage is `totalUsage` with the cache split nested under `inputTokenDetails` (`cacheReadTokens`/`cacheWriteTokens`). **Token reporting fixed end to end:** the dialect now emits `usage` on the streaming final chunk (it was dropped entirely, which is why tokens/second was never computable), reads the nested cache split, honours the `cache-write-tokens` fallback with the CLI's zero-wins precedence, and both buffered and streamed paths report `prompt_tokens_details.cached_tokens` plus `cache_read_input_tokens`/`cache_write_input_tokens`; `mr_core::usage` learned the `inputTokenDetails` spellings (explicitly *not* `noCacheTokens`, which is the uncached share); the relay's tap now keeps the generation window (`GenerationUsage`) instead of discarding it, records the breakdown into the v3 `usage_tokens` side table in the same transaction as the ledger row, taps and records **every authenticated key** (not only capped ones, via `QuotaManager::observe`), and `GET /api/usage` plus the Quota panel now serve and display cached tokens, cache-write tokens and tokens/second (em dash when the provider reported no timing). | Proven, not asserted: a unit probe on the *legacy* path printed `call B arguments = "B-ARGSA-ARGS"` — stream A's fragment inside stream B's call — and that exact case is now the regression test `proof_the_legacy_thread_local_path_misattributes_a_fragment`. Two new tests pin the fixed behaviour at both layers: `commandcode::tests::two_concurrent_streams_do_not_contaminate_each_others_tool_calls` (interleaved frames, no empty id/name may ever be emitted) and `server::tests::two_concurrent_commandcode_streams_do_not_share_translation_state` (the relay's own `translate_stream_chunk` entry point). A verbatim capture of the live endpoint is checked in as `crates/mr-dialects/tests/fixtures/real_tool_call.ndjson` and replayed by `a_real_captured_stream_yields_one_call_and_its_cache_split`. `cargo test --workspace` → **1244 passed, 0 failed** (37 + 301 + 3 + 96 + 656 + 151), including the stale `finish_emits_the_terminal_frame_and_then_the_done_sentinel` assertion that had pinned the old "never emit usage" behaviour. |

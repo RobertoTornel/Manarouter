@@ -29,15 +29,15 @@ The two processes share state through files, not through IPC: the conductor writ
 
 | View | Shows | Can change |
 |---|---|---|
-| **Overview** | Relay and conductor status, uptime, snapshot digest and age, configuration counts, whether a panel password is set, pending-restart state | Nothing |
+| **Overview** | Control-plane uptime, relay reachability, snapshot digest and age, configuration counts, and whether a panel password is set | Nothing |
 | **Providers** | Every provider, its dialect, base URL, auth, key strategy, account count, and health | Add, edit, enable/disable, remove; add, enable/disable and remove accounts |
 | **Models** | Discovered and hand-entered models per provider | Hide/show and delete a model; sync and hand-entry live in the Providers drawer |
 | **Combos** | Every combo with its steps **in priority order** | Create, edit, reorder steps, enable/disable, remove |
 | **Keys** | Client keys by label and prefix | Create (plaintext shown once), edit the policy, rotate the secret in place (new plaintext shown once, old secret invalidated after commit), enable/disable, delete |
 | **Aliases** | Alias to target mappings | Add, remove |
 | **Quota** | Per-account windows, cooldowns, reset instants, and usage over time | Nothing (windows are declared in the configuration) |
-| **Settings** | Ports, the relay connection pool (including a low-resource profile), the panel password, and the raw configuration | Edit; **ports apply on next restart** |
-| **Documentation** | The top-level files in `docs/`, shown as markdown source | Nothing |
+| **Settings** | Listen ports, client-key access, upstream proxies, the relay connection pool (including a low-resource profile), quota display, pricing data, the panel password, and the raw configuration | Edit; **ports apply on next restart** |
+| **Documentation** | The top-level files in `docs/`, rendered from markdown | Nothing |
 
 The **Models** view distinguishes discovered from hand-entered metadata explicitly, because a sync
 must never overwrite what a human typed. If the two ever disagreed and the panel did not say which
@@ -149,9 +149,9 @@ Each of those is a choice with a cost:
   running a local router. A panel that fails to load its own stylesheet because the network is down
   would be an obvious own goal.
 
-The panel is served from the `panel/` directory on disk, located once at startup beside the working
-directory or the executable, so there is no build step, no `node_modules`, and no version skew against
-the API it talks to. A missing `panel/` directory degrades to a placeholder page rather than a crash.
+The panel is served from the `panel/` directory on disk, located once at startup by searching the
+working directory, its parents, and the executable's directory, so there is no build step, no
+`node_modules`, and no version skew against the API it talks to. A missing `panel/` directory degrades to a placeholder page rather than a crash.
 
 ## See also
 

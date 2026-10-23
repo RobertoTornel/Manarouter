@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::CONTENT_TYPE;
 use http::{HeaderMap, Method, Uri};
-use http_body_util::{BodyExt as _, Full};
+use http_body_util::{BodyExt as _, Full, Limited};
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as LegacyClient;
@@ -44,11 +44,15 @@ use crate::error::{Error, Result};
 /// `QUOTA_ENDPOINT_TIMEOUT_MS`, so one unreachable upstream cannot hang a whole panel refresh.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Hard ceiling on a quota reply body. Quota payloads are kilobytes; without a cap a broken or
+/// hostile upstream could stream until the process runs out of memory.
+const MAX_RESPONSE_BODY: usize = 8 * 1024 * 1024;
+
 /// One HTTP request a quota fetcher wants made.
 ///
 /// Owned rather than borrowed so a test double can keep the requests it was handed, and so the
 /// trait method needs no lifetime plumbing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct QuotaRequest {
     /// The HTTP method.
     pub method: Method,
@@ -60,6 +64,21 @@ pub struct QuotaRequest {
     pub body: Bytes,
     /// Per-request timeout, or `None` for the client's default.
     pub timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for QuotaRequest {
+    /// Deliberately redacted: a header value usually *is* the credential, and a quota URL can carry
+    /// a token in its query string, so neither is printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("QuotaRequest")
+            .field("method", &self.method)
+            .field("url", &self.url.split('?').next().unwrap_or(&self.url))
+            .field("header_names", &names)
+            .field("body_len", &self.body.len())
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl QuotaRequest {
@@ -272,9 +291,9 @@ impl QuotaHttp for HyperQuotaHttp {
         let uri: Uri = url
             .parse()
             .map_err(|_| Error::Config("a quota request url was not a valid URI".to_owned()))?;
-        if uri.scheme().is_none() || uri.host().is_none() {
+        if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.host().is_none() {
             return Err(Error::Config(
-                "a quota request url must be absolute (scheme and host)".to_owned(),
+                "a quota request url must be absolute and use http or https".to_owned(),
             ));
         }
         let host = uri.host().unwrap_or("<no host>").to_owned();
@@ -299,7 +318,10 @@ impl QuotaHttp for HyperQuotaHttp {
         })?;
 
         let timeout = timeout.unwrap_or(self.default_timeout);
-        let response = tokio::time::timeout(timeout, self.client.request(request))
+        // One deadline for the whole exchange: the reply body shares the request's single bound
+        // instead of getting a fresh timeout of its own.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let response = tokio::time::timeout_at(deadline, self.client.request(request))
             .await
             .map_err(|_| {
                 Error::Io(io::Error::new(
@@ -312,7 +334,8 @@ impl QuotaHttp for HyperQuotaHttp {
         let status = response.status().as_u16();
         let response_headers = collect_headers(response.headers());
 
-        let collected = tokio::time::timeout(timeout, response.into_body().collect())
+        let body = Limited::new(response.into_body(), MAX_RESPONSE_BODY);
+        let collected = tokio::time::timeout_at(deadline, body.collect())
             .await
             .map_err(|_| {
                 Error::Io(io::Error::new(

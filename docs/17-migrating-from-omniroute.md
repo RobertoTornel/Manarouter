@@ -277,7 +277,7 @@ locate the reference database
   -> open the COPY read-only
   -> read everything
   -> close, delete the copy
-  -> re-hash the original and confirm it is byte-identical
+  -> re-hash the original and report whether it is still unchanged
 ```
 
 The original belongs to a running application. It may be mid-write, it may be in WAL mode with
@@ -289,8 +289,9 @@ Copying also makes the operation **repeatable**. A migration that failed halfway
 again, because nothing about the source changed. That property is worth the copy on its own.
 
 The hash is re-checked at the end specifically to catch a migration that modified the source by
-accident. If the hashes differ, the migration reports it as an error rather than a warning, because
-at that point something is wrong that the operator needs to know about immediately.
+accident. A difference is reported as a **warning**, not an error: the reference is usually running
+while it is imported, and what matters is that the copy the import actually read is the one that was
+hashed. `--json` records the same fact as `source_changed_while_reading`.
 
 ## Credential handling
 
@@ -314,13 +315,16 @@ The vault key is generated on first use and stored `0600`. See [Security §2](21
 The reference router exposed the same model under several spellings — a vendor-prefixed id, a
 short-prefix id, and a bare id. Client configurations in the wild use all three.
 
-The migration generates one alias per alternative spelling so those clients keep working unchanged:
+The migration generates an alias for each spelling of a synthetic effort variant, so those clients
+keep working unchanged:
 
 | Reference spelling | Alias target |
 |---|---|
-| `openai/gpt-5` | `openai/gpt-5` |
-| `gpt-5` (bare) | `openai/gpt-5` |
-| `openai:gpt-5` | `openai/gpt-5` |
+| `gpt-5-high` (bare) | `gpt-5` |
+| `openai/gpt-5-high` | `gpt-5` |
+
+The target is always the bare model id. A qualified `provider/model` target is not a reachable model
+id, and writing it here would alias a model to itself.
 
 An alias is only created when the target resolves unambiguously. If two enabled providers offer the
 same bare model id, no bare alias is created, and the migration says so — a bare alias that resolved
@@ -393,7 +397,7 @@ deleting.
 |---|---|---|
 | `reference database not found at ~/.omniroute/storage.sqlite` | Different install path | Pass `--db /path/to/storage.sqlite`. The message lists the paths that were tried. |
 | `database is locked` | The other application holds an exclusive lock | Stop the other application, or copy the file yourself while it is stopped and point `--db` at the copy. |
-| `original file changed during migration` | Something wrote to the source, or the copy was made from a moving target | Stop the other application and re-run. |
+| `the reference database changed while it was being read` | The reference kept running and wrote to the file mid-import | Nothing: the import read its own copy, and the warning is informational. Stop the other application and re-run only if you need a stable hash. |
 | `credential failed format check` for one account | The stored value is truncated or was already invalid | Re-key that account by hand after the import. |
 | `no catalogue entry` for a provider | A private or new endpoint | Add it by hand with `mr provider add`, or contribute it to `catalog/providers.toml`. |
 | A combo imported with a disabled step | Its provider did not come across | Expected. Fix the provider, then re-enable the step. |

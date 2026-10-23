@@ -174,8 +174,11 @@ pub fn build_state(
             .map_err(|e| StartupError::new(format!("could not open the credential vault: {e}")))?,
     );
 
-    let refresh_vault =
-        Vault::open(mr_core::config::config_dir()).expect("vault was just opened successfully");
+    let refresh_vault = Vault::open(mr_core::config::config_dir()).map_err(|e| {
+        StartupError::new(format!(
+            "could not reopen the credential vault for token refresh: {e}"
+        ))
+    })?;
     let refresh_store = Arc::new(mr_core::oauth::refresh::VaultStore::new(refresh_vault));
     let oauth_refreshers = mr_core::oauth::platforms()
         .iter()

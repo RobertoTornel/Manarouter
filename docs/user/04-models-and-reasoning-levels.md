@@ -16,7 +16,7 @@ CURL
 unset MR_CLIENT_KEY
 ```
 
-When Manarouter has no client keys configured, its loopback development setup can allow requests without a key; once keys are configured, send a valid Manarouter client key. The model listing is built from the current routing snapshot and does not contact providers. It includes visible provider models, their reasoning metadata, and combo names. Read `manarouter.reasoning_levels` and `manarouter.default_reasoning_level` when choosing a level-qualified name.
+When Manarouter has no client keys configured, its loopback development setup can allow requests without a key (a keyless bind on a non-loopback address is refused unless `relay.no_key_required` and `relay.allow_remote_without_key` are both set deliberately); once keys are configured, send a valid Manarouter client key. The model listing is built from the current routing snapshot and does not contact providers. It includes visible provider models, their reasoning metadata, and combo names. Read `manarouter.reasoning_levels` and `manarouter.default_reasoning_level` when choosing a level-qualified name.
 
 Use a fully qualified provider/model name for a provider model:
 
@@ -85,4 +85,4 @@ See [Calling the API](03-calling-the-api.md) for base URLs, authentication, rout
 
 ## Not yet implemented
 
-The panel's general models table does not display each model's reasoning levels or effective default today; check `GET /v1/models` for that metadata. It also does not show a per-request reasoning substitution in a user-friendly usage view. The relay logs out-of-range direct model-level substitutions, but do not assume an arbitrary client will receive a special response field identifying the final upstream tier.
+The panel's general models table does not display each model's reasoning levels or effective default today; check `GET /v1/models` for that metadata. It also does not show a per-request reasoning substitution in a user-friendly usage view. The relay logs out-of-range direct model-level substitutions at debug level, but do not assume an arbitrary client will receive a special response field identifying the final upstream tier.

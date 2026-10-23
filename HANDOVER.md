@@ -108,12 +108,12 @@ Test distribution, so a failure points somewhere. These are the counts from the 
 |---|---|
 | `mr-core` lib | 641 |
 | `manarouter-relay` lib | 230 |
-| `mr-dialects` lib | 142 |
+| `mr-dialects` lib | 147 |
 | `mr-cli` bin | 96 |
 | `manarouter-conductor` lib | 34 |
 | `manarouter-relay` bin | 3 |
 | `mr-core` integration (`imported_grants_are_independent`) | 1, **ignored by default** |
-| **total (excluding the ignored one)** | **1 146** |
+| **total (excluding the ignored one)** | **1 151** |
 
 Three more suites live outside the workspace crate list and are run separately:
 `tools/mock-upstream` (22), `panel/test/*.test.mjs` (42, Node) and the two Python/bash harnesses
@@ -292,8 +292,9 @@ token cap needs a reservation: the number of tokens is not known until the upstr
   reservation when the ticket is dropped.
 - **Only keys that carry a cap are metered.** An uncapped key pays no ledger I/O and no parsing
   cost; `QuotaManager::is_metered` decides.
-- The **live schema is unchanged**: `user_version` stays 3. No migration was needed and none was
-  added. The `KeyEntry` in the relay now carries the limits, behind an `Arc` so that the copy made
+- The schema is now **v4** (`MIGRATION_V4`, `key_usage_bytes`); the quota columns this section
+  describes came with v2's `key_usage`/`provider_quota_state`, so the cap work itself added no
+  migration. The `KeyEntry` in the relay now carries the limits, behind an `Arc` so that the copy made
   on every authenticated request is an atomic increment rather than a 72-byte memcpy.
 
 Ten unit tests in `quota.rs` and two end-to-end tests in `server.rs` cover the caps, the flat

@@ -68,7 +68,7 @@ mr key rotate <id> --print
 mr key remove <id>
 ```
 
-A newly created or rotated key is printed once; save it securely and do not share it. Rotation invalidates the old key. `mr key create --help` shows optional `--allow-models`, `--allow-routes`, `--limit-requests`, and `--note` restrictions.
+A newly created or rotated key is printed once; save it securely and do not share it. Rotation invalidates the old key. `mr key create --help` shows optional `--allow-models`, `--allow-routes`, `--limit-requests`, and `--note` restrictions. `mr key remove` deletes a key immediately and any client still using it starts receiving 401 responses, so retire the client first.
 
 ## Start and diagnose
 
@@ -79,7 +79,7 @@ mr doctor
 mr version
 ```
 
-`mr serve` runs relay and conductor together in the foreground; Ctrl-C stops the foreground session. Port options override the configured ports for that invocation. The default relay API port is 20900 and panel/control port is 20901. For unattended operation, use the deployment instructions in the project README rather than treating this foreground command as a service manager.
+`mr serve` runs relay and conductor together in the foreground; Ctrl-C stops the foreground session. Port options override the configured ports for that invocation. The default relay API port is 20900 and panel/control port is 20901. Both listeners bind the host configured in `config.json` (loopback by default); do not move them to a public interface without authentication, TLS, and a firewall. For unattended operation, use the deployment instructions in the project README rather than treating this foreground command as a service manager.
 
 `mr doctor` is a read-only diagnostic: it checks config validation, vault metadata, snapshot status, client keys, and listener addresses. It does not probe/bind ports, contact providers, open the vault, or repair anything. `mr version` prints the version and configuration locations.
 
@@ -98,7 +98,7 @@ Do not rely on them to inspect, edit, validate, or rekey configuration/vault fil
 
 `mr migrate omniroute` previews an import by default. The implementation reads the source database without modifying the original and only applies changes to Manarouter when explicitly passed `--apply`; inspect `mr migrate --help` before using it. This is a state-changing import and should be planned with a backup.
 
-Global options: `--help`, `--version`, `--json`, and `--config-dir <DIR>`. For exact positional arguments, accepted values, and flags, the installed binary's own `--help` is authoritative.
+Global options: `--help`, `--json`, and `--config-dir <DIR>`; `mr --version` prints the CLI version but is only accepted before the subcommand. For exact positional arguments, accepted values, and flags, the installed binary's own `--help` is authoritative.
 
 ## Related guides
 

@@ -3,7 +3,7 @@
 > **Mirrors `catalog/providers.toml` — the data is the truth.**
 >
 > There is no generator script, so this file is written by hand and a test in `mr-core` checks the
-> tables below against the TOML, row for row: an id, a dialect, a base URL, an auth kind or a
+> tables below against the TOML, row for row: an id, a label, a dialect, a base URL, an auth kind or a
 > capability list that disagrees fails the build. The prose under the tables is written by hand and
 > is not checked.
 
@@ -33,6 +33,8 @@ many of OmniRoute's credentialed providers could be carried across.
 | `cline` | Cline | `open-ai` | `https://api.cline.bot/api/v1` | `oauth` (cline) | chat, models, tool-calling, reasoning |
 | `github-copilot` | GitHub Copilot | `copilot` | `https://api.githubcopilot.com` | `oauth` (github-copilot) | chat, responses, messages, embeddings, models, tool-calling, reasoning, vision |
 | `openai-codex` ⚠ | OpenAI Codex (ChatGPT subscription) | `codex` | `https://chatgpt.com/backend-api/codex` | `oauth` (openai-codex) | responses, tool-calling, reasoning, vision |
+
+`cline` is catalogued for its dialect, endpoint and capabilities only: the cline OAuth platform is not registered in this build, so there is no working login for it — [the implementation status](../23-implementation-status.md) records it as unavailable.
 
 ## Command Code bridge (1)
 

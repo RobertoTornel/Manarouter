@@ -115,8 +115,9 @@ fn inspect(
         Ok(config) => {
             let issues = config.validate();
             if issues.is_empty() {
-                let state = if config_path.is_file() { "ok" } else { "warn" };
-                let summary = if config_path.is_file() {
+                let present = config_path.is_file();
+                let state = if present { "ok" } else { "warn" };
+                let summary = if present {
                     "configuration parsed and validation passed".to_owned()
                 } else {
                     "configuration file is absent; using first-run defaults".to_owned()
@@ -225,18 +226,17 @@ fn inspect_vault(config_dir: &Path) -> Check {
             );
             (status, detail)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
-            if encrypted_path.is_file() {
-                "fail"
-            } else {
-                "warn"
-            },
-            if encrypted_path.is_file() {
-                "vault key file is absent while encrypted vault data exists; restore the matching key from backup before using stored credentials".to_owned()
-            } else {
-                "vault key file is absent and no encrypted data was found; first-use setup may create one".to_owned()
-            },
-        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let data_exists = encrypted_path.is_file();
+            (
+                if data_exists { "fail" } else { "warn" },
+                if data_exists {
+                    "vault key file is absent while encrypted vault data exists; restore the matching key from backup before using stored credentials".to_owned()
+                } else {
+                    "vault key file is absent and no encrypted data was found; first-use setup may create one".to_owned()
+                },
+            )
+        }
         Err(error) => (
             "fail",
             format!("cannot inspect vault key metadata: {error}"),

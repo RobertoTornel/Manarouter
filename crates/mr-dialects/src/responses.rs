@@ -607,8 +607,16 @@ fn finish_reason(response: &Value) -> &'static str {
         .and_then(Value::as_str)
         .unwrap_or("completed")
     {
-        // Truncation is the only incomplete reason Codex reports.
-        "incomplete" => "length",
+        // `max_output_tokens` is a truncation; a content filter is not, and reporting
+        // it as `length` tells the client to retry a generation that will be filtered again.
+        "incomplete" => match response
+            .get("incomplete_details")
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str)
+        {
+            Some("content_filter") => "content_filter",
+            _ => "length",
+        },
         // A failure has no Chat Completions equivalent; the answer is what it is.
         "failed" => "stop",
         _ if has_tool_calls => "tool_calls",
@@ -629,7 +637,7 @@ fn pivot_usage(usage: Option<&Value>) -> Value {
     let total = usage
         .and_then(|u| u.get("total_tokens"))
         .and_then(Value::as_u64)
-        .unwrap_or(input + output);
+        .unwrap_or(input.saturating_add(output));
     let cached = usage
         .and_then(|u| u.get("input_tokens_details"))
         .and_then(|details| details.get("cached_tokens"))
@@ -1024,7 +1032,7 @@ fn final_chunk(state: &ResponseStreamState) -> Value {
         value["usage"] = json!({
             "prompt_tokens": state.prompt_tokens,
             "completion_tokens": state.completion_tokens,
-            "total_tokens": state.prompt_tokens + state.completion_tokens,
+            "total_tokens": state.prompt_tokens.saturating_add(state.completion_tokens),
             "prompt_tokens_details": {"cached_tokens": state.cached_tokens},
         });
     }

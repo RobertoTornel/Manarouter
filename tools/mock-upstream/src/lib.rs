@@ -354,7 +354,7 @@ async fn chat_completions(
         }
         attach_echo_headers(resp, &headers, body.len())
     } else {
-        respond(&mock, &headers, body, fault)
+        respond(&mock, &headers, body, fault).await
     }
 }
 
@@ -363,7 +363,7 @@ async fn chat_completions(
 /// A body that is not JSON is answered with a 400 in the upstream's own error shape: that is what
 /// a real provider does, and a relay test that accidentally forwards garbage should see a
 /// plausible upstream rejection rather than a mock-specific one.
-fn respond(mock: &Mock, headers: &HeaderMap, body: Bytes, fault: Fault) -> Response {
+async fn respond(mock: &Mock, headers: &HeaderMap, body: Bytes, fault: Fault) -> Response {
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -400,7 +400,7 @@ fn respond(mock: &Mock, headers: &HeaderMap, body: Bytes, fault: Fault) -> Respo
         .unwrap_or(0);
 
     let resp = if wants_stream {
-        sse_response(mock, &id, model, created, &fault)
+        sse_response(mock, &id, model, created, &fault).await
     } else {
         json_response(
             StatusCode::OK,
@@ -431,7 +431,7 @@ fn respond(mock: &Mock, headers: &HeaderMap, body: Bytes, fault: Fault) -> Respo
 }
 
 /// An SSE completion whose frames can be cut short by `--die-after`.
-fn sse_response(_mock: &Mock, id: &str, model: &str, created: u64, fault: &Fault) -> Response {
+async fn sse_response(_mock: &Mock, id: &str, model: &str, created: u64, fault: &Fault) -> Response {
     let chunk = |delta: Value, finish: Value| -> String {
         format!(
             "data: {}\n\n",
@@ -446,7 +446,7 @@ fn sse_response(_mock: &Mock, id: &str, model: &str, created: u64, fault: &Fault
     };
 
     if fault.ttfb_ms > 0 {
-        std::thread::sleep(Duration::from_millis(fault.ttfb_ms));
+        tokio::time::sleep(Duration::from_millis(fault.ttfb_ms)).await;
     }
     let content = fault.content_or_default();
     let mut frames: Vec<String> = vec![

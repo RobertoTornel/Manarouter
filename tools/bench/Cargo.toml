@@ -4,7 +4,7 @@
 name = "manarouter-bench"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 license = "MIT"
 publish = false
 description = "Measures the relay's own added latency overhead against the budget in docs/16-latency-engineering.md, using a local fake upstream and no network, credentials or cost."

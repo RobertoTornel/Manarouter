@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import datetime as _datetime
 import json
+import math
 import sys
 import urllib.error
 import urllib.request
@@ -105,13 +106,17 @@ def as_number(raw: object) -> float | None:
     if isinstance(raw, bool) or raw is None:
         return None
     if isinstance(raw, (int, float)):
-        return float(raw)
-    if isinstance(raw, str):
+        number = float(raw)
+    elif isinstance(raw, str):
         try:
-            return float(raw.strip())
+            number = float(raw.strip())
         except ValueError:
             return None
-    return None
+    else:
+        return None
+    # Upstream is untrusted: inf/nan serialise as invalid JSON ("Infinity"/"NaN")
+    # and int() raises OverflowError/ValueError downstream, so reject them here.
+    return number if math.isfinite(number) else None
 
 
 def as_int(raw: object) -> int | None:
@@ -125,7 +130,12 @@ def per_million(raw: object) -> float | None:
     number = as_number(raw)
     if number is None:
         return None
-    return round(number * TOKENS_PER_UNIT, COST_DECIMALS)
+    cost = number * TOKENS_PER_UNIT
+    # A huge finite upstream value overflows to inf when scaled, and inf is not
+    # valid JSON, so drop the cost instead of emitting an unusable table.
+    if not math.isfinite(cost):
+        return None
+    return round(cost, COST_DECIMALS)
 
 
 def fetch_source(url: str) -> str:
@@ -220,7 +230,13 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         raw = fetch_source(SOURCE_URL)
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as error:
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        OSError,
+        TimeoutError,
+        UnicodeDecodeError,
+    ) as error:
         print(f"error: could not fetch {SOURCE_URL}: {error}", file=sys.stderr)
         print("error: refusing to write a partial price table", file=sys.stderr)
         return 1

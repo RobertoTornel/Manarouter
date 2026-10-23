@@ -10,9 +10,9 @@ mr version
 mr models list
 ```
 
-`mr doctor` reads the configuration and checks its validation, vault-file metadata, routing snapshot, client-key setup, and configured listener addresses. It does not open the vault, contact providers, bind or probe ports, or repair files. `mr version` shows the configuration path. `mr models list` lists configured model ids without fetching anything. These checks do not change Manarouter state.
+`mr doctor` reads the configuration and checks its validation, vault-file metadata, routing snapshot, client-key setup, and configured listener addresses. It does not open the vault, contact providers, bind or probe ports, or repair files. `mr version` shows the configuration path. `mr models list` prints the stored model catalogue from earlier syncs without fetching anything. These checks do not change Manarouter state.
 
-Do not use `mr models sync` as a read-only check: it contacts the provider and saves the returned model list. `mr provider test <provider>` sends one real authenticated upstream request; it may consume quota or incur charges. Use either only when you intend that network request.
+Do not use `mr models sync` as a read-only check: it contacts the provider and saves the returned model list. `mr provider test <provider>` makes a real authenticated upstream request — by default a model-list probe; `--model` adds a one-token completion that may consume quota. Use either only when you intend that network request.
 
 ## The relay or panel will not start
 
@@ -55,7 +55,7 @@ A 429 can be the provider's own rate/quota response, or Manarouter's `no_usable_
 
 ### Other upstream or gateway errors
 
-A provider response can be passed through to the caller. Check the provider's service status, endpoint/base URL, model availability, account state, and network access from the Manarouter host. A timeout or connection failure is not proof that a credential is wrong. If you choose to run `mr provider test <provider>`, remember it makes a real upstream request and may use quota. Share only redacted status/error text when seeking help.
+A provider response can be passed through to the caller. Check the provider's service status, endpoint/base URL, model availability, account state, and network access from the Manarouter host. A timeout or connection failure is not proof that a credential is wrong. If you choose to run `mr provider test <provider>`, remember the default probe is an authenticated model-list call; adding `--model` sends a one-token completion that may use quota. Share only redacted status/error text when seeking help.
 
 ## OAuth account no longer works
 

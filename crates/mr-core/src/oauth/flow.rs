@@ -75,13 +75,22 @@ pub fn url_decode(value: &str) -> String {
                 i += 1;
             }
             b'%' if i + 2 < bytes.len() => {
-                let hex = &value[i + 1..i + 3];
-                match u8::from_str_radix(hex, 16) {
-                    Ok(b) => {
-                        out.push(b);
+                // Decode from bytes, never by slicing the &str: the next two bytes may fall
+                // inside a multi-byte character (e.g. "%aé"), and slicing there panics.
+                fn hex_digit(b: u8) -> Option<u8> {
+                    match b {
+                        b'0'..=b'9' => Some(b - b'0'),
+                        b'a'..=b'f' => Some(b - b'a' + 10),
+                        b'A'..=b'F' => Some(b - b'A' + 10),
+                        _ => None,
+                    }
+                }
+                match (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push((hi << 4) | lo);
                         i += 3;
                     }
-                    Err(_) => {
+                    _ => {
                         out.push(bytes[i]);
                         i += 1;
                     }
@@ -318,7 +327,12 @@ impl Http {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
 
-        let collected = tokio::time::timeout(REQUEST_TIMEOUT, response.into_body().collect())
+        // Bound the reply: a bare `collect()` under a timeout lets a hostile or broken
+        // token endpoint stream gigabytes into RAM before the deadline fires. Token replies
+        // are a few kilobytes; one mebibyte is well above any legitimate error body.
+        const MAX_REPLY: usize = 1024 * 1024;
+        let reply = http_body_util::Limited::new(response.into_body(), MAX_REPLY);
+        let collected = tokio::time::timeout(REQUEST_TIMEOUT, reply.collect())
             .await
             .map_err(|_| oauth_error(format!("timed out reading the reply from {host}")))?
             .map_err(|e| Error::Io(io::Error::other(format!("OAuth reply from {host}: {e}"))))?
@@ -930,7 +944,14 @@ pub async fn drive_device_polls(
         // every later wait uses the schedule's current interval, which `SlowDown` has grown.
         // The injected clock advances only when we actually sleep, so `expired()` tracks the
         // deadline instead of drifting ahead of it.
-        let wait = schedule.interval();
+        // Cap the wait at the code's remaining lifetime: a provider-supplied interval larger
+        // than `expires_in` would otherwise park the login for the whole interval. The 1s floor
+        // stops a zero interval from becoming a hot poll loop against the provider.
+        let remaining = expires_in.saturating_sub(schedule.elapsed());
+        let wait = schedule
+            .interval()
+            .min(remaining)
+            .max(Duration::from_secs(1));
         tokio::time::sleep(wait).await;
         schedule.advance(wait);
         if schedule.expired() {
@@ -1012,8 +1033,8 @@ mod tests {
         assert!(error.contains("no code parameter"), "{error}");
     }
 
-    /// A bare code cannot be checked against the session's state, so it is *reported* rather than
-    /// silently accepted: the caller decides, and today it refuses.
+    /// A bare code carries no state, so the parser reports it rather than inventing one; whether
+    /// that is enough to bind the code to the attempt is the session's call, not the parser's.
     #[test]
     fn a_bare_code_has_no_state_to_check() {
         let parsed = parse_pasted_redirect("abc123").expect("a bare token is a code");

@@ -15,6 +15,7 @@ const MAX_ENTRIES: usize = 256;
 struct Pin {
     provider_id: String,
     model: String,
+    level: u8,
     expires_at: Instant,
     touched_at: Instant,
 }
@@ -47,11 +48,19 @@ impl StickySuccess {
                 pins.remove(combo_id.as_str());
                 return None;
             }
-            (pin.provider_id.clone(), pin.model.clone(), pin.expires_at)
+            (
+                pin.provider_id.clone(),
+                pin.model.clone(),
+                pin.level,
+                pin.expires_at,
+            )
         };
         // Provider/account eligibility work is intentionally outside the cache lock.
         let index = steps.iter().position(|step| {
-            step.provider_id.as_str() == identity.0 && step.model == identity.1 && eligible(step)
+            step.provider_id.as_str() == identity.0
+                && step.model == identity.1
+                && step.level == identity.2
+                && eligible(step)
         });
         let mut pins = self
             .pins
@@ -60,7 +69,8 @@ impl StickySuccess {
         if let Some(pin) = pins.get_mut(combo_id.as_str()) {
             if pin.provider_id != identity.0
                 || pin.model != identity.1
-                || pin.expires_at != identity.2
+                || pin.level != identity.2
+                || pin.expires_at != identity.3
             {
                 return None;
             }
@@ -106,6 +116,7 @@ impl StickySuccess {
             Pin {
                 provider_id: step.provider_id.as_str().to_owned(),
                 model: step.model.clone(),
+                level: step.level,
                 expires_at: now + window,
                 touched_at: now,
             },

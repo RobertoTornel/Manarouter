@@ -66,6 +66,9 @@ pub fn pivot_request_to_anthropic(
         .get("max_tokens")
         .or_else(|| obj.get("max_completion_tokens"))
         .and_then(Value::as_u64)
+        // Anthropic requires at least one output token, so a client that sends `max_tokens: 0`
+        // would otherwise turn every request into a hard upstream 400: treat it as omitted.
+        .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_MAX_TOKENS);
     out.insert("max_tokens".into(), json!(max_tokens));
 
@@ -236,16 +239,33 @@ fn openai_image_to_anthropic(part: &Value) -> Option<Value> {
         .and_then(Value::as_str)?;
     if let Some(rest) = url.strip_prefix("data:") {
         let (meta, data) = rest.split_once(',')?;
+        // RFC 2397 allows a data URL that is not base64, but Anthropic's `base64` source means
+        // base64: forwarding raw data is rejected upstream (and corrupts the image), so such a
+        // part is dropped like any other unsupported part.
+        if !meta
+            .split(';')
+            .skip(1)
+            .any(|p| p.trim().eq_ignore_ascii_case("base64"))
+        {
+            return None;
+        }
         let media_type = meta.split(';').next().unwrap_or("image/png");
+        if media_type.is_empty() {
+            return None;
+        }
         Some(json!({
             "type": "image",
             "source": {"type": "base64", "media_type": media_type, "data": data}
         }))
-    } else {
+    } else if url.starts_with("https://") || url.starts_with("http://") {
+        // Anthropic's `url` source only accepts http(s); a file:/data:/other scheme is a hard
+        // 400 for the whole request, so it is dropped instead of forwarded.
         Some(json!({
             "type": "image",
             "source": {"type": "url", "url": url}
         }))
+    } else {
+        None
     }
 }
 

@@ -85,8 +85,8 @@ broken or the endpoint moved. Recording it in the data means the panel can show 
    mr models sync thing                   # only once test passes
    ```
 
-   `mr provider test` prints the provider's **actual response body** on failure. That is the point of
-   the command: a generic "request failed" tells you nothing about whether the key is wrong or the
+   `mr provider test` prints the provider's **response body** on failure, with credential values
+   redacted and the body truncated. That is the point of the command: a generic "request failed" tells you nothing about whether the key is wrong or the
    body shape is.
 
 4. **If it is genuinely uncertain**, say so in `note` with `UNCERTAIN` and the reason. Do not omit the

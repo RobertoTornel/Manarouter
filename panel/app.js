@@ -57,7 +57,10 @@ async function loadProviders(force = false) {
 // subscription dies with the view — no manual unsubscription bookkeeping, no leaks.
 const healthSubs = new Set();
 function emitHealth() {
-  for (const cb of healthSubs) cb(state.health);
+  for (const cb of healthSubs) {
+    // One view's failing callback must not starve the other subscribers or abort the poll tick.
+    try { cb(state.health); } catch (err) { console.error('health subscriber failed', err); }
+  }
 }
 
 async function refreshHealth() {
@@ -99,6 +102,7 @@ async function restartFlow() {
     danger: false, // disruptive, not destructive — so the confirm button is pink, not red
   });
   if (!ok) return;
+  if (state.restarting) return; // a second dialog was confirmed while this one was open
 
   state.restarting = true;
   updateHealthPill();
@@ -126,7 +130,8 @@ async function restartFlow() {
   if (back) {
     state.health = back;
     toast.success('Restart complete.');
-    await Promise.all([refreshPorts(), loadProviders(true), refreshHealth()]);
+    // A refresh can still fail just after the port reopens; the panel must re-render anyway.
+    await Promise.allSettled([refreshPorts(), loadProviders(true), refreshHealth()]);
     renderRoute();
   } else {
     updateHealthPill();
@@ -210,17 +215,26 @@ const ROUTES = [
   { id: 'docs', re: /^#\/docs(?:\/(.+))?$/, title: 'Documentation', navLabel: 'Documentation', navTitle: 'Read and download Manarouter documentation.', render: renderDocs },
 ];
 
+// Bumped on every route render: a stale view's late rejection must not touch the current route.
+let routeSeq = 0;
+
 function renderRoute() {
   const gate = !state.session?.authenticated && state.session?.password_required;
   if (gate) { showLogin(); return; }
 
+  const seq = ++routeSeq; // this render owns <main> until the next navigation
   healthSubs.clear(); // previous view's live subscriptions die here
   clear(drawerRoot);  // drawers are per-view UI state
 
   const hash = location.hash || '#/overview';
   const route = ROUTES.find((r) => r.re.test(hash)) ?? ROUTES[0];
   const m = hash.match(route.re);
-  const param = m && m[1] ? decodeURIComponent(m[1]) : null;
+  let param = null;
+  if (m && m[1]) {
+    // The hash is attacker-controllable (a shared link). A malformed %-escape must fall back to
+    // the raw segment; throwing here escapes the router and leaves "Loading..." up forever.
+    try { param = decodeURIComponent(m[1]); } catch { param = m[1]; }
+  }
 
   document.title = `Manarouter — ${route.title}`;
   document.getElementById('topbar-title').textContent = route.title;
@@ -237,6 +251,7 @@ function renderRoute() {
   clear(mainEl);
   mainEl.append(h('div', { class: 'toolbar' }, spinner(), h('span', { class: 'count' }, 'Loading…')));
   route.render(mainEl, ctx, param).catch((err) => {
+    if (seq !== routeSeq) return; // a newer route owns <main>; its error screen is not ours to show
     clear(mainEl);
     const box = errorBlock(err);
     const retry = h('button', { class: 'btn', type: 'button' }, 'Retry');
@@ -322,6 +337,9 @@ const poller = createPoller({ tick: refreshHealth, intervalMs: 5000 });
 // A 401 from any authenticated call lands here exactly once, centrally (see api.js).
 onUnauthorized(() => {
   state.session = { authenticated: false, password_required: state.session?.password_required ?? true };
+  // Concurrent 401s (a view fires several requests at once) must not rebuild the sign-in form
+  // the user is already typing into.
+  if (!loginRoot.hidden) return;
   showLogin('Your session has expired — please sign in again.');
 });
 

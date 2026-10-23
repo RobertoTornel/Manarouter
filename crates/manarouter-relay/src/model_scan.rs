@@ -423,6 +423,13 @@ impl<'a> Scanner<'a> {
             self.skip_value();
             return None;
         }
+        // A fraction or an exponent is not an unsigned integer. Consume the rest of the literal so
+        // the scan stays aligned with the document, then report the value as absent rather than
+        // returning a truncated prefix that strands the scanner on the `.` and hides later fields.
+        if matches!(self.peek(), Some(b'.' | b'e' | b'E')) {
+            self.skip_value();
+            return None;
+        }
         // `from_utf8` cannot fail here: the slice is all ASCII digits by construction.
         std::str::from_utf8(&self.body[start..self.pos])
             .ok()
@@ -818,7 +825,7 @@ mod tests {
         assert_eq!(scan_request_head(br#"{"n":3}"#).n, Some(3));
         assert_eq!(scan_request_head(br#"{"n":0}"#).n, Some(0));
         assert_eq!(scan_request_head(br#"{"n":-1}"#).n, None);
-        assert_eq!(scan_request_head(br#"{"n":1.5}"#).n, Some(1));
+        assert_eq!(scan_request_head(br#"{"n":1.5}"#).n, None);
         assert_eq!(scan_request_head(br#"{"n":"2"}"#).n, None);
     }
 

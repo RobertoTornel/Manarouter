@@ -278,7 +278,11 @@ pub struct RelayState {
     /// The pooled upstream client, shared by every worker so the connection pool is not siloed.
     upstream: Upstream,
     /// Configured client keys, or empty when the instance is open.
-    keys: Vec<KeyEntry>,
+    keys: ArcSwap<Vec<KeyEntry>>,
+    /// Whether `config.json` declares any client keys at all, even when none of them could be
+    /// loaded. Kept separate from the ring length so that a configuration whose hashes are all
+    /// malformed fails closed instead of silently reopening the relay.
+    keys_declared: std::sync::atomic::AtomicBool,
     /// The configuration directory, so a reload knows where to look.
     config_dir: std::path::PathBuf,
     /// Proxy-selection counters: the round-robin ticket and the per-proxy in-flight counts.
@@ -293,15 +297,12 @@ pub struct RelayState {
 impl RelayState {
     /// Build the state from a configuration and its compiled snapshot.
     pub fn new(config: &Config, snapshot: RoutingSnapshot, upstream: Upstream) -> Self {
-        let keys = config
-            .client_keys
-            .iter()
-            .filter_map(KeyEntry::from_config)
-            .collect();
+        let keys = key_ring(config);
         Self {
             table: ArcSwap::from_pointee(RouteTable::new(snapshot)),
             upstream,
-            keys,
+            keys: ArcSwap::from_pointee(keys),
+            keys_declared: std::sync::atomic::AtomicBool::new(!config.client_keys.is_empty()),
             config_dir: mr_core::config::config_dir(),
             proxy_selection: ProxySelectionState::new(&config.proxies),
         }
@@ -393,6 +394,13 @@ impl RelayState {
         if let Err(e) = snapshot.write_to(&mr_core::config::snapshot_path()) {
             tracing::warn!(error = %e, "could not persist the recompiled snapshot");
         }
+        // Client keys live in the same file the routing table is compiled from. A reload that
+        // refreshed only the table would leave a revoked or disabled key working until restart.
+        self.keys.store(Arc::new(key_ring(&config)));
+        self.keys_declared.store(
+            !config.client_keys.is_empty(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.install(snapshot);
         Ok(digest)
     }
@@ -414,12 +422,12 @@ impl RelayState {
 
     /// Whether any client keys are configured.
     pub fn keys_are_configured(&self) -> bool {
-        !self.keys.is_empty()
+        !self.keys.load().is_empty()
     }
 
     /// The number of configured keys.
     pub fn key_count(&self) -> usize {
-        self.keys.len()
+        self.keys.load().len()
     }
 
     /// Hash a presented key for comparison.
@@ -445,12 +453,26 @@ impl RelayState {
     ///   there is nothing to authenticate against.
     /// * Keys configured and none presented — refused.
     /// * Keys configured and a wrong one presented — refused.
+    /// * Client keys configured but none of them loadable (every `key_hash` malformed) — refused
+    ///   as well, rather than reopened: a broken configuration must not remove authentication.
     ///
     /// Hashes are checked in configuration order, returning immediately at the first match. This
     /// makes successful authentication cost proportional to the match position; it does not conceal
     /// the matching key's position from an observer able to measure the relay.
     pub fn authenticate(&self, presented: Option<&str>) -> AuthOutcome {
-        if self.keys.is_empty() {
+        let keys = self.keys.load();
+        if keys.is_empty() {
+            // Keys are declared but not one of them could be loaded. Refusing is the safe
+            // direction: returning `Open` would publish a relay the operator believes is protected.
+            if self
+                .keys_declared
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return match presented {
+                    Some(_) => AuthOutcome::Rejected,
+                    None => AuthOutcome::Missing,
+                };
+            }
             return AuthOutcome::Open;
         }
         let Some(key) = presented else {
@@ -459,7 +481,7 @@ impl RelayState {
         let hash = Self::hash_presented(key);
         // Key hashes are compared in configured order. Stop at the first match to keep the common
         // path proportional to the matching key's position rather than scanning all configured keys.
-        for entry in &self.keys {
+        for entry in keys.iter() {
             if entry.matches(&hash) {
                 return AuthOutcome::Ok(entry.clone());
             }
@@ -494,6 +516,15 @@ impl AuthOutcome {
             _ => None,
         }
     }
+}
+
+/// Build the client-key ring for a configuration.
+fn key_ring(config: &Config) -> Vec<KeyEntry> {
+    config
+        .client_keys
+        .iter()
+        .filter_map(KeyEntry::from_config)
+        .collect()
 }
 
 #[cfg(test)]
@@ -544,7 +575,8 @@ mod tests {
         RelayState {
             table: ArcSwap::from_pointee(RouteTable::new(snapshot)),
             upstream: Upstream::default_pool().expect("a client can always be built"),
-            keys,
+            keys: ArcSwap::from_pointee(keys),
+            keys_declared: std::sync::atomic::AtomicBool::new(false),
             config_dir: std::path::PathBuf::from("/tmp"),
             proxy_selection: ProxySelectionState::empty(),
         }

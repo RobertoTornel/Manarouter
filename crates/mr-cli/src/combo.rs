@@ -296,7 +296,7 @@ fn add(ctx: &Ctx, args: AddArgs) -> Result<(), CliError> {
     if let Some(ms) = args.window_ms {
         combo.hedge.window_ms = u16::try_from(ms).map_err(|_| {
             CliError::validation(format!(
-                "--window-ms must fit in {ms}ms as a u16 (max 65535)"
+                "--window-ms must fit in a u16 (max 65535); got {ms}"
             ))
         })?;
         combo.hedge.enabled = true;
@@ -412,7 +412,12 @@ fn alias_points_to(alias_to: &str, combo: &str) -> bool {
 
 fn remove(ctx: &Ctx, name: &str, force: bool) -> Result<(), CliError> {
     let mut cfg = ctx.load()?;
-    require_combo(&cfg, name)?;
+    let resolved = require_combo(&cfg, name)?;
+    // Match references and delete by the resolved name: `name` may be the combo id,
+    // so scanning with the raw token would miss aliases/keys that use the name (and
+    // would let `remove <id>` bypass `--force`).
+    let canonical_name: String = resolved.name.clone();
+    let name: &str = canonical_name.as_str();
 
     let mut refs: Vec<String> = Vec::new();
     for a in &cfg.aliases {

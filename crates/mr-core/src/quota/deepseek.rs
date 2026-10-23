@@ -141,8 +141,8 @@ fn parse_balances(body: &Value) -> Result<Vec<BalanceInfo>> {
             total: money(entry, "total_balance", currency)?,
             // `granted_balance`/`topped_up_balance` are optional in the payload; absent
             // means "not reported", which the detail rows leave at zero.
-            granted: money(entry, "granted_balance", currency).unwrap_or(0.0),
-            topped_up: money(entry, "topped_up_balance", currency).unwrap_or(0.0),
+            granted: money(entry, "granted_balance", currency)?,
+            topped_up: money(entry, "topped_up_balance", currency)?,
         });
     }
     Ok(balances)

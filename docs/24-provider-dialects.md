@@ -127,8 +127,8 @@ already end in `/v1`" (`crates/mr-dialects/src/anthropic.rs:43-50`).
 - a base that carries none gets the dialect's version added to a translator-supplied path, so
   `https://api.deepseek.com` plus `chat/completions` is
   `https://api.deepseek.com/v1/chat/completions`;
-- a path with no version at all and a base with no version at all is the only case where a version
-  is genuinely absent, and the dialect's version is added there too.
+- a path with no version and a base with no version is the only case where neither supplies a
+  version, and there the dialect's version is added too.
 
 So **a request that is translated and the same request passed through now reach the same upstream
 at the same URL**, which is what the two conventions were always trying to say.

@@ -52,8 +52,9 @@ depends on configuration structure.
 
 One part of that table is compiled but only partly executed: the hedged race is resolved into the
 snapshot, `hedge_decide` is called from the request path, and the participants are dispatched
-concurrently — but the four winner-fail modes and the mid-stream switch are not implemented, because
-the winner is committed before its body streams. See §4 and
+concurrently. Of the four winner-fail modes only `pick-highest-passed` is implemented; a winner that
+dies mid-body is recovered from a participant that passed the same window, under the combo's
+`midstream_policy`. See §4 and
 [`23-implementation-status.md`](23-implementation-status.md).
 
 The tradeoff is honest and worth stating: **the relay is fast at the cost of being dumb.** It cannot
@@ -80,11 +81,11 @@ client ──► relay :20900
              └─ 9. record health             in-memory success/failure and cooldown state
 ```
 
-Step 9 is deliberately the only bookkeeping on the path, and it stays in memory. The relay does
-**not** record token usage today, and neither does anything else: the `Store` has a `usage` table
-and the conductor has a read-only `/api/quota` that aggregates it, but no code path in either
-service constructs a `UsageRecord` or feeds the queue, so the table stays empty and `/api/quota`
-reports nothing. The fire-and-forget usage writer the design calls for is still unimplemented; see
+Step 9 is deliberately the only bookkeeping on the request path, and it stays in memory. Token usage
+is settled after the response ends: the relay's quota module enforces each client key's rolling
+request and token caps and writes the per-key ledger that `/api/usage` serves; the conductor's
+`/api/quota` serves the provider quota windows it caches in `provider_quota_state`. The
+account-level `usage` table still has no production writer. See [`08-quota-tracking.md`](08-quota-tracking.md) and
 [`23-implementation-status.md`](23-implementation-status.md).
 
 Steps 3 to 6 are the whole latency story, and each of them is deliberately a constant-time
@@ -174,11 +175,11 @@ frames when it has to rewrite their payloads.
 | Hedged race execution | `manarouter-relay` | `hedge_decide` is called from the request path: the participants are dispatched at once, the highest-priority one that answers inside the window wins, and the losers are dropped. The winner's body is watched, and a death after the commit is recovered from a participant that passed the same window. |
 | Combo and key-strategy compilation | `manarouter-conductor` | Resolved into ordered steps and account orders once per config change, not per request. |
 | Request-time step and account choice | `manarouter-relay` | `select.rs` walks the compiled steps, applies the key strategy and advances the rotation counters. |
-| Quota accounting | `manarouter-conductor` | `/api/quota` reads usage rows from `Store`, but nothing writes them yet; the relay applies transient cooldowns from its own in-memory health state. The per-key ledger that *is* written is served at `/api/usage`, with the token estimate computed in the conductor rather than on the relay's request path. |
+| Quota accounting | `manarouter-conductor` | `/api/quota` serves provider quota windows cached in `provider_quota_state`; `/api/usage` serves the per-key ledger the relay writes at settlement, where it also enforces the per-key caps. The relay additionally applies transient cooldowns from its own in-memory health state. |
 | OAuth authorization (login) | `manarouter-conductor` | The relay holds a `Refresher` per platform and refreshes an expiring token in front of a request. |
 | The web panel | `manarouter-conductor` | Same process, but a separate task and a separate port. |
 | Credential storage | `mr-core::secret` | Encrypted at rest; the vault is opened once at startup and an account's secret is decrypted when a request tries that account (step 5b). |
-| Usage history, quota aggregates, the oplog | `mr-core::store` | SQLite, WAL. The `usage` and `account_health` tables have no writer yet, so they stay empty. Reads are off the hot path, except the small `oauth_credential` metadata lookup an OAuth account needs before its token is refreshed. |
+| Usage history, quota aggregates, the oplog | `mr-core::store` | SQLite, WAL. Usage rows are written by the relay as each request settles. Reads are off the hot path, except the small `oauth_credential` metadata lookup an OAuth account needs before its token is refreshed. |
 
 The rule of thumb: **if it can be decided before a request arrives, it belongs in the conductor. If
 it can only be known while bytes are moving, it belongs in the relay.** Anything that is neither is
@@ -199,8 +200,9 @@ privileges:
 
 Keeping them apart means a cross-site request forgery against the panel cannot cause a request to be
 proxied, and a compromised relay cannot rewrite its own configuration. The panel's API is
-credential-minting and therefore guarded by an Argon2id password hash and an origin check; the relay
-has no administrative endpoints at all.
+credential-minting, so it is guarded by an Argon2id password hash and an origin check; there is no
+default password — without one the conductor refuses to bind beyond loopback unless the operator
+sets `allow_remote_without_password`. The relay has no administrative endpoints at all.
 
 This is the specific mistake both reference projects made — one serves its dashboard and its
 inference API from one Next.js process on one port, with no privilege separation between them.
@@ -248,8 +250,8 @@ For contrast, the measured baseline of an existing Javascript router on this mac
 purely local `/v1/models` with no upstream involved at all, was **5.2–9.2 seconds**. The gap is not
 a matter of tuning the same design; it is a different design.
 
-`tools/bench/` is where the harness that enforces these numbers is meant to live, and it is
-currently an empty directory — no automated check measures them yet, so treat the table as a design
+`tools/bench/` holds the harness that measures these numbers — a separate crate with its own
+`Cargo.toml` and `src/` — but it is not wired into CI, so treat the table as a design
 budget, not a measured guarantee. `tools/mock-upstream` is the deterministic upstream such a harness
 would drive. See `docs/16-latency-engineering.md` and
 [`23-implementation-status.md`](23-implementation-status.md).

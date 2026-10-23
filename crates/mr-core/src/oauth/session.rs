@@ -34,6 +34,10 @@ pub struct OAuthSessions {
 struct ManualSlot {
     provider_id: String,
     state: String,
+    /// Whether this platform binds the code to the attempt with a PKCE verifier of its own. When
+    /// it does, a paste carrying only the code is still ours and is accepted; when it does not,
+    /// the state is the only thing tying the code to this sign-in and is required.
+    pkce_bound: bool,
     port: u16,
     callback: Mutex<Option<Callback>>,
     notify: tokio::sync::Notify,
@@ -143,6 +147,7 @@ impl OAuthSessions {
             Arc::new(ManualSlot {
                 provider_id,
                 state,
+                pkce_bound: platform.requires_pkce(),
                 port: redirect_port,
                 callback: Mutex::new(None),
                 notify: tokio::sync::Notify::new(),
@@ -197,7 +202,10 @@ impl OAuthSessions {
         self.ensure_capacity().await?;
         let authorization = platform.device_start().await.map_err(safe_error)?;
         let expires = tokio::time::Instant::now() + authorization.expires_in.min(SESSION_TTL);
-        let interval = authorization.interval.max(Duration::from_secs(1));
+        let interval = authorization
+            .interval
+            .max(Duration::from_secs(1))
+            .min(SESSION_TTL);
         let id = self
             .insert(Pending {
                 platform,
@@ -216,9 +224,21 @@ impl OAuthSessions {
     }
 
     async fn ensure_capacity(&self) -> Result<(), String> {
-        let mut sessions = self.sessions.lock().await;
-        sessions.retain(|_, pending| pending.expires > tokio::time::Instant::now());
-        if sessions.len() >= MAX_SESSIONS {
+        let now = tokio::time::Instant::now();
+        let live = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.retain(|_, pending| pending.expires > now);
+            sessions.len()
+        };
+        // The paste registry is reaped here too. Nothing else ever walks it, so without this every
+        // abandoned attempt leaves a slot behind for the life of the process — one more per TTL
+        // window, even though the session registry itself is capped at MAX_SESSIONS. Taken under
+        // its own lock, never nested with the session lock, so no ordering can deadlock.
+        self.manual
+            .lock()
+            .await
+            .retain(|_, slot| slot.expires > now);
+        if live >= MAX_SESSIONS {
             return Err("too many pending OAuth sessions; finish or restart one".into());
         }
         Ok(())
@@ -284,20 +304,29 @@ impl OAuthSessions {
         if tokio::time::Instant::now() >= slot.expires {
             return Err("this sign-in expired; start it again".into());
         }
-        // The state is not ceremony: it is what ties this code to *our* authorization request.
-        // Without it, anyone able to reach the panel could redeem a code from their own flow.
-        let state = parsed.state.ok_or_else(|| {
-            "the pasted value has no state parameter, so it cannot be tied to this sign-in; paste \
-             the whole URL from the browser's address bar"
-                .to_string()
-        })?;
-        if state != slot.state {
-            return Err(
-                "that redirect belongs to a different sign-in attempt — its state parameter does \
-                 not match this session; paste the URL from the attempt you just started"
-                    .into(),
-            );
-        }
+        // The state ties this code to *our* authorization request. It is not ceremony: without it,
+        // a code from a different flow can be bound to this session, and the router ends up
+        // holding somebody else's account. But where the platform enforces PKCE the code is
+        // already bound to this session's verifier — a foreign code simply fails at exchange — so
+        // a paste carrying only the code is accepted rather than refused. Asking for the whole URL
+        // there would be friction with nothing behind it, and the code alone is the easiest thing
+        // an operator can select out of a provider's page.
+        let state =
+            match parsed.state {
+                Some(state) if state == slot.state => state,
+                Some(_) => return Err(
+                    "that redirect belongs to a different sign-in attempt — its state parameter \
+                     does not match this session; paste the URL from the attempt you just started"
+                        .into(),
+                ),
+                None if slot.pkce_bound => slot.state.clone(),
+                None => return Err(
+                    "the pasted value has no state parameter, and this platform's flow does not \
+                     bind the code to this sign-in on its own, so the two cannot be tied together; \
+                     paste the whole URL from the browser's address bar"
+                        .into(),
+                ),
+            };
         let mut parked = slot.callback.lock().await;
         if parked.is_some() {
             return Err("a redirect was already submitted for this sign-in".into());
@@ -317,9 +346,15 @@ impl OAuthSessions {
         id: &str,
         provider_id: &str,
     ) -> Result<(TokenSet, super::AccountIdentity), String> {
-        let result = self.finish_browser_inner(id, provider_id).await;
-        // One exit for every path — success, refusal, expiry — so a stale slot can never outlive
-        // the attempt it belongs to.
+        // Take the session here rather than inside the helper: only the caller that actually
+        // acquired this attempt may retire its paste slot. A concurrent duplicate call, or one
+        // naming the wrong provider, finds nothing to take and must leave the live attempt's slot
+        // alone — removing it would silently disable the paste fallback for a sign-in that
+        // somebody else is still waiting on.
+        let pending = self.take(id, provider_id).await?;
+        let result = self.finish_browser_inner(id, pending).await;
+        // One exit for every path of the attempt we own — success, refusal, expiry — so a stale
+        // slot can never outlive it.
         self.manual.lock().await.remove(id);
         result
     }
@@ -327,9 +362,8 @@ impl OAuthSessions {
     async fn finish_browser_inner(
         &self,
         id: &str,
-        provider_id: &str,
+        mut pending: Pending,
     ) -> Result<(TokenSet, super::AccountIdentity), String> {
-        let mut pending = self.take(id, provider_id).await?;
         if pending.busy {
             self.reinsert(id.to_owned(), pending).await?;
             return Err("OAuth session operation already in progress".into());
@@ -498,7 +532,7 @@ impl OAuthSessions {
                 })
             }
             DevicePoll::SlowDown => {
-                pending.interval += Duration::from_secs(5);
+                pending.interval = pending.interval.saturating_add(Duration::from_secs(5));
                 pending.last_polled = Some(tokio::time::Instant::now());
                 let interval_seconds = pending.interval.as_secs();
                 self.reinsert(id.to_owned(), pending).await?;
@@ -599,12 +633,24 @@ mod tests {
     /// actually completed the sign-in rather than just that something did.
     struct FakeBrowser {
         exchanged: std::sync::Mutex<Vec<String>>,
+        pkce: bool,
     }
 
     impl FakeBrowser {
         fn leaked() -> &'static Self {
+            Self::leaked_with_pkce(true)
+        }
+
+        /// The same double, but with no PKCE binding — the shape of a platform whose code is only
+        /// tied to the attempt by its state parameter.
+        fn leaked_without_pkce() -> &'static Self {
+            Self::leaked_with_pkce(false)
+        }
+
+        fn leaked_with_pkce(pkce: bool) -> &'static Self {
             Box::leak(Box::new(Self {
                 exchanged: std::sync::Mutex::new(Vec::new()),
+                pkce,
             }))
         }
 
@@ -636,7 +682,7 @@ mod tests {
             }
         }
         fn requires_pkce(&self) -> bool {
-            true
+            self.pkce
         }
         fn validates_redirect_port(&self) -> bool {
             false
@@ -807,11 +853,29 @@ mod tests {
         assert_eq!(identity.id, "acct-1");
     }
 
-    /// A bare code carries no state, so it cannot be tied to this attempt. Saying that plainly is
-    /// better than exchanging it and letting the provider produce a confusing error.
+    /// When the platform enforces PKCE, the code is already bound to this attempt by the verifier:
+    /// a foreign code cannot be redeemed with it. A bare code is then exactly as safe as the full
+    /// URL, and refusing it would be friction with nothing behind it.
     #[tokio::test]
-    async fn a_bare_code_is_refused_with_an_explanation() {
+    async fn a_bare_code_is_accepted_when_pkce_binds_it() {
         let platform = FakeBrowser::leaked();
+        let sessions = OAuthSessions::new();
+        let (id, _url) = sessions
+            .start_browser(platform, "provider-1".into())
+            .await
+            .expect("a loopback flow starts");
+
+        sessions
+            .submit_redirect(&id, "provider-1", "just-a-code")
+            .await
+            .expect("a PKCE-bound session can use a bare code");
+    }
+
+    /// Without PKCE, the state is the only thing tying the code to this sign-in, so a bare code is
+    /// refused rather than exchanged and left for the provider to reject obscurely.
+    #[tokio::test]
+    async fn a_bare_code_is_refused_without_pkce() {
+        let platform = FakeBrowser::leaked_without_pkce();
         let sessions = OAuthSessions::new();
         let (id, _url) = sessions
             .start_browser(platform, "provider-1".into())
@@ -821,7 +885,7 @@ mod tests {
         let error = sessions
             .submit_redirect(&id, "provider-1", "just-a-code")
             .await
-            .expect_err("a code without state cannot be verified");
+            .expect_err("a code without state cannot be verified without PKCE");
         assert!(error.contains("state parameter"), "{error}");
     }
 

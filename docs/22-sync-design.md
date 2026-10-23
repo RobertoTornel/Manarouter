@@ -4,8 +4,8 @@
 > transport. Nothing in this document describes behaviour you can rely on today.
 
 It is written anyway, for a specific reason: **v1's schema choices only make sense in the light of
-it.** A reader who finds an unused `revision` column, a `deleted_at` on every table, and an `oplog`
-that nothing reads deserves to know why they are there, and a future implementer deserves a starting
+it.** A reader who finds an unused `revision` column, `deleted_at` tombstones on every syncable table, and an `oplog`
+that only a pending-changes count reads deserves to know why they are there, and a future implementer deserves a starting
 point rather than a blank page.
 
 ## The problem
@@ -42,7 +42,7 @@ to work between machines that are frequently offline.
 
 ### A monotonic `revision` per record
 
-Every row carries a `revision` that increments on every write. It is what lets a merge distinguish
+Every syncable row carries a `revision` that increments on every write. It is what lets a merge distinguish
 "changed" from "unchanged" without comparing payloads, and it is what makes "this side is newer" a
 decidable question rather than a guess at timestamps.
 
@@ -82,7 +82,7 @@ codebase. This is the reason `store.rs` exists as a layer rather than raw querie
 oplog(entity, id, revision, op, updated_at, payload_hash)
 ```
 
-It is written on every mutation and read only for a "pending changes" count. Nothing consumes it
+It is written on every mutation and read only for a "pending changes" count. No sync code consumes it
 today.
 
 Writing it from day one is what avoids a painful backfill. The alternative is to add replication in
@@ -93,7 +93,7 @@ anything changed before the upgrade never syncs.
 ### Unknown-key preservation
 
 The configuration format preserves fields it does not recognise
-([Configuration §forward compatibility](03-configuration.md)). That is what stops an older instance
+([Configuration](03-configuration.md)). That is what stops an older instance
 from destroying a newer instance's settings during a round trip — without it, a downgrade is a silent
 data-loss event.
 
@@ -137,7 +137,7 @@ of the `steps` array produces an interleaving that **neither operator chose**. T
 configuration, a valid routing order, and not what either person asked for — a wrong answer that is
 much harder to notice than a conflict would have been.
 
-So combos merge per record, the loser is retained in the oplog, and the panel reports the conflict.
+So combos merge per record, the losing revision is recorded in the oplog, and the panel reports the conflict.
 Nothing is silently lost; the operator decides.
 
 ## Credentials
@@ -171,7 +171,7 @@ The dividing line is consistent: **configuration is shared, observation is not.*
 | A peer is offline for a week | Edits accumulate in the oplog. On reconnect, the peer pulls everything since its watermark and merges. Nothing is lost, and nothing syncs until then. |
 | Clock skew between peers | `revision` decides, not wall-clock time. Timestamps are for display. A peer with a wrong clock can mislabel *when* something happened but cannot win a merge it should lose. |
 | A peer runs an older version | Unknown fields are preserved, so the older peer's round trip does not destroy them. If the older peer does not know about an entity type, it passes the records through untouched. |
-| Two peers edit the same combo at once | One wins per record; the loser is retained in the oplog and reported as a conflict. The operator resolves it. |
+| Two peers edit the same combo at once | One wins per record; the losing revision is recorded in the oplog and reported as a conflict. The operator resolves it. |
 | A tombstone arrives for a record edited recently locally | The tombstone carries a revision. If the local edit is **newer**, the tombstone loses and the local record survives — otherwise a deletion made a week ago would silently undo today's work. |
 | A peer never returns | Its records stay. There is no automatic expiry, because "unreachable" and "deleted" are not the same thing and must never be conflated. |
 

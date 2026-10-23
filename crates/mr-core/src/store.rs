@@ -2359,11 +2359,18 @@ impl Store {
     /// The ledger grows with traffic, so it needs a retention policy. Pruning is by occurrence
     /// time, not write time: a row written late about an old request is still old.
     ///
-    /// The byte counts go with the row they belong to: a size that outlived its ledger row would
-    /// be a number about a request nobody can find any more.
+    /// The byte counts and the v3 token breakdown go with the row they belong to: a size or a
+    /// cache split that outlived its ledger row would be a number about a request nobody can find
+    /// any more — and, since `usage_tokens` has no foreign key to this table, it would accumulate
+    /// forever while the ledger it describes shrank.
     pub fn prune_key_usage(&self, before: Millis) -> Result<u64> {
         let mut guard = self.guard()?;
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM usage_tokens WHERE usage_id IN \
+             (SELECT id FROM key_usage WHERE occurred_at < ?1)",
+            params![before.as_millis()],
+        )?;
         tx.execute(
             "DELETE FROM key_usage_bytes WHERE usage_id IN \
              (SELECT id FROM key_usage WHERE occurred_at < ?1)",

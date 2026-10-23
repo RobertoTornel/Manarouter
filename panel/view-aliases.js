@@ -8,6 +8,7 @@ import { extractList } from './format.js';
 
 export async function renderAliases(mount, ctx) {
   let aliases = [];
+  let loadSeq = 0;
 
   const tableWrap = h('div', { class: 'table-scroll' });
   const count = h('span', { class: 'count' });
@@ -39,9 +40,11 @@ export async function renderAliases(mount, ctx) {
     e.preventDefault();
     clearFieldErrors(addForm);
     addBtn.disabled = true;
+    const from = fromIn.value.trim();
+    const to = toIn.value.trim();
     try {
-      await api.post('/api/aliases', { from: fromIn.value.trim(), to: toIn.value.trim() });
-      ctx.toast.success(`Alias ${fromIn.value.trim()} → ${toIn.value.trim()} added.`);
+      await api.post('/api/aliases', { from, to });
+      ctx.toast.success(`Alias ${from} → ${to} added.`);
       fromIn.value = '';
       toIn.value = '';
       await reload();
@@ -56,12 +59,16 @@ export async function renderAliases(mount, ctx) {
   await reload();
 
   async function reload() {
+    const seq = ++loadSeq;
+    let next;
     try {
-      aliases = extractList(await api.get('/api/aliases'), 'aliases');
+      next = extractList(await api.get('/api/aliases'), 'aliases');
     } catch (err) {
-      tableWrap.replaceChildren(errorBlock(err));
+      if (seq === loadSeq) tableWrap.replaceChildren(errorBlock(err));
       return;
     }
+    if (seq !== loadSeq) return; // a stale response must not overwrite a newer list
+    aliases = next;
     updateCount();
     renderTable();
   }

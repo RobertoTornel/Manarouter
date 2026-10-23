@@ -14,6 +14,19 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 
+<!-- The router (app.js) reads every fragment as a route and falls back to Overview, so following
+     the skip link would replace the current view instead of moving the reader into <main>. Focus
+     it in place and leave the hash — and the current view — alone. -->
+<script>
+  document.addEventListener('click', (e) => {
+    const link = e.target instanceof Element ? e.target.closest('a.skip-link') : null;
+    if (!link) return;
+    e.preventDefault();
+    const main = document.getElementById('main');
+    if (main) { main.focus(); main.scrollIntoView({ block: 'start' }); }
+  });
+</script>
+
 <div id="app-root">
   <div id="shell" hidden>
     <aside class="sidebar">

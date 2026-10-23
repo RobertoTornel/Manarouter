@@ -133,7 +133,7 @@ export function deriveProviderHealth(provider) {
 
 /** Group raw `details` into { byField: {field: [messages]}, general: [strings] }. Pure. */
 export function groupProblems(details) {
-  const byField = {};
+  const byField = Object.create(null);
   const general = [];
   for (const item of details ?? []) {
     if (typeof item === 'string') { general.push(item); continue; }
@@ -192,7 +192,7 @@ export function relayProbeUrl(relay) {
   if (port == null || port === '') return null;
   let host = relay.host ?? '';
   if (host === '' || host === '0.0.0.0' || host === '::' || host === '[::]') host = '127.0.0.1';
-  if (host.includes(':')) host = `[${host}]`; // bare IPv6 literal
+  if (host.includes(':') && !(host.startsWith('[') && host.endsWith(']'))) host = `[${host}]`;
   return `http://${host}:${port}/`;
 }
 

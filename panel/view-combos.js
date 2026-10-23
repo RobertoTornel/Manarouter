@@ -428,7 +428,7 @@ export async function renderCombos(mount, ctx, selectedId) {
     nameIn.addEventListener('input', () => { draft.name = nameIn.value; });
     labelIn.addEventListener('input', () => { draft.label = labelIn.value; });
 
-    right.replaceChildren(editor);
+    target.replaceChildren(editor);
     renderSteps();
     if (isNew) nameIn.focus();
 
@@ -498,7 +498,9 @@ export async function renderCombos(mount, ctx, selectedId) {
         li.addEventListener('drop', (e) => {
           e.preventDefault();
           li.classList.remove('drag-over');
-          const from = Number(e.dataTransfer.getData('text/plain'));
+          const raw = e.dataTransfer.getData('text/plain');
+          if (!/^\d+$/.test(raw)) return;
+          const from = Number(raw);
           if (Number.isInteger(from)) doMove(from, i);
         });
 
@@ -529,6 +531,7 @@ export async function renderCombos(mount, ctx, selectedId) {
     // The ONLY way order changes. After the re-render the moved row is focused so keyboard
     // users keep their place in the list.
     function doMove(from, to) {
+      if (!Number.isInteger(from) || from < 0 || from >= draft.steps.length) return;
       if (to < 0 || to >= draft.steps.length || from === to) return;
       draft.steps = moveStep(draft.steps, from, to);
       // Positional references move with the rows — forgetting this would silently re-point

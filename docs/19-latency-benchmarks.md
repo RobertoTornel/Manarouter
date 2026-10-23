@@ -1,9 +1,8 @@
 # Latency benchmarks
 
 This document records what has been measured, what has not, and how any number here was obtained.
-It is deliberately short on numbers, because at the time of writing the relay's own overhead has
-**not** been measured. Everything in the "budget" section is a target. The distinction is the whole
-point of the document.
+The relay's **total** added overhead has now been measured (section 3); the per-stage rows in the
+budget are still targets. Keeping that distinction is the whole point of the document.
 
 ## 1. The baseline that motivated the project
 
@@ -42,61 +41,65 @@ The per-stage targets from [Latency engineering §6](16-latency-engineering.md#6
 | Upstream write | 20 µs | 80 µs |
 | **Total added overhead** | **< 150 µs** | **< 500 µs** |
 
-**These are targets.** They were derived by budgeting the loopback floor across the stages. They are
-**not** enforced anywhere yet: the harness that would assert them (`tools/bench`) does not exist — the
-directory is empty, there is no `mr-bench` package, and CI excludes `bench` from its tool matrix. A
-target that nothing checks is a wish, and this one is currently a wish.
+**These are targets**, derived by budgeting the loopback floor across the stages. Only the **Total**
+row is measured so far, by `tools/bench` (`manarouter-bench`), which exits non-zero on a breach. It is
+not a CI gate: microsecond timings on a shared machine are too noisy to fail a build, so the tool is
+run by hand on a quiet machine. The per-stage rows remain unmeasured targets.
 
-To put the scale in context: at 150 µs of added overhead against a provider whose own TTFB is 400 ms,
-the router is responsible for 0.04% of what the user waits for. That is the correct place for it to
-be. The value the router adds is not speed against a single provider — it is not spending seconds,
-and being able to race several providers in parallel.
+To put the scale in context: at the measured 14.6 µs of added overhead against a provider whose own
+TTFB is 400 ms, the router is responsible for under 0.004% of what the user waits for. That is the
+correct place for it to be. The value the router adds is not speed against a single provider — it is
+not spending seconds, and being able to race several providers in parallel.
 
 ## 3. What has actually been measured
 
-**Nothing, in the relay.** The relay itself runs, but no harness in this tree measures it: `tools/bench`
-is empty and there is no `mr-bench` package, so there is no reproducible number to publish. This
-section will stay empty rather than be filled with an estimate.
+**The total, not the stages.** `tools/bench` (`manarouter-bench`) sends each request twice — straight
+to a loopback fake upstream, then through the shipping relay's router in process — and reports the
+difference. One release-build run on an idle machine, 300 samples: **14.6 µs p50, 41.8 µs p90,
+110.5 µs p99, 209.9 µs max**, inside the 150/500 µs budget. The per-stage rows are still unmeasured:
+there is no per-stage instrumentation, so none is published. The measurement is noisy (a run taken
+while the machine was compiling reported p99 1040 µs), so a breach is a reason to re-run, not a
+verdict.
 
 This is worth being explicit about because it is exactly the kind of gap that gets papered over. A
 plausible-sounding "~40 µs of overhead" invented for a README is worse than a blank, because the
 first person to measure it will find the claim false and stop trusting everything else in the
 document.
 
-## 4. How it will be measured
+## 4. How it is measured
 
-### Against the mock, not against a provider
+### Against a fake upstream, not against a provider
 
-`tools/mock-upstream` is a deterministic HTTP server that answers the OpenAI, Anthropic and Google
-shapes with a configurable delay and a configurable body. Every benchmark that produces a claim about
-**the router's own overhead** runs against it.
+`tools/bench` starts its own fake upstream on loopback. `tools/mock-upstream` is a separate
+deterministic HTTP server (OpenAI, Anthropic and Google shapes, `--delay` in milliseconds,
+configurable body) used to drive the relay as a real process. A claim about **the router's own
+overhead** comes from the in-process run, so neither a provider nor a client-side TCP hop is inside
+the number.
 
 Determinism is not a nicety here, it is what makes the number meaningful. A benchmark against a real
 provider measures the provider, the network, the time of day and the router's contribution summed
 together, and the router's share is unidentifiable within the noise. Worse, for a benchmark that runs
 in CI: a latency assertion against a real provider is flaky, a flaky assertion gets disabled or given
 a wide tolerance, and a disabled or over-toleranced assertion protects nothing. The mock gives a
-distribution narrow enough that a regression of tens of microseconds fails the build, which is the
-only version of this measurement that has any effect.
+distribution narrow enough that a regression of tens of microseconds shows up in the percentiles,
+which is the only version of this measurement that has any effect.
 
 ### The method
 
 ```bash
-# Terminal 1 — the deterministic upstream, 5 ms of deliberate delay.
-# `--delay` is in milliseconds; there is no `--delay-ms`.
-cargo run --release -p mock-upstream -- --port 21900 --delay 5
-
-# Terminal 2 — the relay, pointing at a config whose only provider is the mock.
-cargo run --release -p manarouter-relay -- --config-dir /tmp/mr-bench
-
-# Terminal 3 — the benchmark. This command does not exist yet: there is no `mr-bench`
-# package and `tools/bench/` is empty, so the run below is the intent, not a recipe.
-cargo run --release -p mr-bench -- --requests 20000 --concurrency 1 --url http://127.0.0.1:20900
+# One process: it starts its own fake upstream, uses a temporary vault and config directory,
+# touches no network beyond loopback, uses no real credential and costs nothing.
+cargo run --release --manifest-path tools/bench/Cargo.toml -- --warmups 20 --samples 300
 ```
 
-Until that third binary exists, a local run is what `tests/local_latency_bench.py` provides — it
-drives the relay against `tools/mock-upstream` and writes a percentile report, which is the only
-harness in the tree today.
+`--report-only` never fails the run; `--json <path>` also writes a machine-readable report. The
+crate is a detached workspace, so `cargo run -p manarouter-bench` from the repository root does not
+work: use the `--manifest-path` form above (or `cd tools/bench`) and add flags after `--`.
+
+To exercise the same path end to end, `tests/local_latency_bench.py` drives the real relay process
+against `tools/mock-upstream` over sockets and writes a percentile report. Unlike the in-process
+bench it includes the relay's accept path and the client-side network hop, so it answers a different
+question and its numbers are not the budget above.
 
 Rules for the run, each of which exists because ignoring it produces a number that is wrong in a
 direction that flatters the project:
@@ -111,8 +114,8 @@ direction that flatters the project:
   overhead the budget describes, and mixing the two produces a p99 that describes nothing.
 - **Report percentiles, not a mean.** A mean latency is the one statistic that hides the problem: it
   is the tail that users notice.
-- **Report the mock's delay alongside the result**, so the reader can subtract it and see what is
-  left.
+- **Report the fake upstream's injected delay alongside the result**, so the reader can subtract it
+  and see what is left.
 
 ### The mock-versus-live rule
 
@@ -130,11 +133,12 @@ what time of day, and how many samples, or it is an anecdote with a decimal poin
 ## 5. Results
 
 | Date | Build | Workload | p50 | p99 | Notes |
-|---|---|---|---|---|---|
-| — | — | — | not measured | not measured | No harness exists yet (`tools/bench/` is empty). |
+|---|---|---|---|---|---|---|---|---|
+| — | release, idle machine | 300 samples, in-process | 14.6 µs added | 110.5 µs added | loopback fake upstream; p90 41.8 µs, max 209.9 µs; `manarouter-bench --warmups 20 --samples 300` |
 
-This table is empty on purpose and will be filled only from a harness that does not exist yet, with
-the command line recorded alongside it.
+Rows are added only from a run whose command line is recorded beside it. The row above is a single
+run, not a distribution of runs, and the tool's README warns that a run taken under load can be an
+order of magnitude worse. Per-stage numbers stay absent until there is per-stage instrumentation.
 
 ## 6. What will not go in this document
 

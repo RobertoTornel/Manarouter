@@ -291,9 +291,11 @@ impl OAuthPlatform for Antigravity {
         }
         url.push_str(&format!("&state={}", url_encode(state)));
         url.push_str("&access_type=offline");
-        if self.tier == ClientTier::Ide {
-            url.push_str("&prompt=consent");
-        }
+        // Both tiers need an explicit consent prompt: Google returns a refresh token only on the
+        // first grant for a client+account, so without it a re-login — or a first Manarouter login
+        // for an account that already granted this shared public client — yields no
+        // refresh_token and `exchange_code` can never renew it.
+        url.push_str("&prompt=consent");
         Ok(url)
     }
 

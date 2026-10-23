@@ -1,6 +1,7 @@
 # Plan — a latency-obsessed AI router (Rust data plane + control plane)
 
-> Status: **awaiting user decisions** on the questions in §15 before implementation begins.
+> Status: **historical plan** — the design as proposed. Current implementation status lives in
+> `docs/23-implementation-status.md`.
 > Working dir: `/home/mana/Documents/seek/Router`
 
 ---
@@ -236,7 +237,7 @@ Router/
 ├── rust-toolchain.toml
 ├── README.md                   # project README (C6)
 ├── LICENSE                     # MIT
-├── plan.md                     # this file
+├── plan-build-history.md       # this file
 ├── docs/
 │   ├── LLM_INDEX.md            # ★ the single file to feed an LLM: map of every doc (C6)
 │   ├── 00-overview.md
@@ -274,15 +275,15 @@ Router/
 │   │   └── <one file per provider family ported>
 │   └── combo-cookbook.md
 ├── crates/
-│   ├── rr-core/                # shared types: Snapshot, Plan, Provider, Key, Combo, Dialect
-│   ├── rr-dialects/            # dialect translation: openai <-> anthropic <-> responses <-> commandcode
-│   ├── rr-relay/               # ← the data plane binary (hot path)
-│   ├── rr-conductor/           # ← the control plane binary + panel + SQLite
-│   └── rr-cli/                 # `mr` CLI: login, add provider, test, bench, migrate
-├── panel/                      # static, embedded into conductor via include_str!
+│   ├── mr-core/                # shared types: Snapshot, Plan, Provider, Key, Combo, Dialect
+│   ├── mr-dialects/            # dialect translation: openai <-> anthropic <-> responses <-> commandcode
+│   ├── manarouter-relay/       # ← the data plane binary (hot path)
+│   ├── manarouter-conductor/   # ← the control plane binary + panel + SQLite
+│   └── mr-cli/                 # `mr` CLI: login, add provider, test, bench, migrate
+├── panel/                      # static files, served from disk by the conductor
 │   ├── index.html
 │   ├── app.js
-│   └── style.css
+│   └── app.css
 ├── migrations/                 # SQLite schema migrations, numbered
 ├── tests/
 │   ├── snapshot_compile.rs
@@ -303,17 +304,17 @@ Router/
 
 ```jsonc
 {
-  "listen": { "host": "127.0.0.1", "port": 20900 },        // ← panel-editable (C7)
-  "control": { "host": "127.0.0.1", "port": 20901, "password_hash": "$2b$…" },
-  "client_keys": [ { "key": "rr-…", "label": "claude-code", "allow": ["*"] } ],
+  "relay": { "host": "127.0.0.1", "port": 20900 },         // ← panel-editable (C7)
+  "control": { "host": "127.0.0.1", "port": 20901, "password_hash": null },   // Argon2id when set
+  "client_keys": [ { "key": "mr-…", "label": "claude-code", "allow": ["*"] } ],
   "providers": [ /* see below */ ],
-  "aliases": { "oad/DeepSeek-V4.1-Flash": "openadapter/DeepSeek-V4.1-Flash" },
+  "aliases": [ /* see docs/03-configuration.md §6 */ ],
   "combos": [ /* see §9 */ ],
-  "quota": { "track": true, "reset_aware": true, "cooldown_on_429_s": 60 },
+  "quota": { "enabled": true, "live_signals_win": true, "default_cooldown_secs": 60 },
   "latency": {
-    "prewarm_connections": true, "pool_idle_s": 300,
-    "upstream_http2": "auto", "tcp_nodelay": true,
-    "hedge": { "default_max_parallel": 3, "default_window_ms": 800 }
+    "prewarm": true, "pool_idle_secs": 90,
+    "upstream_http2": true, "tcp_nodelay": true,
+    "hedge_width": 3, "hedge_window_ms": 400
   }
 }
 ```
@@ -447,7 +448,7 @@ cheap memchr for `"usage"` before the terminator.
 
 ### 6.5 Porting OmniRoute's providers
 
-`mr-cli migrate omniroute --db ~/.omniroute/storage.sqlite` will:
+`mr migrate omniroute --db ~/.omniroute/storage.sqlite` will:
 
 1. Read `provider_connections` and emit one `Provider + keys` block per connection, **preserving
    `priority`, `global_priority`, `max_concurrent`, `group`** and de-duplicating by provider.
@@ -459,8 +460,9 @@ cheap memchr for `"usage"` before the terminator.
    `fallbackStrategy` into our config.
 5. Report a dry-run diff before writing.
 
-Secrets are **never** written into the repo or the snapshot; they live in `~/.config/manarouter/secrets/`
-mode `0600` (Q14) and are referenced by id.
+Secrets are **never** written into the repo or the snapshot; they live in the encrypted vault
+`~/.config/manarouter/vault.enc`, unlocked by `vault.key` (`0600`; directory `0700`) (Q14), and are
+referenced by id.
 
 ---
 

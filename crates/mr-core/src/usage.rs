@@ -91,7 +91,9 @@ impl TokenUsage {
     /// computed there cannot disagree. Callers that need to distinguish "no tokens" from "not
     /// reported" must read the fields directly.
     pub fn total(&self) -> u64 {
-        self.input_tokens.unwrap_or(0) + self.output_tokens.unwrap_or(0)
+        self.input_tokens
+            .unwrap_or(0)
+            .saturating_add(self.output_tokens.unwrap_or(0))
     }
 
     /// The share of the prompt that came from cache, in `0.0..=1.0`.
@@ -149,7 +151,12 @@ fn as_token_count(value: &Value) -> Option<u64> {
         // A fractional token count is not meaningful, but a float that is exactly integral is how
         // several gateways spell an integer. Round, then refuse a negative.
         if f.is_finite() && f >= 0.0 {
-            return Some(f.round() as u64);
+            let rounded = f.round();
+            // A count that rounds past `u64::MAX` has no honest representation. Saturating the cast
+            // would turn a broken or hostile report into the largest possible charge.
+            if rounded < u64::MAX as f64 {
+                return Some(rounded as u64);
+            }
         }
         return None;
     }

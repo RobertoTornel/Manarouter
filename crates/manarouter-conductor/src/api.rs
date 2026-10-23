@@ -2394,8 +2394,10 @@ async fn fetch_model_list(
     let bytes = collected.to_bytes();
 
     if !status.is_success() {
-        let body = String::from_utf8_lossy(&bytes);
-        let snippet: String = body.chars().take(512).collect();
+        // An upstream body is untrusted: decode a bounded prefix instead of the whole payload
+        // just to print a 512-character excerpt of it.
+        let head = &bytes[..bytes.len().min(2048)];
+        let snippet: String = String::from_utf8_lossy(head).chars().take(512).collect();
         return Err(ApiError::upstream(
             StatusCode::BAD_GATEWAY,
             format!("the model list request failed with {status}: {snippet}"),

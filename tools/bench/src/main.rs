@@ -49,6 +49,15 @@ const EXIT_BUDGET: i32 = 1;
 /// Exit status for a hard error.
 const EXIT_ERROR: i32 = 2;
 
+/// Remove the temporary configuration directory, then exit with `code`.
+///
+/// `std::process::exit` does not run destructors, so the `TempDir` would otherwise be left behind
+/// on every exit path, contradicting the promise that the temporary state is deleted.
+fn exit_clean(config_dir: &Path, code: i32) -> ! {
+    let _ = std::fs::remove_dir_all(config_dir);
+    std::process::exit(code)
+}
+
 fn main() {
     // The relay's state records the configuration directory even when it never reads it, so point
     // it at a temporary one: this tool must not touch the operator's real configuration.
@@ -58,14 +67,14 @@ fn main() {
         Ok(request) => request,
         Err(message) => {
             eprintln!("manarouter-bench: {message}");
-            std::process::exit(EXIT_ERROR);
+            exit_clean(config_dir.path(), EXIT_ERROR);
         }
     };
 
     let options = match request {
         Request::Help => {
             print!("{HELP}");
-            std::process::exit(0);
+            exit_clean(config_dir.path(), 0);
         }
         Request::Run(options) => *options,
     };
@@ -81,7 +90,7 @@ fn main() {
         Ok(runtime) => runtime,
         Err(e) => {
             eprintln!("manarouter-bench: the async runtime did not start: {e}");
-            std::process::exit(EXIT_ERROR);
+            exit_clean(config_dir.path(), EXIT_ERROR);
         }
     };
 
@@ -92,20 +101,20 @@ fn main() {
             print!("{}", report.summary);
             if let Err(e) = write_json(&report, options.json.as_deref()) {
                 eprintln!("manarouter-bench: the JSON report was not written: {e}");
-                std::process::exit(EXIT_ERROR);
+                exit_clean(config_dir.path(), EXIT_ERROR);
             }
             if report.verdict.is_pass() || options.report_only {
-                std::process::exit(0);
+                exit_clean(config_dir.path(), 0);
             }
             eprintln!(
                 "manarouter-bench: the added overhead is over budget: {}",
                 report.reasons.join("; ")
             );
-            std::process::exit(EXIT_BUDGET);
+            exit_clean(config_dir.path(), EXIT_BUDGET);
         }
         Err(e) => {
             eprintln!("manarouter-bench: {e}");
-            std::process::exit(EXIT_ERROR);
+            exit_clean(config_dir.path(), EXIT_ERROR);
         }
     }
 }

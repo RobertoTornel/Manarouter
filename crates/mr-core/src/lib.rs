@@ -115,5 +115,5 @@ pub const SNAPSHOT_VERSION: u32 = 6;
 /// turns into a token estimate when the provider reported no counts of its own. The store
 /// currently has four migrations; per-key rolling admission is not yet implemented. Keep this
 /// version aligned with `MIGRATIONS` until the complete, tested admission migration is added. The
-/// compile-time assert below enforces that invariant.
+/// compile-time assert in [`store`] enforces that invariant.
 pub const SCHEMA_VERSION: u32 = 4;

@@ -94,7 +94,7 @@ magic[8] | version u32 | digest u64 | payload_len u32 | checksum u64 | payload[.
 | Field | Offset | Type | Protects against |
 |---|---|---|---|
 | `magic` | 0 | 8 bytes | Being handed an unrelated file. The constant is `SNAPSHOT_MAGIC = *b"MROUTES1"` in `mr-core/src/lib.rs`. A mismatch is reported as *"this is not a compiled routing snapshot"*, before any structure is built. |
-| `version` | 8 | `u32` LE | Loading a layout this binary cannot interpret. `SNAPSHOT_VERSION = 4`. A mismatch is refused, not guessed at. |
+| `version` | 8 | `u32` LE | Loading a layout this binary cannot interpret. `SNAPSHOT_VERSION = 6`. A mismatch is refused, not guessed at. |
 | `digest` | 12 | `u64` LE | Being unable to tell "the file changed" from "the bytes changed" without comparing whole snapshots. Copied from `Config::routing_digest()`. |
 | `payload_len` | 20 | `u32` LE | A truncated or padded file. Checked against the actual byte count in both directions: fewer bytes is a precise "truncated" error, more bytes is a "trailing bytes" error. |
 | `checksum` | 24 | `u64` LE | A single flipped byte anywhere meaningful. |
@@ -396,7 +396,8 @@ file leaves the relay serving the previous table. This is the same degradation r
 compile: stale routing is recoverable, an outage is not.
 
 The handle is `Clone` and shares one `ArcSwap`, so every worker in the process observes the same table
-and sees an install at the same moment. `#[derive(Default)]` on `RoutingSnapshot` produces an empty
+and sees an install at the same moment. `Default` for `RoutingSnapshot` (a hand-written `impl`, not a
+derive) produces an empty
 table with a zero digest; it is a placeholder for a handle that has not been given a compiled table
 yet, not a routing decision — a `Default` snapshot resolves everything to `NotFound`.
 
@@ -404,16 +405,18 @@ yet, not a routing decision — a `Default` snapshot resolves everything to `Not
 
 ## 10. Version and compatibility
 
-`SNAPSHOT_MAGIC` is `*b"MROUTES1"` and `SNAPSHOT_VERSION` is `4`, both in
+`SNAPSHOT_MAGIC` is `*b"MROUTES1"` and `SNAPSHOT_VERSION` is `6`, both in
 `crates/mr-core/src/lib.rs`.
 
-The version history is worth recording, because Feature 3 spent two of it. Version 3 added the
+The version history is worth recording, because it has moved repeatedly. Version 3 added the
 per-step reasoning-level fields (`levels`, `default_level`, `reasoning_json`), `input_modalities` and
 `pricing`, plus the proxy pool and the per-key limit table — but it declared the fields without
 writing them, so a version-3 frame would decode with empty level tables. Version 4 completed the
 feature: a step's level metadata is now actually encoded, and every lookup entry carries the level it
-resolves to (`level` plus the `requested` it is compared against). A version-2 or version-3 snapshot
-is therefore refused rather than read as though it carried levels it does not.
+resolves to (`level` plus the `requested` it is compared against). Version 5 added compiled
+client-key limits and proxy assignments/settings, and version 6 added modality fallback defaults. A
+version-2 through version-5 snapshot is therefore refused rather than read as though it carried
+fields it does not.
 
 The rule is absolute: **a change to the compiled layout requires a `SNAPSHOT_VERSION` bump.** The
 version is not a semver hint; the decoder has no compatibility paths, and a table written under a
@@ -435,7 +438,7 @@ routing for the interval until it does. The magic check rejects a plain non-snap
 reason — a `config.json` or a database should never be interpretable as routing data.
 
 `SNAPSHOT_MAGIC` and `SNAPSHOT_VERSION` are separate from `CONFIG_FORMAT_VERSION` (still 1) and
-`SCHEMA_VERSION` (now 2). They version three different things — the authored file, the compiled
+`SCHEMA_VERSION` (now 4). They version three different things — the authored file, the compiled
 table, and the database — and conflating them would force an unnecessary migration in two of the
 three whenever the third changed. The three are free to move independently, and now do.
 

@@ -90,7 +90,11 @@ pub fn usage_urls(provider_id: &str) -> Option<&'static [&'static str]> {
 fn to_number(value: Option<&Value>) -> Option<f64> {
     match value? {
         Value::Number(number) => number.as_f64(),
-        Value::String(text) if !text.trim().is_empty() => text.trim().parse::<f64>().ok(),
+        Value::String(text) if !text.trim().is_empty() => text
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|number| number.is_finite()),
         _ => None,
     }
 }
@@ -418,11 +422,16 @@ impl QuotaFetcher for MiniMax {
                 .trim()
                 .to_string();
 
+            // A 404/405/5xx is a region or outage miss, not a rejected key: the documented
+            // fallback runs first, and the message heuristic only decides for non-retryable
+            // statuses.
+            let retryable =
+                response.status == 404 || response.status == 405 || response.status >= 500;
             // Authentication failures never fall through: the next host would reject the same key.
             if response.status == 401
                 || response.status == 403
                 || status_code as i64 == 1004
-                || looks_like_auth_failure(&status_msg)
+                || (!retryable && looks_like_auth_failure(&status_msg))
             {
                 return Err(Error::InvalidState(format!(
                     "minimax quota rejected the credential (HTTP {}): {}",
@@ -436,8 +445,6 @@ impl QuotaFetcher for MiniMax {
             }
 
             if !response.is_success() {
-                let retryable =
-                    response.status == 404 || response.status == 405 || response.status >= 500;
                 last_error = Some(Error::InvalidState(format!(
                     "minimax remains endpoint {} returned HTTP {}",
                     *url, response.status

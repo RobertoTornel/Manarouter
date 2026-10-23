@@ -23,6 +23,8 @@ curl http://127.0.0.1:20900/v1/models \
 
 Replace `YOUR_CLIENT_KEY` with the client key saved from your terminal. Expect a JSON list of models the relay can route. Keep the key on the app side: the provider credential stays inside Manarouter.
 
+Inlining the real key in a shell command writes it to your shell history and exposes it in `ps` to other local users. For a shared or recorded terminal, keep the header in a `0600` curl config file and pass it with `curl -K <file>` instead.
+
 ## Disable or rotate a key
 
 To stop a key from being accepted without deleting its record, disable it by the key ID shown in `mr key list`:
@@ -43,9 +45,9 @@ Expect a replacement plaintext once, and the old key to become invalid immediate
 
 ## Limits and current controls
 
-The data format has optional rolling limits for **5 hours**, **1 week**, and **30 days**. Each window can cap tokens, requests, or both; zero means that dimension is uncapped. These rolling limits are not exposed in `mr key create` or the panel key form, but **the relay does enforce them**: a request that would exceed a cap is refused with HTTP 429 before it reaches the provider, and the refusal carries a `Retry-After`.
+The data format has optional rolling limits for **5 hours**, **1 week**, and **30 days**. Each window can cap tokens, requests, or both; zero means that dimension is uncapped. These rolling limits are not exposed in `mr key create`, but the panel key editor does expose them, and **the relay enforces them**: a request that would exceed a cap is refused with HTTP 429 before it reaches the provider, and the refusal carries a `Retry-After`.
 
-The CLI and panel expose a separate `--limit-requests` request-count field, and the relay enforces that too: it is a flat, non-rolling budget of requests. The panel key view shows the configured request limit, allowed models/routes, and enabled state; it does not show rolling-window usage.
+The CLI and panel expose a separate `--limit-requests` request-count field, and the relay enforces that too: it is a flat, non-rolling budget of requests. The panel key view shows the configured request limit, rolling caps, allowed models/routes, and enabled state; it does not show rolling-window usage.
 
 Two things are still not enforced: the **model and route allow-lists** are not applied to API requests, and the **token caps can be overshot** by the request that crosses them — the completion size is not knowable before the model has answered, so the relay reserves an estimate of the prompt and settles with the real usage afterwards. The *next* request is the one that is refused. Treat the allow-lists as configuration, not as an access-control boundary.
 

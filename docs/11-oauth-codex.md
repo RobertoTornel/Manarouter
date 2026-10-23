@@ -21,7 +21,7 @@ The shared machinery — single-flight refresh, the 401 repair path, the loopbac
 | Token | `https://auth.openai.com/oauth/token` |
 | Refresh | `https://auth.openai.com/oauth/token` — the same URL, **different encoding** (§3) |
 | Revoke | `https://auth.openai.com/oauth/revoke` — a first-party-client fact recorded for completeness; **no code path in this build calls it** |
-| Issuer | `https://auth.openai.com` (`DEFAULT_ISSUER`) |
+| Issuer | `https://auth.openai.com` |
 
 Do not use the second literal that appears in the Codex binary, `app_69a1d78e929881919bba0dbda1f6436d`.
 It is for **agent identity / workload-identity registration**, not the interactive login flow, and
@@ -47,10 +47,11 @@ Codex also supports a **device-code** flow (§2a), which needs no inbound connec
 | Fallback | `http://127.0.0.1:1457/auth/callback` |
 | Bind address | `127.0.0.1` only |
 
-Both ports are registered with the provider, which is what makes the fallback work. The URI is built
+Port 1455 is the published redirect; 1457 is the fallback used when 1455 is already taken
+(`crates/mr-core/src/published.rs`). The URI is built
 from the port actually bound — `format!("http://127.0.0.1:{actual_port}/auth/callback")` — so the
 value sent at authorize time and the value sent at token time always agree. If they disagree, the
-token exchange is rejected even though the authorize step succeeded; see §6 of
+token exchange is rejected even though the authorize step succeeded; see §8 of
 `docs/10-oauth-overview.md` for why neither the host nor the port may be normalised.
 
 ### PKCE and `state`

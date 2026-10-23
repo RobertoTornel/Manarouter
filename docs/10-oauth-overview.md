@@ -229,7 +229,7 @@ A refresh window is how far *before* expiry the credential is refreshed.
 
 | Platform | Window | Source |
 |---|---|---|
-| Codex | 5 minutes (`CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES = 5`) | primary (`openai/codex`) |
+| Codex | 5 minutes (`Codex::refresh_lead`, 300 s) | primary (`openai/codex`) |
 | Copilot | `refresh_in` from the mint response, ~1500 s; the language server sets `expires_at = now + refresh_in + 60` and VS Code refreshes at `expires_at - 300` | primary/T2 |
 | Antigravity | 60 seconds | T2 — the reverse-engineered IDE client refreshes within 60 s of expiry |
 | Claude Code | **4 hours** | **UNCERTAIN** — not in the research dossier; see below |
@@ -310,13 +310,14 @@ than a credential compromise.
 An access token can expire between the moment a request is built and the moment the upstream reads
 it. The repair is deliberately short:
 
-1. A request returns `401`.
-2. The conductor refreshes the account's credential **once**, through the single-flight guard.
-3. The request is retried **once** with the new credential.
-4. If the retry also returns `401`, that is a failure — not a reason to loop.
+1. Before building a request, the relay checks the account's credential and refreshes it **once**
+   through the single-flight guard if it is inside the refresh window (`Refresher::ensure_fresh`).
+2. The request is sent with the new credential.
+3. If the upstream still returns `401`, that is a failure — not a reason to loop.
 
-The conductor performs this rather than the relay because the vault is on disk and the relay has no
-business touching disk. The relay reports the `401` upstream; the conductor owns the credential.
+The relay performs the refresh because it is the process that holds the parsed credential and the
+refresher; the conductor owns the login. A `401` that survives the pre-flight refresh is recorded as
+`auth-failed` (below) rather than retried in a loop.
 
 ### What happens when the refresh itself fails
 

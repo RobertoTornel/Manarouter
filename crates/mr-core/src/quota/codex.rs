@@ -383,7 +383,10 @@ fn push_window(out: &mut Vec<Window>, key: impl Into<String>, names: &[&str], re
     out.push(Window {
         key: key.into(),
         family: limit_seconds.map(|seconds| WindowFamily::from_seconds(seconds as u64)),
-        used_percent,
+        // `used_percent` comes from an untrusted provider body and is only checked for finiteness
+        // by `number`; enforce the `0..=100` invariant this struct documents so a negative or
+        // oversized value cannot reach the governing fraction or the detail rows.
+        used_percent: used_percent.clamp(0.0, 100.0),
         reset_at: window_reset_at(window),
         latent: is_latent(window),
     });

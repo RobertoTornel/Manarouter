@@ -17,10 +17,10 @@ Expect a new provider entry configured from the catalogue. To see supported cata
 For a custom compatible endpoint, give Manarouter an ID, dialect, and base URL. For example:
 
 ```bash
-mr provider add my-endpoint --id my-endpoint --dialect open-ai --base-url https://api.example.test/v1
+mr provider add my-endpoint --id my-endpoint --dialect openai --base-url https://api.example.test/v1
 ```
 
-Expect a provider named `my-endpoint`. The base URL must start with `https://` or `http://`; use loopback HTTP only for a local service. The dialect spellings include `open-ai`, `anthropic`, `google`, `codex`, `copilot`, `antigravity`, and `command-code-go`. Use `mr provider add --help` for the complete options, including `--auth` and `--header`, when configuring a custom endpoint.
+Expect a provider named `my-endpoint`. The base URL must start with `https://` or `http://`; use loopback HTTP only for a local service. The dialect spellings include `openai`, `anthropic`, `google`, `codex`, `copilot`, `antigravity`, and `command-code-go`. Use `mr provider add --help` for the complete options, including `--auth` and `--header`, when configuring a custom endpoint.
 
 The panel's provider form lets you choose a dialect and enter a base URL, but it does not currently auto-fill URLs when you choose an OAuth or Command Code Go dialect. The CLI does copy those values from a catalogue entry. For example, `command-code` is the catalogue ID for the Command Code Go dialect, and OAuth catalogue entries include `openai-codex`, `github-copilot`, and `antigravity`:
 

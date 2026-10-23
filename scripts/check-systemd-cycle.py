@@ -55,7 +55,21 @@ def parse_unit(path: Path) -> dict[str, list[str]]:
     means a stray `After=` in a comment or a description cannot be mistaken for a dependency.
     """
     found: dict[str, list[str]] = {}
+    # systemd joins a line ending in a backslash with the following line before
+    # parsing, so "After=a.service \" + "b.service" is one directive. Without the
+    # join a split dependency list was dropped, reporting a real cycle as OK.
+    logical: list[str] = []
+    pending = ""
     for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = raw.rstrip()
+        if stripped.endswith("\\"):
+            pending += stripped[:-1] + " "
+            continue
+        logical.append(pending + stripped)
+        pending = ""
+    if pending:
+        logical.append(pending)
+    for raw in logical:
         line = raw.strip()
         if not line or line.startswith("#") or line.startswith(";"):
             continue
@@ -136,15 +150,30 @@ def load(dir_arg: str) -> dict[str, dict[str, list[str]]]:
         raise SystemExit(2)
     units: dict[str, dict[str, list[str]]] = {}
     for path in sorted(directory.iterdir()):
-        if path.suffix in (".service", ".target", ".socket", ".timer", ".path"):
+        if path.suffix not in (".service", ".target", ".socket", ".timer", ".path"):
+            continue
+        # A directory or dangling symlink can carry a unit-like name. Reading it used
+        # to raise IsADirectoryError/FileNotFoundError, which escaped as a traceback
+        # with exit 1 -- indistinguishable from "cycle found" (also exit 1).
+        if not path.is_file():
+            print(
+                f"check-systemd-cycle: not a regular file: {path}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        try:
             units[path.name] = parse_unit(path)
+        except OSError as err:
+            print(f"check-systemd-cycle: cannot read {path}: {err}", file=sys.stderr)
+            raise SystemExit(2)
     return units
 
 
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
-        print(__doc__.strip().splitlines()[-5], file=sys.stderr)
-        print("usage: check-systemd-cycle.py <unit-dir> [...]", file=sys.stderr)
+        # Not taken from __doc__: under -OO the docstring is stripped, so indexing it
+        # raised AttributeError instead of printing usage and exiting 2.
+        print("usage: check-systemd-cycle.py <unit-dir> [<unit-dir> ...]", file=sys.stderr)
         return 2
 
     units: dict[str, dict[str, list[str]]] = {}

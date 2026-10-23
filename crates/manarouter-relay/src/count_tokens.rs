@@ -27,8 +27,9 @@
 //! The estimate is the **length of the request body in bytes, divided by
 //! [`CHARS_PER_TOKEN`](crate::quota::CHARS_PER_TOKEN) (four), rounded up, and never less than one
 //! token**. It is the same four-bytes-per-token approximation the relay already uses to size a
-//! quota reservation ([`crate::quota::estimate_prompt_tokens`]), so a client sees the same number
-//! the relay itself assumes when it reserves quota for the same body.
+//! quota reservation ([`crate::quota::estimate_prompt_tokens`]), but rounded up rather than down
+//! and floored at one, so it can exceed — never fall below — the number the relay assumes when it
+//! reserves quota for the same body.
 //!
 //! Nothing is parsed. The body is measured, not read: a length and a division, no allocation, no
 //! JSON parse, no walking of the request. That is deliberate. This route sits on the request path

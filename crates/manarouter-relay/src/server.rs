@@ -1866,18 +1866,25 @@ fn request_with_model(body: &Bytes, model: &str) -> Option<Bytes> {
 ///
 /// `max` is checked before the body is buffered in full, so an oversized upload is refused while it
 /// arrives rather than after it has already been held in memory.
-async fn read_body(body: AxumBody, max: usize) -> Result<Bytes, BodyError> {
+async fn read_body(mut body: AxumBody, max: usize) -> Result<Bytes, BodyError> {
     use http_body_util::BodyExt as _;
-    match body.collect().await {
-        Ok(collected) => {
-            let bytes = collected.to_bytes();
-            if bytes.len() > max {
+    // The limit is enforced while the body arrives, not after it has been buffered in full: a
+    // client must not be able to make the relay hold an arbitrarily large upload before it is told
+    // the request is too big.
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(e) => return Err(BodyError::Read(e.to_string())),
+        };
+        if let Some(data) = frame.data_ref() {
+            if buf.len() + data.len() > max {
                 return Err(BodyError::TooLarge);
             }
-            Ok(bytes)
+            buf.extend_from_slice(data);
         }
-        Err(e) => Err(BodyError::Read(e.to_string())),
     }
+    Ok(Bytes::from(buf))
 }
 
 /// The model name from a scanned head.
@@ -2423,28 +2430,30 @@ async fn build_client_response(
         // state instead, which is the same corruption seen from the other side. Its state is
         // `commandcode` below, owned per stream and dropped with the body.
         let mut commandcode = mr_dialects::commandcode::Translator::new();
-        let stream = frames.scan((String::new(), false), move |(pending, started), frame| {
-            if !*started {
-                *started = true;
-                mr_dialects::reset_stream_state();
-            }
-            let ctx = TranslateCtx {
-                route,
-                client_dialect,
-                upstream_dialect,
-                upstream_model: &model,
-                client_streaming,
-                session_id: None,
-            };
-            let out = match frame {
-                Ok(frame) => frame
-                    .into_data()
-                    .ok()
-                    .map(|chunk| translate_stream_chunk(&ctx, &mut commandcode, pending, &chunk)),
-                Err(e) => Some(vec![Err(e)]),
-            };
-            async move { Some(out) }
-        });
+        let stream = frames.scan(
+            (Vec::<u8>::new(), false),
+            move |(pending, started), frame| {
+                if !*started {
+                    *started = true;
+                    mr_dialects::reset_stream_state();
+                }
+                let ctx = TranslateCtx {
+                    route,
+                    client_dialect,
+                    upstream_dialect,
+                    upstream_model: &model,
+                    client_streaming,
+                    session_id: None,
+                };
+                let out = match frame {
+                    Ok(frame) => frame.into_data().ok().map(|chunk| {
+                        translate_stream_chunk(&ctx, &mut commandcode, pending, &chunk)
+                    }),
+                    Err(e) => Some(vec![Err(e)]),
+                };
+                async move { Some(out) }
+            },
+        );
         let stream = stream.filter_map(|item| async move { item });
         let stream = stream.flat_map(|chunks| {
             futures_util::stream::iter(chunks.into_iter().map(|c| c.map(http_body::Frame::data)))
@@ -2509,21 +2518,18 @@ async fn build_client_response(
 fn translate_stream_chunk(
     ctx: &TranslateCtx<'_>,
     commandcode: &mut mr_dialects::commandcode::Translator,
-    pending: &mut String,
+    pending: &mut Vec<u8>,
     chunk: &Bytes,
 ) -> Vec<Result<Bytes, hyper::Error>> {
-    // A chunk that is not valid UTF-8 at its end is kept whole and retried once the rest arrives;
-    // `from_utf8` failing on a truncated multi-byte character is the same situation as a truncated
-    // line, and treating it as an error would drop a legitimate frame.
-    let Ok(text) = std::str::from_utf8(chunk) else {
-        pending.push_str(&String::from_utf8_lossy(chunk));
-        return Vec::new();
-    };
-    pending.push_str(text);
+    // The carry is kept as bytes, not as `str`. A multi-byte character split across two frames is
+    // normal on a byte stream, and decoding each frame on its own would replace both halves with
+    // U+FFFD; only complete lines are decoded, so the character arrives intact with the next frame.
+    pending.extend_from_slice(chunk);
 
     let mut out = Vec::new();
-    while let Some(idx) = pending.find('\n') {
-        let line: String = pending.drain(..=idx).collect();
+    while let Some(idx) = pending.iter().position(|b| *b == b'\n') {
+        let line = String::from_utf8_lossy(&pending[..=idx]).into_owned();
+        pending.drain(..=idx);
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             out.push(Ok(Bytes::from_static(b"\n")));
@@ -3255,7 +3261,7 @@ mod tests {
             session_id: None,
         };
         let mut commandcode = mr_dialects::commandcode::Translator::new();
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let metadata = Bytes::from_static(b"{\"type\":\"start\"}\n");
         assert!(translate_stream_chunk(&ctx, &mut commandcode, &mut pending, &metadata).is_empty());
         let token = Bytes::from_static(b"{\"type\":\"text-delta\",\"text\":\"OK\"}\n");
@@ -3300,10 +3306,10 @@ mod tests {
         };
         let mut a = mr_dialects::commandcode::Translator::new();
         let mut b = mr_dialects::commandcode::Translator::new();
-        let (mut pa, mut pb) = (String::new(), String::new());
+        let (mut pa, mut pb) = (Vec::new(), Vec::new());
 
         let run = |t: &mut mr_dialects::commandcode::Translator,
-                   pending: &mut String,
+                   pending: &mut Vec<u8>,
                    frame: &'static str|
          -> String {
             let out =
@@ -3408,7 +3414,7 @@ mod tests {
             session_id: None,
         };
         let mut t = mr_dialects::commandcode::Translator::new();
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         for frame in [
             "{\"type\":\"tool-input-start\",\"id\":\"c1\",\"toolName\":\"f\"}\n",
             "{\"type\":\"finish\",\"finishReason\":\"tool-calls\"}\n",

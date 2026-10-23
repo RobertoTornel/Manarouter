@@ -399,7 +399,7 @@ impl OAuthPlatform for Codex {
             Ok(reply) => reply,
         };
 
-        if reply.status == 403 || reply.status == 404 {
+        if reply.status == 403 {
             return Ok(DevicePoll::Pending);
         }
         if !(200..300).contains(&reply.status) {
@@ -465,6 +465,11 @@ impl OAuthPlatform for Codex {
             });
         };
         extra.insert("chatgpt_account_id".into(), Value::String(account_id));
+        // The browser path (`token_set_from`) persists the id_token too; `migrate` reads the
+        // stored credential back expecting that shape.
+        if let Some(id_token) = id_token {
+            extra.insert("id_token".into(), Value::String(id_token));
+        }
 
         let expires_in = value
             .get("expires_in")

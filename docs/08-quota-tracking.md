@@ -240,15 +240,17 @@ lacked usage rather than silently summing what it has.
 
 ## Where the data lives
 
-The **intended** home for usage and quota history is **`state.sqlite`**, never `config.json`: the
+The home for usage and quota history is **`state.sqlite`**, never `config.json`: the
 configuration is meant to be readable, diffable and version-controllable, and a file that changes on
-every request is none of those. The `usage` and `account_health` tables exist in the schema, and
-`/api/quota` reads them.
+every request is none of those. The relay records a `key_usage` row per request, and the schema also
+carries `usage`, `account_health` and `provider_quota_state`; the conductor serves them through
+`/api/usage` and `/api/quota`.
 
 What is *not* there today is live cooldown state. The relay's cooldowns (from `429`/`401` signals and
 `QuotaConfig`) are held in memory in the relay process and are never written to the database, so they
-are lost when the relay restarts, and deleting `state.sqlite` does not clear them. Because no usage
-writer exists, deleting the file currently loses nothing but the OAuth credential rows.
+are lost when the relay restarts, and deleting `state.sqlite` does not clear them. **Back the file
+up before deleting it:** it also holds the per-key usage ledger and the OAuth credential rows, and
+neither can be reconstructed.
 
 Retention is the operator's decision. There is no default pruning, because silently deleting an
 operator's usage history is worse than an unpruned database, and the panel shows the file's size so
@@ -256,8 +258,8 @@ the decision can be made with information.
 
 ## Limitations
 
-Stated so they are not discovered later. Most of these describe the intended accounting, and none of
-them is observable yet because no usage writer exists:
+Stated so they are not discovered later. Most of these describe the intended accounting; only what
+the provider actually reports reaches the ledger:
 
 - **Usage a provider does not report is not counted.** Streamed responses frequently omit it.
 - **Requests that fail before reaching the provider are not counted against quota**, correctly — they

@@ -87,10 +87,10 @@ impl QuotaFetcher for OpenRouter {
         let token = credential.expose();
 
         let key = match send(ctx, KEY_URL, token).await? {
-            response if is_auth_rejection(&response) => {
+            Some(response) if is_auth_rejection(&response) => {
                 return Err(auth_rejected("openrouter", &response));
             }
-            response if response.is_success() => response
+            Some(response) if response.is_success() => response
                 .json()
                 .ok()
                 .and_then(|body| parse_key_response(&body)),
@@ -99,10 +99,10 @@ impl QuotaFetcher for OpenRouter {
         };
 
         let credits = match send(ctx, CREDITS_URL, token).await? {
-            response if is_auth_rejection(&response) => {
+            Some(response) if is_auth_rejection(&response) => {
                 return Err(auth_rejected("openrouter", &response));
             }
-            response if response.is_success() => response
+            Some(response) if response.is_success() => response
                 .json()
                 .ok()
                 .and_then(|body| parse_credits_response(&body)),
@@ -265,11 +265,17 @@ fn build_quota(key: Option<&KeyFields>, credits: Option<&CreditsFields>) -> Usag
 }
 
 /// One authenticated `GET` with `Accept: application/json`.
-async fn send(ctx: &QuotaFetchContext, url: &str, token: &str) -> Result<QuotaResponse> {
+async fn send(ctx: &QuotaFetchContext, url: &str, token: &str) -> Result<Option<QuotaResponse>> {
     let request = QuotaRequest::get(url)
         .bearer(token)
         .header("Accept", "application/json");
-    ctx.http.request(request).await
+    // A transient failure degrades to the other endpoint instead of discarding its
+    // payload; anything else (a credential that cannot form a header) is surfaced.
+    match ctx.http.request(request).await {
+        Ok(response) => Ok(Some(response)),
+        Err(Error::Io(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn is_auth_rejection(response: &QuotaResponse) -> bool {

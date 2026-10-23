@@ -1,9 +1,8 @@
 //! `mr alias` — alternative spellings that resolve to a real model or combo.
 //!
 //! The target check here is mr-core's own validation rule wearing a better error message: an
-//! alias must point at a combo, a provider, a `provider/model` qualified id, or a bare model the
-//! config can actually reach. Anything else never reaches disk (`Ctx::save` re-validates anyway,
-//! as a second net).
+//! alias must point at a combo, a provider, or a bare model the config can actually reach.
+//! Anything else never reaches disk (`Ctx::save` re-validates anyway, as a second net).
 
 use clap::Subcommand;
 
@@ -39,9 +38,12 @@ pub async fn run(cmd: AliasCmd, ctx: &Ctx) -> Result<(), CliError> {
     }
 }
 
-/// Which kind of thing the alias points at, for the list table (never a guess: `other` when the
+/// Which kind of thing the alias points at, for the list table (never a guess: `stale` when the
 /// target has gone stale, which is exactly what an operator needs to see).
-fn kind_of(cfg: &mr_core::config::Config, to: &str) -> &'static str {
+///
+/// `reachable` is `cfg.reachable_model_ids()` computed once by the caller: this runs per row,
+/// and rebuilding the model list for every alias is wasteful on a large catalog.
+fn kind_of(cfg: &mr_core::config::Config, reachable: &[String], to: &str) -> &'static str {
     if cfg.combo(to).is_some() {
         "combo"
     } else if cfg.provider(to).is_some() {
@@ -49,6 +51,7 @@ fn kind_of(cfg: &mr_core::config::Config, to: &str) -> &'static str {
     } else if to
         .split_once('/')
         .is_some_and(|(p, _)| cfg.provider(p).is_some())
+        || reachable.iter().any(|m| m == to)
     {
         "model"
     } else {
@@ -61,17 +64,18 @@ fn list(ctx: &Ctx) -> Result<(), CliError> {
     if ctx.json {
         return print_json(&cfg.aliases);
     }
+    let reachable = cfg.reachable_model_ids();
     let mut t = Table::new(["FROM", "KIND", "TO"]);
     for a in &cfg.aliases {
         t.row(vec![
             a.from.clone(),
-            kind_of(&cfg, &a.to).to_owned(),
+            kind_of(&cfg, &reachable, &a.to).to_owned(),
             a.to.clone(),
         ]);
     }
     t.print();
     if cfg.aliases.is_empty() {
-        say("no aliases; `mr alias add gpt-5 openai/gpt-5` teaches the router a short name");
+        say("no aliases; `mr alias add gpt-5 gpt-5.5` teaches the router a short name");
     }
     Ok(())
 }
@@ -138,7 +142,8 @@ fn resolve_target(cfg: &mr_core::config::Config, to: &str) -> Result<(), CliErro
     if cfg.combo(to).is_some() || cfg.provider(to).is_some() {
         return Ok(());
     }
-    if cfg.reachable_model_ids().iter().any(|m| m == to) {
+    let reachable = cfg.reachable_model_ids();
+    if reachable.iter().any(|m| m == to) {
         return Ok(());
     }
 
@@ -146,7 +151,7 @@ fn resolve_target(cfg: &mr_core::config::Config, to: &str) -> Result<(), CliErro
         "alias target `{to}` names neither a combo, a provider, nor a model"
     ));
     if let Some((provider, bare)) = to.split_once('/') {
-        if cfg.provider(provider).is_some() && cfg.reachable_model_ids().iter().any(|m| m == bare) {
+        if cfg.provider(provider).is_some() && reachable.iter().any(|m| m == bare) {
             err = err.with_detail(format!(
                 "config validation takes bare model ids, not qualified ones: did you mean `{bare}`?"
             ));
@@ -172,7 +177,7 @@ fn resolve_target(cfg: &mr_core::config::Config, to: &str) -> Result<(), CliErro
             }
         ))
         .with_detail(format!("reachable models: {}", {
-            let ids = cfg.reachable_model_ids();
+            let ids = reachable;
             if ids.is_empty() {
                 "(none yet — sync a model list with `mr models sync <provider>`, or add a \
                      combo step)"
@@ -231,6 +236,10 @@ mod tests {
             let mut combo = Combo::new("Brains", ComboStep::new("openai", "gpt-5.5"));
             combo.steps.push(ComboStep::new("openai", "o3"));
             cfg.combos.push(combo);
+            assert_eq!(
+                kind_of(&cfg, &cfg.reachable_model_ids(), "gpt-5.5"),
+                "model"
+            );
             cfg.save_default().unwrap();
 
             let ctx = Ctx { json: false };
@@ -364,8 +373,9 @@ mod tests {
             let ctx = Ctx { json: false };
             list(&ctx).unwrap();
             let cfg = mr_core::config::Config::load_default().unwrap();
-            assert_eq!(kind_of(&cfg, "gone"), "stale");
-            assert_eq!(kind_of(&cfg, "a"), "stale");
+            let reachable = cfg.reachable_model_ids();
+            assert_eq!(kind_of(&cfg, &reachable, "gone"), "stale");
+            assert_eq!(kind_of(&cfg, &reachable, "a"), "stale");
         });
     }
 }

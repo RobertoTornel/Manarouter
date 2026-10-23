@@ -28,7 +28,7 @@ If a client key is restricted to an allow-list of models, allow the combo name a
 - `round-robin` rotates the candidate order; currently unavailable steps are still placed after available ones.
 - `reset-aware-priority` keeps available steps in their authored order and moves unavailable steps after them; among unavailable steps with a known account cooldown, the earliest cooldown expiry is tried first. It does not remove those steps from the combo.
 
-For example, use `--strategy reset-aware-priority` instead of `--strategy priority` when you want healthy steps preferred while a step's account is cooling down. The strategy uses the relay's account-availability/cooldown state, not declared quota-window counters or a live provider quota meter. See [quota and usage](06-quota.md) for the current quota limits.
+For example, use `--strategy reset-aware-priority` instead of `--strategy priority` when you want healthy steps preferred while a step's account is cooling down. The strategy uses the relay's account-availability and cooldown state, which reflects declared quota windows that are currently full, rather than a live provider quota meter. See [quota and usage](06-quota.md) for the current quota limits.
 
 ## Edit, disable, or remove
 

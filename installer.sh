@@ -47,11 +47,11 @@ fi
 command -v cargo >/dev/null 2>&1 || die "cargo was not found in PATH. Install Rust from https://rustup.rs and open a new terminal."
 command -v rustup >/dev/null 2>&1 || log "rustup was not found; using the cargo toolchain already installed."
 
-if [[ -e "$INSTALL_DIR" && ! -d "$INSTALL_DIR/.git" ]]; then
+if [[ -e "$INSTALL_DIR" && ! -e "$INSTALL_DIR/.git" ]]; then
   die "install path exists and is not a Git checkout: $INSTALL_DIR (set MANAROUTER_INSTALL_DIR to choose another path)"
 fi
 mkdir -p "$(dirname "$INSTALL_DIR")" "$BIN_DIR"
-if [[ -d "$INSTALL_DIR/.git" ]]; then
+if [[ -e "$INSTALL_DIR/.git" ]]; then
   log "Updating source in $INSTALL_DIR"
   git -C "$INSTALL_DIR" pull --ff-only || die "could not fast-forward existing checkout; resolve it manually or choose a fresh MANAROUTER_INSTALL_DIR"
 else
@@ -85,7 +85,7 @@ if [[ "$INSTALL_USER_SERVICES" == "1" ]]; then
   fi
   command -v systemctl >/dev/null 2>&1 || die "systemctl is required for --systemd-user"
   [[ "$INSTALL_DIR" != *" "* ]] || die "systemd WorkingDirectory cannot contain spaces; set MANAROUTER_INSTALL_DIR to a whitespace-free path"
-  systemctl --user show-environment >/dev/null 2>&1 || die "systemd user manager is unavailable; run from a logged-in systemd session (or enable lingering with loginctl enable-linger $USER)"
+  systemctl --user show-environment >/dev/null 2>&1 || die "systemd user manager is unavailable; run from a logged-in systemd session (or enable lingering with loginctl enable-linger ${USER:-$(id -un)})"
   UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
   mkdir -p "$UNIT_DIR" "$HOME/.config/manarouter" "$HOME/.local/state/manarouter"
   chmod 0700 "$HOME/.config/manarouter" "$HOME/.local/state/manarouter"

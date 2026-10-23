@@ -31,8 +31,8 @@ not symmetric:
 - **Stop reasons.** `stop_sequence` and `max_tokens` are distinct, and a translator that maps both to
   `stop` loses the ability to tell a truncation from a completion.
 
-The router prefers a native endpoint wherever the catalogue knows of one, and
-[the catalogue](catalog.md) records which providers have one.
+The catalogue's `dialect` column records which providers speak Messages natively; prefer those
+([the catalogue](catalog.md)).
 
 ## Headers
 
@@ -49,8 +49,9 @@ anthropic-version: 2023-06-01
 
 ## `max_tokens` is required, and defaults to 8192
 
-Anthropic requires `max_tokens`. OpenAI does not. A client written against OpenAI that omits it and
-is pointed at `/v1/messages` would otherwise get a 400 that says nothing useful about why.
+Anthropic requires `max_tokens`. OpenAI does not. A client written against OpenAI that omits it,
+routed to an Anthropic-shaped upstream, would otherwise get a 400 that says nothing useful about
+why.
 
 So the shim **supplies 8192** when a client omits it. Chosen to be large enough for a real answer and
 small enough that a runaway generation is bounded — and, critically, **never unbounded**. A missing

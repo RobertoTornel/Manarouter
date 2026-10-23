@@ -75,6 +75,8 @@ Run these steps in your second terminal. `openai` is an example catalogue provid
      -d '{"model":"PROVIDER/MODEL_FROM_LIST","messages":[{"role":"user","content":"Hello"}]}'
    ```
 
+   Substituting a real client key writes it into your shell history and exposes it in `ps`. If that matters, keep the header in a 0600 curl config file and pass it with `curl -K <file>`.
+
    Expect a JSON completion if the model and credentials are accepted. This calls the upstream provider and may incur charges.
 
 ## Where to go next

@@ -391,7 +391,7 @@ async fn sync_one(
     if let Some(secret) = &secret {
         match &p.auth {
             AuthKind::QueryParam { param } => {
-                query = format!("?{param}={}", net::url_encode(secret));
+                query = format!("?{}={}", net::url_encode(param), net::url_encode(secret));
             }
             _ => headers = auth_headers(p, secret)?,
         }

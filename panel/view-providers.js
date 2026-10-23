@@ -16,6 +16,18 @@ import {
   deriveProviderHealth, accountState, formatAge, formatCompact,
 } from './format.js';
 
+// Server- and catalogue-supplied OAuth URLs are bound to an href and to window.open. Only http(s)
+// is safe there: a javascript: or data: URL would execute in the panel's own origin. Anything that
+// is not a well-formed http(s) URL is treated as unusable and is not offered as a link.
+function httpUrl(value) {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
 // --------------------------------------------------------------------------- OAuth redirect paste
 //
 // The manual fallback for the browser flow. The loopback capture can fail without telling anyone:
@@ -64,11 +76,16 @@ export function buildRedirectPaste(p, ctx, session) {
     if (submit.disabled) return;
     const url = input.value.trim();
     if (!url) {
-      ctx.toast.warning('Paste the URL you were redirected to first.');
+      ctx.toast.warning('Paste the redirect URL, or just the code, first.');
       input.focus();
       return;
     }
-    if (!session.id) return; // the flow already ended; there is nothing left to hand this to
+    if (!session.id) {
+      // The flow already ended: say so instead of dropping the paste on the floor.
+      ctx.toast.warning('That sign-in already finished. Start it again to paste a redirect.');
+      hide();
+      return;
+    }
     const sessionId = session.id;
     submit.disabled = true;
     status.replaceChildren(h('p', { class: 'muted' }, 'Checking the pasted URL…'));
@@ -803,13 +820,14 @@ export async function renderProviders(mount, ctx) {
     async function runBrowser() {
       const start = await api.post(`/api/oauth/${encodeURIComponent(details.id)}/authorize`, { provider_id: p.id });
       session.id = start.session_id;
-      window.open(start.authorization_url, '_blank', 'noopener,noreferrer');
+      const authorizeUrl = httpUrl(start.authorization_url);
+      if (authorizeUrl) window.open(authorizeUrl, '_blank', 'noopener,noreferrer');
       // Immediate, not after a timeout: the person who knows the capture failed can act now. The
       // /complete call below is already queued and will resolve once the pasted URL is accepted.
       redirectPaste.show();
       progress.replaceChildren(
         h('span', {}, 'Waiting for you to finish signing in… '),
-        h('a', { href: start.authorization_url, target: '_blank', rel: 'noopener noreferrer' }, 'Reopen the page'),
+        h('a', { href: httpUrl(start.authorization_url) ?? '#', target: '_blank', rel: 'noopener noreferrer' }, 'Reopen the page'),
       );
       try {
         const done = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/complete`, { provider_id: p.id });
@@ -828,13 +846,15 @@ export async function renderProviders(mount, ctx) {
       const start = await api.post(`/api/oauth/${encodeURIComponent(details.id)}/device-code`, { provider_id: p.id });
       progress.replaceChildren(
         h('span', {}, 'Open '),
-        h('a', { href: start.verification_uri, target: '_blank', rel: 'noopener noreferrer' }, start.verification_uri),
+        h('a', { href: httpUrl(start.verification_uri) ?? '#', target: '_blank', rel: 'noopener noreferrer' }, start.verification_uri),
         h('span', {}, ' and enter this code: '),
         h('strong', { class: 'mono', style: 'letter-spacing:2px;font-size:15px;' }, start.user_code),
       );
-      window.open(start.verification_uri, '_blank', 'noopener,noreferrer');
-      const deadline = Date.now() + start.expires_in_seconds * 1000;
-      let intervalMs = Math.max(1000, start.interval_seconds * 1000);
+      const verificationUrl = httpUrl(start.verification_uri);
+      if (verificationUrl) window.open(verificationUrl, '_blank', 'noopener,noreferrer');
+      const ttl = Number(start.expires_in_seconds);
+      const deadline = Date.now() + (Number.isFinite(ttl) && ttl > 0 ? ttl * 1000 : 300000);
+      let intervalMs = Math.max(1000, Number(start.interval_seconds) * 1000 || 1000);
       while (Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, intervalMs));
         const result = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/poll`, { provider_id: p.id });
@@ -845,8 +865,8 @@ export async function renderProviders(mount, ctx) {
           return;
         }
         if (result.status === 'failed') throw new Error(result.message);
-        if (result.interval_seconds) intervalMs = Math.max(intervalMs, result.interval_seconds * 1000);
-        if (result.retry_after_seconds) intervalMs = Math.max(intervalMs, result.retry_after_seconds * 1000);
+        if (result.interval_seconds) intervalMs = Math.max(intervalMs, Number(result.interval_seconds) * 1000 || 0);
+        if (result.retry_after_seconds) intervalMs = Math.max(intervalMs, Number(result.retry_after_seconds) * 1000 || 0);
       }
       throw new Error('The device code expired before it was approved. Start again.');
     }

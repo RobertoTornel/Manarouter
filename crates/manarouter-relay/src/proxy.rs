@@ -1077,8 +1077,11 @@ where
             return Err(ProxyError::Closed("reading the CONNECT reply"));
         }
         head.push(byte[0]);
-        if let Some(end) = find_subslice(&head, TERMINATOR) {
-            head.truncate(end);
+        // The terminator can only be at the tail here: an earlier occurrence would have
+        // returned on the iteration that pushed its last byte. Checking the tail is O(1),
+        // where searching the whole buffer per byte made a hostile proxy's reply O(n^2).
+        if head.ends_with(TERMINATOR) {
+            head.truncate(head.len() - TERMINATOR.len());
             return Ok(head);
         }
         if head.len() > limits.max_reply_bytes {
@@ -1328,7 +1331,8 @@ where
         ATYP_DOMAIN => {
             let mut len = [0u8; 1];
             read_exact_timed(stream, &mut len, limits, "the SOCKS5 reply domain length").await?;
-            1 + usize::from(len[0]) + 2
+            // The length byte was consumed above, so only the domain and the port remain.
+            usize::from(len[0]) + 2
         }
         other => return Err(ProxyError::SocksAddressType(other)),
     };

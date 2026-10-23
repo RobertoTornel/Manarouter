@@ -293,7 +293,11 @@ impl Account {
     /// A deny entry always wins over an allow entry, so an operator can allow `*` and then carve
     /// out an exception without having to enumerate everything else.
     pub fn allows_model(&self, model: &str) -> bool {
-        if self.models_deny.iter().any(|m| m == model || m == "*") {
+        if self
+            .models_deny
+            .iter()
+            .any(|m| m == model || m == "*" || glob_match(m, model))
+        {
             return false;
         }
         if self.models_allow.is_empty() {

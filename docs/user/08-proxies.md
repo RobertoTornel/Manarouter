@@ -18,8 +18,9 @@ Two rules are worth knowing before you configure anything:
 * **A proxy in the pool is used even when nothing names it.** If the proxy list is not empty and a
   provider (and its account) do not name a proxy, the configured `proxy_strategy` picks one from the
   pool for every request. Configuring a proxy therefore changes where *all* your provider traffic
-  goes, not only the traffic of a provider you name it on. If you want a proxy for one provider
-  only, name it on that provider and leave the rest alone — with an empty pool, no proxy is used.
+  goes, not only the traffic of a provider you name it on. There is no per-provider scoping: once
+  any proxy is in the pool it is used for every provider that does not name its own, so keep the
+  pool empty if the rest of your traffic must stay direct.
 
 ## Which proxy a request uses
 
@@ -30,8 +31,8 @@ The precedence is:
 3. otherwise the **pool**, chosen by `proxy_strategy`;
 4. otherwise a **direct** connection (the pool is empty).
 
-`proxy_strategy` is one of `priority` (the first proxy in the list), `least-used` (the proxy with the
-fewest requests in flight), `random` or `round-robin`.
+`proxy_strategy` is one of `priority` (the lowest `priority` value first, ties in list order),
+`least-used` (the proxy with the fewest requests in flight), `random` or `round-robin`.
 
 A proxy that you have **disabled** is not dialed. If a provider or account names a disabled proxy,
 its traffic goes out directly, because "disabled" means "do not use this one" — not "use it and hope
@@ -62,7 +63,8 @@ A proxy that needs a password stores it in the vault and names the vault entry i
 username is either the proxy's `username` field or the userinfo in the URL; the `username` field
 wins when both are present. A configured username with no readable vault secret is an error, not an
 unauthenticated dial — the relay refuses the request rather than connecting to the proxy without a
-credential.
+credential. SOCKS4 is the exception: its userid has no password field, so a username alone is
+accepted.
 
 The password is read from the vault at the moment the tunnel is opened, so rotating it takes effect
 on the next request rather than at the next restart.

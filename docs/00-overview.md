@@ -107,7 +107,7 @@ The full request path, step by step, is in [architecture](01-architecture.md).
 | Hedged race with four winner-fail modes | the race is implemented and unit-tested, and so is the winner's recovery; `pick-highest-passed` (the default) runs, the other three modes are accepted and ignored for now | [the hedged race](07-hedged-race.md) |
 | Reset-aware priority | implemented (the selector demotes an exhausted step and restores it once its reset passes) | [combos](06-combos.md) §3 |
 | Session affinity for a combo winner | implemented (combo-wide, process-local, default 1800 s window) | [the hedged race](07-hedged-race.md) |
-| Quota windows, live signals, cooldowns | cooldowns and live signals implemented in the relay; `/api/quota` reads a `usage` table that nothing writes yet, so it reports nothing | [configuration](03-configuration.md) §3 |
+| Quota windows, live signals, cooldowns | implemented: cooldowns and live signals in the relay; `/api/quota` serves cached provider windows and `/api/usage` serves the per-request ledger the relay records | [configuration](03-configuration.md) §3 |
 | OAuth login flows | implemented for Codex, Copilot and Antigravity; the `cline` catalogue entry is a migration refusal, not a working login | [security](21-security.md) §5 |
 | Web panel | implemented (served by the conductor on 20901) | [architecture](01-architecture.md) §6 |
 | `mr` CLI | implemented except `mr vault` and `mr config`, whose bodies still return "not implemented yet" | [quickstart](02-quickstart.md) |
@@ -116,8 +116,8 @@ The full request path, step by step, is in [architecture](01-architecture.md).
 
 Status here means "present in this tree", not "shipped". The schema, the snapshot format, both dialect
 layers, the provider catalogue, the data plane, the control plane and the panel are in place and
-tested. The exceptions are named in the table above — hedged execution, and the two stubbed CLI
-bodies. [`23-implementation-status.md`](23-implementation-status.md) holds the audited list.
+tested. The exceptions are named in the table above — the three winner-fail modes that are not yet
+wired, and the two stubbed CLI bodies. [`23-implementation-status.md`](23-implementation-status.md) holds the audited list.
 
 ---
 

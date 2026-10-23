@@ -71,7 +71,7 @@ export async function renderOverview(mount, ctx) {
     try {
       // mode:'no-cors' gives an opaque response: we cannot read status codes cross-origin, but a
       // resolve proves the socket answered. Reachability is all the panel claims here.
-      await fetch(url, { mode: 'no-cors', signal: controller.signal });
+      await fetch(url, { mode: 'no-cors', cache: 'no-store', signal: controller.signal });
       up = true;
     } catch {
       up = false;
@@ -106,8 +106,6 @@ export async function renderOverview(mount, ctx) {
   ctx.onHealth((health) => {
     if (!alive.on) return;
     renderStats(health);
-    const live = root.querySelector('[data-live="uptime"]');
-    if (live && health) live.textContent = formatUptime(health.uptime_secs);
   });
 
   await Promise.all([ctx.loadProviders().catch(() => null), ctx.refreshPorts()]);

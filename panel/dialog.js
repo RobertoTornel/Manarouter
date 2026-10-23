@@ -8,6 +8,15 @@ import { h, icon } from './dom.js';
 
 const FOCUSABLE = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
 
+let dialogSeq = 0;
+
+/** Append a uniquely-identified title heading and name the dialog with it. */
+function addTitle(card, text, cls) {
+  const id = `dlg-title-${++dialogSeq}`;
+  card.setAttribute('aria-labelledby', id);
+  return h('h2', { id, class: cls }, text);
+}
+
 /**
  * Open a modal. build(content, close) fills the card; close(result) resolves and tears down.
  * Every caller gets focus management and the Escape/Tab handling for free.
@@ -43,6 +52,13 @@ function openDialog(root, build, { dismissable = true } = {}) {
       // Focus trap: cycle within the dialog so keyboard users cannot fall behind the modal.
       const items = [...card.querySelectorAll(FOCUSABLE)].filter((el) => !el.disabled);
       if (!items.length) return;
+      // Focus can sit on the body after a backdrop click; without this the next Tab would
+      // walk the page behind the modal instead of staying in it.
+      if (!card.contains(document.activeElement)) {
+        items[0].focus();
+        e.preventDefault();
+        return;
+      }
       const first = items[0];
       const last = items[items.length - 1];
       if (e.shiftKey && document.activeElement === first) { last.focus(); e.preventDefault(); }
@@ -79,8 +95,8 @@ export function confirmDialog(root, {
 } = {}) {
   const { done, close } = openDialog(root, (card, close) => {
     card.append(
-      h('h2', { id: 'dlg-title' }, title),
-      message ? h('p', { class: 'dialog-msg' }, message) : null,
+      addTitle(card, title),
+      ...(message ? [h('p', { class: 'dialog-msg' }, message)] : []),
       ...warnLines.map((w) => h('p', { class: 'dialog-warn' }, w)),
       h('div', { class: 'dialog-actions' },
         h('button', {
@@ -135,7 +151,7 @@ export function secretKeyDialog(root, { key, label = 'Client key' }) {
     });
 
     card.append(
-      h('h2', { id: 'dlg-title' }, label),
+      addTitle(card, label),
       h('p', { class: 'dialog-warn' },
         'This is the only time the full key is shown. Copy it and store it now — it cannot be retrieved again.'),
       h('div', { class: 'key-reveal' }, input, copyBtn),
@@ -158,8 +174,6 @@ export function closeButton(onClick, label = 'Close') {
   return b;
 }
 
-let dialogSeq = 0;
-
 /**
  * A modal whose body the caller builds: `build(body, close)` fills it, and the returned promise
  * resolves with whatever `close` was called with (dismissal resolves `false`).
@@ -170,12 +184,10 @@ let dialogSeq = 0;
  */
 export function contentDialog(root, title, build, { dismissable = true } = {}) {
   return openDialog(root, (card, close) => {
-    const headingId = `dlg-title-${++dialogSeq}`;
-    card.setAttribute('aria-labelledby', headingId);
     const body = h('div', { class: 'dialog-body' });
     card.append(
       h('div', { class: 'dialog-head' },
-        h('h2', { id: headingId, class: 'dialog-title' }, title),
+        addTitle(card, title, 'dialog-title'),
         closeButton(() => close(false), 'Close')),
       body,
     );

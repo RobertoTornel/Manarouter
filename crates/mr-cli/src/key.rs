@@ -5,7 +5,7 @@
 //! config.json and never stored or printed again — `key list` shows id, label, prefix and
 //! permissions only, and its `--json` output strips `key_hash` the way the panel API does.
 //!
-//! The mint format (`mr-` + 40 lowercase hex chars from 25 random bytes, prefix = the first seven
+//! The mint format (`mr-` + 50 lowercase hex chars from 25 random bytes, prefix = the first seven
 //! characters) mirrors `manarouter-conductor`'s `generate_client_key`, so a key minted by the CLI
 //! and one minted by the panel are indistinguishable to the relay.
 
@@ -73,7 +73,7 @@ pub struct CreateArgs {
     pub note: Option<String>,
 }
 
-/// Mint a client key: `mr-` + 40 lowercase hex characters (25 random bytes).
+/// Mint a client key: `mr-` + 50 lowercase hex characters (25 random bytes).
 ///
 /// Cross-crate format: the panel mints exactly this shape, and the relay only ever sees the
 /// SHA-256 of whatever string this produced.

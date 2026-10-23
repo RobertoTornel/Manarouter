@@ -81,7 +81,8 @@ document states that T2 uses **no PKCE**.
 
 > **UNCERTAIN, and the two statements are in direct conflict.** The dossier is the verified source
 > used throughout this document set, so this document follows it: **T2 sends PKCE `S256`**, and the
-> implementation should send a `code_verifier` at exchange time. But the conflict is unresolved, and
+> implementation sends the matching `code_verifier` at exchange time (`requires_pkce` is true only for
+> the IDE tier). But the conflict is unresolved, and
 > the consequence of getting it wrong runs in both directions:
 >
 > - If the implementation sends a `code_challenge` at authorize time and the server (or a future
@@ -92,7 +93,7 @@ document states that T2 uses **no PKCE**.
 > - If the implementation omits **both**, it matches the "no PKCE" reading and fails only if the
 >   server actually requires PKCE.
 >
-> The safe engineering resolution is to make the challenge/verifier pair a property of the tier, not
+> The safe engineering resolution — the one the implementation follows — is to make the challenge/verifier pair a property of the tier, not
 > a global constant: T1's loopback path sends neither, T2 sends both, and the pair is never sent
 > half-way. Verify against a live Antigravity login before treating either as settled.
 
@@ -127,9 +128,9 @@ https://accounts.google.com/o/oauth2/v2/auth
   &response_type=code
   &redirect_uri=http%3A%2F%2Flocalhost%3A51121%2Foauth-callback
   &scope=<the 5 scopes, space-joined, URL-encoded>
-  &code_challenge=<S256>
+  &code_challenge=<base64url(SHA-256(verifier))>
   &code_challenge_method=S256
-  &state=<base64 of {verifier, projectId}>
+  &state=<random nonce>
   &access_type=offline
   &prompt=consent
 ```
