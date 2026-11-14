@@ -258,7 +258,7 @@ millisecond of each other and each caller got its own response, while a batch of
 one-second timeout shipped the two requests that had arrived after that second. The text also
 `ast.parse`s for both a batch and a streaming bundle.
 
-**What has actually been exercised.** The workspace suite is green — 1 904 passed, 0 failed, 4
+**What has actually been exercised.** The workspace suite is green — 1 906 passed, 0 failed, 4
 ignored (`cargo test --workspace`) — the panel suite is green (374 tests, `node --test
 panel/test/*.test.mjs`), and — the part that matters most — a second
 conductor built from this tree was driven over a socket on `127.0.0.1:20999` with its own config and
@@ -293,14 +293,54 @@ reads one field will certify an object missing everything else**, and `known: tr
 degraded summary rather than a healthy one. Both halves of a JSON contract need a test that posts the
 client's real payload at the real server.
 
-**Limit 1 — no Modal deployment has ever been created by this code.** The `modal` CLI and the Python
-`modal` package are absent from this machine, and Modal publishes no public deployment REST API
-(`/docs/api`, `/docs/rest`, `/docs/guide/deploying-apps` and `api.modal.com` all fail; the CLI is the
-only documented path and has no `--detach`). Manarouter therefore generates the bundle, `ast.parse`s
+**Limit 1 — no deployment is created by this code; a human runs `modal deploy`.** The `modal` CLI and
+the Python package were absent from this machine when the limit was written, and Modal publishes no
+public deployment REST API (`/docs/api`, `/docs/rest`, `/docs/guide/deploying-apps` and
+`api.modal.com` all fail; the CLI is the only documented path and has no `--detach`). Manarouter therefore generates the bundle, `ast.parse`s
 it, reports its SHA-256, and prints the exact `modal deploy` command plus the proxy-token headers a
 curl call needs. A human runs it. The endpoint then becomes an ordinary `modal-vllm` provider whose
 `base_url` the operator pastes at the review step. That boundary is deliberate and documented, not a
 gap to be closed by pretending.
+
+**What the first live boot found.** A file the panel generated was deployed by hand and served
+`Qwen/Qwen3.8-27B` on an RTX PRO 6000, and the card found five things no green suite on either side
+could: four that stopped the container from ever binding its port, and one that left a healthy engine
+unreachable. The first four are fixed in the generator and the fifth in both templates:
+
+1. A recorded `max_num_seqs` of zero reaches vLLM as `--max-num-seqs 0`, which fails its argument
+   validation, so the container pays for a boot that serves nothing. It is now a hard problem on the
+   record, and a blank field no longer means zero: it takes the fit's `max_num_seqs_effective` (54 at
+   262 144 tokens for this checkpoint), because vLLM's own default of 1024 exceeds what a hybrid model
+   can admit — the container said so verbatim: `max_num_seqs (1024) exceeds available Mamba cache
+   blocks (681)`, raised from `compilation.py` while resolving CUDA-graph sizes.
+2. The image environment must carry `VLLM_USE_FLASHINFER_SAMPLER=0`. The sampler JIT compiles with
+   `nvcc`, and a `debian_slim` image has no CUDA toolkit: `Could not find nvcc and default
+   cuda_home='/usr/local/cuda' doesn't exist`.
+3. `serve()` must spawn the server and return. Modal's proxy does not forward a request into a
+   function that has not reported readiness, so a `serve()` blocked on `process.wait()` left every
+   authenticated request hanging until the proxy answered **303** with a retry token, then started
+   another container — ten RTX PRO 6000s at $3.0312/hour each before the app was stopped.
+4. Modal admits **one input per container** by default, so concurrency has to be declared:
+   `@modal.concurrent(max_inputs=MAX_INPUTS)`, 32 for a streaming bundle (the conductor previously
+   defaulted that ceiling to 1, which is the same container-per-request bill) and the batch size for
+   a `batch` deployment, which would otherwise deadlock waiting for a batch no container can hold.
+5. Modal measures the 64-character app-name limit on the finished name, prefix included, and rejects
+   a name of exactly 64; a long account and repository produced 79 characters and `modal deploy`
+   refused it. The slug is now sized against the prefix.
+
+A sixth finding is a choice rather than a defect. This checkpoint's text-only prompts trip
+`Qwen3VLProcessor` (`Found 1 <||image_pad|> tokens in the text but no images were passed`) during
+dummy profiling, and the live file works around it with `--limit-mm-per-prompt.image 0` and
+`--limit-mm-per-prompt.video 0`. The generators do not emit that flag, because the relay does forward
+image content upstream and silently dropping it would be a lie about the deployment: what belongs in
+the wizard is a visible modality choice, text-only by default. Until that exists, a VL checkpoint
+deployed from the panel fails at profiling. That limitation is real and unpatched.
+
+The endpoint answered `GET /v1/models` with **200** and the checkpoint's own list, on **one**
+container for the request, and `POST /v1/chat/completions` answered "17 × 23 is 391" in 3.3 s on a
+warm container. The reply body carried the model's reasoning in `content` (`…</think>` and all),
+because no reasoning parser is configured on either side; that is a product observation, not a
+deployment failure.
 
 **Limit 2 — requirement 10 cannot be implemented as literally written.** Modal documents no per-GPU
 free/paid gating: all eleven cards carry an unconditional per-second price, and "using a GPU requires

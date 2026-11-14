@@ -2387,6 +2387,11 @@ struct Bundle {
 /// "a batch of N" is not a vLLM flag: it is this queue. It is stdlib-only on purpose — it has to run
 /// in whatever image vLLM runs in, and every extra import is one more way for a paid container to
 /// fail at boot. The panel's generator emits the same layer for the same reason, in the same words.
+/// How many simultaneous requests a streaming container admits when the deployment records no
+/// `max_num_seqs`. Modal admits one input per container by default, so a second concurrent request
+/// starts a second GPU; a live run did exactly that and reached ten cards at $3.03/hour each.
+const DEFAULT_STREAMING_INPUTS: &str = "32";
+
 const BATCH_ASSEMBLER: &str = r#"
 VLLM_PORT = 8001
 
@@ -2519,10 +2524,15 @@ fn deployment_bundle(provider_id: &str, deployment: &RentalDeployment, gpu: &Gpu
         .max_model_len
         .map(|len| len.to_string())
         .unwrap_or_else(|| "None".to_owned());
+    // `MAX_NUM_SEQS` does double duty: it caps the sequences a step schedules when the operator
+    // set one, and it is the number of inputs a streaming container admits. vLLM's own default of
+    // 1024 sequences is more than a hybrid model can often admit, and leaving this at 1 made every
+    // simultaneous request start another GPU container; 32 is a modest ceiling that neither pins
+    // vLLM's scheduler (an unset value still emits no flag) nor pays for a card per request.
     let max_seqs = deployment
         .max_num_seqs
         .map(|seqs| seqs.to_string())
-        .unwrap_or_else(|| "1".to_owned());
+        .unwrap_or_else(|| DEFAULT_STREAMING_INPUTS.to_owned());
     let quant_args = if deployment.weight_quant == "none" {
         String::new()
     } else {
@@ -2582,8 +2592,9 @@ fn deployment_bundle(provider_id: &str, deployment: &RentalDeployment, gpu: &Gpu
                 .to_owned()
         }
         (RentalMode::Streaming, _) => format!(
-            "# Mode: streaming — several sessions may share this card; the server schedules up to\n\
-             # MAX_NUM_SEQS ({max_seqs}) sequences per step and admits the rest as KV cache frees.\n"
+            "# Mode: streaming — several sessions may share this card; the container admits up to\n\
+             # MAX_NUM_SEQS ({max_seqs}) simultaneous requests and vLLM schedules the rest as KV\n\
+             # cache frees.\n"
         ),
     };
 
@@ -3528,6 +3539,27 @@ mod tests {
         assert!(bundle.text.contains("\"--port\",\n        \"8000\","));
         assert!(bundle.text.contains("subprocess.Popen(args)"));
         assert!(bundle.text.contains("max_inputs=MAX_NUM_SEQS"));
+    }
+
+    #[test]
+    fn a_streaming_bundle_admits_more_than_one_request_per_container() {
+        // Modal's default is one input per container, so a second simultaneous request starts a
+        // second card: a live run reached ten RTX PRO 6000 containers, $3.03/hour each. An unset
+        // `max_num_seqs` must therefore not become `MAX_NUM_SEQS = 1`, and it must still emit no
+        // `--max-num-seqs` flag, because that value is only an admission ceiling here.
+        let deployment = RentalDeployment::new("acc", "Qwen/Qwen3.8-27B", "H100");
+        let gpu = gpu_by_id("H100").expect("H100 is in the catalog");
+        assert_eq!(deployment.max_num_seqs, None);
+        let bundle = deployment_bundle("rental-acc-qwen38", &deployment, gpu);
+        assert!(bundle.text.contains("MAX_NUM_SEQS = 32"), "{}", bundle.text);
+        assert!(!bundle.text.contains("\"--max-num-seqs\""));
+        assert!(!bundle.text.contains("max_inputs=1"));
+
+        let mut pinned = deployment.clone();
+        pinned.max_num_seqs = Some(54);
+        let bundle = deployment_bundle("rental-acc-qwen38", &pinned, gpu);
+        assert!(bundle.text.contains("MAX_NUM_SEQS = 54"), "{}", bundle.text);
+        assert!(bundle.text.contains("\"--max-num-seqs\",\n        \"54\","));
     }
 
     #[test]
