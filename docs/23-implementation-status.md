@@ -113,7 +113,7 @@ to answer it with. The short form, with the evidence:
 
 | Family | Routes | What answers | Tests |
 |---|---|---|---|
-| Text | `/v1/chat/completions`, `/v1/responses` and its four sub-routes, `/v1/messages`, `count_tokens` | proxied through the step loop; Responses and Anthropic are translated per dialect | 196 in `server::tests` |
+| Text | `/v1/chat/completions`, `/v1/responses` and its four sub-routes, `/v1/messages`, `count_tokens` | proxied through the step loop; Responses and Anthropic are translated per dialect | 197 in `server::tests` |
 | Models | list, retrieve, delete | the compiled snapshot; nothing is forwarded | same |
 | Audio | speech, transcriptions, translations | proxied, multipart forwarded as multipart | same |
 | Realtime | `/v1/realtime` (WebSocket), `client_secrets`, `calls` | proxied; the socket is pumped frame by frame, not buffered | 18 in `realtime::tests` |
@@ -131,7 +131,12 @@ and asks whether that step's provider declares the capability the route needs �
 variants against 19 `RouteKind`s — and when none does, the answer is `404 unsupported_endpoint`
 naming the route and the capability (`crates/manarouter-relay/src/server.rs:2042-2053`). A provider
 that offers only speech, or only embeddings, therefore works for exactly those routes instead of
-failing at translation time on a shape it never promised. Families that answer from local state —
+failing at translation time on a shape it never promised. Two tests hold the two halves: the shipped
+catalogue refuses to let `fish-audio`, `elevenlabs`, `deepgram` or `stability-ai` declare anything
+but their one family (`crates/mr-core/src/catalog.rs:613`), and a provider declaring only
+`audio-speech` serves `/v1/audio/speech` with its own body while `/v1/chat/completions` answers the
+capability refusal without being dialled
+(`server::tests::a_speech_only_provider_serves_speech_and_refuses_every_other_route`). Families that answer from local state —
 files, uploads, batches, evals, stored responses and the vector-store routes themselves — need no
 provider and consult no capability. The one outbound call a vector store makes is the embedding
 request the store's text requires, and that is resolved to a provider declaring `Embeddings`
@@ -468,8 +473,8 @@ never used it — its credential is the `kaggle` CLI's own login, not a lane sec
 credential is stored today. [26-gpu-lanes.md](26-gpu-lanes.md) §9 records the removal.
 
 Test totals on this revision: `cargo test -p manarouter-conductor --lib` → 38 `gpu_api` tests and
-11 Kaggle tests, all passing. `cargo test --workspace --lib` → 1 936 passing; `cargo test
---workspace` → 2 040 passing with 4 ignored (the reference-vault refresh test and three quota
+11 Kaggle tests, all passing. `cargo test --workspace --lib` → 1 937 passing; `cargo test
+--workspace` → 2 041 passing with 4 ignored (the reference-vault refresh test and three quota
 doctests marked `no_run`). `node --test panel/test/*.test.mjs` → 381 passing and
 `node --test panel-lab/test/*.test.mjs` → 334 passing.
 

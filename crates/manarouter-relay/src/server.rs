@@ -13002,6 +13002,71 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     }
 
     #[tokio::test]
+    async fn a_speech_only_provider_serves_speech_and_refuses_every_other_route() {
+        let (url, seen) = fake_upstream().await;
+        // The fish.audio shape: one family is declared, so exactly one route is reachable and the
+        // model is listed for discovery. A provider that declares only this must not be asked for
+        // a chat completion it never promised, and the speech request must arrive as its own JSON
+        // body rather than translated into a chat shape on the way out.
+        let provider = provider_with_capabilities(
+            "fish",
+            &url,
+            "speech-1",
+            &[Capability::AudioSpeech, Capability::Models],
+        );
+        let state = state_over(vec![provider], Vec::new());
+
+        let response = dispatch(
+            state.clone(),
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/audio/speech"),
+            HeaderMap::new(),
+            AxumBody::from(r#"{"model":"fish/speech-1","input":"hello","voice":"default"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(
+                seen.len(),
+                1,
+                "the speech request did not reach the provider"
+            );
+            assert!(seen[0].contains(r#""input":"hello""#), "{}", seen[0]);
+            assert!(
+                !seen[0].contains("messages"),
+                "a speech body was rewritten into a chat body: {}",
+                seen[0]
+            );
+        }
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            HeaderMap::new(),
+            AxumBody::from(
+                r#"{"model":"fish/speech-1","messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = body_text(response).await;
+        assert!(body.contains("unsupported_endpoint"), "{body}");
+        assert!(
+            body.contains("chat.completions requires the chat capability"),
+            "{body}"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "a provider that does not declare chat was dialled anyway"
+        );
+    }
+
+    #[tokio::test]
     async fn a_combo_reaches_the_capable_step_when_the_first_one_cannot_serve_the_route() {
         let (incapable_url, incapable_seen) = fake_upstream().await;
         let (capable_url, capable_seen) = fake_upstream().await;
