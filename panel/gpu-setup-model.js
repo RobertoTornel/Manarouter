@@ -2009,7 +2009,7 @@ export function stepList(draft, catalog = null) {
           visible: d.mode === 'batch' && d.batchFill !== 'timeout',
           notes: ['With no timeout, a request waits until the batch is full, however long that takes. That is a choice, not an oversight: nothing here adds a hidden cap.'],
         }),
-        numberField({ name: 'shutdownCooldownSecs', label: 'Shutdown cooldown (seconds)', value: fieldValue(d, 'shutdownCooldownSecs'), min: SCALEDOWN_WINDOW_LIMITS.min, max: SCALEDOWN_WINDOW_LIMITS.max, step: 1, hint: 'Modal `scaledown_window`: default 60, range 2–1200.' }),
+        numberField({ name: 'shutdownCooldownSecs', label: 'Shutdown cooldown (seconds)', value: fieldValue(d, 'shutdownCooldownSecs'), min: SCALEDOWN_WINDOW_LIMITS.min, max: SCALEDOWN_WINDOW_LIMITS.max, step: 1, hint: 'Modal `scaledown_window`: default 60, range 2–1200. A 50 GB checkpoint takes about three minutes to boot, so a 60-second window re-pays that boot after every short gap; a live 27B deployment needed 300.' }),
         readout({
           name: 'sizingKvBasis', label: 'KV bytes per token', value: sizing.kv_bytes_per_token ?? null,
           visible: sizing.kv_bytes_per_token != null,
