@@ -477,6 +477,14 @@ ledger, which makes a capped batch able to overspend by the unpriced share but n
 items not yet dispatched are retired, items in flight finish. It is the same machinery the cap uses,
 which is why the two share a terminal status.
 
+**This lane is not the deployed endpoint's batching.** A deployment may itself be applied in `batch`
+mode with a fill policy — `full` makes its batch wait until it holds `batch.size` items, `timeout`
+ships a short batch after `batch_timeout_secs` — and that is recorded with the deployment
+([25-gpu-rentals.md](25-gpu-rentals.md) §2). The relay lane described in this section is a different
+thing: it dispatches every item through the ordinary request path and never waits for a batch to fill.
+Confusing the two is the usual reason someone expects a submitted file to sit still until more lines
+arrive; it will not.
+
 **Priority.** A batch and an interactive request share the endpoint, and the lane has no priority
 class: an interactive request can be delayed by an item already in flight, but never by one that is
 waiting — an item holds no KV reservation between attempts. The knob is `MANAROUTER_BATCH_WORKERS`
@@ -487,8 +495,9 @@ billed the same as finishing it — the relay does not do that to save a queue p
 **What the lane deliberately does not do.** It does not re-apply per-client-key quota to individual
 items. A batch is authorized once, as a whole, when it is submitted, so an operator who meters client
 keys should treat one batch as one metered submission rather than N metered calls. It does not price
-tokens (see the cost report above), and it does not deploy anything: a rented GPU is woken and torn
-down by the operator, per [25-gpu-rentals.md](25-gpu-rentals.md) §1.
+tokens (see the cost report above), it does not deploy anything — a rented GPU is woken and torn down
+by the operator, per [25-gpu-rentals.md](25-gpu-rentals.md) §1 — and it does not read a deployment's
+`mode` or fill policy, because those describe the endpoint rather than the queue.
 
 ### Error envelopes
 

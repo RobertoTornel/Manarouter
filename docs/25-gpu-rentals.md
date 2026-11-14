@@ -73,13 +73,35 @@ longer describes them. What remains for these platforms is the record under `doc
 
 ## 2. The two lanes (requirement 9)
 
-An account can run a model in either of two modes, and they are meant to be used on **two different
-cards at the same time**:
+A deployment is in one of two modes. They are independent deployments, not two halves of one
+deployment, and they can run at the same time on the same model with different card configurations:
 
 | Mode | What it is | Which card | Why |
 |---|---|---|---|
-| **Single** | One request is pinned to one chosen GPU. It is a request that must not queue. | the expensive card | latency matters more than throughput |
-| **Batch** | *n* requests accumulate on **another** chosen GPU, and are executed together. | the cheap card | throughput matters more than latency |
+| **Streaming** (`streaming`) | A live vLLM endpoint holding N simultaneous sessions. Each request answers on its own; nothing waits for company. | the card that keeps latency down | latency matters more than throughput |
+| **Batch** (`batch`) | *n* requests are collected into a batch on the deployment's card and executed together, then the answers are written out. | the card where throughput is cheapest | throughput matters more than latency |
+
+Streaming is not "single": a streaming endpoint is one container with a KV pool and a
+`--max-num-seqs`, so it serves many sessions concurrently — that is the whole point of deploying
+vLLM rather than calling a model one request at a time. The wizard asks how many simultaneous
+sessions it must hold, and the fit check judges that number, not one.
+
+**A batch has to decide when to fire.** `batch.fill` is one of:
+
+| Fill | What happens | When to choose it |
+|---|---|---|
+| `full` (default) | Nothing ships until the batch holds `batch.size` items — however long that takes. | the job is big enough that a full batch always arrives, and a partial one wastes a cold start |
+| `timeout` | Whatever has arrived ships after `timeout_secs` (1–3600) as a short batch. | the traffic is bursty, or the operator would rather have a partial answer promptly than wait for stragglers |
+
+`full` really is unbounded: a request can wait indefinitely for company. That is an informed choice
+by the operator, recorded with the deployment, not a timeout someone forgot to set; the panel says so
+in the sizing step. `timeout` always carries its duration, and the shape is validated on both sides:
+a size of zero, a duration without the timeout policy, or a timeout policy without a duration is
+refused.
+
+The fill policy never changes the fit arithmetic. A batch is judged against `batch.size` items (it
+must be able to hold that many at the configured context length); a streaming deployment is judged
+against `sessions`. The rest of the sizing is identical.
 
 The operator's own measurements on a 27 B-class model make the case: the more expensive card came out
 **40 % cheaper per token** on decode-bound batches (derived $1.26/M vs $2.08/M at 2K context with 64
@@ -94,9 +116,9 @@ A single request that arrives when the pool is full is refused with a distinguis
 
 ## 3. Creating an account (requirement 8)
 
-**An account is a platform credential. It is created on its own, and it holds many models.** This is
-the one place the GPU-rental flow deliberately differs from the ordinary provider flow, where adding a
-provider drops you straight into that provider's first-account form.
+**An account is a platform credential. It is created on its own, and many deployments may bill
+through it.** This is the one place the GPU-rental flow deliberately differs from the ordinary
+provider flow, where adding a provider drops you straight into that provider's first-account form.
 
 Creating a rental account asks for the platform and its credentials — for Modal, a **proxy token**
 pair, `Modal-Key` (`wk-…`) and `Modal-Secret` (`ws-…`). The credential is written to the vault as a
@@ -104,7 +126,46 @@ bundle and referenced from `config.json` by id; **the secret itself never appear
 in a snapshot, in a log, or in this repository.** Entering it goes through the same
 `--secret-stdin`-style flow the rest of the project uses, so it does not land in shell history.
 
-An account carries no model. Models are attached to it afterwards, and one account can hold many.
+An account carries no model. Models are attached to it afterwards, and the relation is not 1:1 in
+either direction: one account can run many deployments, and the same repository on the same card can
+be deployed under a second account when the operator needs more containers than one workspace will
+give. What identifies a deployment is the tuple (account, repository, mode, card, card count); two
+deployments that agree on all five are the same provider and the second is refused as a duplicate,
+while disagreeing on any of them produces a distinct provider id, app name and endpoint.
+
+**Hugging Face tokens are their own list, not account state.** A token is created on its own page —
+`Add HuggingFace token`, the same shape as adding an account — and stored at `hf:<id>`. A deployment
+that needs one names it; a token can be used by deployments on several accounts, several tokens can
+exist for one operator, and a public repository needs none. Nothing requires the number of tokens to
+match the number of accounts. Re-recording an existing token id replaces the value in place, which is
+how a token is rotated without touching any deployment.
+
+**The page itself has three actions and one list.** `#/gpu-rentals` opens on the operator's existing
+deployments — provider id, model, account, card, mode, fill policy, endpoint, and the state the
+conductor reports — with three actions above it:
+
+| Action | What it opens |
+|---|---|
+| **Deploy model** | the deployment window: account, model, mode, batch size and fill policy (batch only), sessions (streaming only), card, card count, model quantisation, KV cache dtype, then the fit report and the bundle. |
+| **Add Modal account** | the same form `#/providers` uses to add a provider: id, label, plan, workspace, proxy token and secret, each with a hint, validated in place. |
+| **Add HuggingFace token** | the same shape again, for a token: id, label, value. The value is written once and only a fingerprint is ever shown back. |
+
+The window is where the fit check runs. Nothing is applied until the numbers agree, and a sizing that
+does not fit produces an error naming what to change — a bigger card would hold it, this quantisation
+would, a smaller cache dtype would, fewer sessions or a smaller batch would — with the exact value
+that fits, not advice to "reduce the batch size". Each suggestion is produced by re-running the same
+sizing with that one field changed, so it is printed only when that change makes this repository fit
+this card; the order is the order of the cost the change imposes on the model (card, weights, cache,
+concurrency, context), and the first suggestion is the one to take unless a later cost matters more.
+"Record deployment" stays disabled until the report is positive, and clicking a suggestion edits the
+draft rather than applying anything: the write still happens once, on the button.
+
+A sizing the panel cannot compute is refused as **unknown**, never reported as "does not fit": the
+report names the missing figure (a catalog width for the quant, a `head_dim` in the config, an
+unrecognised card), prints no suggestions because none of them could be proven, and keeps the button
+disabled. The distinction matters because "does not fit" is a claim about a measurement, and an
+unestimated pool is not one. The step wizard behind `#/gpu-rentals/new/<step>` still exists for a
+first-time walkthrough, and the window reuses it rather than duplicating the questions.
 
 ---
 
@@ -149,7 +210,16 @@ HF token **only once the repository is known to be gated** — and it can know t
 prompt**, because the metadata endpoint answers anonymously (HTTP 200) and reports `gated` as
 `false`, `"auto"` or `"manual"` even for repositories whose *files* are 401.
 
-So: public repository → no token field at all. Gated repository → the field appears, with the reason.
+So: public repository → no token field at all. Gated repository → the field appears, with the reason,
+offering the recorded tokens by id and a "new token" path that writes `hf:<id>` through
+`create-hf-token` before the deployment is submitted. The token is never inherited from the account,
+and the deployment records the token *id*, never the value.
+
+One consequence has to be said plainly: recording the id does not put the token in the container. The
+generated `modal_app.py` carries no secret by design, so a gated repository needs the operator to
+mount a Modal secret (`manarouter-hf`) before the first fetch; the apply response warns about this
+whenever a token is named. Until that mount is added to the generator, a gated deployment needs one
+hand edit after `modal deploy`.
 
 **And a gated repository is not the end of the sizing story.** A quantised repository usually names
 its unquantised base (`cardData.base_model`), and the base is usually public. Fetching the base's
@@ -186,8 +256,14 @@ guess look like a fact.
 
 | Operator's words | What it is | What it does |
 |---|---|---|
-| **"Simultaneous Sessions"** | vLLM's `--max-num-seqs`, derived from the KV pool | how many requests the container will run at once |
+| **"Simultaneous Sessions"** (streaming) | how many requests must be in flight at once; sized against the KV pool | the fit check refuses the deployment if the pool cannot hold that many at `max_model_len` |
+| **"Batch size"** (batch) | how many items one batch holds | replaces sessions in the fit check; the batch must be able to hold all of them at once |
 | **"Shutdown Cooldown (seconds)"** | Modal's `scaledown_window` (default 60 s, range 2–1200 s) | how long an idle container stays warm before it is released |
+
+`--max-num-seqs` is still what vLLM schedules per step, and the generator sets it from the
+deployment's own numbers — but it is a scheduling knob, not the operator's question. The operator
+answers "how many sessions at once" for streaming, or "how big is a batch" for batch; the panel
+derives the flag. Confusing the two is what makes a sizing form ask a question nobody can answer.
 
 They are shown together because they trade against each other: a longer cooldown costs money while
 idle and saves a cold start later, and a cold start on this class of model is **~110 s on the cheaper
@@ -249,6 +325,10 @@ Where the architecture genuinely cannot be read, `confidence` is `"unavailable"`
 
 On success a rental deployment is a normal Manarouter provider of dialect `modal-vllm`: it appears in
 the provider list, its models appear in `/v1/models`, and it can be used in combos like anything else.
+Its provider id names the shape — account, repository, mode, card and card count — so
+`#/providers` lists a streaming endpoint and a batch endpoint of the same model as two providers
+rather than one that silently changed meaning. Deployments applied before this identity widened keep
+their old ids: a provider is not renamed under an operator's feet.
 The difference is that its capacity is tracked in **KV tokens** and its spend is tracked in
 **dollars**.
 
@@ -432,6 +512,14 @@ that safe to run overnight:
 * The pool of workers is the knob. `MANAROUTER_BATCH_WORKERS` (default 4, clamped to 1–64) sets how
   many items a batch may have in flight at once; `1` gives a batch one slot and leaves the rest of
   the endpoint to interactive calls.
+
+**This lane is not the deployment's batching.** §2's `batch` mode is a property of the deployed
+endpoint: the container collects items and decides when to fire, and the fill policy is recorded with
+the deployment. The relay's batch lane is a separate thing: it takes an uploaded JSONL file, dispatches
+items through the ordinary request path, caps the spend, and retries. It does not read the deployment's
+`mode` and does not wait for a batch to fill; if an operator wants items to accumulate before dispatch,
+that happens on the rented endpoint, which is where the `fill` policy applies. The two are documented
+together because they are easy to confuse and impossible to substitute for one another.
 
 There is deliberately no priority class and no pre-emption. Cancelling a generation to make room for
 another request does not refund the GPU seconds — the card was occupied either way — so the choice is

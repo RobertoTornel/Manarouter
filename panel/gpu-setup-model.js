@@ -241,20 +241,51 @@ function slugify(value) {
 }
 
 /**
- * The stable part of the app name: `rental-<account>-<repo-name>`, at most 64 characters.
+ * The trailing `-<mode>-<card>[-x<n>]` half of every derived name.
+ *
+ * Mirrors `DeploymentShape::suffix` in `crates/mr-core/src/rental.rs`. It exists because one
+ * repository may be deployed several times under one account — stream on one card, batch that
+ * ships a half-full batch on another, batch that waits for a full one on a third — and two of
+ * those must never share a provider id or a Modal app.
+ *
+ * @param {string} mode
+ * @param {string} gpu
+ * @param {number} gpuCount
+ * @returns {string}
+ */
+export function deploymentSuffix(mode, gpu, gpuCount) {
+  const count = Math.max(1, Math.trunc(toNumber(gpuCount) ?? 1));
+  let suffix = `-${text(mode) === 'batch' ? 'batch' : 'streaming'}`;
+  const card = slugify(gpu);
+  if (card) suffix += `-${card}`;
+  if (count > 1) suffix += `-x${count}`;
+  return suffix;
+}
+
+/**
+ * The stable part of the app name: `rental-<account>-<repo-name>-<mode>-<card>`, at most 64
+ * characters.
  *
  * Mirrors `mr_core::rental::app_slug`. One string identifies both the provider id (built from it
  * in the conductor) and the Modal app, so the preview and the deployed name cannot drift.
+ * Truncation eats the account/repository half and never the suffix: the suffix is the only part
+ * that tells two deployments of one checkpoint apart.
  *
  * @param {string} accountId
  * @param {string} repo
+ * @param {string} mode
+ * @param {string} gpu
+ * @param {number} gpuCount
  * @returns {string}
  */
-export function appSlug(accountId, repo) {
+export function appSlug(accountId, repo, mode, gpu, gpuCount) {
   const name = String(repo ?? '').split('/').filter(Boolean).pop() ?? '';
-  let slug = `rental-${slugify(accountId)}-${slugify(name)}`;
-  if (slug.length > 64) slug = slug.slice(0, 64);
-  return slug.replace(/-+$/, '');
+  const suffix = deploymentSuffix(mode, gpu, gpuCount);
+  const room = Math.max(0, 64 - suffix.length);
+  let head = `rental-${slugify(accountId)}-${slugify(name)}`;
+  if (head.length > room) head = head.slice(0, room);
+  head = head.replace(/-+$/, '');
+  return `${head}${suffix}`;
 }
 
 /**
@@ -262,10 +293,13 @@ export function appSlug(accountId, repo) {
  *
  * @param {string} accountId
  * @param {string} repo
+ * @param {string} mode
+ * @param {string} gpu
+ * @param {number} gpuCount
  * @returns {string}
  */
-export function modalAppName(accountId, repo) {
-  return `manarouter-${appSlug(accountId, repo)}`;
+export function modalAppName(accountId, repo, mode, gpu, gpuCount) {
+  return `manarouter-${appSlug(accountId, repo, mode, gpu, gpuCount)}`;
 }
 
 /**
@@ -273,7 +307,8 @@ export function modalAppName(accountId, repo) {
  *
  * `https://<workspace>--<app-name>-<function>.modal.run`, dots in the app name becoming dashes,
  * with the generated bundle's single web function named `serve`. `null` when a part is missing:
- * the caller must ask for an explicit URL rather than invent one.
+ * the caller must ask for an explicit URL rather than invent one. A card is required for the same
+ * reason: without it the name would describe every deployment of the repository at once.
  *
  * The same derivation is `mr_core::rental::modal_base_url`; the two are kept in step by a golden
  * value on each side.
@@ -286,10 +321,10 @@ export function modalBaseUrl(draft) {
   const workspace = slugify(d.workspace);
   const account = slugify(d.accountId);
   const name = slugify((d.repo.split('/').filter(Boolean).pop()) ?? '');
-  if (!workspace || !account || !name) return null;
+  if (!workspace || !account || !name || !slugify(d.gpu)) return null;
   // UNCERTAIN: the URL shape and the `serve` function half are reverse-engineered from Modal's
   // documented app naming. `modal deploy` prints the real URL, which is authoritative if it differs.
-  return `https://${workspace}--${modalAppName(d.accountId, d.repo).replace(/\./g, '-')}-serve.modal.run`;
+  return `https://${workspace}--${modalAppName(d.accountId, d.repo, d.mode, d.gpu, d.gpuCount).replace(/\./g, '-')}-serve.modal.run`;
 }
 
 /** Quote a JS string as a Python string literal without inventing escapes. */
@@ -314,14 +349,26 @@ function pyString(value) {
 export function emptyDraft(platformId) {
   return {
     platform: typeof platformId === 'string' ? platformId.trim() : '',
+    // `new` creates the account this rental bills through; `existing` reuses one already recorded,
+    // which is the normal case once an account has been created: one account may host several
+    // rentals, and the account's credential is written once.
+    accountMode: 'new',
     accountId: '',
+    // Shown on the list instead of the id when the operator gives one. Empty falls back to the id,
+    // which is what a flow that never asked for a label has always recorded.
+    accountLabel: '',
     // The Modal workspace the account's apps deploy into. Not a secret: it is the half of the
     // endpoint URL the panel can know without deploying anything.
     workspace: '',
     plan: 'unknown',
     tokenId: '',
     tokenSecret: '',
-    hfToken: '',
+    // A Hugging Face token is named, never pasted here: `hfTokenId` is an id from the recorded
+    // tokens (`hf_tokens` in `GET /api/gpu/rentals`). `hfTokenNew`/`hfTokenNewLabel` hold a token
+    // being added in the same step, so a gated repository does not force a second visit.
+    hfTokenId: '',
+    hfTokenNew: '',
+    hfTokenNewLabel: '',
     hfTokenNeeded: false,
     repo: '',
     revision: '',
@@ -333,6 +380,16 @@ export function emptyDraft(platformId) {
     maxNumSeqs: null,
     shutdownCooldownSecs: SCALEDOWN_WINDOW_LIMITS.default,
     mode: 'streaming',
+    // How many sessions this deployment is asked to hold at once. Streaming is not "one request
+    // at a time": one vLLM process serves several, so both modes carry a concurrency figure and
+    // the fit check judges the card against it.
+    sessions: 1,
+    // A batch deployment's fill policy. `full` waits for `batchSize` requests however long that
+    // takes, which is the operator's informed choice; `timeout` ships a half-full batch after
+    // `batchTimeoutSecs`.
+    batchSize: 8,
+    batchFill: 'full',
+    batchTimeoutSecs: 60,
     // A quant the repository does not ship, recorded as a future GPU job. The bundle still serves
     // what the repository ships; this field is never executed by the wizard.
     requantizeTo: '',
@@ -350,7 +407,15 @@ export function normalizeDraft(draft) {
   const given = asObject(draft);
   const merged = { ...emptyDraft(given.platform), ...given };
   merged.platform = text(merged.platform);
+  merged.accountMode = text(merged.accountMode) === 'existing' ? 'existing' : 'new';
   merged.accountId = text(merged.accountId);
+  merged.accountLabel = text(merged.accountLabel);
+  merged.hfTokenId = text(merged.hfTokenId);
+  merged.hfTokenNew = text(merged.hfTokenNew);
+  merged.hfTokenNewLabel = text(merged.hfTokenNewLabel);
+  // A pre-fix draft pasted the token value onto the model step. It is dropped rather than carried
+  // into a payload: a value is written once, by the token action, and never round-trips.
+  delete merged.hfToken;
   merged.workspace = text(merged.workspace);
   merged.plan = text(merged.plan) || 'unknown';
   merged.repo = text(merged.repo);
@@ -361,6 +426,10 @@ export function normalizeDraft(draft) {
   // `interactive` is the pre-fix spelling of `streaming`; an old draft keeps loading, but nothing
   // new is ever written with it.
   merged.mode = text(merged.mode) === 'batch' ? 'batch' : 'streaming';
+  merged.sessions = Math.max(1, Math.trunc(toNumber(merged.sessions) ?? 1));
+  merged.batchSize = Math.max(1, Math.trunc(toNumber(merged.batchSize) ?? 8));
+  merged.batchFill = text(merged.batchFill) === 'timeout' ? 'timeout' : 'full';
+  merged.batchTimeoutSecs = Math.max(1, Math.trunc(toNumber(merged.batchTimeoutSecs) ?? 60));
   merged.requantizeTo = text(merged.requantizeTo);
   merged.baseUrl = text(merged.baseUrl);
   // A pre-fix draft could name a second card for the batch lane. A rental is one model on one card,
@@ -1753,6 +1822,10 @@ export function stepList(draft, catalog = null) {
   const probe = asObject(d.probe);
   const hasRepo = d.repo.trim().length > 0;
   const gated = requiresHfToken(probe);
+  // Visibility follows the same rule `validateStep` enforces: the draft's own `hfTokenNeeded`, or a
+  // probe that says the repository is gated. Reading only the probe put a "choose a token" problem
+  // on a field the form was not drawing.
+  const tokenNeeded = d.hfTokenNeeded || gated;
   const probedQuants = asArray(probe.quants).map(asObject);
   const sizing = asObject(d.sizing);
   const measured = asObject(sizing.measured_reference);
@@ -1771,13 +1844,29 @@ export function stepList(draft, catalog = null) {
     {
       id: 'account',
       title: 'Account',
-      hint: 'This rental\'s own account. Each rental has its own account, credential and vault entry: nothing is shared with another rental. Continuing stores it in the vault, and the panel cannot delete an account later.',
+      hint: 'The account this rental bills through. One account can host several rentals, and one model on one card can be recorded under several accounts, so this step either creates an account or names one that already exists.',
       fields: [
-        textField({ name: 'accountId', label: 'Account id', required: true, value: fieldValue(d, 'accountId'), placeholder: 'mana-modal', hint: 'Local identifier for this rental\'s vault entry. An id another rental already pays from is refused.' }),
-        textField({ name: 'workspace', label: 'Modal workspace', required: true, value: fieldValue(d, 'workspace'), placeholder: 'mana', hint: 'The workspace this account\'s apps deploy into, for example `mana`. Not a secret: it is the half of the endpoint URL Manarouter can know without deploying.' }),
-        selectField({ name: 'plan', label: 'Plan', optionsSource: 'plans', required: true, value: planLabel, hint: 'Unknown is a real answer and is never rendered as free or as paid.' }),
-        textField({ name: 'tokenId', label: 'Modal proxy token id', kind: 'password', required: true, value: fieldValue(d, 'tokenId'), placeholder: 'wk-…', hint: 'Half of the Modal proxy token pair: the `wk-…` id the relay sends as `Modal-Key`. Stored in the vault; never rendered back.' }),
-        textField({ name: 'tokenSecret', label: 'Modal proxy token secret', kind: 'password', required: true, value: fieldValue(d, 'tokenSecret'), placeholder: 'ws-…', hint: 'The other half: the `ws-…` secret sent as `Modal-Secret`. Both halves are stored as one vault entry, so an account cannot exist half-configured.' }),
+        selectField({
+          name: 'accountMode', label: 'Account', optionsSource: 'accountModes', required: true,
+          value: d.accountMode,
+          hint: 'Create a new account, or reuse one already recorded. Reusing does not touch its credential: the vault entry is written once, when the account is created.',
+        }),
+        textField({
+          name: 'accountId', label: 'New account id', required: true,
+          visible: d.accountMode !== 'existing',
+          value: fieldValue(d, 'accountId'), placeholder: 'mana-modal',
+          hint: 'Local identifier for the account, and the name of its vault entry. Several rentals may name the same account.',
+        }),
+        selectField({
+          name: 'accountId', label: 'Account', optionsSource: 'accounts', required: true,
+          visible: d.accountMode === 'existing',
+          value: fieldValue(d, 'accountId'),
+          hint: 'A recorded account. Its credential stays where it is; this rental only names it.',
+        }),
+        textField({ name: 'workspace', label: 'Modal workspace', required: true, visible: d.accountMode !== 'existing', value: fieldValue(d, 'workspace'), placeholder: 'mana', hint: 'The workspace this account\'s apps deploy into, for example `mana`. Not a secret: it is the half of the endpoint URL Manarouter can know without deploying.' }),
+        selectField({ name: 'plan', label: 'Plan', optionsSource: 'plans', required: true, visible: d.accountMode !== 'existing', value: planLabel, hint: 'Unknown is a real answer and is never rendered as free or as paid.' }),
+        textField({ name: 'tokenId', label: 'Modal proxy token id', kind: 'password', required: true, visible: d.accountMode !== 'existing', value: fieldValue(d, 'tokenId'), placeholder: 'wk-…', hint: 'Half of the Modal proxy token pair: the `wk-…` id the relay sends as `Modal-Key`. Stored in the vault; never rendered back.' }),
+        textField({ name: 'tokenSecret', label: 'Modal proxy token secret', kind: 'password', required: true, visible: d.accountMode !== 'existing', value: fieldValue(d, 'tokenSecret'), placeholder: 'ws-…', hint: 'The other half: the `ws-…` secret sent as `Modal-Secret`. Both halves are stored as one vault entry, so an account cannot exist half-configured.' }),
         readout({
           name: 'planMarker', label: 'Plan marker', optionsSource: 'planMarker',
           hint: 'Shown only for a card the catalog marks `free_plan: "unavailable"`.',
@@ -1786,7 +1875,7 @@ export function stepList(draft, catalog = null) {
         readout({
           name: 'accountCredentialNote', label: 'Credential handling', value: 'vault',
           notes: [
-            'The HuggingFace token is not collected here; it belongs to the model step and only appears when the repository is gated.',
+            'A HuggingFace token is never collected here: tokens are independent of accounts and are named on the model step, only when the repository is gated.',
             'No secret is ever echoed back by `POST /api/gpu/apply`: the response carries a vault id and a fingerprint.',
           ],
         }),
@@ -1799,10 +1888,21 @@ export function stepList(draft, catalog = null) {
       fields: [
         textField({ name: 'repo', label: 'HuggingFace repo', required: true, value: fieldValue(d, 'repo'), placeholder: 'orcarouter/Qwen3.8-27B-Uncensored-FP8', hint: '`owner/name`, as on huggingface.co.' }),
         textField({ name: 'revision', label: 'Revision', value: fieldValue(d, 'revision'), placeholder: 'main', hint: 'Branch, tag or commit. Empty means the repo default.' }),
+        selectField({
+          name: 'hfTokenId', label: 'HuggingFace token', optionsSource: 'hfTokens',
+          required: false, visible: tokenNeeded,
+          value: fieldValue(d, 'hfTokenId'),
+          hint: 'Only needed because this repository is gated: unauthenticated file fetches answer 401. A token is shared by any number of accounts, so this list is independent of the account step.',
+        }),
         textField({
-          name: 'hfToken', label: 'HuggingFace token', kind: 'password', required: gated,
-          value: fieldValue(d, 'hfToken'), visible: gated,
-          hint: 'Only needed because this repository is gated: unauthenticated file fetches answer 401.',
+          name: 'hfTokenNew', label: 'Add a HuggingFace token', kind: 'password', visible: tokenNeeded,
+          value: fieldValue(d, 'hfTokenNew'), placeholder: 'hf_…',
+          hint: 'Paste one to add it now; it is written to the vault under the id below and never rendered back. Leave empty to use a recorded token.',
+        }),
+        textField({
+          name: 'hfTokenNewLabel', label: 'New token id', visible: tokenNeeded && Boolean(d.hfTokenNew),
+          value: fieldValue(d, 'hfTokenNewLabel'), placeholder: 'hub-main',
+          hint: 'The id this token is recorded under, so a later rental can name it instead of pasting it again.',
         }),
         readout({
           name: 'probeGated', label: 'Gated', value: d.probe == null ? null : (gated ? 'token required' : 'public'),
@@ -1875,7 +1975,34 @@ export function stepList(draft, catalog = null) {
       hint: 'The probe’s architecture gives an analytic KV estimate. Overrides are yours; vLLM’s startup line is authoritative.',
       fields: [
         numberField({ name: 'maxModelLen', label: 'Max model length', value: fieldValue(d, 'maxModelLen'), min: 1, step: 1, hint: 'vLLM `--max-model-len`. Defaults to the config’s `max_position_embeddings`; lowering it raises concurrency.' }),
-        numberField({ name: 'maxNumSeqs', label: 'Simultaneous sessions', value: fieldValue(d, 'maxNumSeqs'), min: 1, step: 1, hint: 'vLLM `--max-num-seqs`, the number of sequences scheduled in one step: the ceiling on simultaneous sessions.' }),
+        numberField({ name: 'maxNumSeqs', label: 'Sequences per step', value: fieldValue(d, 'maxNumSeqs'), min: 1, step: 1, hint: 'vLLM `--max-num-seqs`: how many sequences one scheduling step admits. This is not the number of simultaneous sessions; it is the ceiling vLLM keeps in flight, and the sessions you ask for below are what the card is judged against.' }),
+        numberField({
+          name: 'sessions', label: 'Concurrent sessions to hold', value: fieldValue(d, 'sessions'), min: 1, step: 1,
+          visible: d.mode !== 'batch',
+          hint: 'One streaming card serves several sessions at once, not one request at a time. This is how many must fit in the KV pool together; the fit check below refuses the deployment if the card cannot hold them.',
+        }),
+        numberField({
+          name: 'batchSize', label: 'Batch size', value: fieldValue(d, 'batchSize'), min: 1, step: 1,
+          visible: d.mode === 'batch',
+          hint: 'How many requests one batch collects before it is worked. This is the batch deployment’s concurrency, and the fit check judges the card against it.',
+        }),
+        choiceField({
+          name: 'batchFill', label: 'Ship a batch when', value: fieldValue(d, 'batchFill'),
+          optionsSource: 'batchFills',
+          visible: d.mode === 'batch',
+          hint: 'A full batch is the cheapest work per request; a timeout keeps a quiet model from holding a request forever.',
+        }),
+        numberField({
+          name: 'batchTimeoutSecs', label: 'Batch timeout (seconds)', value: fieldValue(d, 'batchTimeoutSecs'),
+          min: 1, max: 3600, step: 1,
+          visible: d.mode === 'batch' && d.batchFill === 'timeout',
+          hint: 'After this long, whatever has arrived ships as a half-full batch rather than waiting for more.',
+        }),
+        readout({
+          name: 'batchWaitNote', label: 'Waiting for a full batch', value: null,
+          visible: d.mode === 'batch' && d.batchFill !== 'timeout',
+          notes: ['With no timeout, a request waits until the batch is full, however long that takes. That is a choice, not an oversight: nothing here adds a hidden cap.'],
+        }),
         numberField({ name: 'shutdownCooldownSecs', label: 'Shutdown cooldown (seconds)', value: fieldValue(d, 'shutdownCooldownSecs'), min: SCALEDOWN_WINDOW_LIMITS.min, max: SCALEDOWN_WINDOW_LIMITS.max, step: 1, hint: 'Modal `scaledown_window`: default 60, range 2–1200.' }),
         readout({
           name: 'sizingKvBasis', label: 'KV bytes per token', value: sizing.kv_bytes_per_token ?? null,
@@ -1938,6 +2065,10 @@ export function stepList(draft, catalog = null) {
       title: 'Review',
       hint: 'The bundle is the deployment: Modal publishes no deployment REST API, so this file and its command are what you run.',
       fields: [
+        readout({
+          name: 'deploymentShape', label: 'What this deployment is', value: deploymentShapeNote(d),
+          notes: ['The mode and the fill policy are recorded with the deployment. A batch that waits for a full batch holds a request until the batch fills; the timeout variant is the one that ships half-full.'],
+        }),
         readout({
           name: 'endpointUrl', label: 'Endpoint URL', value: modalBaseUrl(d),
           notes: ['Derived from the account\'s Modal workspace and the generated app name. Nothing is deployed yet: `modal deploy` prints the real URL, and if it differs, that one wins.'],
@@ -2074,30 +2205,42 @@ export function validateStep(draft, stepId, catalog = null, accounts = null) {
   }
 
   if (id === 'account') {
-    if (!d.accountId) {
-      problems.push(problem('accountId', 'An account id is required: it names the vault entry and the deployment’s billing account.'));
-    } else if (!slugLike(d.accountId)) {
-      problems.push(problem('accountId', 'Use letters, digits, dot, dash or underscore, starting with a letter or digit.'));
-    } else if (asArray(accounts).some((account) => text(asObject(account).id) === d.accountId)) {
-      problems.push(problem('accountId', `Account "${d.accountId}" already pays for another rental. Each rental has its own account, credential and vault entry, so this one needs a new account id.`));
-    }
-    if (!d.workspace) {
-      problems.push(problem('workspace', 'The Modal workspace is required: it is half of the endpoint URL and the app deploys into it.'));
-    } else if (d.workspace.length > 63 || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(d.workspace)) {
-      problems.push(problem('workspace', 'A Modal workspace is up to 63 lowercase letters, digits or dashes, with no dash at either end (for example `mana`).'));
-    }
-    if (!PLAN_IDS.includes(d.plan)) {
-      problems.push(problem('plan', `Plan must be one of ${PLAN_IDS.join(', ')}; leave it on unknown rather than guessing.`));
-    }
-    if (!d.tokenId) {
-      problems.push(problem('tokenId', 'The Modal proxy token id is required (Modal-Key).'));
-    } else if (/^ak-/.test(d.tokenId)) {
-      problems.push(problem('tokenId', 'That is a Modal API token (ak-…), not a proxy token. The relay sends proxy tokens as Modal-Key (wk-…).'));
-    }
-    if (!d.tokenSecret) {
-      problems.push(problem('tokenSecret', 'The Modal proxy token secret is required (Modal-Secret).'));
-    } else if (/^as-/.test(d.tokenSecret)) {
-      problems.push(problem('tokenSecret', 'That is a Modal API token secret (as-…), not a proxy token secret (ws-…).'));
+    const recorded = asArray(accounts).map(asObject);
+    const reuse = d.accountMode === 'existing';
+    if (reuse) {
+      // Reusing an account names it and nothing else: its workspace, plan and credential are
+      // already recorded, and re-sending them would be a second write of the same secret.
+      if (!d.accountId) {
+        problems.push(problem('accountId', 'Choose the recorded account this rental bills through.'));
+      } else if (!recorded.some((account) => text(account.id) === d.accountId)) {
+        problems.push(problem('accountId', `"${d.accountId}" is not a recorded account on this platform, so there is nothing to reuse.`));
+      }
+    } else {
+      if (!d.accountId) {
+        problems.push(problem('accountId', 'An account id is required: it names the vault entry and the deployment’s billing account.'));
+      } else if (!slugLike(d.accountId)) {
+        problems.push(problem('accountId', 'Use letters, digits, dot, dash or underscore, starting with a letter or digit.'));
+      } else if (recorded.some((account) => text(account.id) === d.accountId)) {
+        problems.push(problem('accountId', `Account "${d.accountId}" is already recorded. Reuse it instead of creating a second one with the same id, which would collide on its vault entry.`));
+      }
+      if (!d.workspace) {
+        problems.push(problem('workspace', 'The Modal workspace is required: it is half of the endpoint URL and the app deploys into it.'));
+      } else if (d.workspace.length > 63 || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(d.workspace)) {
+        problems.push(problem('workspace', 'A Modal workspace is up to 63 lowercase letters, digits or dashes, with no dash at either end (for example `mana`).'));
+      }
+      if (!PLAN_IDS.includes(d.plan)) {
+        problems.push(problem('plan', `Plan must be one of ${PLAN_IDS.join(', ')}; leave it on unknown rather than guessing.`));
+      }
+      if (!d.tokenId) {
+        problems.push(problem('tokenId', 'The Modal proxy token id is required (Modal-Key).'));
+      } else if (/^ak-/.test(d.tokenId)) {
+        problems.push(problem('tokenId', 'That is a Modal API token (ak-…), not a proxy token. The relay sends proxy tokens as Modal-Key (wk-…).'));
+      }
+      if (!d.tokenSecret) {
+        problems.push(problem('tokenSecret', 'The Modal proxy token secret is required (Modal-Secret).'));
+      } else if (/^as-/.test(d.tokenSecret)) {
+        problems.push(problem('tokenSecret', 'That is a Modal API token secret (as-…), not a proxy token secret (ws-…).'));
+      }
     }
   }
 
@@ -2115,8 +2258,13 @@ export function validateStep(draft, stepId, catalog = null, accounts = null) {
     if (asArray(probe.errors).length > 0) {
       problems.push(problem('repo', `The last probe failed: ${asArray(probe.errors).map((e) => (typeof e === 'string' ? e : text(e?.message) || JSON.stringify(e))).join('; ')}`));
     }
-    if (requiresHfToken(probe) && !d.hfToken) {
-      problems.push(problem('hfToken', 'This repository is gated, so a HuggingFace token is needed for the file fetches. It is stored in the vault, never on the panel.'));
+    if (requiresHfToken(probe) && !d.hfTokenId && !d.hfTokenNew) {
+      problems.push(problem('hfTokenId', 'This repository is gated, so a HuggingFace token is needed for the file fetches. Choose a recorded token or add one; it is stored in the vault, never on the panel.'));
+    }
+    if (d.hfTokenNew && !d.hfTokenNewLabel) {
+      problems.push(problem('hfTokenNewLabel', 'Give the new token an id, so a later rental can name it instead of pasting it again.'));
+    } else if (d.hfTokenNew && !slugLike(d.hfTokenNewLabel)) {
+      problems.push(problem('hfTokenNewLabel', 'Use letters, digits, dot, dash or underscore for the token id.'));
     }
   }
 
@@ -2172,6 +2320,25 @@ export function validateStep(draft, stepId, catalog = null, accounts = null) {
       const value = toNumber(seqs);
       if (value == null || !Number.isInteger(value) || value < 1) {
         problems.push(problem('maxNumSeqs', 'Simultaneous sessions must be a whole number of at least 1, or empty.'));
+      }
+    }
+    const sessions = d.sessions;
+    if (sessions == null || sessions === '' || !Number.isInteger(toNumber(sessions)) || toNumber(sessions) < 1) {
+      problems.push(problem('sessions', 'Concurrent sessions must be a whole number of at least 1.'));
+    }
+    if (d.mode === 'batch') {
+      const size = toNumber(d.batchSize);
+      if (size == null || !Number.isInteger(size) || size < 1) {
+        problems.push(problem('batchSize', 'Batch size must be a whole number of at least 1.'));
+      }
+      if (d.batchFill !== 'full' && d.batchFill !== 'timeout') {
+        problems.push(problem('batchFill', 'Choose one fill policy: wait until full, or ship after a timeout.'));
+      }
+      if (d.batchFill === 'timeout') {
+        const secs = toNumber(d.batchTimeoutSecs);
+        if (secs == null || !Number.isInteger(secs) || secs < 1 || secs > 3600) {
+          problems.push(problem('batchTimeoutSecs', 'Batch timeout must be a whole number of seconds between 1 and 3600.'));
+        }
       }
     }
     const cooldown = toNumber(d.shutdownCooldownSecs);
@@ -2245,6 +2412,23 @@ function vllmVersion(catalog) {
  * @param {object} catalog
  * @returns {{filename: string, text: string, command: string, notes: string[]}}
  */
+/**
+ * One sentence naming what the recorded deployment is, in the same words the bundle uses: a mode,
+ * a card (or several), and — for a batch — how a batch decides it is done collecting. The review
+ * step shows this because the fill policy is part of the deployment, not a detail of the app.
+ */
+export function deploymentShapeNote(draft) {
+  const d = normalizeDraft(draft);
+  const card = d.gpu ? `${d.gpuCount > 1 ? `${d.gpuCount} × ` : ''}${d.gpu}` : 'a card not chosen yet';
+  if (d.mode === 'batch') {
+    const when = d.batchFill === 'timeout'
+      ? `a batch ships after ${d.batchTimeoutSecs} s even if it is not full`
+      : 'a batch waits until it is full, however long that takes';
+    return `Batch of ${d.batchSize} on ${card}: ${when}.`;
+  }
+  return `Streaming on ${card}, holding ${d.sessions} simultaneous session${d.sessions === 1 ? '' : 's'}.`;
+}
+
 export function deploymentBundle(draft, sizing, catalog) {
   const d = normalizeDraft(draft);
   const index = catalogIndex(catalog);
@@ -2263,11 +2447,11 @@ export function deploymentBundle(draft, sizing, catalog) {
   const cudaPinned = gpuId === 'B300';
   const version = vllmVersion(catalog);
   const clamp = clampScaledown(d.shutdownCooldownSecs);
-  const gated = d.hfTokenNeeded || requiresHfToken(d.probe) || Boolean(d.hfToken);
+  const gated = d.hfTokenNeeded || requiresHfToken(d.probe) || Boolean(d.hfTokenId || d.hfTokenNew);
   const utilization = toNumber(d.gpuMemoryUtilization) ?? DEFAULT_GPU_MEMORY_UTILIZATION;
   // The same derivation the conductor records as the provider's base_url, so the app this file
   // deploys and the URL the panel shows cannot drift apart.
-  const appName = modalAppName(d.accountId, d.repo);
+  const appName = modalAppName(d.accountId, d.repo, d.mode, d.gpu, d.gpuCount);
   const derivedUrl = modalBaseUrl(d);
   const secretName = 'manarouter-hf';
   const volumeName = 'manarouter-hf-cache';
@@ -2447,21 +2631,26 @@ function optionalInt(value) {
 }
 
 /**
- * The `create-account` body for `POST /api/gpu/apply` (§5).
+ * The `create-account` body for `POST /api/gpu/apply` (§5), or `null` when this rental reuses an
+ * account that is already recorded.
  *
- * This is the one payload that carries a credential, and it exists because the vault write is
- * the point of the request. It must be posted and dropped, never rendered, logged or kept in
- * component state; the server answers with a vault id and a fingerprint, never the value.
+ * This is the one payload that carries an account credential, and it exists because the vault
+ * write is the point of the request. It must be posted and dropped, never rendered, logged or kept
+ * in component state; the server answers with a vault id and a fingerprint, never the value. A
+ * HuggingFace token is not part of it: tokens are their own entity, added by
+ * {@link hfTokenApplyPayload} and named by the deployment.
  *
  * @param {object} draft
+ * @returns {object|null}
  */
 export function accountApplyPayload(draft) {
   const d = normalizeDraft(draft);
+  if (d.accountMode === 'existing') return null;
   const payload = {
     action: 'create-account',
     account: {
       id: d.accountId,
-      label: d.accountId,
+      label: d.accountLabel || d.accountId,
       platform: d.platform,
       plan: d.plan,
       // Not a secret: the Modal workspace the apps deploy into, and the half of the endpoint URL
@@ -2469,10 +2658,29 @@ export function accountApplyPayload(draft) {
       workspace: d.workspace,
       token_id: d.tokenId,
       token_secret: d.tokenSecret,
-      hf_token: d.hfToken || null,
     },
   };
   return payload;
+}
+
+/**
+ * The `create-hf-token` body for `POST /api/gpu/apply`, or `null` when the draft adds no token.
+ *
+ * A token is written once and then named by id: the value must be posted and dropped exactly like
+ * an account credential. The id is the draft's `hfTokenNewLabel`, which is what a later rental
+ * selects from the recorded list.
+ *
+ * @param {object} draft
+ * @returns {object|null}
+ */
+export function hfTokenApplyPayload(draft) {
+  const d = normalizeDraft(draft);
+  if (!d.hfTokenNew) return null;
+  const id = d.hfTokenNewLabel;
+  return {
+    action: 'create-hf-token',
+    token: { id, label: id, secret: d.hfTokenNew },
+  };
 }
 
 /**
@@ -2514,6 +2722,14 @@ export function applyPayload(draft, sizing) {
     shutdown_cooldown_secs: clampScaledown(d.shutdownCooldownSecs).seconds,
     mode: d.mode === 'batch' ? 'batch' : 'streaming',
   };
+  if (deployment.mode === 'batch') {
+    // The recorded fill policy, not a hidden default: `full` carries no timeout at all, because a
+    // number nobody reads is a number that looks like a cap.
+    deployment.batch = { size: Math.max(1, Math.trunc(toNumber(d.batchSize) ?? 1)), fill: d.batchFill };
+    if (d.batchFill === 'timeout') {
+      deployment.batch.timeout_secs = Math.max(1, Math.trunc(toNumber(d.batchTimeoutSecs) ?? 1));
+    }
+  }
   if (d.revision) deployment.revision = d.revision;
   if (optionalInt(d.maxModelLen) != null) deployment.max_model_len = optionalInt(d.maxModelLen);
   if (optionalInt(d.maxNumSeqs) != null) deployment.max_num_seqs = optionalInt(d.maxNumSeqs);
@@ -2521,7 +2737,12 @@ export function applyPayload(draft, sizing) {
   const wire = wireSizing(d, sizing);
   if (wire) deployment.sizing = wire;
 
-  return { action: 'create-deployment', account_id: d.accountId, deployment };
+  // The token is named by id beside the account id, not inside the account: the same token may be
+  // named by deployments on several accounts, and this one may need none.
+  const hfToken = d.hfTokenId || null;
+  return hfToken
+    ? { action: 'create-deployment', account_id: d.accountId, hf_token: hfToken, deployment }
+    : { action: 'create-deployment', account_id: d.accountId, deployment };
 }
 
 // ---------------------------------------------------------------------------
@@ -2554,4 +2775,219 @@ export function parseModelNameSize(name) {
     return { value, token: `${match[1]}${unit}` };
   }
   return { value: null, token: null };
+}
+
+// ---------------------------------------------------------------------------
+// fit
+// ---------------------------------------------------------------------------
+
+/** Per-card VRAM as the catalog states it, under either spelling. */
+function cardVram(gpu) {
+  const entry = asObject(gpu);
+  const bytes = toNumber(entry.vram_bytes ?? entry.vramBytes);
+  if (bytes != null && bytes > 0) return bytes;
+  const gib = toNumber(entry.vram_gib ?? entry.vramGib);
+  return gib != null && gib > 0 ? gib * 1024 ** 3 : null;
+}
+
+/**
+ * Does this draft fit the card it names, and if not, what exactly would make it fit?
+ *
+ * WHY this exists as one function rather than as branches in the deploy window: "it does not fit"
+ * is only useful when it says what to change, and each answer is a recomputation, not a guess. The
+ * suggestions are produced by re-running `applySizing` with one field changed at a time, so a
+ * suggestion is printed only when that change — on this repository, on this catalog — actually
+ * produces a fit. Nothing here is a rule of thumb like "use a bigger card".
+ *
+ * The order of the suggestions is the order of the cost they impose: a different card changes
+ * nothing about the model, a smaller model quant costs quality, a smaller cache quant costs
+ * accuracy on long contexts, a smaller batch costs concurrency, a smaller context costs reach.
+ * The first suggestion is therefore the one to take unless one of the later costs matters more.
+ *
+ * @param {object} draft
+ * @param {object|null} sizing the result of `applySizing` for this draft
+ * @param {object|null} catalog
+ * @returns {{ok: boolean, known: boolean, blockers: Array<{code: string, message: string}>,
+ *   suggestions: Array<{field: string, value: number|string, label: string, detail: string}>,
+ *   fit: {gpu: string, gpu_count: number, pool: number|null, max_model_len: number|null,
+ *     sessions_at_max_len: number|null, needed: number, mode: string}}}
+ */
+export function fitReport(draft, sizing, catalog = null) {
+  const d = normalizeDraft(draft);
+  const index = catalogIndex(catalog);
+  const probe = asObject(d.probe);
+  const result = asObject(sizing ?? d.sizing);
+  const gpuId = text(d.gpu);
+  const gpuCount = Math.max(1, Math.trunc(toNumber(d.gpuCount) ?? 1));
+  const mode = d.mode === 'batch' ? 'batch' : 'streaming';
+  // Both modes serve concurrent sessions; the batch size *is* the concurrency a batch deployment
+  // is asked for, so a batch is judged against its own N and a streaming endpoint against the
+  // sessions the operator says it must hold. Judging streaming at one session was the old
+  // assumption that "streaming" meant "one request at a time", which one vLLM card disproves.
+  const needed = mode === 'batch'
+    ? Math.max(1, Math.trunc(toNumber(d.batchSize) ?? 1))
+    : Math.max(1, Math.trunc(toNumber(d.sessions) ?? 1));
+  const pool = toNumber(result.kv_pool_tokens);
+  const budget = toNumber(result.kv_budget_bytes);
+  const maxLen = toNumber(result.max_model_len);
+  const atMax = toNumber(result.simultaneous_sessions_at_max_len);
+
+  const fit = {
+    gpu: gpuId,
+    gpu_count: gpuCount,
+    pool,
+    max_model_len: maxLen,
+    sessions_at_max_len: atMax,
+    needed,
+    mode,
+  };
+  const blockers = [];
+  const suggestions = [];
+
+  // `applySizing` answers with `{draft, sizing, warnings}`; the figures a candidate is judged on
+  // live in `sizing`, so each reader goes through the envelope here instead of reading the
+  // envelope's own (absent) pool and session fields, which made every candidate look like a
+  // refusal and silently emptied the suggestion list.
+  const sizes = (candidate) => asObject(applySizing({ ...d, ...candidate }, probe, catalog).sizing);
+  const sessionCount = (next) => toNumber(asObject(next).simultaneous_sessions_at_max_len);
+  const poolOf = (next) => toNumber(asObject(next).kv_pool_tokens);
+  const holds = (next) => {
+    const p = poolOf(next);
+    const s = sessionCount(next);
+    if (p == null || !(p > 0)) return false;
+    // `sessions_at_max_len` is null when no context is known; the pool alone then has to hold the
+    // sessions at the context vLLM would use, which is the only figure available.
+    if (s != null) return s >= needed;
+    const len = toNumber(asObject(next).max_model_len);
+    return len == null ? false : p >= needed * len;
+  };
+
+  if (Object.keys(result).length === 0 || result.method === 'unavailable') {
+    const missing = asArray(result.missing).map((entry) => text(entry)).filter(Boolean);
+    blockers.push({
+      code: 'unknown',
+      message: missing.length
+        ? `The KV pool cannot be estimated from this repository and card, so fit is unknown rather than good: ${missing.join('; ')}.`
+        : 'The KV pool has not been estimated yet, so fit is unknown rather than good.',
+    });
+    return { ok: false, known: false, blockers, suggestions, fit };
+  }
+
+  if (pool == null) {
+    blockers.push({ code: 'unknown', message: 'The sizing result carries no KV pool figure, so fit is unknown rather than good.' });
+    return { ok: false, known: false, blockers, suggestions, fit };
+  }
+
+  if (budget != null && budget <= 0) {
+    blockers.push({
+      code: 'weights',
+      message: `The weights (${gib(toNumber(result.weights_bytes) ?? 0)} GiB) plus the ${gib(OVERHEAD_BYTES)} GiB of overhead do not fit the ${gib(toNumber(result.vram_bytes) ?? 0)} GiB budget on ${gpuId || 'this card'}${gpuCount > 1 ? ` ×${gpuCount}` : ''}.`,
+    });
+  } else if (!(pool > 0)) {
+    blockers.push({
+      code: 'pool',
+      message: `The KV pool on ${gpuId || 'this card'} is empty, so no session fits even though the weights do.`,
+    });
+  } else if (atMax != null && atMax < needed) {
+    blockers.push({
+      code: 'sessions',
+      message: `${mode === 'batch' ? `A batch of ${needed}` : `${needed} concurrent session${needed === 1 ? '' : 's'}`} at the full ${maxLen ?? '?'} tokens needs ${needed} slot${needed === 1 ? '' : 's'}, and ${gpuId || 'this card'} holds ${atMax}.`,
+    });
+  }
+
+  if (blockers.length === 0) return { ok: true, known: true, blockers, suggestions, fit };
+
+  // --- what would make it fit ---------------------------------------------------------------
+  // A card: the smallest VRAM increase on the same platform that holds this draft unchanged.
+  const gpu = gpuId && hasOwn(index.gpuById, gpuId) ? index.gpuById[gpuId] : null;
+  const currentVram = cardVram(gpu);
+  const platformId = text(d.platform);
+  const platform = platformId && hasOwn(index.platformById, platformId) ? index.platformById[platformId] : null;
+  const siblings = asArray(platform?.gpus).map(asObject)
+    .filter((entry) => text(entry.id))
+    .map((entry) => ({ id: text(entry.id), vram: cardVram(entry) }))
+    .filter((entry) => entry.vram != null)
+    .sort((a, b) => a.vram - b.vram);
+  const currentCountVram = currentVram == null ? null : currentVram * gpuCount;
+  for (const sibling of siblings) {
+    if (sibling.id === gpuId) continue;
+    if (currentCountVram != null && sibling.vram <= currentCountVram) continue;
+    const next = sizes({ gpu: sibling.id });
+    if (!holds(next)) continue;
+    suggestions.push({
+      field: 'gpu',
+      value: sibling.id,
+      label: `Change GPU to ${sibling.id}`,
+      detail: `${gib(sibling.vram)} GiB per card instead of ${currentVram == null ? 'the card you chose' : `${gib(currentVram)} GiB`} holds this model, quant and batch unchanged.`,
+    });
+    break;
+  }
+
+  // A smaller model quant, but only one the repository actually ships: a suggestion to requantise
+  // is a different, hours-long job and is not what "make this fit" means here.
+  const quants = quantOptions(probe, gpuId, catalog).available.filter((entry) => entry.inRepo);
+  const currentBpp = quants.find((entry) => entry.id === text(d.weightQuant))?.bytesPerParam ?? null;
+  const smaller = quants
+    .filter((entry) => entry.id !== text(d.weightQuant))
+    .filter((entry) => (currentBpp == null || entry.bytesPerParam == null ? true : entry.bytesPerParam < currentBpp))
+    .sort((a, b) => (b.bytesPerParam ?? 0) - (a.bytesPerParam ?? 0));
+  for (const quant of smaller) {
+    const next = sizes({ weightQuant: quant.id });
+    if (!holds(next)) continue;
+    suggestions.push({
+      field: 'weightQuant',
+      value: quant.id,
+      label: `Use the ${quant.label || quant.id} weights`,
+      detail: `The repository ships ${quant.id}${quant.bytesPerParam == null ? '' : ` at ${quant.bytesPerParam} bytes per parameter`}; it loads on ${gpuId || 'this card'} where ${text(d.weightQuant) || 'the chosen quant'} does not.`,
+    });
+    break;
+  }
+
+  // A smaller cache quant the catalog says this card can execute.
+  const dtypes = kvDtypesForGpu(catalog, gpuId).filter((entry) => entry.legal !== false && entry.id);
+  const currentWidth = dtypes.find((entry) => entry.id === text(d.kvCacheDtype))?.bytesPerElement ?? null;
+  const narrower = dtypes
+    .filter((entry) => entry.id !== text(d.kvCacheDtype) && entry.id !== 'auto')
+    .filter((entry) => (currentWidth == null || entry.bytesPerElement == null ? true : entry.bytesPerElement < currentWidth))
+    .sort((a, b) => (b.bytesPerElement ?? 0) - (a.bytesPerElement ?? 0));
+  for (const dtype of narrower) {
+    const next = sizes({ kvCacheDtype: dtype.id });
+    if (!holds(next)) continue;
+    suggestions.push({
+      field: 'kvCacheDtype',
+      value: dtype.id,
+      label: `Use the ${dtype.label || dtype.id} KV cache`,
+      detail: `${dtype.bytesPerElement ?? '?'} bytes per element instead of ${currentWidth ?? '?'} halves the cache${dtype.bytesPerElement === 1 ? '' : ' per element'}, which is enough for this batch on ${gpuId || 'this card'}; a cache quant is not free of accuracy cost on long contexts.`,
+    });
+    break;
+  }
+
+  // A smaller concurrency figure: the pool divided by the full context is the largest number of
+  // sequences that can coexist, and vLLM would otherwise start and then fail to schedule the rest.
+  if (atMax != null && atMax >= 1 && atMax < needed) {
+    suggestions.push({
+      field: mode === 'batch' ? 'batchSize' : 'sessions',
+      value: atMax,
+      label: mode === 'batch' ? `Set the batch size to ${atMax}` : `Ask for ${atMax} session${atMax === 1 ? '' : 's'}`,
+      detail: `At the full ${maxLen ?? '?'}-token context the pool holds ${atMax} sequence${atMax === 1 ? '' : 's'}; asking for more does not fail to start, it queues the extra requests until one finishes.`,
+    });
+  }
+
+  // A smaller context: the largest reference context at which the requested batch still fits.
+  if (maxLen != null && maxLen > 0) {
+    const rungs = [...SIZING_CONTEXT_LADDER].filter((context) => context < maxLen);
+    for (let i = rungs.length - 1; i >= 0; i -= 1) {
+      const next = sizes({ maxModelLen: rungs[i] });
+      if (!holds(next)) continue;
+      suggestions.push({
+        field: 'maxModelLen',
+        value: rungs[i],
+        label: `Cap the context at ${rungs[i]} tokens`,
+        detail: `${needed} sequence${needed === 1 ? '' : 's'} fit at ${rungs[i]} tokens where ${maxLen} does not; requests longer than the cap are refused rather than truncated.`,
+      });
+      break;
+    }
+  }
+
+  return { ok: false, known: true, blockers, suggestions, fit };
 }

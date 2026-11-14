@@ -34,6 +34,8 @@ const {
   catalogIndex,
   deploymentBundle,
   emptyDraft,
+  fitReport,
+  hfTokenApplyPayload,
   kvDtypesForGpu,
   maxGpuCountFor,
   modalBaseUrl,
@@ -302,12 +304,16 @@ test('emptyDraft fills every documented key and starts on Modal with no plan cla
   assert.deepEqual(d, {
     platform: 'modal',
     accountId: '',
+    accountLabel: '',
     workspace: '',
     plan: 'unknown',
     tokenId: '',
     tokenSecret: '',
-    hfToken: '',
+    accountMode: 'new',
     hfTokenNeeded: false,
+    hfTokenId: '',
+    hfTokenNew: '',
+    hfTokenNewLabel: '',
     repo: '',
     revision: '',
     gpu: '',
@@ -318,12 +324,33 @@ test('emptyDraft fills every documented key and starts on Modal with no plan cla
     maxNumSeqs: null,
     shutdownCooldownSecs: 60,
     mode: 'streaming',
+    sessions: 1,
+    batchSize: 8,
+    batchFill: 'full',
+    batchTimeoutSecs: 60,
     requantizeTo: '',
     gpuMemoryUtilization: 0.92,
     baseUrl: '',
     sizing: null,
     probe: null,
   });
+});
+
+test('the review says which mode the deployment is and how its batch fills', () => {
+  const { deploymentShapeNote } = model;
+  assert.equal(deploymentShapeNote(draft({ gpu: 'RTX-PRO-6000', sessions: 6 })),
+    'Streaming on RTX-PRO-6000, holding 6 simultaneous sessions.');
+  assert.equal(deploymentShapeNote(draft({ gpu: 'RTX-PRO-6000', sessions: 1 })),
+    'Streaming on RTX-PRO-6000, holding 1 simultaneous session.');
+  assert.equal(deploymentShapeNote(draft({ gpu: 'l40s', gpuCount: 2, sessions: 3 })),
+    'Streaming on 2 × l40s, holding 3 simultaneous sessions.');
+  assert.equal(deploymentShapeNote(draft({ mode: 'batch', batchSize: 8, batchFill: 'full', gpu: 'RTX-PRO-6000' })),
+    'Batch of 8 on RTX-PRO-6000: a batch waits until it is full, however long that takes.');
+  // The timeout is the half-full variant, and it names the wait it was given.
+  assert.equal(deploymentShapeNote(draft({ mode: 'batch', batchSize: 4, batchFill: 'timeout', batchTimeoutSecs: 30, gpu: 'l40s' })),
+    'Batch of 4 on l40s: a batch ships after 30 s even if it is not full.');
+  // Never silent about a card that has not been chosen: the sentence is a readout, not a promise.
+  assert.match(deploymentShapeNote(draft({ mode: 'batch', batchSize: 2, gpu: '' })), /a card not chosen yet/);
 });
 
 test('emptyDraft returns a fresh object each call', () => {
@@ -377,24 +404,45 @@ test('stepList field inventory is stable per step', () => {
   );
   assert.deepEqual(inventory, {
     platform: ['platform', 'platformDeployment'],
-    account: ['accountId', 'workspace', 'plan', 'tokenId', 'tokenSecret', 'planMarker', 'accountCredentialNote'],
-    model: ['repo', 'revision', 'hfToken', 'probeGated', 'probeParams', 'probeArch', 'probeQuants', 'probeWarnings'],
+    // Two controls write the same draft key: a text input for a new id, and a select of recorded
+    // ones for a reuse. Exactly one is visible, keyed by `accountMode`, so the duplicate is the
+    // inventory being honest rather than two fields.
+    account: [
+      'accountMode', 'accountId', 'accountId', 'workspace', 'plan', 'tokenId', 'tokenSecret',
+      'planMarker', 'accountCredentialNote',
+    ],
+    model: [
+      'repo', 'revision', 'hfTokenId', 'hfTokenNew', 'hfTokenNewLabel',
+      'probeGated', 'probeParams', 'probeArch', 'probeQuants', 'probeWarnings',
+    ],
     card: ['gpu', 'gpuCount', 'mode', 'gpuMemoryUtilization', 'weightQuant', 'kvCacheDtype', 'requantizeTo', 'gpuPrice', 'cardPlanMarker'],
     sizing: [
-      'maxModelLen', 'maxNumSeqs', 'shutdownCooldownSecs',
+      'maxModelLen', 'maxNumSeqs', 'sessions', 'batchSize', 'batchFill', 'batchTimeoutSecs',
+      'batchWaitNote', 'shutdownCooldownSecs',
       'sizingKvBasis', 'sizingKvPool', 'sizingMeasured', 'sizingCalibration',
       'sizingAssumptions', 'sizingUnavailable', 'sizingWarnings',
     ],
-    review: ['endpointUrl', 'baseUrl', 'bundleFilename', 'bundleCommand', 'bundleNotes', 'bundleWarnings', 'sizingDelta'],
+    review: [
+      'deploymentShape','endpointUrl', 'baseUrl', 'bundleFilename', 'bundleCommand', 'bundleNotes', 'bundleWarnings', 'sizingDelta'],
   });
 });
 
-test('the model step hides the HF token until the probe says the repo is gated', () => {
+test('the model step names a recorded HF token, and only for a gated repo', () => {
   const fields = (d) => stepList(d, CATALOG).find((s) => s.id === 'model').fields;
-  assert.equal(fields(draft()).find((f) => f.name === 'hfToken').visible, false);
+  const byName = (d, name) => fields(d).find((f) => f.name === name);
+  assert.equal(byName(draft(), 'hfTokenId').visible, false,
+    'a public repository names no token, so the selector is not offered');
   const gated = draft({ probe: gatedProbe(), hfTokenNeeded: true });
-  assert.equal(fields(gated).find((f) => f.name === 'hfToken').visible, true);
-  assert.equal(fields(gated).find((f) => f.name === 'hfToken').kind, 'password');
+  const select = byName(gated, 'hfTokenId');
+  assert.equal(select.visible, true);
+  assert.equal(select.kind, 'select');
+  assert.equal(select.optionsSource, 'hfTokens', 'the list is the recorded tokens, not an account field');
+  assert.equal(select.required, false, 'a token is named by id and may be added on the same step');
+  const pasted = byName(gated, 'hfTokenNew');
+  assert.equal(pasted.visible, true);
+  assert.equal(pasted.kind, 'password', 'a pasted token is a secret field');
+  assert.equal(byName(draft({ hfTokenNew: 'hf_x', hfTokenNeeded: true }), 'hfTokenNewLabel').visible, true,
+    'a pasted token needs an id to be named by later');
 });
 
 test('the card step offers one mode axis, and batch is a choice not a second card', () => {
@@ -488,16 +536,21 @@ test('a probe that belongs to another repo is never silently reused', () => {
   ]);
 });
 
-test('a gated repo needs its HF token before the model step passes', () => {
-  const gated = draft({ probe: gatedProbe(), repo: 'orcarouter/Qwen3.8-27B-Uncensored-FP8', hfTokenNeeded: true, hfToken: '' });
+test('a gated repo needs a token named or pasted before the model step passes', () => {
+  const gated = draft({
+    probe: gatedProbe(), repo: 'orcarouter/Qwen3.8-27B-Uncensored-FP8', hfTokenNeeded: true,
+    hfTokenId: '', hfTokenNew: '', hfTokenNewLabel: '',
+  });
   const problems = problemsOf(gated, 'model');
   assert.equal(problems.length, 1);
-  assert.equal(problems[0].field, 'hfToken');
+  assert.equal(problems[0].field, 'hfTokenId');
   assert.match(problems[0].message, /token/i);
-  assert.deepEqual(
-    problemsOf({ ...gated, hfToken: 'hf_placeholder' }, 'model'),
-    [],
-  );
+  assert.deepEqual(problemsOf({ ...gated, hfTokenId: 'hub-main' }, 'model'), [],
+    'naming a recorded token is enough');
+  assert.deepEqual(problemsOf({ ...gated, hfTokenNew: 'hf_placeholder', hfTokenNewLabel: 'hub-new' }, 'model'), [],
+    'pasting a new one is enough too');
+  assert.equal(problemsOf({ ...gated, hfTokenNew: 'hf_placeholder', hfTokenNewLabel: '' }, 'model').length, 1,
+    'a pasted token without an id could not be named by a later rental');
 });
 
 test('the card step requires a GPU and at least one card', () => {
@@ -561,7 +614,7 @@ test('mode is exactly one of streaming or batch, and the legacy spelling never s
 
 test('the endpoint URL is derived from the workspace and app name, and only an override is validated', () => {
   const derived = modalBaseUrl(draft());
-  assert.equal(derived, 'https://mana--manarouter-rental-mana-modal-qwen3-8-27b-serve.modal.run');
+  assert.equal(derived, 'https://mana--manarouter-rental-mana-modal-qwen3-8-27b-streaming-rtx-pro-6000-serve.modal.run');
   assert.deepEqual(problemsOf(draft({ baseUrl: '' }), 'review'), [],
     'the normal path pastes nothing: the workspace and app name are enough');
   assert.deepEqual(problemsOf(draft({ workspace: '', baseUrl: '' }), 'review'), [
@@ -1273,7 +1326,7 @@ test('the bundle is a complete runnable modal_app.py plus the command that deplo
   assert.equal(bundle.command, 'modal deploy modal_app.py');
   assert.match(bundle.text, /^"""modal_app\.py/);
   assert.match(bundle.text, /import modal/);
-  assert.match(bundle.text, /app = modal\.App\("manarouter-rental-mana-modal-qwen3-8-27b"\)/,
+  assert.match(bundle.text, /app = modal\.App\("manarouter-rental-mana-modal-qwen3-8-27b-streaming-rtx-pro-6000"\)/,
     'the app name is the one the derived endpoint URL is built from');
   assert.match(bundle.text, /gpu="RTX-PRO-6000"/);
   assert.match(bundle.text, /scaledown_window=60/);
@@ -1458,7 +1511,7 @@ test('an unknown card is named in the notes instead of being silently deployed',
 test('the bundle says the endpoint is derived, and the printed one wins if it differs', () => {
   const derived = deploymentBundle(draft(), draft().sizing, CATALOG);
   assert.match(derived.notes.join('\n'),
-    /Manarouter computes the endpoint URL as https:\/\/mana--manarouter-rental-mana-modal-qwen3-8-27b-serve\.modal\.run/);
+    /Manarouter computes the endpoint URL as https:\/\/mana--manarouter-rental-mana-modal-qwen3-8-27b-streaming-rtx-pro-6000-serve\.modal\.run/);
   assert.match(derived.notes.join('\n'), /`modal deploy` prints the authoritative URL; if it differs, override/);
   const overridden = deploymentBundle(draft({ baseUrl: 'https://printed--by-modal.modal.run' }), draft().sizing, CATALOG);
   assert.match(overridden.notes.join('\n'), /overridden to https:\/\/printed--by-modal\.modal\.run/);
@@ -1504,9 +1557,8 @@ test('no payload carries a second card, even from a draft written before the mod
   assert.ok(!JSON.stringify(payload).includes('batch_gpu'));
 });
 
-test('the account payload writes the credentials once, and hf_token is null when unused', () => {
-  const withToken = accountApplyPayload(draft({ hfToken: 'hf_placeholder' }));
-  assert.deepEqual(withToken, {
+test('the account payload writes the platform credential and no HuggingFace token', () => {
+  assert.deepEqual(accountApplyPayload(draft()), {
     action: 'create-account',
     account: {
       id: 'mana-modal',
@@ -1516,29 +1568,65 @@ test('the account payload writes the credentials once, and hf_token is null when
       workspace: 'mana',
       token_id: 'wk-x',
       token_secret: 'ws-y',
-      hf_token: 'hf_placeholder',
     },
   });
-  assert.equal(accountApplyPayload(draft({ hfToken: '' })).account.hf_token, null);
+  assert.equal('hf_token' in accountApplyPayload(draft({ hfTokenId: 'hub-main' })).account, false,
+    'a token is its own record; the account never carries one');
+});
+
+test('reusing a recorded account posts nothing at all', () => {
+  assert.equal(accountApplyPayload(draft({ accountMode: 'existing', accountId: 'mana-modal' })), null);
+  assert.equal(accountApplyPayload(draft({ accountMode: 'new' })).action, 'create-account');
+});
+
+test('a pasted HuggingFace token is posted as its own record, once, under the id a rental names', () => {
+  assert.equal(hfTokenApplyPayload(draft()), null, 'no pasted token means no write');
+  assert.deepEqual(hfTokenApplyPayload(draft({ hfTokenNew: 'hf_placeholder', hfTokenNewLabel: 'hub-new' })), {
+    action: 'create-hf-token',
+    token: { id: 'hub-new', label: 'hub-new', secret: 'hf_placeholder' },
+  });
+});
+
+test('the deployment names a token by id beside its account, or names none', () => {
+  const withToken = applyPayload(draft({ hfTokenId: 'hub-main' }), draft().sizing);
+  assert.equal(withToken.hf_token, 'hub-main');
+  assert.equal(withToken.account_id, 'mana-modal');
+  const publicRepo = applyPayload(draft({ hfTokenId: '' }), draft().sizing);
+  assert.equal('hf_token' in publicRepo, false, 'a public repository names no token at all');
 });
 
 // ---------------------------------------------------------------------------
 // one account per rental
 // ---------------------------------------------------------------------------
 
-test('an account id another rental already pays from is refused, and says why', () => {
+test('creating an account whose id is already recorded is refused, and says to reuse it', () => {
   const d = draft();
   const accounts = [{ id: 'mana-modal', platform: 'modal', workspace: 'mana', has_credential: true }];
   const result = validateStep(d, 'account', CATALOG, accounts);
   assert.equal(result.ok, false);
   assert.deepEqual(result.problems, [{
     field: 'accountId',
-    message: 'Account "mana-modal" already pays for another rental. Each rental has its own account, '
-      + 'credential and vault entry, so this one needs a new account id.',
+    message: 'Account "mana-modal" is already recorded. Reuse it instead of creating a second one '
+      + 'with the same id, which would collide on its vault entry.',
   }]);
   assert.deepEqual(validateStep(draft({ accountId: 'mana-modal-2' }), 'account', CATALOG, accounts).problems, []);
   assert.deepEqual(validateStep(d, 'account', CATALOG, []).problems, [],
     'with no recorded accounts there is nothing to collide with');
+});
+
+test('reusing an account names one that is recorded, and asks for no credential', () => {
+  const accounts = [{ id: 'mana-modal', platform: 'modal', workspace: 'mana', has_credential: true }];
+  const reuse = draft({ accountMode: 'existing', accountId: 'mana-modal', workspace: '', tokenId: '', tokenSecret: '' });
+  assert.deepEqual(validateStep(reuse, 'account', CATALOG, accounts).problems, [],
+    'a reused account writes nothing, so it needs no workspace or credential');
+  assert.deepEqual(validateStep({ ...reuse, accountId: '' }, 'account', CATALOG, accounts).problems, [{
+    field: 'accountId',
+    message: 'Choose the recorded account this rental bills through.',
+  }]);
+  assert.deepEqual(validateStep({ ...reuse, accountId: 'ghost' }, 'account', CATALOG, accounts).problems, [{
+    field: 'accountId',
+    message: '"ghost" is not a recorded account on this platform, so there is nothing to reuse.',
+  }]);
 });
 
 test('the account step always writes its own credential, so both halves are required', () => {
@@ -1551,7 +1639,121 @@ test('the account step always writes its own credential, so both halves are requ
 test('the account payload carries the Modal workspace as a non-secret field', () => {
   const payload = accountApplyPayload(draft({ workspace: 'mana-team' }));
   assert.equal(payload.account.workspace, 'mana-team');
+  assert.equal(payload.account.label, 'mana-modal',
+    'a flow that never asked for a label records the id, which is what the list has always shown');
+  assert.equal(accountApplyPayload(draft({ accountLabel: 'Modal — mana' })).account.label,
+    'Modal — mana', 'a label the operator typed is the one recorded, not the id');
   assert.equal(payload.account.token_secret, 'ws-y');
   assert.ok(!JSON.stringify(payload.account.workspace).includes('ws-y'),
     'the workspace is not the secret and must not be confused with one');
+});
+
+// ---------------------------------------------------------------------------
+// fitReport — what fits, and what to change when it does not
+// ---------------------------------------------------------------------------
+
+/**
+ * The sizing figures this catalog and probe produce on one RTX PRO 6000: a 1 784 103-token pool,
+ * which is six slots at the full 262 144-token context. Every test below is written against that
+ * one number so the boundary is exercised from both sides rather than guessed at.
+ */
+function fitted(overrides = {}) {
+  const d = draft(overrides);
+  return { draft: d, sizing: d.sizing, catalog: CATALOG };
+}
+
+test('streaming is judged on the sessions it must hold, not on one request at a time', () => {
+  const { draft: d, sizing } = fitted();
+  assert.equal(sizing.simultaneous_sessions_at_max_len, 6, 'the pool holds six full-context slots');
+  assert.equal(fitReport({ ...d, sessions: 1 }, sizing, CATALOG).ok, true);
+  assert.equal(fitReport({ ...d, sessions: 6 }, sizing, CATALOG).ok, true,
+    'a streaming endpoint that must hold six sessions fits exactly at its limit');
+  assert.equal(fitReport({ ...d, sessions: 7 }, sizing, CATALOG).ok, false,
+    'one more session than the pool holds is a refusal, not a warning');
+});
+
+test('a batch is judged on its own size, so the same card refuses a batch it would stream', () => {
+  const { draft: d, sizing } = fitted({ mode: 'batch', batchSize: 8 });
+  const report = fitReport(d, sizing, CATALOG);
+  assert.equal(report.ok, false);
+  assert.equal(report.known, true, 'the pool is known; only the batch is too large');
+  assert.deepEqual(report.blockers.map((b) => b.code), ['sessions']);
+  assert.match(report.blockers[0].message, /^A batch of 8 at the full 262144 tokens needs 8 slots/);
+  assert.equal(fitReport({ ...d, batchSize: 6 }, sizing, CATALOG).ok, true,
+    'the same deployment with a batch of six fits what six sessions fit');
+});
+
+test('the fill policy never changes whether a deployment fits', () => {
+  const { draft: d, sizing } = fitted({ mode: 'batch', batchSize: 7 });
+  for (const fill of ['full', 'timeout']) {
+    const report = fitReport({ ...d, batchFill: fill, batchTimeoutSecs: 30 }, sizing, CATALOG);
+    assert.equal(report.ok, false, `${fill} does not make seven slots fit six`);
+    assert.deepEqual(report.blockers.map((b) => b.code), ['sessions']);
+    assert.deepEqual(report.fit, {
+      gpu: 'RTX-PRO-6000',
+      gpu_count: 1,
+      pool: sizing.kv_pool_tokens,
+      max_model_len: 262144,
+      sessions_at_max_len: 6,
+      needed: 7,
+      mode: 'batch',
+    }, 'how a batch fills is a latency choice; the fit verdict is about capacity alone');
+  }
+});
+
+test('every suggestion names one concrete change, and only when that change actually fits', () => {
+  const { draft: d, sizing } = fitted({ mode: 'batch', batchSize: 8 });
+  const report = fitReport(d, sizing, CATALOG);
+  assert.ok(report.suggestions.length > 0, 'a refusal must offer a way out');
+  const names = report.suggestions.map((s) => s.field);
+  assert.ok(!names.includes('requantizeTo'),
+    're-quantising the weights is a second upload, not a way to make this deployment fit');
+  for (const suggestion of report.suggestions) {
+    assert.notEqual(suggestion.value, null, `${suggestion.field} names a value`);
+    const changed = { ...d, [suggestion.field]: suggestion.value };
+    assert.equal(fitReport(changed, applySizing(changed, changed.probe, CATALOG).sizing, CATALOG).ok, true,
+      `${suggestion.label} must actually fit, not merely look smaller`);
+  }
+  // The order is the order of the cost each change imposes on the model, so the card comes first:
+  // a bigger card keeps the batch, the context and the quant exactly as the operator asked for.
+  assert.deepEqual(
+    { field: report.suggestions[0].field, value: report.suggestions[0].value },
+    { field: 'gpu', value: 'B300' },
+    'a card that holds this draft unchanged is the first thing to offer',
+  );
+  // Dropping the batch to what the chosen card holds is still offered, further down: it keeps the
+  // card, the context and the quant and gives up only the concurrency the card cannot serve.
+  const concurrency = report.suggestions.find((s) => s.field === 'batchSize');
+  assert.deepEqual({ field: concurrency?.field, value: concurrency?.value },
+    { field: 'batchSize', value: 6 });
+});
+
+test('a refusal that cannot be fixed by dropping concurrency still names a change that fits', () => {
+  // On a card the weights alone overflow there is no concurrency left to give up, so the pool-side
+  // suggestions are the only way out. Reading the sizing envelope instead of its `sizing` made every
+  // candidate look like a second refusal and left this case with no suggestion at all.
+  const { draft: d } = fitted({ mode: 'streaming', sessions: 1 });
+  const small = { ...d, gpu: 'T4', sizing: null };
+  small.sizing = applySizing(small, small.probe, CATALOG).sizing;
+  const report = fitReport(small, small.sizing, CATALOG);
+  assert.equal(report.ok, false);
+  assert.deepEqual(report.blockers.map((b) => b.code), ['weights'],
+    'the weights alone do not fit a 16 GiB card');
+  assert.ok(report.suggestions.length > 0, 'a weights refusal must still name a way out');
+  assert.equal(report.suggestions[0].field, 'gpu');
+  for (const suggestion of report.suggestions) {
+    const changed = { ...small, [suggestion.field]: suggestion.value };
+    assert.equal(fitReport(changed, applySizing(changed, changed.probe, CATALOG).sizing, CATALOG).ok, true,
+      `${suggestion.label} must actually fit`);
+  }
+});
+
+test('fit is reported as unknown, never as good, when the pool cannot be estimated', () => {
+  const d = draft();
+  const unavailable = { ...d.sizing, method: 'unavailable', kv_pool_tokens: null, kv_budget_bytes: null, missing: ['a catalog entry for GPU "RTX-PRO-6000"'] };
+  const report = fitReport(d, unavailable, null);
+  assert.equal(report.ok, false);
+  assert.equal(report.known, false, '"I cannot tell" is not a pass');
+  assert.deepEqual(report.blockers.map((b) => b.code), ['unknown']);
+  assert.deepEqual(report.suggestions, [], 'no suggestion can be proven, so none is printed');
 });

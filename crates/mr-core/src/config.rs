@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::rental::RentalAccount;
+use crate::rental::{HuggingFaceToken, RentalAccount};
 
 use crate::dialect::{InputModality, ReasoningLevel};
 use crate::error::{Error, Result};
@@ -149,6 +149,16 @@ pub struct Config {
     /// different answers and must not be collapsed into one flag.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rental_accounts: Vec<RentalAccount>,
+
+    /// HuggingFace tokens, in operator-chosen order.
+    ///
+    /// Deliberately **not** nested inside [`Self::rental_accounts`]. A token authenticates a
+    /// repository fetch, not a rental: one token commonly serves deployments on several accounts,
+    /// and an account may host a public model that needs none. Keeping the two collections apart
+    /// is what makes a deployment name the token it uses
+    /// ([`crate::rental::RentalDeployment::hf_token`]) instead of inheriting one from its biller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub huggingface_tokens: Vec<HuggingFaceToken>,
 
     /// Fields this binary does not know about, preserved verbatim.
     #[serde(flatten)]
@@ -616,6 +626,7 @@ impl Default for Config {
             allow_remote_without_key: false,
             sync: SyncConfig::default(),
             rental_accounts: Vec::new(),
+            huggingface_tokens: Vec::new(),
             extra: Map::new(),
         }
     }
@@ -1638,7 +1649,7 @@ mod tests {
     use super::*;
     use crate::ids::{AccountId, ComboId};
     use crate::model::{Account, ComboStep, ModelEntry, ModelSource};
-    use crate::rental::RentalPlan;
+    use crate::rental::{HuggingFaceToken, RentalPlan};
 
     fn provider(id: &str) -> Provider {
         Provider::new(id, crate::Dialect::OpenAi, "https://example.test")
@@ -1759,11 +1770,20 @@ mod tests {
         acct.extra
             .insert("future_field".to_string(), Value::from(7));
         cfg.rental_accounts.push(acct);
+        let mut token = HuggingFaceToken::new("hub-main");
+        token.label = "Mana on the Hub".to_string();
+        token.secret_ref = Some("hf:hub-main".to_string());
+        cfg.huggingface_tokens.push(token);
         cfg.save(&p).unwrap();
 
         let back = Config::load(&p).unwrap();
         assert_eq!(back, cfg);
         assert_eq!(back.rental_accounts.len(), 1);
+        assert_eq!(back.huggingface_tokens.len(), 1);
+        assert_eq!(
+            back.huggingface_tokens[0].secret_ref.as_deref(),
+            Some("hf:hub-main")
+        );
         assert_eq!(back.rental_accounts[0].plan, RentalPlan::Paid);
         assert_eq!(
             back.rental_accounts[0].extra.get("future_field"),
@@ -1775,12 +1795,14 @@ mod tests {
         let text = std::fs::read_to_string(&p).unwrap();
         let mut raw: Value = serde_json::from_str(&text).unwrap();
         assert!(raw.get("rental_accounts").is_some(), "{raw}");
+        assert!(raw.get("huggingface_tokens").is_some(), "{raw}");
         assert!(raw.get("extra").is_none(), "{raw}");
 
         // An empty list is omitted rather than written as `[]`, so a config that has never rented
         // anything stays byte-identical to one from before the field existed.
         let empty = serde_json::to_string(&Config::default()).unwrap();
         assert!(!empty.contains("rental_accounts"), "{empty}");
+        assert!(!empty.contains("huggingface_tokens"), "{empty}");
 
         // An unknown *sibling* still lands in `extra`: the added field has not disturbed the
         // flatten that makes downgrade safe.

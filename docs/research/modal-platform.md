@@ -310,9 +310,12 @@ of that decision with the shape Modal's own CLI actually handed the operator.
 - `crates/mr-core/src/model.rs:275` — an account stores one `secret_ref`. There is no token-id,
   token-secret or profile column anywhere in `Account`.
 - `crates/manarouter-conductor/src/gpu_api.rs:97-115` — `rental_credential_id` returns
-  `rental:<account id>` and documents the **combined** `wk-<token_id>.ws-<token_secret>` value;
-  `rental_hf_token_id` returns `rental:<account id>:hf`. The shape refusal is
-  `modal_credential_problem` (`:117-132`).
+  `rental:<account id>` and documents the **combined** `wk-<token_id>.ws-<token_secret>` value. A
+  Hugging Face token now has its own entity and its own vault id, `hf:<token id>`
+  (`mr_core::rental::hf_token_vault_id`), written by the `create-hf-token` apply action and named by a
+  deployment; `rental_hf_token_id` → `rental:<account id>:hf` survives only as a **legacy** read path
+  for accounts written before that split, so an existing gated-repository setup keeps probing. The
+  shape refusal is `modal_credential_problem` (`:117-132`).
 - Split points: `crates/manarouter-relay/src/server.rs:4028-4042` (`apply_auth` splits with
   `split_once('.')` and inserts `modal-key` / `modal-secret`); `crates/manarouter-conductor/src/api.rs:2461-2477`
   (same split, and the `invalid_credential` message "Modal account secrets must be the Token

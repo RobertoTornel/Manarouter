@@ -6,10 +6,27 @@
 //! with no model attached, and choosing the credential and choosing the model are two different
 //! acts, made at two different times. The types keep them apart.
 //!
-//! The account is **not** shared between rentals. The credential, the vault entry and the usage
-//! belong to exactly one deployment. A second deployment needs its own account, because sharing
-//! one would make the vault entry, and every usage figure read against it, describe work that one
-//! account did not do.
+//! The relation runs in both directions, and neither side is capped. One account may host several
+//! deployments, and one model-on-a-GPU may be recorded under several accounts: each pairing is its
+//! own provider with its own id, its own URL and its own bill, so the same checkpoint can be run
+//! twice on two accounts (a paid one and a free one, say) without either record overwriting the
+//! other. The account owns the platform credential and the vault entry; each deployment names the
+//! account it bills through, so usage stays attributable per provider while the credential is
+//! entered once. Creating an account and setting up a model are therefore two separate acts, at
+//! two separate times, and a second model on the same account does not need a second workspace
+//! credential.
+//!
+//! ## HuggingFace tokens are their own entity
+//!
+//! A HuggingFace token is not part of an account. It authenticates a *repository fetch*, not a
+//! rental: the same token may be needed by deployments on five different accounts, and one account
+//! may host a public model that needs no token at all. It therefore lives in
+//! [`crate::config::Config::huggingface_tokens`], with its own id and its own vault entry
+//! ([`hf_token_vault_id`]), and a [`RentalDeployment`] names the token it uses with
+//! [`RentalDeployment::hf_token`]. The relation is many-to-many for the same reason the account one
+//! is: one token serves many deployments, and a deployment that needs none records none. Nothing
+//! here is fixed to a particular count — three models on three cards, six accounts and two tokens
+//! is an ordinary configuration, and so is one of each.
 //!
 //! ## Why an account is not a [`crate::model::Provider`]
 //!
@@ -59,29 +76,83 @@ use crate::gpu::sizing::SizingResult;
 /// The key a [`RentalDeployment`] is stored under inside `Provider.extra`.
 pub const RENTAL_EXTRA_KEY: &str = "rental";
 
-/// The `modal.App` name a deployment's generated bundle uses.
+/// What distinguishes two deployments of the same repository on the same account.
 ///
-/// Derived from the account and the repository, so the same deployment always gets the same app
-/// name — and therefore the same URL — and applying it twice collides instead of deploying a
-/// second app. Shared with the panel model, which mirrors this function, so the URL the wizard
-/// previews is the URL the bundle is deployed under.
-pub fn modal_app_name(account_id: &str, repo: &str) -> String {
-    format!("manarouter-{}", app_slug(account_id, repo))
+/// One account may host the same checkpoint several times — a streaming endpoint on one card and
+/// a batch endpoint on another is the ordinary case — so the identity of a deployment is the
+/// account, the repository, the mode and the card. Everything derived from that identity (the
+/// provider id, the `modal.App` name, the endpoint URL) carries the same suffix, so two of them can
+/// never overwrite each other's record or deploy over each other's app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeploymentShape<'a> {
+    /// The account the deployment bills through.
+    pub account_id: &'a str,
+    /// The HuggingFace repository.
+    pub repo: &'a str,
+    /// `streaming` or `batch`.
+    pub mode: RentalMode,
+    /// Catalog GPU id, e.g. `RTX-PRO-6000`.
+    pub gpu: &'a str,
+    /// How many of that card.
+    pub gpu_count: u32,
 }
 
-/// The stable part of the app name: `rental-<account>-<repo-name>`, at most 64 characters.
+impl<'a> DeploymentShape<'a> {
+    /// The identity from the parts a deployment already stores.
+    pub fn of(deployment: &'a RentalDeployment) -> Self {
+        Self {
+            account_id: &deployment.account,
+            repo: &deployment.repo,
+            mode: deployment.mode,
+            gpu: &deployment.gpu,
+            gpu_count: deployment.gpu_count,
+        }
+    }
+
+    /// The trailing `-<mode>-<card>[-x<n>]` half of every derived name.
+    fn suffix(&self) -> String {
+        let mut suffix = format!("-{}", self.mode.as_str());
+        let card = slugify(self.gpu);
+        if !card.is_empty() {
+            suffix.push('-');
+            suffix.push_str(&card);
+        }
+        if self.gpu_count > 1 {
+            suffix.push_str(&format!("-x{}", self.gpu_count));
+        }
+        suffix
+    }
+}
+
+/// The `modal.App` name a deployment's generated bundle uses.
+///
+/// Derived from the deployment's identity, so the same deployment always gets the same app name —
+/// and therefore the same URL — while two deployments that differ in mode or card get different
+/// ones. Shared with the panel model, which mirrors this function, so the URL the panel previews is
+/// the URL the bundle is deployed under.
+pub fn modal_app_name(shape: DeploymentShape<'_>) -> String {
+    format!("manarouter-{}", app_slug(shape))
+}
+
+/// The stable part of the app name: `rental-<account>-<repo-name>-<mode>-<card>`, at most 64
+/// characters.
 ///
 /// Provider ids use this shape too (`Provider::id` is built from it in the conductor), so one
-/// string identifies both the provider and the Modal app.
-pub fn app_slug(account_id: &str, repo: &str) -> String {
-    let name = repo.rsplit('/').next().unwrap_or(repo);
-    let mut slug = format!("rental-{}-{}", slugify(account_id), slugify(name));
-    if slug.len() > 64 {
-        slug.truncate(64);
+/// string identifies both the provider and the Modal app. Truncation eats the account/repository
+/// half, never the suffix: the suffix is the only part that makes two deployments distinguishable.
+pub fn app_slug(shape: DeploymentShape<'_>) -> String {
+    let name = shape.repo.rsplit('/').next().unwrap_or(shape.repo);
+    let head = format!("rental-{}-{}", slugify(shape.account_id), slugify(name));
+    let suffix = shape.suffix();
+    let room = 64usize.saturating_sub(suffix.len());
+    let mut slug = head;
+    if slug.len() > room {
+        slug.truncate(room);
     }
     while slug.ends_with('-') {
         slug.pop();
     }
+    slug.push_str(&suffix);
     slug
 }
 
@@ -91,20 +162,21 @@ pub fn app_slug(account_id: &str, repo: &str) -> String {
 /// app name replaced by dashes. The generated bundle exposes one web function named `serve`, so
 /// that is the function half.
 ///
-/// `None` when a part is missing: an account with no recorded workspace, or an app name that would
-/// be empty. The caller must then ask for an explicit URL rather than invent one.
+/// `None` when a part is missing: an account with no recorded workspace, or a name that would be
+/// empty. The caller must then ask for an explicit URL rather than invent one.
 // UNCERTAIN: the URL shape and the `serve` function half are reverse-engineered from Modal's
 // documented app naming; `modal deploy` prints the real URL, which is authoritative if it differs.
-pub fn modal_base_url(workspace: &str, account_id: &str, repo: &str) -> Option<String> {
+pub fn modal_base_url(workspace: &str, shape: DeploymentShape<'_>) -> Option<String> {
     let workspace = slugify(workspace);
-    let account = slugify(account_id);
-    let name = slugify(repo.rsplit('/').next().unwrap_or(repo));
-    if workspace.is_empty() || account.is_empty() || name.is_empty() {
+    let account = slugify(shape.account_id);
+    let name = slugify(shape.repo.rsplit('/').next().unwrap_or(shape.repo));
+    let card = slugify(shape.gpu);
+    if workspace.is_empty() || account.is_empty() || name.is_empty() || card.is_empty() {
         return None;
     }
     Some(format!(
         "https://{workspace}--{}-serve.modal.run",
-        modal_app_name(account_id, repo).replace('.', "-")
+        modal_app_name(shape).replace('.', "-")
     ))
 }
 
@@ -261,10 +333,13 @@ impl FactSource {
 
 /// A platform credential for renting GPUs, with no model attached.
 ///
-/// Secrets are never stored here. `secret_ref` and `hf_secret_ref` are **vault entry ids**
-/// ([`crate::secret`]) pointing at the platform's one combined credential string and, where a model is gated, a
-/// HuggingFace token. A config file is meant to be readable and diffable; a credential in it is
-/// not.
+/// Secrets are never stored here. `secret_ref` is a **vault entry id** ([`crate::secret`]) pointing
+/// at the platform's one combined credential string. A config file is meant to be readable and
+/// diffable; a credential in it is not.
+///
+/// [`RentalAccount::hf_secret_ref`] is kept only to read accounts written before HuggingFace
+/// tokens became their own entity; new code records a [`HuggingFaceToken`] and a deployment names
+/// it. Nothing writes the account field any more.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RentalAccount {
     /// Slug, operator-visible, unique among accounts.
@@ -293,7 +368,12 @@ pub struct RentalAccount {
     /// Vault entry id holding the platform's one combined credential string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<String>,
-    /// Vault entry id holding a HuggingFace token, when a chosen repo needs one.
+    /// **Legacy.** Vault entry id of a HuggingFace token recorded on the account before tokens
+    /// became independent.
+    ///
+    /// New accounts do not set this: a token is a [`HuggingFaceToken`] with its own id, and a
+    /// deployment names the one it uses. Kept so an older config keeps probing gated repositories;
+    /// it is never written and never required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hf_secret_ref: Option<String>,
     /// The platform-side ceiling on concurrent containers.
@@ -423,6 +503,121 @@ impl RentalMode {
     }
 }
 
+/// When a `batch` deployment stops waiting and sends the batch it has.
+///
+/// A batch endpoint collects requests until it has [`BatchShape::size`] of them. What it does when
+/// the queue stays short is the operator's decision, because the two answers cost different money:
+/// [`BatchFill::Full`] holds every request until the batch is complete (the cheapest per request,
+/// and a request can wait a long time for the last seat), while [`BatchFill::Timeout`] sends a
+/// half-full batch once [`BatchShape::timeout_secs`] elapse, which keeps latency bounded and pays
+/// for the empty seats. Neither is a default the software may pick for the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BatchFill {
+    /// Wait for `size` requests, however long that takes.
+    #[default]
+    Full,
+    /// Send whatever has arrived once `timeout_secs` have passed.
+    Timeout,
+}
+
+impl BatchFill {
+    /// The stable identifier written to config.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Timeout => "timeout",
+        }
+    }
+
+    /// Parse a fill identifier.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "full" | "wait" | "wait-until-full" => Some(Self::Full),
+            "timeout" | "timed" | "timeout-partial" => Some(Self::Timeout),
+            _ => None,
+        }
+    }
+}
+
+/// How a `batch` deployment fills one batch: how many requests it holds, and when it gives up
+/// waiting for more.
+///
+/// Only meaningful on [`RentalMode::Batch`]; [`RentalDeployment::problems`] refuses it elsewhere
+/// rather than storing a setting nothing reads. This is a *record of intent* — the generated bundle
+/// is a plain vLLM server, and the dispatcher that actually groups requests is the serving layer's
+/// job — so the shape is what the operator decided and what admission control sizes against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchShape {
+    /// Requests per batch. The `N` in "batching N".
+    pub size: u32,
+    /// Whether the batch waits for `size`, or ships early on a timeout.
+    #[serde(default)]
+    pub fill: BatchFill,
+    /// Seconds to wait before shipping a short batch. Required by [`BatchFill::Timeout`], refused
+    /// by [`BatchFill::Full`] (where it would be a number nothing reads).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u32>,
+}
+
+impl BatchShape {
+    /// A shape that waits for a full batch.
+    pub const fn full(size: u32) -> Self {
+        Self {
+            size,
+            fill: BatchFill::Full,
+            timeout_secs: None,
+        }
+    }
+
+    /// A shape that ships a short batch after `timeout_secs`.
+    pub const fn with_timeout(size: u32, timeout_secs: u32) -> Self {
+        Self {
+            size,
+            fill: BatchFill::Timeout,
+            timeout_secs: Some(timeout_secs),
+        }
+    }
+
+    /// Problems with this shape on its own, as `(field, message)` pairs.
+    pub fn problems(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if self.size == 0 {
+            out.push((
+                "batch.size".to_string(),
+                "a batch must hold at least one request".to_string(),
+            ));
+        }
+        match self.fill {
+            BatchFill::Full => {
+                if self.timeout_secs.is_some() {
+                    out.push((
+                        "batch.timeout_secs".to_string(),
+                        "a batch that waits until it is full has no timeout to record; set \
+                         `batch.fill` to `timeout` to ship a short batch"
+                            .to_string(),
+                    ));
+                }
+            }
+            BatchFill::Timeout => match self.timeout_secs {
+                None | Some(0) => out.push((
+                    "batch.timeout_secs".to_string(),
+                    "a batch that ships early needs a positive `batch.timeout_secs`".to_string(),
+                )),
+                Some(secs) if secs > 3600 => out.push((
+                    "batch.timeout_secs".to_string(),
+                    format!(
+                        "`batch.timeout_secs` is {secs}; a batch that waits over an hour is \
+                             `batch.fill: full`"
+                    ),
+                )),
+                Some(_) => {}
+            },
+        }
+        out
+    }
+}
+
 /// A recorded intent to re-quantise a larger checkpoint for a smaller card.
 ///
 /// **Planned and recorded, not executed.** Requantisation needs a GPU, a calibration dataset and an
@@ -431,6 +626,74 @@ impl RentalMode {
 /// the feasibility gates and the "never synthesise `--quantization`" rule are unit-tested; this
 /// alias is what a deployment stores next to the deployment's own fields.
 pub use crate::gpu::requantize::RequantizePlan;
+
+/// A HuggingFace token, independent of every rental account.
+///
+/// A token authenticates a repository fetch, not a rental, so it is recorded once and named by the
+/// deployments that need it. Several deployments on several accounts may name the same token, and
+/// a deployment whose repository is public names none. [`Self::secret_ref`] is a **vault entry
+/// id**; the token value itself is never stored in the config.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HuggingFaceToken {
+    /// Slug, operator-visible, unique among tokens.
+    pub id: String,
+    /// Human label, for example "Mana on the Hub".
+    #[serde(default)]
+    pub label: String,
+    /// Vault entry id holding the token value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
+    /// Operator note, shown in the panel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Fields this binary does not know about, preserved verbatim on round-trip.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// The vault id a [`HuggingFaceToken`] is written to.
+///
+/// Derived from the token id rather than accepted from a client, exactly as the platform
+/// credential's id is derived from the account id, so the panel, the CLI and the relay cannot
+/// disagree about where a token lives.
+pub fn hf_token_vault_id(token_id: &str) -> String {
+    format!("hf:{token_id}")
+}
+
+impl HuggingFaceToken {
+    /// A token with the given id, everything else defaulted.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: String::new(),
+            secret_ref: None,
+            note: None,
+            extra: Map::new(),
+        }
+    }
+
+    /// Whether this token holds a vault reference at all.
+    pub fn has_secret(&self) -> bool {
+        self.secret_ref
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Reason the token is not usable yet, if any.
+    pub fn problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.id.trim().is_empty() {
+            out.push("HuggingFace token id is empty".to_string());
+        }
+        if !self.has_secret() {
+            out.push(format!(
+                "HuggingFace token {} has no secret_ref: it cannot authenticate a fetch",
+                self.id
+            ));
+        }
+        out
+    }
+}
 
 /// One model on one GPU, as stored in `Provider.extra["rental"]`.
 ///
@@ -442,6 +705,13 @@ pub use crate::gpu::requantize::RequantizePlan;
 pub struct RentalDeployment {
     /// [`RentalAccount::id`] this deployment bills against.
     pub account: String,
+    /// [`HuggingFaceToken::id`] this deployment uses when its repository is gated.
+    ///
+    /// `None` is the ordinary case for a public checkpoint. The token is *not* reached through the
+    /// account: the same token may serve deployments on several accounts, and one account may host
+    /// deployments that need different tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hf_token: Option<String>,
     /// HuggingFace repo id, for example `orcarouter/Qwen3.8-27B-Uncensored-FP8`.
     pub repo: String,
     /// Commit, tag or branch. `None` means the repo's default revision.
@@ -473,6 +743,13 @@ pub struct RentalDeployment {
     /// `streaming` for a live endpoint, `batch` for a queue drained in bulk.
     #[serde(default)]
     pub mode: RentalMode,
+    /// How a `batch` deployment fills and ships a batch.
+    ///
+    /// `None` on a streaming deployment, and `None` on a batch deployment written before this field
+    /// existed — an old record keeps loading unchanged rather than being given a batch size nobody
+    /// chose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchShape>,
     /// Identifier of the generated deployment bundle, once one has been produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_id: Option<String>,
@@ -508,6 +785,7 @@ impl RentalDeployment {
     ) -> Self {
         Self {
             account: account.into(),
+            hf_token: None,
             repo: repo.into(),
             revision: None,
             gpu: gpu.into(),
@@ -518,6 +796,7 @@ impl RentalDeployment {
             max_num_seqs: None,
             shutdown_cooldown_secs: None,
             mode: RentalMode::Streaming,
+            batch: None,
             bundle_id: None,
             requantize: None,
             architecture: None,
@@ -616,6 +895,36 @@ impl RentalDeployment {
                     ),
                 ));
             }
+        }
+        match (self.mode, self.batch) {
+            (RentalMode::Streaming, Some(_)) => out.push((
+                "batch".to_string(),
+                "a streaming deployment has no batch to fill; drop `batch`, or set `mode: batch`"
+                    .to_string(),
+            )),
+            (RentalMode::Batch, None) => out.push((
+                "batch".to_string(),
+                "a batch deployment must record `batch.size` and whether it waits for a full \
+                 batch (`batch.fill`: `full`) or ships a short one (`timeout`)"
+                    .to_string(),
+            )),
+            (RentalMode::Batch, Some(batch)) => {
+                out.extend(batch.problems());
+                if let (Some(seqs), true) = (self.max_num_seqs, batch.size > 0) {
+                    if batch.size > seqs {
+                        out.push((
+                            "batch.size".to_string(),
+                            format!(
+                                "a batch of {} cannot be scheduled by a server limited to \
+                                 `max_num_seqs` {seqs}; raise `max_num_seqs` or lower the batch \
+                                 size",
+                                batch.size
+                            ),
+                        ));
+                    }
+                }
+            }
+            (RentalMode::Streaming, None) => {}
         }
         out
     }
@@ -1213,28 +1522,102 @@ mod tests {
         );
     }
 
+    fn shape<'a>(account: &'a str, repo: &'a str, gpu: &'a str) -> DeploymentShape<'a> {
+        DeploymentShape {
+            account_id: account,
+            repo,
+            mode: RentalMode::Streaming,
+            gpu,
+            gpu_count: 1,
+        }
+    }
+
     #[test]
     fn a_workspace_derives_one_shared_modal_url() {
         // Golden value: the panel model mirrors this function, so both sides preview and record the
-        // same string for the same account and repo.
+        // same string for the same deployment.
         assert_eq!(
-            modal_base_url("mana", "mana-modal", "Qwen/Qwen3-8B").as_deref(),
-            Some("https://mana--manarouter-rental-mana-modal-qwen3-8b-serve.modal.run")
+            modal_base_url("mana", shape("mana-modal", "Qwen/Qwen3-8B", "RTX-PRO-6000")).as_deref(),
+            Some(
+                "https://mana--manarouter-rental-mana-modal-qwen3-8b-streaming-rtx-pro-6000-\
+                 serve.modal.run"
+            )
         );
         assert_eq!(
-            modal_app_name("mana-modal", "Qwen/Qwen3-8B"),
-            "manarouter-rental-mana-modal-qwen3-8b"
+            modal_app_name(shape("mana-modal", "Qwen/Qwen3-8B", "RTX-PRO-6000")),
+            "manarouter-rental-mana-modal-qwen3-8b-streaming-rtx-pro-6000"
         );
         // The workspace and the account id are normalised, not trusted verbatim.
         assert_eq!(
-            modal_base_url("Mana_Team", "Mana Modal", "org/Qwen3.8").as_deref(),
-            Some("https://mana-team--manarouter-rental-mana-modal-qwen3-8-serve.modal.run")
+            modal_base_url("Mana_Team", shape("Mana Modal", "org/Qwen3.8", "L40S")).as_deref(),
+            Some(
+                "https://mana-team--manarouter-rental-mana-modal-qwen3-8-streaming-l40s-serve.\
+                 modal.run"
+            )
         );
         // No workspace means no invented URL.
-        assert_eq!(modal_base_url("", "a", "org/repo"), None);
-        assert_eq!(modal_base_url("   ", "a", "org/repo"), None);
-        assert_eq!(modal_base_url("mana", "", "org/repo"), None);
-        assert_eq!(modal_base_url("mana", "a", ""), None);
+        assert_eq!(modal_base_url("", shape("a", "org/repo", "L40S")), None);
+        assert_eq!(modal_base_url("   ", shape("a", "org/repo", "L40S")), None);
+        assert_eq!(modal_base_url("mana", shape("", "org/repo", "L40S")), None);
+        assert_eq!(modal_base_url("mana", shape("a", "", "L40S")), None);
+    }
+
+    #[test]
+    fn one_repository_on_one_account_gets_a_name_per_mode_and_card() {
+        // The requirement this encodes: stream on one card, then batch with a timeout on another,
+        // then batch that waits for a full batch — three deployments of one checkpoint under one
+        // account, and none of them may share a provider id, an app name or an endpoint.
+        let base = shape("mana-modal", "Qwen/Qwen3-8B", "RTX-PRO-6000");
+        let batch_full = DeploymentShape {
+            mode: RentalMode::Batch,
+            ..base
+        };
+        let other_card = DeploymentShape {
+            gpu: "L40S",
+            ..base
+        };
+        let two_cards = DeploymentShape {
+            gpu_count: 2,
+            ..base
+        };
+        let slugs = [
+            app_slug(base),
+            app_slug(batch_full),
+            app_slug(other_card),
+            app_slug(two_cards),
+        ];
+        assert_eq!(
+            slugs[0],
+            "rental-mana-modal-qwen3-8b-streaming-rtx-pro-6000"
+        );
+        assert_eq!(slugs[1], "rental-mana-modal-qwen3-8b-batch-rtx-pro-6000");
+        assert_eq!(slugs[2], "rental-mana-modal-qwen3-8b-streaming-l40s");
+        assert_eq!(
+            slugs[3],
+            "rental-mana-modal-qwen3-8b-streaming-rtx-pro-6000-x2"
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for slug in &slugs {
+            assert!(seen.insert(slug.clone()), "two deployments share `{slug}`");
+        }
+    }
+
+    #[test]
+    fn a_long_name_is_truncated_from_the_front_so_the_suffix_survives() {
+        // Truncating the tail would collapse every deployment of a long repository onto one name,
+        // which is the collision the suffix exists to prevent.
+        let long = "org/".to_owned() + &"very-long-model-name-".repeat(6);
+        let shape = DeploymentShape {
+            account_id: "an-account-with-a-long-id",
+            repo: &long,
+            mode: RentalMode::Batch,
+            gpu: "RTX-PRO-6000",
+            gpu_count: 4,
+        };
+        let slug = app_slug(shape);
+        assert!(slug.len() <= 64, "`{slug}` is {} characters", slug.len());
+        assert!(slug.ends_with("-batch-rtx-pro-6000-x4"), "got `{slug}`");
+        assert!(!slug.contains("--"));
     }
 
     #[test]

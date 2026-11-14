@@ -687,3 +687,67 @@
 .gpu-rentals .gpu-review { margin-top: 12px; }
 
 .gpu-rentals .gpu-missing-setup { max-width: 780px; }
+
+/* ---------- the deploy window ----------
+ * The window is a dialog, so it lives in #dialog-root rather than under `.gpu-rentals`; these rules
+ * are unscoped for that reason. They widen the dialog for the one form that shows every step at
+ * once, then give its sections, verdict and command the same rhythm the page uses.
+ */
+
+.dialog:has(.gpu-deploy-section) { width: min(880px, 100%); }
+
+.dialog-body .gpu-deploy-section { margin-bottom: 18px; }
+.dialog-body .gpu-deploy-section > .hint { margin: 0 0 10px; }
+.dialog-body .gpu-deploy-section > .hint:last-child { margin-bottom: 0; }
+/* Same title rank as the panel's other ruled block titles: quiet, uppercase, one hairline. */
+.dialog-body .gpu-deploy-section > h3 {
+  margin: 0 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+  color: var(--tx3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* The verdict: a bordered block so "it fits" and "it does not" are structurally, not only
+ * chromatically, different from the fields around them. The colour repeats that difference for
+ * anyone who reads at a glance; the border and the heading carry it for anyone who does not. */
+.dialog-body .gpu-deploy-fit {
+  margin: 4px 0 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--line2);
+  border-left: 3px solid var(--red);
+  border-radius: 6px;
+  background: var(--bg2);
+}
+.dialog-body .gpu-deploy-fit-ok { border-left-color: var(--green); }
+.dialog-body .gpu-deploy-fit > h3 { margin: 0 0 8px; font-size: 13px; }
+.dialog-body .gpu-deploy-fit .gpu-actions { margin-top: 10px; }
+.dialog-body .gpu-deploy-fit .gpu-actions .btn { justify-content: flex-start; text-align: left; }
+
+/* The command is the deployment. It gets a monospace block that scrolls sideways instead of
+ * wrapping into something nobody can paste, with its filename and copy button on one line above. */
+.dialog-body .gpu-deploy-command {
+  margin: 10px 0 14px;
+  border: 1px solid var(--line2);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg0);
+}
+.dialog-body .gpu-deploy-command > .toolbar {
+  margin: 0;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg2);
+}
+.dialog-body .gpu-deploy-command pre {
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+}

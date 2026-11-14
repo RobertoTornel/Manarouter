@@ -34,12 +34,15 @@
 //! Nothing here ever returns, logs, or formats a secret. A rental account's platform credential is
 //! written once, when the account is created, at the vault id `rental:<account id>`, as the
 //! combined `wk-<id>.ws-<secret>` string the three existing Modal readers already split on
-//! (`split_once('.')`); a Hugging Face token supplied with it goes to `rental:<account id>:hf`.
-//! Both are derived from the account id rather than accepted from the client, and are reported
-//! only as `secret_ref`/`hf_secret_ref` and a fingerprint. Creating a deployment performs no vault
-//! write at all: the providers it derives point at the one credential the account already owns, so
-//! applying another deployment cannot rotate or duplicate it, and an account whose credential is
-//! missing is refused instead of being given a placeholder.
+//! (`split_once('.')`). A Hugging Face token is a separate entity with a separate id: it is
+//! written to `hf:<token id>` by `create-hf-token`, reported as `secret_ref` and a fingerprint,
+//! and named by each deployment that needs it (`deployment.hf_token`). It is deliberately not
+//! derived from an account, because one token commonly serves deployments on several accounts and
+//! one account may host deployments that need different tokens. Both ids are derived from their
+//! own slug rather than accepted from the client. Creating a deployment performs no vault write at
+//! all: the providers it derives point at the credentials the account and token already own, so
+//! applying another deployment cannot rotate or duplicate them, and a credential that is missing
+//! is refused instead of being given a placeholder.
 //!
 //! # The probe, and the gated-repository fallback
 //!
@@ -80,8 +83,9 @@ use mr_core::lane::{plan_lane, LaneKind, Traffic};
 use mr_core::model::ModelEntry;
 use mr_core::quota::http::{QuotaHttp, QuotaRequest};
 use mr_core::rental::{
-    parse_deployment, plan_launch, RentalAccount, RentalDeployment, RentalMode, RentalPlan,
-    RentalPlatform, RentalSchedule, RequantizePlan,
+    hf_token_vault_id, parse_deployment, plan_launch, BatchFill, BatchShape, HuggingFaceToken,
+    RentalAccount, RentalDeployment, RentalMode, RentalPlan, RentalPlatform, RentalSchedule,
+    RequantizePlan,
 };
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -104,7 +108,10 @@ fn rental_credential_id(account_id: &str) -> String {
     format!("rental:{account_id}")
 }
 
-/// Vault id of an account's Hugging Face token, or `None` while the account has none.
+/// **Legacy.** Vault id where a Hugging Face token was stored when it belonged to an account.
+///
+/// New tokens live at [`hf_token_vault_id`] and are named by a deployment. This id is still read
+/// for an account written before that split, so an existing gated-repository setup keeps probing.
 fn rental_hf_token_id(account_id: &str) -> String {
     format!("rental:{account_id}:hf")
 }
@@ -444,14 +451,43 @@ async fn post_probe(
     Ok(Json(body))
 }
 
-/// The Hugging Face token for this probe: either supplied in the body, or read from the vault for
-/// an account named by `account_id`.
+/// The Hugging Face token for this probe.
+///
+/// Three spellings, in this order: a literal `hf_token` in the body (a one-off paste, never
+/// stored), an `hf_token_id` naming a recorded [`HuggingFaceToken`], or a legacy `account_id`
+/// whose account still carries `hf_secret_ref`. The middle one is the normal case and is what makes
+/// the token independent of the account: the same token id serves any account.
 ///
 /// The token is never echoed in an error: every message below says *that* a token is missing, not
 /// which value was looked for.
 async fn probe_token(state: &AppState, map: &Map<String, Value>) -> ApiResult<Option<String>> {
     if let Some(token) = string_field(map, "hf_token") {
         return Ok(Some(token));
+    }
+    if let Some(token_id) = string_field(map, "hf_token_id") {
+        let config = state.current_config().await;
+        let Some(token) = config
+            .huggingface_tokens
+            .iter()
+            .find(|token| token.id == token_id)
+            .cloned()
+        else {
+            return Err(ApiError::bad(
+                "not_found",
+                format!("there is no Hugging Face token with id `{token_id}`"),
+            ));
+        };
+        let vault_id = token
+            .secret_ref
+            .clone()
+            .unwrap_or_else(|| hf_token_vault_id(&token.id));
+        let vault = state.vault.lock().await;
+        return match vault.get(&vault_id) {
+            Ok(value) => Ok(value),
+            Err(e) => Err(ApiError::internal(format!(
+                "the Hugging Face token `{token_id}` could not be read from the vault: {e}"
+            ))),
+        };
     }
     let Some(account_id) = string_field(map, "account_id") else {
         return Ok(None);
@@ -1159,6 +1195,7 @@ pub async fn rentals_body(state: &AppState) -> Value {
                     "model": model,
                     "model_in_provider": model.is_some(),
                     "account": deployment.account,
+                    "hf_token": deployment.hf_token,
                     "repo": deployment.repo,
                     "revision": deployment.revision,
                     "gpu": deployment.gpu,
@@ -1171,6 +1208,11 @@ pub async fn rentals_body(state: &AppState) -> Value {
                     "max_num_seqs": deployment.max_num_seqs,
                     "shutdown_cooldown_secs": deployment.shutdown_cooldown_secs,
                     "mode": deployment.mode.as_str(),
+                    "batch": deployment.batch.map(|batch| json!({
+                        "size": batch.size,
+                        "fill": batch.fill.as_str(),
+                        "timeout_secs": batch.timeout_secs,
+                    })),
                     "bundle_id": deployment.bundle_id,
                     "sizing": deployment
                         .sizing
@@ -1246,16 +1288,47 @@ pub async fn rentals_body(state: &AppState) -> Value {
         })
         .collect();
 
+    // Tokens are listed beside accounts, never inside them: the whole point of the split is that a
+    // token is not owned by whichever account happened to be created first.
+    let hf_token_rows: Vec<Value> = config
+        .huggingface_tokens
+        .iter()
+        .map(|token| {
+            let secret_ref = token
+                .secret_ref
+                .clone()
+                .unwrap_or_else(|| hf_token_vault_id(&token.id));
+            let fingerprint = vault.fingerprint_of(&secret_ref).map(str::to_owned);
+            let problems: Vec<Value> = token
+                .problems()
+                .into_iter()
+                .map(|message| json!(message))
+                .collect();
+            json!({
+                "id": token.id,
+                "label": token.label,
+                "secret_ref": secret_ref,
+                "has_secret": token.has_secret(),
+                "fingerprint": fingerprint,
+                "note": token.note,
+                "problems": problems,
+            })
+        })
+        .collect();
+
     let errors = deployment_errors;
 
     json!({
         "checked_at": CATALOG_CHECKED_AT,
         "accounts": account_rows,
+        "hf_tokens": hf_token_rows,
         "deployments": deployments,
         "usage": usage_json,
         "errors": errors,
         "notes": [
             "credentials are reported as vault fingerprints, never as values",
+            "`hf_tokens` is independent of `accounts`: a deployment names a token with its \
+             `hf_token` field, and several deployments on different accounts may name the same one",
             "`plan` is what the operator declared; it is never inferred from the card's free-plan \
              state, which is often `unknown`",
         ],
@@ -1409,14 +1482,19 @@ async fn post_apply(
     let map = object_body(body, "apply")?;
     match string_field(&map, "action").as_deref() {
         Some("create-account") => create_account(&state, &map).await.map(Json),
+        Some("create-hf-token") => create_hf_token(&state, &map).await.map(Json),
         Some("create-deployment") => create_deployment(&state, &map).await.map(Json),
         Some(other) => Err(ApiError::bad(
             "invalid_body",
-            format!("`{other}` is not a known action; use `create-account` or `create-deployment`"),
+            format!(
+                "`{other}` is not a known action; use `create-account`, `create-hf-token` or \
+                 `create-deployment`"
+            ),
         )),
         None => Err(ApiError::bad(
             "invalid_body",
-            "the apply body needs an `action` of `create-account` or `create-deployment`",
+            "the apply body needs an `action` of `create-account`, `create-hf-token` or \
+             `create-deployment`",
         )),
     }
 }
@@ -1478,7 +1556,16 @@ async fn create_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
     };
     let token_id = string_field(&account_map, "token_id");
     let token_secret = string_field(&account_map, "token_secret");
-    let hf_token = string_field(&account_map, "hf_token");
+    // A Hugging Face token is not account state. Accepting one here is what used to tie a token to
+    // whichever account happened to be created first, so it is refused with the action that does
+    // hold one: `create-hf-token`, whose id a deployment then names.
+    if account_map.contains_key("hf_token") || account_map.contains_key("hf_secret_ref") {
+        return Err(ApiError::bad(
+            "invalid_body",
+            "a Hugging Face token is not part of an account: create it with the `create-hf-token` \
+             action and name it from the deployment's `hf_token` field",
+        ));
+    }
     let max_concurrent_containers = account_map
         .get("max_concurrent_containers")
         .and_then(Value::as_u64)
@@ -1563,17 +1650,6 @@ async fn create_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
         }
         account.secret_ref = Some(credential_id.clone());
     }
-    let hf_token_id = rental_hf_token_id(&id);
-    if let Some(token) = &hf_token {
-        if let Err(e) = state.tx_put(&mut tx, &hf_token_id, token).await {
-            state.tx_rollback(tx).await;
-            return Err(ApiError::internal(format!(
-                "the Hugging Face token could not be written to the vault: {e}"
-            )));
-        }
-        account.hf_secret_ref = Some(hf_token_id.clone());
-    }
-
     let next = with_account(&current, &account);
     if let Err(error) = state.commit_locked(next).await {
         state.tx_rollback(tx).await;
@@ -1581,12 +1657,9 @@ async fn create_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
     }
     drop(guard);
 
-    let (fingerprint, hf_fingerprint) = {
+    let fingerprint = {
         let vault = state.vault.lock().await;
-        (
-            vault.fingerprint_of(&credential_id).map(str::to_owned),
-            vault.fingerprint_of(&hf_token_id).map(str::to_owned),
-        )
+        vault.fingerprint_of(&credential_id).map(str::to_owned)
     };
     Ok(json!({
         "action": "create-account",
@@ -1601,13 +1674,100 @@ async fn create_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
         "vault": {
             "credential_id": credential_id,
             "fingerprint": fingerprint,
-            "hf_token_id": hf_token.as_ref().map(|_| hf_token_id.clone()),
-            "hf_fingerprint": hf_fingerprint,
         },
         "restart_pending": state.restart.is_pending(),
         "applies_on": "immediately",
         "note": "the account is a record of what is rented; it takes effect as a provider when a \
                  deployment is applied to it",
+    }))
+}
+
+/// Create a Hugging Face token, or replace the value of one that already exists.
+///
+/// The token is its own entity because it authenticates a repository fetch, not a rental: the same
+/// token may be named by deployments on several accounts, and an account may host deployments that
+/// need none. The vault id is derived from the token id, exactly as an account's credential id is
+/// derived from the account id, and only the id and a fingerprint are ever returned.
+async fn create_hf_token(state: &AppState, map: &Map<String, Value>) -> ApiResult<Value> {
+    let token_value = map.get("token").cloned().unwrap_or(Value::Null);
+    let token_map = object_body(token_value, "token")?;
+    let id = match string_field(&token_map, "id") {
+        Some(id) => id,
+        None => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "the token needs an `id`: a short slug such as `hub-main`",
+            ))
+        }
+    };
+    if let Some(problem) = slug_problem(&id) {
+        return Err(ApiError::bad("invalid_body", problem));
+    }
+    let label = string_field(&token_map, "label").unwrap_or_else(|| id.clone());
+    let Some(secret) = string_field(&token_map, "secret") else {
+        return Err(ApiError::bad(
+            "invalid_body",
+            "the token needs a `secret`: the value from huggingface.co/settings/tokens. It is \
+             written to the vault and never returned",
+        ));
+    };
+    if secret.trim().is_empty() {
+        return Err(ApiError::bad("invalid_body", "`secret` must not be empty"));
+    }
+
+    let guard = state.mutation_lock.lock().await;
+    let current = state.current_config().await;
+    let existing = current
+        .huggingface_tokens
+        .iter()
+        .find(|token| token.id == id)
+        .cloned();
+    // Replacing the value of a recorded token is a rotation, and is allowed deliberately: the id
+    // names the vault entry, so `Vault::put` replaces the value in place and every deployment that
+    // names this token picks the new value up without being re-applied.
+    let mut token = existing
+        .clone()
+        .unwrap_or_else(|| HuggingFaceToken::new(&id));
+    token.label = label;
+    token.note = string_field(&token_map, "note").or(token.note);
+    let vault_id = token
+        .secret_ref
+        .clone()
+        .unwrap_or_else(|| hf_token_vault_id(&token.id));
+    token.secret_ref = Some(vault_id.clone());
+
+    let mut tx = crate::state::VaultTx::default();
+    if let Err(e) = state.tx_put(&mut tx, &vault_id, &secret).await {
+        state.tx_rollback(tx).await;
+        return Err(ApiError::internal(format!(
+            "the Hugging Face token could not be written to the vault: {e}"
+        )));
+    }
+    let next = with_hf_token(&current, &token);
+    if let Err(error) = state.commit_locked(next).await {
+        state.tx_rollback(tx).await;
+        return Err(error.into());
+    }
+    drop(guard);
+
+    let fingerprint = {
+        let vault = state.vault.lock().await;
+        vault.fingerprint_of(&vault_id).map(str::to_owned)
+    };
+    Ok(json!({
+        "action": "create-hf-token",
+        "token": {
+            "id": token.id,
+            "label": token.label,
+            "replaced": existing.is_some(),
+        },
+        "vault": {
+            "secret_ref": vault_id,
+            "fingerprint": fingerprint,
+        },
+        "applies_on": "immediately",
+        "note": "a deployment names this token with its `hf_token` field; the token is never \
+                 reached through an account",
     }))
 }
 
@@ -1641,6 +1801,84 @@ fn validate_plan_limits(value: &Value) -> ApiResult<()> {
         }
     }
     Ok(())
+}
+
+/// Read the `batch` object of a `create-deployment` body.
+///
+/// Kept separate from the long field list so the two decisions it encodes — a batch has a size, and
+/// only a batch that ships early has a timeout — are testable without an HTTP round trip.
+fn parse_batch_shape(value: &Value, mode: RentalMode) -> ApiResult<BatchShape> {
+    if mode != RentalMode::Batch {
+        return Err(ApiError::bad(
+            "invalid_body",
+            "`batch` describes how a `batch` deployment fills; a `streaming` deployment has no \
+             batch to fill",
+        ));
+    }
+    let Some(object) = value.as_object() else {
+        return Err(ApiError::bad(
+            "invalid_body",
+            "`batch` must be an object, for example {\"size\": 8, \"fill\": \"timeout\", \
+             \"timeout_secs\": 30}",
+        ));
+    };
+    let size = match object.get("size").and_then(Value::as_u64) {
+        Some(size) if size > 0 => size.min(u64::from(u32::MAX)) as u32,
+        Some(_) => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "`batch.size` must be at least 1",
+            ))
+        }
+        None => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "`batch.size` is the number of requests one batch holds",
+            ))
+        }
+    };
+    let fill =
+        match object.get("fill") {
+            None => BatchFill::default(),
+            Some(Value::String(text)) => match BatchFill::parse(text) {
+                Some(fill) => fill,
+                None => return Err(ApiError::bad(
+                    "invalid_body",
+                    "`batch.fill` must be `full` (wait until the batch is complete) or `timeout` \
+                     (ship a short batch)",
+                )),
+            },
+            Some(_) => {
+                return Err(ApiError::bad(
+                    "invalid_body",
+                    "`batch.fill` must be `full` or `timeout`",
+                ))
+            }
+        };
+    let timeout_secs = match object.get("timeout_secs") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_u64() {
+            Some(secs) if secs > 0 && secs <= 3600 => Some(secs as u32),
+            _ => {
+                return Err(ApiError::bad(
+                    "invalid_body",
+                    "`batch.timeout_secs` must be between 1 and 3600 seconds",
+                ))
+            }
+        },
+    };
+    let shape = BatchShape {
+        size,
+        fill,
+        timeout_secs,
+    };
+    if let Some((field, message)) = shape.problems().into_iter().next() {
+        return Err(ApiError::bad(
+            "invalid_body",
+            format!("`{field}`: {message}"),
+        ));
+    }
+    Ok(shape)
 }
 
 async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiResult<Value> {
@@ -1729,6 +1967,19 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
         },
         None => RentalMode::default(),
     };
+    // A batch deployment states how it fills a batch, because "batching N" is undefined without
+    // it. A streaming deployment may not carry one: the value would be a setting nothing reads.
+    let batch = match deployment_map.get("batch") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(parse_batch_shape(value, mode)?),
+    };
+    if mode == RentalMode::Batch && batch.is_none() {
+        return Err(ApiError::bad(
+            "invalid_body",
+            "a `batch` deployment needs a `batch` object with `size` and `fill` (`full` waits for \
+             the batch to fill; `timeout` also needs `timeout_secs` and ships a short batch)",
+        ));
+    }
     let shutdown_cooldown_secs = deployment_map
         .get("shutdown_cooldown_secs")
         .and_then(Value::as_u64)
@@ -1865,23 +2116,24 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
         ));
     }
 
-    // One account, one rental. A second deployment on the same account would share its vault
-    // entry and its usage figures, and neither can be attributed to a single rental.
-    let account_in_use = current.providers.iter().find_map(|provider| {
-        match parse_deployment(provider.id.as_ref(), &provider.extra) {
-            Ok(Some(deployment)) if deployment.account == account_id => {
-                Some(provider.id.to_string())
-            }
-            _ => None,
-        }
-    });
-    if let Some(existing) = account_in_use {
-        return Err(ApiError::conflict(format!(
-            "rental account `{account_id}` already pays for deployment `{existing}`; each rental \
-             has its own account, credential and vault entry, so a second rental needs a new \
-             account id"
-        )));
-    }
+    // Several deployments may share one account, and one model-on-a-GPU may be recorded under
+    // several accounts: each pairing gets its own provider id (`provider_id_for` above), so two
+    // models under one account stay distinguishable, and so do the same model under two accounts.
+    // The account owns the credential and the vault entry; each deployment names the account it
+    // bills through, and usage is attributed per provider. Account creation and model setup are
+    // therefore separate acts, which is the point of the two entities.
+
+    // One account may host the same checkpoint more than once — a streaming endpoint on one card
+    // and a batch endpoint on another, or two batch sizes on two cards — so the identity carries the
+    // mode and the card, and each of those is its own provider, app and endpoint. Both the derived
+    // URL (below) and the provider id read this shape, so they cannot disagree.
+    let shape = mr_core::rental::DeploymentShape {
+        account_id: &account.id,
+        repo: &repo,
+        mode,
+        gpu: gpu.id,
+        gpu_count: gpu_count as u32,
+    };
 
     let base_url = match base_url_override {
         Some(url) => url,
@@ -1901,7 +2153,7 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
                     ),
                 ));
             };
-            let Some(url) = mr_core::rental::modal_base_url(workspace, &account.id, &repo) else {
+            let Some(url) = mr_core::rental::modal_base_url(workspace, shape) else {
                 return Err(ApiError::bad(
                     "invalid_body",
                     "the endpoint URL could not be derived from that workspace and repository \
@@ -1912,7 +2164,7 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
         }
     };
 
-    let provider_id = provider_id_for(&account.id, &repo);
+    let provider_id = provider_id_for(shape);
     if current
         .providers
         .iter()
@@ -1925,8 +2177,9 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
     }
 
     // The account's own credential is written once, when the account is created; this deployment
-    // only points at it. The entry belongs to exactly one account and one rental, so there is no
-    // other provider it could be shared with, and no copy that could go stale on rotation.
+    // only points at it. The vault id is derived from the account id, so every deployment on this
+    // account reads the same entry: a rotation on the account reaches all of them, and no copy can
+    // go stale. Another account cannot point here, because its id derives a different vault id.
     let credential_id = account
         .secret_ref
         .clone()
@@ -1944,7 +2197,44 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
         }
     }
 
+    // The Hugging Face token is named by the deployment, not inherited from the account: the same
+    // token may serve deployments on several accounts, and this deployment may need none. A named
+    // token must exist and hold a vault entry, so a gated repository fails here rather than at the
+    // first fetch inside a container.
+    let hf_token =
+        match string_field(map, "hf_token").or_else(|| string_field(&deployment_map, "hf_token")) {
+            Some(token_id) => {
+                let Some(token) = current
+                    .huggingface_tokens
+                    .iter()
+                    .find(|token| token.id == token_id)
+                else {
+                    return Err(ApiError::not_found(format!(
+                        "there is no Hugging Face token with id `{token_id}`; create it with the \
+                     `create-hf-token` action, or omit `hf_token` for a public repository"
+                    )));
+                };
+                let vault_id = token
+                    .secret_ref
+                    .clone()
+                    .unwrap_or_else(|| hf_token_vault_id(&token.id));
+                let vault = state.vault.lock().await;
+                if !vault.contains(&vault_id) {
+                    return Err(ApiError::bad(
+                        "missing_credential",
+                        format!(
+                            "Hugging Face token `{token_id}` has no value at `{vault_id}` in the \
+                         vault; set it with the `create-hf-token` action before deploying"
+                        ),
+                    ));
+                }
+                Some(token.id.clone())
+            }
+            None => None,
+        };
+
     let mut deployment = RentalDeployment::new(account.id.clone(), &repo, gpu.id);
+    deployment.hf_token = hf_token;
     deployment.gpu_count = gpu_count as u32;
     deployment.weight_quant = weight_quant;
     deployment.kv_cache_dtype = kv_cache_dtype;
@@ -1955,6 +2245,7 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
         .map(|value| value.min(u64::from(u32::MAX)) as u32);
     deployment.shutdown_cooldown_secs = shutdown_cooldown_secs;
     deployment.mode = mode;
+    deployment.batch = batch;
     deployment.requantize = requantize;
     deployment.sizing = sizing;
     let review = deployment.problems();
@@ -1972,6 +2263,18 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
 
     let bundle = deployment_bundle(&provider_id, &deployment, gpu);
     deployment.bundle_id = Some(bundle.id.clone());
+
+    // A recorded token id is not a mounted token. The bundle deliberately carries no secret, so a
+    // gated repository needs the operator to mount one in Modal; say that now rather than letting
+    // the first fetch inside the container discover it.
+    if deployment.hf_token.is_some() {
+        warnings.push(
+            "the generated app does not mount a Hugging Face secret: create one with `modal \
+             secret create manarouter-hf HF_TOKEN=...` and add it to the image before the first \
+             fetch, or a gated repository will fail to load"
+                .to_owned(),
+        );
+    }
 
     let mut provider = mr_core::Provider::new(provider_id.clone(), Dialect::ModalVllm, &base_url);
     provider.label = Some(format!("{repo} · {}×{}", deployment.gpu_count, gpu.id));
@@ -2002,8 +2305,9 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
     };
     provider.models.push(model);
 
-    // The provider's sole account references this rental account's own vault entry. Accounts are
-    // not shared between rentals, so no second provider points at that entry.
+    // The provider's sole account references the rental account's vault entry. Several
+    // deployments may reference the same entry: the credential belongs to the account, not to one
+    // rental.
     let mut account_row = mr_core::Account::new(account.label.clone());
     account_row.secret_ref = Some(credential_id.clone());
     account_row.max_concurrent = 1;
@@ -2039,9 +2343,16 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
         "action": "create-deployment",
         "provider_id": provider_id,
         "account_id": account.id,
+        // The token id this deployment named, or null for a public repository. The id, never the
+        // value: the value lives at `hf:<id>` and is read only when a probe needs it.
+        "deployment": {
+            "account": deployment.account,
+            "repo": deployment.repo,
+            "hf_token": deployment.hf_token,
+        },
         "vault": {
-            // This account's own entry, referenced — not copied, and not shared with another
-            // rental.
+            // The account's own entry, referenced — not copied. A second deployment on the same
+            // account references this same entry.
             "secret_id": credential_id,
             "fingerprint": fingerprint,
         },
@@ -2078,7 +2389,8 @@ struct Bundle {
 fn deployment_bundle(provider_id: &str, deployment: &RentalDeployment, gpu: &GpuSpec) -> Bundle {
     // The same derivation the recorded `base_url` uses, so the URL the panel shows is the URL this
     // app is deployed under.
-    let app_name = mr_core::rental::modal_app_name(&deployment.account, &deployment.repo);
+    let app_name =
+        mr_core::rental::modal_app_name(mr_core::rental::DeploymentShape::of(deployment));
     let gpu_spec = if deployment.gpu_count > 1 {
         format!("{}:{}", gpu.id, deployment.gpu_count)
     } else {
@@ -2118,6 +2430,36 @@ fn deployment_bundle(provider_id: &str, deployment: &RentalDeployment, gpu: &Gpu
         None => String::new(),
     };
 
+    // What the recorded mode means for this file, in the file. A batch deployment is a plain vLLM
+    // server like any other; the layer that groups requests into a batch of `size` is not generated
+    // here, and saying so beats a comment that implies otherwise.
+    let mode_note = match (deployment.mode, deployment.batch) {
+        (RentalMode::Batch, Some(batch)) => {
+            let when = match batch.fill {
+                BatchFill::Full => format!(
+                    "waits until {} requests have arrived",
+                    batch.size
+                ),
+                BatchFill::Timeout => format!(
+                    "ships whatever has arrived after {}s, so a half-full batch still goes out",
+                    batch.timeout_secs.unwrap_or(0)
+                ),
+            };
+            format!(
+                "# Mode: batch — one batch holds {} requests and {when}.\n\
+                 # UNCERTAIN: this file serves vLLM directly; the dispatcher that groups requests\n\
+                 # into that batch is the serving layer's, and this build does not generate it.\n",
+                batch.size
+            )
+        }
+        (RentalMode::Batch, None) => {
+            "# Mode: batch, with no recorded batch shape.\n".to_owned()
+        }
+        (RentalMode::Streaming, _) => format!(
+            "# Mode: streaming — several sessions may share this card; the server schedules up to\n\
+             # MAX_NUM_SEQS ({max_seqs}) sequences per step and admits the rest as KV cache frees.\n"
+        ),
+    };
     let text = format!(
         r#"# Generated by Manarouter (POST /api/gpu/apply) for provider `{provider_id}`.
 #
@@ -2129,7 +2471,7 @@ fn deployment_bundle(provider_id: &str, deployment: &RentalDeployment, gpu: &Gpu
 #     https://<workspace>--<app name>-serve.modal.run
 # `modal deploy` prints the authoritative URL. If they differ, use the printed one: the panel's
 # base URL is an editable override for exactly that case.
-import subprocess
+{mode_note}import subprocess
 
 import modal
 
@@ -2170,6 +2512,7 @@ def serve() -> None:
     subprocess.Popen(args)
 "#,
         filename = "modal_app.py",
+        mode_note = mode_note,
         provider_id = provider_id,
         app_name = py_str(&app_name),
         model = py_str(&deployment.repo),
@@ -2244,10 +2587,10 @@ fn change_needs_restart(before: &Config, after: &Config) -> Option<&'static str>
 
 /// A provider id for a deployment: stable, lowercase, and derived from the account and repository
 /// so that applying the same deployment twice collides instead of duplicating.
-fn provider_id_for(account_id: &str, repo: &str) -> String {
+fn provider_id_for(shape: mr_core::rental::DeploymentShape<'_>) -> String {
     // The same helper the panel and the derived URL use, so the provider id and the Modal app name
     // cannot drift apart.
-    mr_core::rental::app_slug(account_id, repo)
+    mr_core::rental::app_slug(shape)
 }
 
 /// Why a value is not usable as a Modal workspace.
@@ -2393,6 +2736,14 @@ fn string_field(map: &Map<String, Value>, key: &str) -> Option<String> {
 }
 
 /// `config` with `account` in [`Config::rental_accounts`], replacing any entry with the same id.
+fn with_hf_token(config: &Config, token: &HuggingFaceToken) -> Config {
+    let mut next = config.clone();
+    next.huggingface_tokens
+        .retain(|existing| existing.id != token.id);
+    next.huggingface_tokens.push(token.clone());
+    next
+}
+
 fn with_account(config: &Config, account: &RentalAccount) -> Config {
     let mut next = config.clone();
     next.rental_accounts
@@ -3128,6 +3479,17 @@ mod tests {
         }
     }
 
+    /// The body a handler would have sent for an error, so a test can assert the message without
+    /// `ApiError` implementing `Debug`.
+    async fn error_text(error: ApiError) -> String {
+        use axum::response::IntoResponse;
+        let response = error.into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read the error body");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
     /// Create a Modal rental account the way the panel does.
     async fn create_modal_account(state: &AppState, id: &str, workspace: &str, credential: &str) {
         let plan_limits = serde_json::to_value(
@@ -3265,10 +3627,11 @@ mod tests {
                     "rental:second-rental".to_owned()
                 ),
             ],
-            "each account's entry is referenced by exactly one provider"
+            "each provider references its account's entry"
         );
-        // A third rental on an account that already pays for one is refused by name.
-        let refused = apply_body(
+        // A second model may be hosted under the same account. The account owns the credential;
+        // the new deployment names that account and references the same vault entry.
+        let third = apply_body(
             &state,
             json!({
                 "action": "create-deployment",
@@ -3280,19 +3643,19 @@ mod tests {
                 },
             }),
         )
-        .await;
-        let message = refused.expect_err("an account may not be shared");
-        assert!(
-            message.contains("already pays for deployment"),
-            "the refusal must say the account is taken: {message}"
-        );
-        assert_eq!(state.current_config().await.providers.len(), 2);
+        .await
+        .expect("a second model may share an account");
+        assert_eq!(third["account_id"], "mana-modal");
+        assert_eq!(third["vault"]["secret_id"], "rental:mana-modal");
+        assert!(!third.to_string().contains(first_credential));
+        assert!(!third.to_string().contains(second_credential));
+        assert_eq!(state.current_config().await.providers.len(), 3);
 
         let body = rentals_body(&state).await;
         assert_eq!(body["accounts"].as_array().expect("accounts").len(), 2);
         assert_eq!(
             body["deployments"].as_array().expect("deployments").len(),
-            2
+            3
         );
         assert!(!body.to_string().contains(first_credential));
         assert!(!body.to_string().contains(second_credential));
@@ -3324,7 +3687,7 @@ mod tests {
         let config = state.current_config().await;
         assert_eq!(
             config.providers[0].base_url,
-            "https://mana--manarouter-rental-mana-modal-qwen3-8b-serve.modal.run"
+            "https://mana--manarouter-rental-mana-modal-qwen3-8b-streaming-h100-serve.modal.run"
         );
         let extra = &config.providers[0].extra[mr_core::rental::RENTAL_EXTRA_KEY];
         assert_eq!(extra["mode"], "streaming");
@@ -3721,5 +4084,339 @@ mod tests {
         );
         assert!(SCHEDULE_HINT.contains("batched:N"));
         assert!(SCHEDULE_HINT.contains("sequential"));
+    }
+
+    // --- Hugging Face tokens are their own entity, not account state ---
+
+    /// Create a token the way the panel does.
+    async fn create_hf_token(state: &AppState, id: &str, secret: &str) {
+        let created = apply_body(
+            state,
+            json!({
+                "action": "create-hf-token",
+                "token": { "id": id, "label": id, "secret": secret },
+            }),
+        )
+        .await
+        .expect("create the token");
+        assert_eq!(created["token"]["id"], id);
+        assert!(
+            !created.to_string().contains(secret),
+            "the token value is never echoed: {created}"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_hugging_face_token_serves_deployments_on_several_accounts() {
+        // The shape the operator described: several accounts, one or two tokens. Nothing here may
+        // require the counts to match, and nothing may tie the token to the first account.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = state_in(dir.path());
+        create_modal_account(&state, "acct-a", "mana", "wk-a-id.ws-a-secret").await;
+        create_modal_account(&state, "acct-b", "mana", "wk-b-id.ws-b-secret").await;
+        create_hf_token(&state, "hub-main", "hf_test_value_1").await;
+
+        let first = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "acct-a",
+                "hf_token": "hub-main",
+                "deployment": { "repo": "org/gated-a", "gpu": "H100", "gpu_count": 1 },
+            }),
+        )
+        .await
+        .expect("deploy on the first account");
+        let second = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "acct-b",
+                "hf_token": "hub-main",
+                "deployment": { "repo": "org/gated-b", "gpu": "H100", "gpu_count": 1 },
+            }),
+        )
+        .await
+        .expect("deploy on the second account");
+        // One token, two accounts: both name the same id, and neither account owns it.
+        assert_eq!(first["deployment"]["hf_token"], json!("hub-main"));
+        assert_eq!(second["deployment"]["hf_token"], json!("hub-main"));
+        // The id is recorded; the value is not, and the bundle cannot mount it, so the response says
+        // so instead of implying the container already has the token.
+        let warnings = first["warnings"].as_array().expect("warnings array");
+        assert!(
+            warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.contains("does not mount a Hugging Face secret"))),
+            "a deploy naming a token warns that mounting it is still a Modal step: {warnings:?}"
+        );
+
+        let config = state.current_config().await;
+        assert_eq!(config.huggingface_tokens.len(), 1);
+        assert!(
+            config
+                .rental_accounts
+                .iter()
+                .all(|account| account.hf_secret_ref.is_none()),
+            "no account may inherit a token"
+        );
+
+        // A third deployment on one of those accounts may need no token at all.
+        let public = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "acct-a",
+                "deployment": { "repo": "org/public", "gpu": "H100", "gpu_count": 1 },
+            }),
+        )
+        .await
+        .expect("deploy a public repo on the first account");
+        assert_eq!(public["deployment"]["hf_token"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn one_repository_runs_in_several_modes_and_cards_under_one_account() {
+        // The shape the operator asked for: stream on one card, batch shipping a short batch on
+        // another, batch waiting for a full batch somewhere else — one account, one repository,
+        // three deployments that must not overwrite each other.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = state_in(dir.path());
+        create_modal_account(&state, "mana-modal", "mana", "wk-id-0a1b.ws-secret-2c3d").await;
+
+        let streaming = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "mana-modal",
+                "deployment": {"repo": "Qwen/Qwen3-8B", "gpu": "H100", "gpu_count": 1},
+            }),
+        )
+        .await
+        .expect("deploy the streaming endpoint");
+        let timed = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "mana-modal",
+                "deployment": {
+                    "repo": "Qwen/Qwen3-8B",
+                    "gpu": "L40S",
+                    "gpu_count": 1,
+                    "mode": "batch",
+                    "batch": {"size": 8, "fill": "timeout", "timeout_secs": 30},
+                },
+            }),
+        )
+        .await
+        .expect("deploy the batch endpoint that ships early");
+        let full = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "mana-modal",
+                "deployment": {
+                    "repo": "Qwen/Qwen3-8B",
+                    "gpu": "RTX-PRO-6000",
+                    "gpu_count": 1,
+                    "mode": "batch",
+                    "batch": {"size": 4, "fill": "full"},
+                },
+            }),
+        )
+        .await
+        .expect("deploy the batch endpoint that waits");
+
+        // Each deployment is its own provider, with its own derived URL.
+        assert_eq!(
+            streaming["provider_id"],
+            json!("rental-mana-modal-qwen3-8b-streaming-h100")
+        );
+        assert_eq!(
+            timed["provider_id"],
+            json!("rental-mana-modal-qwen3-8b-batch-l40s")
+        );
+        assert_eq!(
+            full["provider_id"],
+            json!("rental-mana-modal-qwen3-8b-batch-rtx-pro-6000")
+        );
+
+        let config = state.current_config().await;
+        assert_eq!(
+            config.providers[0].base_url,
+            "https://mana--manarouter-rental-mana-modal-qwen3-8b-streaming-h100-serve.modal.run"
+        );
+        assert_eq!(
+            config.providers[1].base_url,
+            "https://mana--manarouter-rental-mana-modal-qwen3-8b-batch-l40s-serve.modal.run"
+        );
+        assert_eq!(config.providers.len(), 3);
+        let batch = &config.providers[1].extra[mr_core::rental::RENTAL_EXTRA_KEY];
+        assert_eq!(batch["mode"], "batch");
+        assert_eq!(batch["batch"]["size"], json!(8));
+        assert_eq!(batch["batch"]["fill"], json!("timeout"));
+        assert_eq!(batch["batch"]["timeout_secs"], json!(30));
+        let waiting = &config.providers[2].extra[mr_core::rental::RENTAL_EXTRA_KEY];
+        assert_eq!(waiting["batch"]["fill"], json!("full"));
+        assert_eq!(waiting["batch"]["timeout_secs"], Value::Null);
+
+        // The same repo, mode and card a second time is still a collision: identity widened, not
+        // abandoned.
+        let repeat = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "mana-modal",
+                "deployment": {"repo": "Qwen/Qwen3-8B", "gpu": "L40S", "mode": "batch", "gpu_count": 1,
+                    "batch": {"size": 16, "fill": "timeout", "timeout_secs": 5}},
+            }),
+        )
+        .await;
+        let error = repeat.expect_err("the same deployment twice must be refused");
+        assert!(error.contains("already"), "got {error}");
+    }
+
+    #[tokio::test]
+    async fn a_batch_deployment_says_how_its_batch_fills() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = state_in(dir.path());
+        create_modal_account(&state, "mana-modal", "mana", "wk-id-4e5f.ws-secret-6g7h").await;
+
+        // A batch with no shape at all cannot be sized, so it is refused by name.
+        let bare = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "mana-modal",
+                "deployment": {"repo": "Qwen/Qwen3-8B", "gpu": "L40S", "mode": "batch"},
+            }),
+        )
+        .await
+        .expect_err("a batch deployment with no batch");
+        assert!(bare.contains("batch"), "got {bare}");
+
+        // A timeout with no number is the same problem, one level down.
+        let no_seconds = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "mana-modal",
+                "deployment": {"repo": "Qwen/Qwen3-8B", "gpu": "L40S", "mode": "batch",
+                    "batch": {"size": 4, "fill": "timeout"}},
+            }),
+        )
+        .await
+        .expect_err("a timeout with no seconds");
+        assert!(no_seconds.contains("timeout_secs"), "got {no_seconds}");
+
+        // A streaming deployment has no batch to fill.
+        let misplaced = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "mana-modal",
+                "deployment": {"repo": "Qwen/Qwen3-8B", "gpu": "L40S",
+                    "batch": {"size": 4, "fill": "full"}},
+            }),
+        )
+        .await
+        .expect_err("a batch shape on a streaming deployment");
+        assert!(misplaced.contains("batch"), "got {misplaced}");
+
+        // A batch larger than the server can schedule is refused rather than recorded to fail later.
+        let oversized = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "mana-modal",
+                "deployment": {"repo": "Qwen/Qwen3-8B", "gpu": "L40S", "mode": "batch",
+                    "max_num_seqs": 2,
+                    "batch": {"size": 8, "fill": "full"}},
+            }),
+        )
+        .await
+        .expect_err("a batch the server cannot schedule");
+        assert!(oversized.contains("max_num_seqs"), "got {oversized}");
+    }
+
+    #[tokio::test]
+    async fn a_token_named_by_a_deployment_must_exist_and_hold_a_value() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = state_in(dir.path());
+        create_modal_account(&state, "acct-a", "mana", "wk-a-id.ws-a-secret").await;
+
+        let missing = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "acct-a",
+                "hf_token": "never-recorded",
+                "deployment": { "repo": "org/gated", "gpu": "H100", "gpu_count": 1 },
+            }),
+        )
+        .await
+        .expect_err("an unrecorded token is refused");
+        assert!(missing.contains("HTTP 404"), "{missing}");
+        assert!(missing.contains("never-recorded"), "{missing}");
+        assert!(
+            !missing.contains("hf_test"),
+            "the refusal names the id, never a value: {missing}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_account_refuses_a_hugging_face_token() {
+        // The old spelling is refused with the action that does hold a token, rather than being
+        // quietly stored on the account: silently accepting it is how a token became account state.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = state_in(dir.path());
+        let refused = apply_body(
+            &state,
+            json!({
+                "action": "create-account",
+                "account": {
+                    "id": "acct-a",
+                    "platform": "modal",
+                    "plan": "paid",
+                    "workspace": "mana",
+                    "token": "wk-a-id.ws-a-secret",
+                    "hf_token": "hf_test_value_1",
+                },
+            }),
+        )
+        .await
+        .expect_err("an account may not carry a token");
+        assert!(refused.contains("HTTP 400"), "{refused}");
+        assert!(refused.contains("create-hf-token"), "{refused}");
+        let config = state.current_config().await;
+        assert!(config.rental_accounts.is_empty(), "nothing was recorded");
+        assert!(config.huggingface_tokens.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_probe_reads_a_token_by_id_without_an_account() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = state_in(dir.path());
+        create_hf_token(&state, "hub-main", "hf_test_value_1").await;
+
+        let mut map = Map::new();
+        map.insert("hf_token_id".to_owned(), json!("hub-main"));
+        let token = match probe_token(&state, &map).await {
+            Ok(token) => token,
+            Err(error) => panic!("read the token: {}", error_text(error).await),
+        };
+        assert_eq!(token.as_deref(), Some("hf_test_value_1"));
+
+        // No account is involved at all: the same call works for a config with zero accounts.
+        assert!(state.current_config().await.rental_accounts.is_empty());
+
+        let mut unknown = Map::new();
+        unknown.insert("hf_token_id".to_owned(), json!("never-recorded"));
+        let error = match probe_token(&state, &unknown).await {
+            Ok(token) => panic!("an unrecorded id must be refused, got {token:?}"),
+            Err(error) => error,
+        };
+        let text = error_text(error).await;
+        assert!(text.contains("never-recorded"), "{text}");
     }
 }

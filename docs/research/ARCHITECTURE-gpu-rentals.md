@@ -31,13 +31,24 @@ differ, the contract is the intent and this list is the truth.
 * The panel setup flow (catalog → account → model → sizing → bundle), including reuse of an account
   that is already stored: `USE` points a second deployment at the same id and sends no credential.
 * One lane held in conductor memory: Kaggle. (Molab, Saturn and Cerebrium were removed 2026-11-13.)
+* `apply` takes three actions — `create-account`, `create-hf-token`, `create-deployment`. A Hugging
+  Face token is its own record at `hf:<id>`, named by each deployment that needs it (§3.4), and
+  re-recording an id rotates the value in place rather than creating a second token.
+* Batch deployments record `BatchShape` (`size`, `fill`, `timeout_secs`) and the fill policy is
+  reflected in the generated bundle's `mode_note`; the batch assembler itself is not generated.
+* The panel's `#/gpu-rentals` page is three actions over one list — `Deploy model`,
+  `Add Modal account`, `Add HuggingFace token` — with the fit check inside the deploy window. The
+  step wizard behind `#/gpu-rentals/new/<step>` remains for a first-time walkthrough.
 
 **Not implemented, and not claimed by the panel**
 
 * A router-controlled Modal lifecycle. The conductor never runs the `modal` CLI or an SDK; a
   container starts when the operator runs the bundle's command.
-* A per-batch dollar cap. `RentalDeployment` has no budget field; the panel reports measured cost
-  after the fact and derives nothing it did not measure.
+* A per-batch dollar cap on a *deployment*. The relay's batch lane has `max_cost_usd`
+  ([../18-api-reference.md](../18-api-reference.md)), but `RentalDeployment` carries no budget field; the panel reports measured cost after the fact and
+  derives nothing it did not measure.
+* A mounted Hugging Face secret. The bundle names no `modal.Secret`, so a gated repository needs the
+  operator to mount `manarouter-hf` by hand; `create-deployment` warns when a token is named.
 * Lane credential persistence. The lanes that remembered an attach (Saturn, molab, Cerebrium) wrote
   it to the vault; those lanes were removed together with `lane_vault.rs`, so no lane credential is
   stored today (`docs/26-gpu-lanes.md` §9).
@@ -131,9 +142,16 @@ That fixes the model to two entities.
 ### 3.1 Rental account — a platform credential, no model attached
 
 A rental account is a **workspace credential for a platform**. It is created on its own, before any
-model is chosen, and it belongs to exactly **one** rental deployment. An account id another rental
-already pays from is refused: one rental has one account, one credential and one vault entry, and
-nothing is shared with another rental.
+model is chosen, and it is a *credential*, not a deployment: several rentals may bill through one
+account, and the same model on the same card may be deployed once per account when an operator wants
+more capacity than one workspace will give. Nothing about the account knows which models use it —
+that direction is recorded on the deployment, as `RentalDeployment.account`.
+
+The count is the operator's business. Three models on three GPU configurations, five or six accounts
+and one or two Hugging Face tokens is a plausible arrangement, and so is one account used by one
+rental; the only thing the conductor enforces is that every deployment names an account that exists.
+A deployment's provider id carries the account and the shape, so two rentals of the same repo under
+different accounts stay distinct providers rather than colliding.
 
 ```rust
 // crates/mr-core/src/rental.rs
@@ -144,7 +162,7 @@ pub struct RentalAccount {
     pub plan: RentalPlan,              // "free" | "paid" | "unknown"
     pub workspace: Option<String>,     // Modal workspace slug; not a secret, half of the derived URL
     pub secret_ref: Option<String>,    // vault entry id holding this account's own credential
-    pub hf_secret_ref: Option<String>, // vault entry id holding a HuggingFace token, when needed
+    pub hf_secret_ref: Option<String>, // LEGACY: see "Hugging Face tokens are not account-scoped" below
     pub max_concurrent_containers: Option<u32>, // platform-side ceiling (Modal Starter: 10) [facts]
     pub note: Option<String>,
     pub extra: Map<String, Value>,     // exit hatch, round-trips unknown keys
@@ -153,6 +171,11 @@ pub struct RentalAccount {
 
 `RentalPlan::Unknown` is a real state and must not be rendered as `Free`. Requirement 10's `(Paid)`
 marker is only truthful when the plan is known *and* the GPU is known to be gated.
+
+`hf_secret_ref` is kept only so files written before Hugging Face tokens became their own entity keep
+working: a deployment whose repo is gated, and which names no token, still falls back to the
+account's recorded token. Nothing new writes it. Tokens live in `Config.huggingface_tokens` and are
+named by the deployment (see §3.4).
 
 ### 3.2 Rental deployment — one model on one GPU
 
@@ -174,6 +197,7 @@ pub struct RentalDeployment {
     pub max_num_seqs: Option<u32>,
     pub shutdown_cooldown_secs: Option<u32>,
     pub mode: RentalMode,            // "streaming" | "batch"; legacy "interactive" loads as streaming
+    pub batch: Option<BatchShape>,   // batch size and fill policy; required when mode == batch
     pub bundle_id: Option<String>,
     pub requantize: Option<RequantizePlan>,
 }
@@ -189,14 +213,35 @@ would be a `SNAPSHOT_VERSION` bump for no runtime benefit — the relay never re
 not. `Provider.extra["rental"]` is deserialised on demand and a malformed value is a validation
 error, not a silent default.
 
-`mode` is one axis with two values, not two GPUs: a rental is one model on one card. `streaming` is a
-live endpoint a request can reach; `batch` is a queue drained in bulk. `batch_gpu` is gone — batching
-changes how the one card is scheduled, never which or how many cards it is. The wire value is
-`streaming`; older files that say `interactive` are still parsed as that same mode, but nothing new
-is written with the old spelling.
+`mode` is one axis with two values, not two GPUs: a rental is one model on a card configuration.
+`streaming` is a live endpoint several sessions reach at once; `batch` is a queue drained in bulk.
+`batch_gpu` is gone — batching changes how the card is scheduled, never which card it is. The wire
+value is `streaming`; older files that say `interactive` are still parsed as that same mode, but
+nothing new is written with the old spelling.
+
+**Identity is (account, repo, mode, card, count).** Two deployments that agree on all five are the
+same provider and the second is refused; differing on any of them is a different endpoint with a
+different app name and a different `base_url`. `DeploymentShape` (`rental.rs`) is that tuple, and
+`app_slug`, `modal_app_name` and `modal_base_url` all take it, so the panel preview and the apply
+path cannot disagree about a name. The suffix is `-<mode>-<card-lowercased>[-x<count>]`, e.g.
+`manarouter-rental-mana-modal-qwen3-8-27b-streaming-rtx-pro-6000`; because the head is truncated at
+64 characters first, the suffix is what survives and keeps the names distinct.
+
+**A batch records how it fills.** `BatchShape { size, fill, timeout_secs }`:
+
+```rust
+pub enum BatchFill { Full, Timeout }   // "full" (default) | "timeout"
+```
+
+`full` means a request waits until the batch is complete, however long that takes — that is the
+operator's stated choice, not a missing timeout. `timeout` means whatever has arrived ships after
+`timeout_secs` (1–3600) as a short batch. `BatchShape::problems()` refuses a zero size, a timeout
+without a duration, a duration without the timeout policy, and a `fill` value it does not know. The
+fill policy never changes the fit calculation: a batch is judged against `batch.size`, a streaming
+deployment against `sessions`.
 
 `base_url` is **derived**, never pasted in the normal path. The account records the Modal workspace
-and the deployment's generated app name is deterministic, so
+and the deployment's generated app name is deterministic from the shape, so
 `https://<workspace>--<modal-app-name>-serve.modal.run` is computed by one shared derivation used by
 both the panel preview and `POST /api/gpu/apply`. Modal publishes no deployment REST API, so this is
 a derived prediction, not a confirmed URL: `modal deploy` prints the authoritative one, and an
@@ -209,15 +254,64 @@ A provider requires a `base_url`, and a Modal account has none: on Modal each ap
 `base_url`, so an account derived from a provider would have to carry a lie. A separate
 `Config.rental_accounts` list avoids the lie and is the seam issues #10–#13 plug into.
 
+### 3.4 Hugging Face tokens are not account-scoped
+
+A Hugging Face token is a credential a *repository* needs, not a workspace. It belongs to the
+operator, is named by id, and is written once to `hf:<id>`. The relation is many-to-many in both
+directions: one token may be named by deployments on several accounts, several tokens may exist for
+one account's deployments, and a public repository needs none.
+
+```rust
+// crates/mr-core/src/rental.rs
+pub struct HuggingFaceToken {
+    pub id: String,                  // operator-chosen, unique, half of the vault id
+    pub label: String,
+    pub secret_ref: Option<String>,  // "hf:<id>", written by create-hf-token
+    pub note: Option<String>,
+    pub extra: Map<String, Value>,
+}
+```
+
+The config holds `huggingface_tokens: Vec<HuggingFaceToken>`, independent of `rental_accounts`.
+Nothing forces the two lists to have equal length in either direction; the operator's arrangement
+(five or six accounts sharing one or two tokens, or one token per account, or no token at all) is
+recorded as given. `RentalDeployment.hf_token: Option<String>` is the deployment's reference, and
+`Config` keeps no implicit "current token".
+
+**What the record does and does not do.** `create-deployment` validates that a named token exists and
+has a vault value, and records the id on the deployment, so a gated repository fails at apply time
+rather than on the first fetch inside a container. It does **not** interpolate the token into the
+generated `modal_app.py`: Modal has no per-run secret environment for this, and a bundle carrying a
+token would be a bundle carrying a secret. The container reads a Modal secret named
+`manarouter-hf`, which the operator creates on their own machine
+(`modal secret create manarouter-hf HF_TOKEN=...`) and whose name the generated file should mount. The
+recorded `hf_token` id says *which* token the deployment expects; mounting it is a deployment-time
+step. **Gap, stated rather than papered over:** the generated `modal_app.py` does not yet add that
+secret to the image, and the bundle's notes do not mention it, so a gated repository deploys and then
+fails on its first fetch until the file is edited by hand. The apply response carries a warning
+saying exactly that (`"... does not mount a Hugging Face secret ..."`) whenever a deployment names a
+token, so the gap is visible at the moment of deployment rather than only in this document. Adding
+the mount is the next piece of work on this path. **UNCERTAIN:** whether the eventual fix should push the secret through the Modal CLI
+instead; that would need the operator's Modal token to have secret-write scope, which the panel does
+not currently assume.
+
+**Legacy fallback, kept deliberately.** Files written before this entity existed may hold
+`RentalAccount.hf_secret_ref = Some("rental:<account>:hf")`. A gated probe with no named token falls
+back to that entry, so old deployments keep fetching. Nothing writes the field any more, and the
+panel labels it as legacy rather than offering to edit it.
+
 ## 4. Configuration schema change
 
-One new top-level key, `#[serde(default)]`, placed **before** `extra` in `Config`:
+Two new top-level keys, both `#[serde(default)]`, placed **before** `extra` in `Config`
+(`huggingface_tokens` immediately after `rental_accounts`):
 
 ```json
 "rental_accounts": [
   { "id": "mana-modal", "label": "Mana on Modal", "platform": "modal", "plan": "paid",
-    "secret_ref": "rental:mana-modal", "hf_secret_ref": "rental:mana-modal:hf",
-    "max_concurrent_containers": 10, "note": null }
+    "secret_ref": "rental:mana-modal", "max_concurrent_containers": 10, "note": null }
+],
+"huggingface_tokens": [
+  { "id": "hf-main", "label": "Personal — read", "secret_ref": "hf:hf-main", "note": null }
 ]
 ```
 
@@ -235,9 +329,11 @@ typed field is what makes the key discoverable and type-checked, so it is specif
 `extra` must stay the last field for the flatten to keep absorbing unknown keys, so the new field goes
 immediately before it and no existing field is reordered.
 
-Vault ids use the existing `secret::` helpers' convention, and are derived from the account id rather
-than accepted from the client: the platform credential lives at `rental:<account id>`, and a Hugging
-Face token, when supplied, at `rental:<account id>:hf`. The credential is **one combined string**, not
+Vault ids use the existing `secret::` helpers' convention, and are derived from the ids the operator
+chose rather than accepted from the client: the platform credential lives at `rental:<account id>`,
+and a Hugging Face token at `hf:<token id>` (`hf_token_vault_id`). The old
+`rental:<account id>:hf` entry is still read when a gated deployment names no token, and is never
+written again. The credential is **one combined string**, not
 a JSON wrapper — a `wk-...` token id and a `ws-...` token secret joined by a single `.`, the two
 halves Modal's dashboard shows and the shape the existing Modal readers already split with
 `split_once('.')`. The apply path is designed and checked against that format: it refuses a missing
@@ -247,15 +343,20 @@ secret or find none.
 **A storage qualification, verified from source:** `Vault::put` takes
 `&mut self` and is **not reference-counted** (`crates/mr-core/src/secret.rs:237`), and
 `Account.secret_ref` is a free-form `Option<String>` with no validation against a naming scheme
-(`model.rs:275`), so the one-account-per-rental rule is the conductor's to keep rather than the
-compiler's. Each account writes its own vault entry (`rental:<account-id>`, plus
-`rental:<account-id>:hf` when a gated repository needs a HuggingFace token) exactly once, at account
-creation, and no two accounts may point at one entry. Writing an id twice clobbers it, and deleting
-it while its rental still references it silently breaks that rental. The conductor rejects a
-deployment whose account id already pays for another rental instead of letting the second write
-overwrite the first credential. `Vault::ids()`, `contains()` and `fingerprint_of()`
-(`secret.rs:356-366`) are what let the panel list accounts by fingerprint without ever reading a
-secret back out.
+(`model.rs:275`), so uniqueness of ids is the conductor's to keep rather than the compiler's. Each
+account writes its own vault entry, `rental:<account-id>`, exactly once, at account creation, and no
+two accounts may share an entry: writing an id twice clobbers it, and deleting it while a rental
+still references it silently breaks that rental. The conductor therefore refuses a second account
+with an existing id (`account_already_exists`) and refuses `create-account` when the vault entry is
+already occupied. A *deployment* may reuse an account freely — that is the normal case, not a
+collision.
+
+Hugging Face tokens follow the same discipline with a different id space: `hf:<token-id>`, written
+once by `create-hf-token`. Recording the same token id again is deliberately allowed and replaces
+the stored value in place: that is how a token is rotated without touching a single deployment,
+because deployments name the token by id rather than holding a copy. `Vault::ids()`, `contains()` and
+`fingerprint_of()` (`secret.rs:356-366`) are what let the panel list accounts and tokens by
+fingerprint without ever reading a secret back out.
 
 ## 5. Conductor API — `/api/gpu/*`
 
@@ -403,19 +504,51 @@ carries its provider id, enabled state, resolved model name and derived sizing.
 
 ### `POST /api/gpu/apply`
 
-One endpoint, two actions, because account creation and deployment creation are separate steps:
+One endpoint, three actions, because a platform credential, a Hugging Face token and a deployment
+are three separate things:
 
 ```json
 {"action": "create-account", "account": {"id": "mana-modal", "label": "...", "platform": "modal",
-   "plan": "paid", "workspace": "mana", "token_id": "...", "token_secret": "...", "hf_token": null}}
+   "plan": "paid", "workspace": "mana", "token_id": "...", "token_secret": "..."}}
+```
+
+```json
+{"action": "create-hf-token", "token": {"id": "hf-main", "label": "Personal — read",
+   "secret": "hf_..."}}
 ```
 
 ```json
 {"action": "create-deployment", "account_id": "mana-modal",
  "deployment": {"repo": "...", "gpu": "RTX-PRO-6000", "gpu_count": 1, "weight_quant": "fp8",
    "kv_cache_dtype": "fp8", "max_model_len": 262144, "max_num_seqs": 64,
-   "shutdown_cooldown_secs": 60, "mode": "streaming", "sizing": {...}}}
+   "shutdown_cooldown_secs": 60, "mode": "batch",
+   "batch": {"size": 8, "fill": "timeout", "timeout_secs": 45}, "sizing": {...}}}
 ```
+
+`create-account` carries **no** `hf_token`: a token is not account-scoped, and the action refuses
+the field rather than ignoring it. `create-hf-token` writes `hf:<id>` and returns the vault entry and
+a fingerprint, never the value; recording an existing id reports `"replaced": true` and rotates it.
+A deployment names a token with `deployment.hf_token` (or a top-level `hf_token`), and only needs one
+when the repository is gated. A named token must exist and hold a value, so that failure happens at
+apply time rather than on the first fetch inside a container.
+
+`create-deployment` requires `batch` when `mode` is `batch` and refuses it otherwise; the accepted
+shape is `{"size": <u32 >= 1>, "fill": "full" | "timeout", "timeout_secs": <1..=3600>}`, and
+`timeout_secs` is required exactly when `fill` is `timeout`. It returns:
+
+```json
+{"action": "create-deployment", "provider_id": "manarouter-rental-mana-modal-...",
+ "account_id": "mana-modal",
+ "deployment": {"account": "mana-modal", "repo": "...", "hf_token": "hf-main"},
+ "vault": {"secret_id": "rental:mana-modal", "fingerprint": "..."},
+ "restart_pending": false, "applies_on": "immediately", "applies_on_note": "...",
+ "bundle": {"id": "...", "filename": "modal_app.py", "text": "..."},
+ "command": "modal deploy modal_app.py", "warnings": []}
+```
+
+`vault.secret_id` is the **account's** entry, referenced not copied — a second deployment on the same
+account reports the same id. `deployment.hf_token` is the token *id*, never its value. There is no
+`provider` object in the response; `provider_id` is the thing to look up.
 
 `base_url` may be omitted: the conductor derives
 `https://<workspace>--<generated-app-name>-serve.modal.run` from the account's recorded workspace.
@@ -432,6 +565,12 @@ credential bound as its account, the model entry, and the derived budget fields
 (`kv_pool_tokens`, `max_context`, `max_concurrent`, `price_per_second`,
 `cold_start_ttfb_timeout_ms`) so the relay enforces them with the KV budget already on the request
 path. It also returns the **bundle** (`modal_app.py` text + command) so the wizard can show it.
+
+The bundle is a *streaming* vLLM app. For a `batch` deployment the file still starts vLLM with the
+right flags, and a generated `mode_note` says which mode the deployment was applied in — but the code
+that accumulates a batch and decides when to fire on `fill`/`timeout_secs` is **not generated**. Saying
+so in the note, rather than shipping an app whose docstring implies batching it does not do, is the
+same rule the rest of this document follows: the file is exactly as capable as it claims.
 
 Everything goes through `AppState::commit` (validate → compile → atomic save → install) and the
 vault write is rolled back if commit fails. No secret is ever echoed back; the response carries the
@@ -973,10 +1112,13 @@ document first described.
   fields, so `GET /api/gpu/rentals` returned
   `fit: {known: true, kv_pool_tokens: null, sessions_at_max_len: null}`. The panel now forwards the
   derived figures, and the conductor can divide the raw pool when only that arrives.
-* **`POST /api/gpu/apply` is create-only.** Re-applying a deployment to the same account and
-  repository returns HTTP **409** (`a provider with id ... already exists`) rather than mutating or
-  duplicating it; the operator must delete the provider or apply under a different repository name.
-  The deployment references the account's existing vault entry rather than copying the credential.
+* **`POST /api/gpu/apply` is create-only.** Re-applying a deployment with the same
+  (account, repository, mode, card, count) returns HTTP **409** (`a provider with id ... already
+  exists`) rather than mutating or duplicating it. The same repository on a different card, in the
+  other mode, on another account or with a different card count is a *different* deployment and is
+  accepted — that is how an operator runs a streaming endpoint and a filling batch of one model at
+  once. The deployment references the account's existing vault entry rather than copying the
+  credential, so many deployments share one account without sharing a billing identity.
 * **`command` is not inside `bundle`.** The apply response returns `command` as a top-level sibling
   of `bundle`; a consumer reading `bundle.command` gets nothing.
 * **Rental facts are a top-level `rental` object.** The generated provider inserts them into

@@ -184,6 +184,9 @@ const winListeners = {};
 
 globalThis.document = {
   createElement: makeEl,
+  // The dialogs in this view append to #dialog-root when the shell provides one and to the body
+  // otherwise. The stub has no shell, so every window in these tests lands on the body.
+  getElementById: () => null,
   createElementNS: (_ns, tag) => makeEl(tag),
   createTextNode: (text) => ({ nodeType: 3, data: String(text), textContent: String(text) }),
   body: makeEl('body'),
@@ -289,8 +292,17 @@ function modalPlatform() {
 function catalog() {
   return {
     platforms: [modalPlatform()],
-    quant_methods: [{ id: 'awq', label: 'AWQ' }],
-    kv_cache_dtypes: [{ id: 'fp8', label: 'fp8' }],
+    // The live catalog records a width for every quant and cache dtype it lists; without one the
+    // sizing cannot compute a weight or cache figure at all, which is a different verdict from
+    // "this does not fit".
+    quant_methods: [
+      { id: 'fp8', label: 'FP8', bytes_per_param: 1, min_compute_cap: 8.9 },
+      { id: 'awq', label: 'AWQ', bytes_per_param: 0.5, min_compute_cap: 8.9 },
+    ],
+    kv_cache_dtypes: [
+      { id: 'auto', label: 'auto' },
+      { id: 'fp8', label: 'fp8', bytes_per_element: 1, min_compute_cap: 8.9 },
+    ],
   };
 }
 
@@ -454,6 +466,23 @@ function setSelect(root, name, value) {
   assert.ok(select, `expected a select for ${name}`);
   select.value = String(value);
   fire(select, 'change');
+}
+
+/** Hold the GET stub while a dialog loads: dialogs read their sources after mountView's own stub
+ *  has been restored, so a test that opens one must keep the handlers alive itself. */
+async function withGet(reply, fn) {
+  const original = api.get;
+  api.get = async (path) => {
+    const value = typeof reply === 'function' ? reply(path) : Object.hasOwn(reply, path) ? reply[path] : undefined;
+    if (value === undefined) throw new Error(`test did not expect GET ${path}`);
+    if (value instanceof Error) throw value;
+    return value;
+  };
+  try {
+    await fn();
+  } finally {
+    api.get = original;
+  }
 }
 
 async function withPost(reply, fn) {
@@ -803,8 +832,12 @@ test('an empty response renders neutral empty states and a next step', async () 
   assert.ok(!descendants(mount).some((el) => el.getAttribute('role') === 'alert'),
     'nothing failed, so nothing is announced as a failure');
   const buttons = descendants(mount).map((el) => textOf(el).trim());
-  assert.ok(buttons.includes('New rental'), 'the operator is told what to do next');
-  assert.ok(buttons.includes('Add rental account'));
+  assert.ok(buttons.includes('Deploy model'), 'the operator is told what to do next');
+  assert.ok(buttons.includes('Add Modal account'));
+  assert.ok(buttons.includes('Add HuggingFace token'),
+    'a token is an independent record, so the page offers it without waiting for a gated repo');
+  assert.ok(!buttons.includes('New rental'),
+    'the page deploys through a window; a link that navigated away would hide the three actions');
 });
 
 test('a hidden tab stops asking for usage numbers', async (t) => {
@@ -1029,14 +1062,17 @@ test('the account step names the write it performs, because the review step come
     'the button that writes a credential to the vault does not read as a plain Continue');
   assert.match(textOf(mount), /Writes this account to the vault now/);
   assert.match(textOf(mount), /The rental itself is saved at the end\./);
-  assert.match(textOf(mount), /Each rental has its own account, credential and vault entry/,
-    'the step says the account is this rental\'s alone');
+  assert.match(textOf(mount), /One account can host several rentals/,
+    'an account is not owned by the rental that first named it');
+  assert.match(textOf(mount), /Several rentals may name the same account\./);
 
-  // There is no "use an existing account" button: an account already recorded belongs to the
-  // rental it pays for, and offering USE here is what made every rental share one credential.
-  assert.equal(descendants(mount).filter((el) => el.tagName === 'BUTTON'
-    && String(el.textContent ?? '') === 'USE').length, 0);
-  assert.match(textOf(mount), /none can be chosen here/);
+  // Reuse is offered on the same step: naming a recorded account writes nothing, so the two paths
+  // sit side by side and only the create path stores a credential.
+  const reuse = descendants(mount).filter((el) => el.tagName === 'BUTTON'
+    && String(el.textContent ?? '') === 'Use this account');
+  assert.equal(reuse.length, 1, 'the recorded account is offered for this rental too');
+  assert.match(textOf(mount), /writes nothing/,
+    'the reuse path says it does not touch the credential');
 });
 
 test('validation pins every problem to its field and reports all of them at once', async (t) => {
@@ -1094,7 +1130,8 @@ test('the account step posts the vault entry before any model step, and clears n
     assert.equal(posts[0].body.account.workspace, 'mana', 'the workspace is recorded as a plain field');
     assert.equal(posts[0].body.account.token_id, 'wk-abc123');
     assert.equal(posts[0].body.account.token_secret, 'ws-super-secret-value');
-    assert.equal(posts[0].body.account.hf_token, null);
+    assert.equal('hf_token' in posts[0].body.account, false,
+      'a HuggingFace token is its own record: the account write does not carry one');
   });
 
   assert.equal(navigations.at(-1), '#/gpu-rentals/new/model');
@@ -1102,33 +1139,323 @@ test('the account step posts the vault entry before any model step, and clears n
   assert.ok(!textOf(mount).includes('ws-super-secret-value'), 'the token value is never rendered back');
 });
 
-test('a recorded account is shown read-only, because it already pays for a rental', async (t) => {
+test('a recorded account is reused for another rental, and a duplicate id is refused before it posts', async (t) => {
   if (!hasSetupModel) return t.skip('panel/gpu-setup-model.js is not present');
   await resetSetup();
   const { mount, navigations } = await mountView({ param: 'new/account', handlers: standardHandlers() });
 
   const text = textOf(mount);
   assert.match(text, /Accounts already recorded for this platform/);
-  assert.match(text, /none can be chosen here: one rental has one account, one credential and one vault entry/);
-  assert.equal(descendants(mount).filter((el) => el.tagName === 'BUTTON'
-    && String(el.textContent ?? '') === 'USE').length, 0, 'no path turns another rental\'s account into this one');
-  assert.ok(mount.querySelector('[data-field="tokenId"]'),
-    'the only way forward is a new account id, which asks for its own token');
+  assert.match(text, /An account can pay for several rentals: choosing one here names it and writes nothing/);
+  const reuse = descendants(mount).filter((el) => el.tagName === 'BUTTON'
+    && String(el.textContent ?? '') === 'Use this account');
+  assert.equal(reuse.length, 1, 'one recorded account, one way to name it');
 
-  setInput(mount, 'accountId', 'mana-modal');
-  setInput(mount, 'workspace', 'mana');
-  setInput(mount, 'tokenId', 'wk-abc123');
-  setInput(mount, 'tokenSecret', 'ws-super-secret-value');
+  // Naming the account is a draft change, not a write: the credential already in the vault is the
+  // one this second rental bills through, and re-sending it would be a second copy of a secret.
+  await withPost({ ignored: true }, async (posts) => {
+    fire(reuse[0], 'click');
+    await settle(4);
+    assert.equal(posts.length, 0, 'reuse posts nothing');
+    const account = mount.querySelector('[data-field="accountId"]');
+    assert.equal(account.value, 'mana-modal', 'the reused id is the draft\'s account');
+    assert.equal(advanceButton(mount).textContent.trim(), 'Continue',
+      'nothing is written, so the button does not promise a write');
+    assert.match(textOf(mount), /Reuses a recorded account: nothing is written/);
+  });
+
+  // Creating a second account under a recorded id would collide on that one vault entry, so the
+  // panel refuses it before sending a credential that cannot be stored.
+  await resetSetup();
+  const second = await mountView({ param: 'new/account', handlers: standardHandlers() });
+  setInput(second.mount, 'accountId', 'mana-modal');
+  setInput(second.mount, 'workspace', 'mana');
+  setInput(second.mount, 'tokenId', 'wk-abc123');
+  setInput(second.mount, 'tokenSecret', 'ws-super-secret-value');
   await withPost({ error: { code: 'conflict' } }, async (posts) => {
-    fire(advanceButton(mount), 'click');
+    fire(advanceButton(second.mount), 'click');
     await settle(6);
     assert.equal(posts.length, 0,
       'the panel refuses the id before it sends a credential that would collide');
-    assert.equal(navigations.includes('#/gpu-rentals/new/model'), false,
+    assert.equal(second.navigations.includes('#/gpu-rentals/new/model'), false,
       'a refused account does not advance');
   });
-  assert.match(textOf(mount), /already pays for another rental/,
-    'the refusal says the account is already some other rental\'s');
+  assert.match(textOf(second.mount), /is already recorded\. Reuse it instead of creating a second one/,
+    'the refusal names the reuse path rather than a missing feature');
+});
+
+test('the page actions open windows rather than routes, and each says what it will write', async (t) => {
+  if (!hasSetupModel) return t.skip('panel/gpu-setup-model.js is not present');
+  await resetSetup();
+  document.body.replaceChildren();
+  const { mount, navigations } = await mountView({ handlers: standardHandlers() });
+  const before = navigations.length;
+
+  // Add a Modal account: the provider form's shape — labelled fields, hints, a secret written once.
+  fire(findButton(mount, 'Add Modal account'), 'click');
+  await settle(6);
+  let text = textOf(document.body);
+  assert.match(text, /Add a Modal account/);
+  assert.match(text, /The credential is written to the vault once/);
+  for (const name of ['id', 'workspace', 'tokenId', 'tokenSecret']) {
+    assert.ok(document.body.querySelector(`[data-field="${name}"]`), `the account window asks for ${name}`);
+  }
+  assert.match(text, /Several deployments may name the same account/,
+    'the window says out loud that an account is not spent by its first deployment');
+  fire(findButton(document.body, 'Cancel'), 'click');
+
+  // Add a HuggingFace token: its own record, not a property of an account.
+  fire(findButton(mount, 'Add HuggingFace token'), 'click');
+  await settle(6);
+  text = textOf(document.body);
+  assert.match(text, /HuggingFace token/);
+  assert.match(text, /not tied to a Modal account/);
+  assert.ok(document.body.querySelector('[data-field="id"]'));
+  assert.ok(document.body.querySelector('[data-field="secret"]'));
+  fire(findButton(document.body, 'Cancel'), 'click');
+
+  assert.equal(navigations.length, before, 'no action navigates away from the inventory');
+});
+
+test('the account window writes one vault entry and never renders the secret back', async (t) => {
+  if (!hasSetupModel) return t.skip('panel/gpu-setup-model.js is not present');
+  await resetSetup();
+  document.body.replaceChildren();
+  const { mount } = await mountView({ handlers: standardHandlers() });
+  fire(findButton(mount, 'Add Modal account'), 'click');
+  await settle(6);
+
+  const type = (name, value) => {
+    const input = document.body.querySelector(`[data-field="${name}"]`);
+    assert.ok(input, `expected a control for ${name}`);
+    input.value = value;
+    fire(input, 'input');
+  };
+  type('id', 'mana-modal-2');
+  type('label', 'Modal — second workspace');
+  type('workspace', 'mana-two');
+  type('tokenId', 'wk-second-account');
+  type('tokenSecret', TOKEN_SECRET);
+
+  await withPost({
+    account_id: 'mana-modal-2',
+    vault: { secret_id: 'rental:mana-modal-2', fingerprint: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
+  }, async (posts) => {
+    fire(findButton(document.body, 'Add account'), 'click');
+    await settle(6);
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].path, '/api/gpu/apply');
+    assert.equal(posts[0].body.action, 'create-account');
+    assert.equal(posts[0].body.account.id, 'mana-modal-2');
+    assert.equal(posts[0].body.account.label, 'Modal — second workspace');
+    assert.equal(posts[0].body.account.workspace, 'mana-two');
+    assert.equal(posts[0].body.account.token_secret, TOKEN_SECRET,
+      'the secret travels once, to the vault, on the request that stores it');
+  });
+
+  const after = textOf(document.body);
+  assert.equal(after.includes(TOKEN_SECRET), false, 'the window never renders the secret back');
+  assert.match(after, /aaaaaaaaaaaaaaaa/);
+  assert.match(after, /no response carries it/);
+});
+
+test('a HuggingFace token is written by its own action, with no account attached', async (t) => {
+  if (!hasSetupModel) return t.skip('panel/gpu-setup-model.js is not present');
+  await resetSetup();
+  document.body.replaceChildren();
+  const { mount } = await mountView({ handlers: standardHandlers() });
+  fire(findButton(mount, 'Add HuggingFace token'), 'click');
+  await settle(6);
+
+  const type = (name, value) => {
+    const input = document.body.querySelector(`[data-field="${name}"]`);
+    assert.ok(input, `expected a control for ${name}`);
+    input.value = value;
+    fire(input, 'input');
+  };
+  type('id', 'hf-main');
+  type('secret', TOKEN_SECRET);
+
+  await withPost({ vault: { secret_id: 'hf:hf-main', fingerprint: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' } },
+    async (posts) => {
+      fire(findButton(document.body, 'Add token'), 'click');
+      await settle(6);
+      assert.equal(posts.length, 1);
+      assert.equal(posts[0].body.action, 'create-hf-token');
+      assert.deepEqual(posts[0].body.token, { id: 'hf-main', label: 'hf-main', secret: TOKEN_SECRET });
+      assert.equal('account' in posts[0].body, false,
+        'a token is not scoped to an account, so the token action names none');
+    });
+});
+
+test('the deploy window shows every step at once and reuses the recorded account', async (t) => {
+  if (!hasSetupModel) return t.skip('panel/gpu-setup-model.js is not present');
+  await resetSetup();
+  document.body.replaceChildren();
+  const { mount } = await mountView({ handlers: standardHandlers() });
+
+  await withGet(standardHandlers(), () => withPost({}, async (posts) => {
+    fire(findButton(mount, 'Deploy model'), 'click');
+    await settle(8);
+    assert.equal(posts.length, 0, 'opening the window writes nothing');
+
+    const title = textOf(document.body);
+    assert.match(title, /Deploy a model/);
+    // Every step is on the page: the window does not paginate the flow.
+    for (const section of ['Account', 'Model', 'Card', 'Sizing']) {
+      assert.ok(descendants(document.body).some((el) => el.tagName === 'SECTION'
+        && /gpu-deploy-section/.test(el.className)),
+      `the window is one scrolling form; it showed: ${textOf(document.body).slice(0, 400)}`);
+      assert.match(title, new RegExp(section), `the ${section} step is in the window`);
+    }
+    // The account is chosen, never created here: creating one is the page's own action.
+    assert.equal(document.body.querySelector('[data-field="accountMode"]'), null,
+      'the window does not offer to create an account a second time');
+    const account = document.body.querySelector('[data-field="accountId"]');
+    assert.ok(account, 'the recorded account is named');
+    assert.equal(account.value, 'mana-modal');
+
+    // The fill policy is a choice of the deployment, and the timeout only exists when it is chosen.
+    assert.ok(document.body.querySelector('[data-field="mode"]'), 'the window offers the mode axis');
+    assert.equal(document.body.querySelector('[data-field="batchSize"]'), null,
+      'streaming does not ask for a batch size');
+  }));
+  assert.ok(descendants(document.body).some((el) => /dialog-backdrop/.test(el.className)),
+    'the window is still on the page when the assertions finish');
+});
+
+test('a gated deploy stores the pasted token before the deployment that names it', async (t) => {
+  if (!hasSetupModel) return t.skip('panel/gpu-setup-model.js is not present');
+  await resetSetup();
+  document.body.replaceChildren();
+  const { mount } = await mountView({ handlers: standardHandlers() });
+  const gated = {
+    ...PROBE,
+    repo: 'orcarouter/Qwen3.8-27B-Uncensored-FP8',
+    gated: { state: 'manual', needs_token: true },
+  };
+  await withGet(standardHandlers(), () => withPost((path, body) => {
+    if (path === '/api/gpu/probe') return gated;
+    if (path !== '/api/gpu/apply') throw new Error(`test did not expect POST ${path}`);
+    if (body.action === 'create-hf-token') {
+      return {
+        token: { id: 'hub-main', label: 'hub-main', replaced: false },
+        vault: { secret_ref: 'hf:hub-main', fingerprint: TOKEN_FINGERPRINT },
+      };
+    }
+    return { provider_id: 'manarouter-rental-mana-modal-qwen3-8-27b-streaming-l40s', account_id: 'mana-modal' };
+  }, async (posts) => {
+    fire(findButton(mount, 'Deploy model'), 'click');
+    await settle(8);
+    setInput(document.body, 'repo', gated.repo);
+    fire(findButton(document.body, 'Probe repository'), 'click');
+    await settle(14);
+    setSelect(document.body, 'gpu', 'rtx-pro-6000');
+    setSelect(document.body, 'weightQuant', 'fp8');
+    setSelect(document.body, 'kvCacheDtype', 'fp8');
+    setInput(document.body, 'hfTokenNew', TOKEN_SECRET);
+    setInput(document.body, 'hfTokenNewLabel', 'hub-main');
+    await settle(4);
+
+    const record = descendants(document.body)
+      .find((el) => el.tagName === 'BUTTON' && String(el.textContent ?? '').trim() === 'Record deployment');
+    assert.ok(record, 'a fitting deployment offers a way to record it');
+    assert.equal(record.disabled, false, 'a fitting gated deployment can be recorded');
+
+    fire(record, 'click');
+    await settle(20);
+
+    const writes = posts.map((post) => post.body).filter((body) => body.action);
+    assert.deepEqual(writes.map((body) => body.action),
+      ['create-hf-token', 'create-deployment'],
+      'the token is written first: a deployment that named an unwritten token would point at nothing');
+    const [token, deployment] = writes;
+    assert.deepEqual(token.token, { id: 'hub-main', label: 'hub-main', secret: TOKEN_SECRET },
+      'the pasted secret is written once, under the id the deployment will name');
+    assert.equal('account' in token, false, 'a token is its own record, not a property of an account');
+    assert.equal(deployment.account_id, 'mana-modal', 'the deployment still bills through its account');
+    assert.equal(deployment.hf_token, 'hub-main',
+      'the deployment names the token by id, and by the id that was just written');
+    assert.equal(deployment.deployment.repo, gated.repo);
+
+    const text = textOf(document.body).replace(/\s+/g, ' ');
+    assert.match(text, /HuggingFace token hub-main/, 'the recorded window names the token it used');
+    assert.match(text, /manarouter-hf/,
+      'a gated deployment is told the container still needs the token mounted as a Modal secret');
+  }));
+});
+
+test('an unestimated deployment is refused as unknown, not claimed unfit', async (t) => {
+  if (!hasSetupModel) return t.skip('panel/gpu-setup-model.js is not present');
+  await resetSetup();
+  document.body.replaceChildren();
+  const { mount } = await mountView({ handlers: standardHandlers() });
+  // A config.json with no head_dim cannot yield a KV figure. "I cannot tell" must not be dressed
+  // as "does not fit", and no suggestion may be printed: none of them could be proven to work.
+  const blind = { ...PROBE, arch: { num_hidden_layers: 64, num_key_value_heads: 8 } };
+  await withGet(standardHandlers(), () => withPost((path) => {
+    if (path === '/api/gpu/probe') return blind;
+    throw new Error(`test did not expect POST ${path}`);
+  }, async (posts) => {
+    fire(findButton(mount, 'Deploy model'), 'click');
+    await settle(8);
+    setInput(document.body, 'repo', blind.repo);
+    fire(findButton(document.body, 'Probe repository'), 'click');
+    await settle(14);
+    setSelect(document.body, 'gpu', 'l40s');
+    setSelect(document.body, 'weightQuant', 'fp8');
+    await settle(4);
+    const text = textOf(document.body).replace(/\s+/g, ' ');
+    assert.match(text, /cannot be checked yet/, 'an unknown verdict says so instead of claiming a refusal');
+    assert.doesNotMatch(text, /This does not fit on the chosen card/,
+      'a verdict the panel could not compute is not reported as a measurement');
+    const buttons = descendants(document.body)
+      .filter((el) => el.tagName === 'BUTTON')
+      .map((el) => String(el.textContent ?? '').trim());
+    assert.equal(buttons.some((label) => /^Change GPU to |^Cap the context at /.test(label)), false,
+      'no suggestion is printed when none can be proven sufficient');
+    assert.equal(findButton(document.body, 'Record deployment').disabled, true,
+      'an unestimated deployment is not recorded either');
+    assert.equal(posts.length, 1, 'only the probe was a request');
+  }));
+});
+
+test('a deployment that does not fit offers the changes that do, and records nothing', async (t) => {
+  if (!hasSetupModel) return t.skip('panel/gpu-setup-model.js is not present');
+  await resetSetup();
+  document.body.replaceChildren();
+  const { mount } = await mountView({ handlers: standardHandlers() });
+  await withGet(standardHandlers(), () => withPost((path) => {
+    if (path === '/api/gpu/probe') return PROBE;
+    throw new Error(`test did not expect POST ${path}`);
+  }, async (posts) => {
+    fire(findButton(mount, 'Deploy model'), 'click');
+    await settle(8);
+    setInput(document.body, 'repo', PROBE.repo);
+    fire(findButton(document.body, 'Probe repository'), 'click');
+    await settle(14);
+    setSelect(document.body, 'gpu', 'l40s');
+    setSelect(document.body, 'weightQuant', 'fp8');
+    setSelect(document.body, 'kvCacheDtype', 'fp8');
+    await settle(4);
+
+    const readout = () => textOf(document.body).replace(/\s+/g, ' ');
+    assert.match(readout(), /This does not fit on the chosen card/,
+      'a deployment that cannot be served is refused before it is recorded');
+    const record = () => findButton(document.body, 'Record deployment');
+    assert.equal(record().disabled, true, 'nothing is recorded while it does not fit');
+
+    // Every suggestion below was produced by re-running the fit check with that one field changed,
+    // so it is a change the panel has already proven sufficient — not a rule of thumb.
+    const cardFix = descendants(document.body).find((el) => el.tagName === 'BUTTON'
+      && /^Change GPU to \S+/.test(String(el.textContent ?? '').trim()) && !el.disabled);
+    assert.ok(cardFix, 'a card that holds this deployment unchanged is offered first');
+    fire(findButton(document.body, 'Cap the context at 32768 tokens'), 'click');
+    await settle(6);
+    assert.equal(posts.length, 1, 'taking a suggestion edits the draft; only the probe was a request');
+    assert.match(readout(), /It fits/, 'the change the panel suggested is the change that fits');
+    assert.equal(record().disabled, false, 'once it fits, it can be recorded');
+  }));
 });
 
 const setupModelUrl = new URL('../gpu-setup-model.js', import.meta.url);

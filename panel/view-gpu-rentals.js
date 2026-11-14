@@ -26,7 +26,10 @@
 // enters the DOM as a text node through h(); there is deliberately no innerHTML in this file.
 
 import { api } from './api.js';
-import { h, chip, field, kv, emptyState, errorBlock, copyButton, spinner } from './dom.js';
+import {
+  h, chip, field, kv, emptyState, errorBlock, copyButton, spinner, formActions, applyFieldErrors,
+} from './dom.js';
+import { contentDialog } from './dialog.js';
 import { formatAge, formatCompact, formatUptime, truncateMiddle } from './format.js';
 import { createPoller } from './poll.js';
 
@@ -323,8 +326,19 @@ function cardHead(title, action = null) {
   return h('div', { class: 'card-head' }, h('h2', {}, title), action);
 }
 
-function button(label, onClick, { className = 'btn', title = null } = {}) {
-  return h('button', { class: className, type: 'button', title, onclick: onClick }, label);
+/**
+ * A button whose `onClick` the caller owns. `disabled` used to be accepted here and dropped on the
+ * floor: every caller that passed it — the step wizard's forward button, the probe button, the
+ * account dialog's save, the deploy window's "Record deployment" — stayed clickable, so a
+ * deployment the fit check had just refused could still be recorded with one click. The attribute
+ * and the property are both set because a disabled control must be disabled for a screen reader,
+ * for a pointer, and for a test that inspects the element rather than the behaviour.
+ */
+function button(label, onClick, { className = 'btn', title = null, disabled = false } = {}) {
+  const el = h('button', { class: className, type: 'button', title, onclick: onClick }, label);
+  el.disabled = Boolean(disabled);
+  if (disabled) el.setAttribute('disabled', '');
+  return el;
 }
 
 function ghostButton(label, onClick, title = null) {
@@ -499,6 +513,8 @@ function normaliseAccount(raw) {
     tokenRef: token,
     fingerprint: asString(pick(raw, 'credential_fingerprint', 'secret_fingerprint', 'fingerprint',
       'token_fingerprint', 'secret_ref_fingerprint')).trim(),
+    // A token is no longer account state; these two read only a legacy account that still carries
+    // one (`hf_secret_ref`), so an older configuration keeps showing what it holds.
     hfFingerprint: asString(pick(raw, 'hf_token_fingerprint', 'hfFingerprint')).trim(),
     hasCredential: asBool(pick(raw, 'has_credential', 'credential_present')),
     hasHfToken: asBool(pick(raw, 'has_hf_token', 'hasHfToken')),
@@ -512,18 +528,63 @@ function normaliseAccount(raw) {
   };
 }
 
+/**
+ * One recorded HuggingFace token.
+ *
+ * Its own entity, not a field of an account: `id` is what a deployment names, `hasSecret` says
+ * whether the vault entry is present, and `problems` is the conductor's list of what is wrong with
+ * it. The value itself is never in this object — the API only ever sends a fingerprint.
+ */
+function normaliseHfToken(raw) {
+  const id = asString(pick(raw, 'id', 'token_id')).trim();
+  return {
+    id,
+    label: asString(pick(raw, 'label', 'name')).trim() || id || '(unnamed token)',
+    secretRef: asString(pick(raw, 'secret_ref', 'vault_id')).trim(),
+    fingerprint: asString(pick(raw, 'fingerprint')).trim(),
+    hasSecret: asBool(pick(raw, 'has_secret', 'hasSecret')),
+    note: asString(pick(raw, 'note')).trim(),
+    problems: listOf(pick(raw, 'problems')).map((entry) => asString(entry)).filter(Boolean),
+    raw,
+  };
+}
+
+/**
+ * A batch's fill policy in one short line. "Batch" on its own does not say whether a half-full batch
+ * may go out, and that difference changes the latency a caller sees, so the table states it. A
+ * handed-down record that predates the shape says so instead of guessing either policy.
+ */
+function modeFillHint(batch) {
+  const shape = objectOf(batch);
+  if (!shape) return h('span', { class: 'hint' }, ' · fill policy not recorded');
+  const size = asNumber(pick(shape, 'size'));
+  const fill = asString(pick(shape, 'fill')).trim() || 'full';
+  const secs = asNumber(pick(shape, 'timeout_secs'));
+  const sizeText = size === null ? 'a batch' : `batches of ${size}`;
+  if (fill === 'timeout') {
+    return h('span', { class: 'hint' }, ` · ${sizeText}, ships after ${secs === null ? 'a timeout' : `${secs}s`} if not full`);
+  }
+  return h('span', { class: 'hint' }, ` · ${sizeText}, waits until full`);
+}
+
 function normaliseDeployment(raw) {
   const deployment = objectOf(pick(raw, 'deployment', 'rental')) ?? raw;
   const sizing = objectOf(pick(raw, 'sizing', 'derived_sizing')) ?? objectOf(pick(deployment, 'sizing'));
   return {
     providerId: asString(pick(raw, 'provider_id', 'providerId', 'id')).trim(),
     accountId: asString(pick(raw, 'account_id', 'account', 'accountId')).trim(),
+    // The token this deployment named, or empty for a public repository.
+    hfToken: asString(pick(raw, 'hf_token', 'hfToken')).trim(),
     repo: asString(pick(deployment, 'repo', 'repository')).trim(),
     gpu: asString(pick(deployment, 'gpu', 'gpu_id')).trim(),
     gpuCount: asNumber(pick(deployment, 'gpu_count', 'gpuCount')),
     weightQuant: asString(pick(deployment, 'weight_quant', 'quant')).trim(),
     kvCacheDtype: asString(pick(deployment, 'kv_cache_dtype', 'kv_dtype')).trim(),
     mode: asString(pick(deployment, 'mode')).trim(),
+    // How a batch fills: `size`, `fill` ('full' or 'timeout') and, only for a timed batch, the
+    // seconds it waits. Absent on a streaming deployment and on a legacy batch record that
+    // predates the shape — which is what `problems` then reports.
+    batch: objectOf(pick(deployment, 'batch')),
     maxModelLen: asNumber(pick(deployment, 'max_model_len')),
     maxNumSeqs: asNumber(pick(deployment, 'max_num_seqs')),
     enabled: asBool(pick(raw, 'enabled')),
@@ -577,8 +638,12 @@ async function renderInventory(mount, ctx) {
     countEl,
     h('span', { class: 'spacer' }),
     ghostButton('Refresh', () => refresh(false), 'Re-read /api/gpu/rentals and /api/gpu/catalog'),
-    button('New rental', () => ctx.navigate('#/gpu-rentals/new/platform'),
-      { className: 'btn btn-primary', title: 'Pick a platform, account, model and card; the flow writes the app file and deploy command' }));
+    ghostButton('Add HuggingFace token', () => openHfTokenDialog(view, ctx),
+      'Record a HuggingFace token; a gated repository names one token, and one token may serve every account'),
+    ghostButton('Add Modal account', () => openAccountDialog(view, ctx),
+      'Record a Modal account and its credential, the same way a provider is added'),
+    button('Deploy model', () => openDeployDialog(view, ctx),
+      { className: 'btn btn-primary', title: 'Choose a model, stream or batch, a card and a quantisation; the window checks that it fits before recording it' }));
 
   // What is rented comes first, then what a rental can be attached to, then what is available.
   // The platform plumbing — plan tiers, generated bundles, lane endpoints — is reference material,
@@ -1139,7 +1204,8 @@ async function renderInventory(mount, ctx) {
     const card = h('section', { class: 'card gpu-section' },
       cardHead('Rental accounts', h('div', { class: 'gpu-head-extras' },
         usageEl,
-        ghostButton('Add rental account', () => ctx.navigate('#/gpu-rentals/new/account')))));
+        ghostButton('Add Modal account', () => openAccountDialog(view, ctx),
+          'Record an account and its credential; the deployment window names it by id'))));
     if (view.rentalsError) {
       card.append(failedEndpoint('GET /api/gpu/rentals', view.rentalsError));
       accountsBox.append(card);
@@ -1147,15 +1213,17 @@ async function renderInventory(mount, ctx) {
     }
     const accounts = listOf(pick(view.rentals, 'accounts')).map(normaliseAccount);
     card.append(hint(
-      'Each rental has its own account: one platform credential under one vault id, plus a '
-      + 'HuggingFace token when a gated repository needs it. Nothing is shared between rentals — not '
-      + 'the credential, not the vault entry, not the billing account. The secret is never rendered, '
-      + 'only a fingerprint, which is what tells two keys apart.'));
+      'An account is one platform credential under one vault id. An account can host several '
+      + 'rentals — the same credential, the same vault entry and the same billing account pay for '
+      + 'each — and a rental always names the one account it bills through. A HuggingFace token is '
+      + 'not part of an account: it is its own record, named only by the rentals whose repository is '
+      + 'gated, so one token can serve every account. The secret is never rendered, only a '
+      + 'fingerprint, which is what tells two keys apart.'));
     if (!accounts.length) {
       card.append(emptyState('No rental accounts yet.',
         'A rental account is a platform credential (Modal: a token id and its secret) plus the Modal '
-        + 'workspace its apps deploy into. Add one per rental: an account already used by another '
-        + 'rental is refused, because each rental bills separately.'));
+        + 'workspace its apps deploy into. Record it once, then point as many rentals at it as you '
+        + 'like: the credential is shared by reference, never copied into a rental.'));
       accountsBox.append(card);
       return;
     }
@@ -1281,7 +1349,8 @@ async function renderInventory(mount, ctx) {
       h('td', {},
         h('span', { class: 'mono' }, dashes(dep.gpu)),
         dep.gpuCount && dep.gpuCount !== 1 ? h('span', { class: 'hint' }, ` ×${dep.gpuCount}`) : null),
-      h('td', {}, chip(dashes(dep.mode), 'chip-neutral')),
+      h('td', {}, chip(dashes(dep.mode), 'chip-neutral'),
+        dep.mode === 'batch' ? modeFillHint(dep.batch) : null),
       h('td', {}, mono(dep.weightQuant)),
       h('td', {}, mono(dep.kvCacheDtype)),
       h('td', { class: 'num', title: 'Derived from the sizing estimate; the vLLM startup line is authoritative' },
@@ -1504,6 +1573,10 @@ async function renderInventory(mount, ctx) {
     paintPlan();
   }
 
+  // The dialogs re-read the page after they record something, through the same function the
+  // Refresh button uses: one fetch path, so a record made in a window cannot leave the list showing
+  // a state the next refresh would contradict.
+  view.refresh = refresh;
   await refresh(false);
 
   // Live counters. start() fires one tick immediately, which the first fetch has already covered,
@@ -1851,11 +1924,17 @@ function refreshSetupCatalog(wizard, mount, ctx, stepParam) {
   };
 }
 
-async function renderSetup(mount, ctx, stepParam) {
-  const wizard = setupSession ?? {
+/**
+ * The mutable node the flow hangs off. Kept in one place because the step wizard on the page and
+ * the deploy window both build one; a second literal copy would drift on the next field.
+ */
+function freshWizard() {
+  return {
     mod: {},
     catalog: {},
     accounts: [],
+    // Recorded HuggingFace tokens, independent of the accounts above: the model step names one.
+    hfTokens: [],
     rentalsError: null,
     draft: {},
     current: null,
@@ -1881,6 +1960,10 @@ async function renderSetup(mount, ctx, stepParam) {
     root: null,
     mount: null,
   };
+}
+
+async function renderSetup(mount, ctx, stepParam) {
+  const wizard = setupSession ?? freshWizard();
   setupSession = wizard;
   wizard.mount = mount;
   wizard.suppressGuard = false;
@@ -1917,6 +2000,7 @@ async function renderSetup(mount, ctx, stepParam) {
   wizard.rentalsError = rentalsResult.status === 'rejected' ? rentalsResult.reason : null;
   const rentals = rentalsResult.status === 'fulfilled' ? objectOf(rentalsResult.value) : null;
   wizard.accounts = listOf(pick(rentals ?? {}, 'accounts', 'rental_accounts')).map(normaliseAccount);
+  wizard.hfTokens = listOf(pick(rentals ?? {}, 'hf_tokens', 'huggingface_tokens')).map(normaliseHfToken);
 
   if (!wizard.draft || typeof wizard.draft !== 'object' || !Object.keys(wizard.draft).length) {
     const platformId = firstPlatformId(wizard.catalog);
@@ -1934,6 +2018,13 @@ async function renderSetup(mount, ctx, stepParam) {
 }
 
 function paintSetup(wizard, mount, ctx, stepParam) {
+  // A window owns its own painting. Everything in this flow that wants to be redrawn calls
+  // paintSetup, so the hook is honoured here once instead of at every call site — the deploy
+  // window sets `repaint` and the step wizard, which never sets it, keeps painting the page.
+  if (typeof wizard.repaint === 'function') {
+    wizard.repaint();
+    return;
+  }
   if (wizard.mount !== mount) return; // a newer render owns the route now
   wizard.ctx = ctx;
 
@@ -2015,7 +2106,9 @@ function paintSetup(wizard, mount, ctx, stepParam) {
 
   // The account step is the flow's one write before the end, and it has already happened by the
   // time the review step exists. A button that says "Continue" while it stores a credential is a trap.
-  const storesAccount = current === 'account' && !wizard.accountResult;
+  const storesAccount = current === 'account'
+    && asString(draftGet(wizard.draft, 'accountMode')).trim() !== 'existing'
+    && !wizard.accountResult;
   const forwardLabel = wizard.busy ? 'Working…'
     : current === 'review' ? 'Save rental'
       : storesAccount ? 'Save account'
@@ -2024,7 +2117,9 @@ function paintSetup(wizard, mount, ctx, stepParam) {
     ? 'Records the request in Manarouter; it does not start a container.'
     : storesAccount
       ? 'Writes this account to the vault now. The rental itself is saved at the end.'
-      : null;
+      : current === 'account'
+        ? 'Reuses a recorded account: nothing is written until the rental is saved.'
+        : null;
 
   const actions = h('div', { class: 'gpu-step-actions' },
     currentIndex > 0 ? ghostButton('Back', () => goPrevious(wizard)) : null,
@@ -2304,9 +2399,56 @@ function chooseOptions(wizard, desc) {
     // One axis, one answer. Legacy drafts say `interactive`; the model normalises that to
     // `streaming`, and the wire value is `streaming`, so no path can produce both lanes at once.
     return [
-      { value: 'streaming', label: 'Streaming — a live endpoint a request can reach', hint: 'The relay routes requests here as they arrive.' },
-      { value: 'batch', label: 'Batch — a queue drained in bulk', hint: 'Offline jobs, flushed when a batch pays for its own boot.' },
+      { value: 'streaming', label: 'Stream — a live endpoint, many sessions at once', hint: 'The relay sends requests here as they arrive, and one vLLM card serves several sessions concurrently. You say how many must fit.' },
+      { value: 'batch', label: 'Batch — requests grouped, then worked together', hint: 'Offline jobs. You choose the batch size and whether a half-full batch may ship after a timeout.' },
     ];
+  }
+  if (source === 'batchFills') {
+    return [
+      { value: 'full', label: 'Wait until the batch is full', hint: 'Every request waits until enough have arrived to fill the batch. No timeout is applied; a quiet model holds requests until it fills.' },
+      { value: 'timeout', label: 'Ship after a timeout, even half full', hint: 'A half-full batch goes out once the timeout passes, so a request never waits longer than that for company.' },
+    ];
+  }
+  if (source === 'accountModes') {
+    // One axis, two answers. Reusing an account is the normal case after the first rental: several
+    // rentals may bill through one account, and its credential is written once.
+    return [
+      { value: 'new', label: 'Create an account', hint: 'Records a new account, its credential and its vault entry.' },
+      { value: 'existing', label: 'Reuse a recorded account', hint: 'Names an account already recorded; nothing about it is rewritten.' },
+    ];
+  }
+  if (source === 'accounts') {
+    const platformId = asString(draftGet(wizard.draft, 'platform')).trim();
+    return listOf(wizard.accounts)
+      .map(objectOf)
+      .filter(Boolean)
+      .filter((account) => !platformId || sameText(pick(account, 'platform'), platformId))
+      .map((account) => {
+        const id = asString(pick(account, 'id')).trim();
+        const plan = asString(pick(account, 'plan')).trim() || 'unknown';
+        const workspace = asString(pick(account, 'workspace')).trim();
+        return {
+          value: id,
+          label: workspace ? `${id} — ${plan}, ${workspace}` : `${id} — ${plan}`,
+        };
+      })
+      .filter((choice) => choice.value);
+  }
+  if (source === 'hfTokens') {
+    return listOf(wizard.hfTokens)
+      .map(objectOf)
+      .filter(Boolean)
+      .map((token) => {
+        const id = asString(pick(token, 'id')).trim();
+        const hasSecret = asBool(pick(token, 'hasSecret')) || asBool(pick(token, 'has_secret'));
+        const label = asString(pick(token, 'label')).trim();
+        const suffix = hasSecret ? 'in the vault' : 'no vault entry yet';
+        return {
+          value: id,
+          label: label && label !== id ? `${id} — ${label} (${suffix})` : `${id} — ${suffix}`,
+        };
+      })
+      .filter((choice) => choice.value);
   }
   if (source === 'catalog.gpus.price_usd_per_second' || source === 'catalog.deployment'
     || source === 'planMarker' || source === 'deploymentBundle.notes' || source === 'deploymentBundle.warnings') {
@@ -2363,6 +2505,18 @@ function resolveOptions(wizard, desc) {
   }
   const options = chooseOptions(wizard, desc);
   if (!options.length) {
+    if (source === 'accounts') {
+      return {
+        options: [],
+        reason: 'No account is recorded on this platform yet, so there is nothing to reuse. Create one here; the next rental can reuse it.',
+      };
+    }
+    if (source === 'hfTokens') {
+      return {
+        options: [],
+        reason: 'No HuggingFace token is recorded yet. Add one below: it is stored in the vault once and can be named by any rental on any account.',
+      };
+    }
     const reason = source
       ? `The catalog has no options for this field (${source}); it stays blank rather than guessed.`
       : 'This field has no option source in the setup model; it stays blank rather than guessed.';
@@ -2460,6 +2614,15 @@ function commitField(wizard, name, value) {
   }
   if (name === 'gpu') {
     wizard.sizing = null;
+  }
+  if (name === 'accountMode' && value === 'existing') {
+    // Reuse writes nothing, so there is no stored account to be stale; the id it names comes from
+    // the recorded list.
+    wizard.accountSignature = null;
+    wizard.accountResult = null;
+  }
+  if (name === 'hfTokenId' || name === 'hfTokenNew' || name === 'hfTokenNewLabel') {
+    wizard.bundle = null;
   }
   if (name === 'accountId' || name === 'plan' || name === 'workspace' || name === 'tokenId' || name === 'tokenSecret') {
     // The stored result describes the account that was written. Editing an identity field makes it
@@ -2567,7 +2730,7 @@ function stepPanels(wizard, stepId) {
       planLimitsPanel(wizard), accountsReferencePanel(wizard), accountResultPanel(wizard),
     ];
   }
-  if (stepId === 'model') return [probePanel(wizard)];
+  if (stepId === 'model') return [probePanel(wizard), hfTokensPanel(wizard)];
   if (stepId === 'card') {
     // The quant selector cannot be filled until the repository has been probed, and the probe
     // button is on the model step. Rather than send the operator backwards to find it, the card
@@ -2657,20 +2820,74 @@ function accountsReferencePanel(wizard) {
     return h('div', { class: 'gpu-blank' },
       hint(wizard.rentalsError
         ? `GET /api/gpu/rentals could not be read, so existing accounts are unknown: ${errorMessage(wizard.rentalsError)}`
-        : 'No account on this platform has been recorded yet. The account you create here is stored in the vault before any model is chosen.'));
+        : 'No account on this platform has been recorded yet, so there is nothing to reuse. The account you create here is stored in the vault before any model is chosen.'));
   }
-  // Read-only on purpose. An account already pays for one rental; offering "USE" here is what made
-  // every rental share a credential. The only way in is a new id with its own token.
+  // Reuse is the normal case: several rentals may bill through one account, and its credential is
+  // written once. Naming it here writes nothing — it only sets `accountMode` and `accountId`.
+  const useAccount = (id) => {
+    commitField(wizard, 'accountMode', 'existing');
+    commitField(wizard, 'accountId', id);
+    paintSetup(wizard, wizard.mount, wizard.ctx, wizard.current);
+  };
   const rows = accounts.map((a) => h('tr', {},
     h('td', {}, mono(a.id), a.label && a.label !== a.id ? h('div', { class: 'hint' }, a.label) : null),
     h('td', {}, a.plan || '—'),
     h('td', {}, mono(a.workspace) || h('span', { class: 'hint' }, 'not recorded')),
-    h('td', {}, a.fingerprint ? mono(a.fingerprint) : h('span', { class: 'hint' }, a.hasCredential ? 'stored' : 'not reported'))));
+    h('td', {}, a.fingerprint ? mono(a.fingerprint) : h('span', { class: 'hint' }, a.hasCredential ? 'stored' : 'not reported')),
+    h('td', {}, ghostButton('Use this account', () => useAccount(a.id)))));
   return h('div', { class: 'gpu-existing' },
     h('h3', {}, 'Accounts already recorded for this platform'),
-    dataTable([{ label: 'Account' }, { label: 'Plan' }, { label: 'Workspace' }, { label: 'Credential' }], rows),
-    richHint('Each of these already pays for a rental, so none can be chosen here: one rental has one '
-      + 'account, one credential and one vault entry. Record a new account id for this rental.'));
+    dataTable([
+      { label: 'Account' },
+      { label: 'Plan' },
+      { label: 'Workspace' },
+      { label: 'Credential' },
+      { label: 'Reuse' },
+    ], rows),
+    richHint('An account can pay for several rentals: choosing one here names it and writes nothing, '
+      + 'so its credential and vault entry stay as they are. Create a new account only when this '
+      + 'rental should bill through a different one.'));
+}
+
+/**
+ * The recorded HuggingFace tokens, shown where one is chosen.
+ *
+ * They are listed apart from the accounts on purpose: a token belongs to no account, so this table
+ * has no account column, and the same row is offered to every rental on every account.
+ */
+function hfTokensPanel(wizard) {
+  const tokens = listOf(wizard.hfTokens).map(objectOf).filter(Boolean);
+  if (!tokens.length) {
+    return h('div', { class: 'gpu-blank' },
+      hint(wizard.rentalsError
+        ? `GET /api/gpu/rentals could not be read, so recorded tokens are unknown: ${errorMessage(wizard.rentalsError)}`
+        : 'No HuggingFace token is recorded yet. A token is its own record, not part of an account: '
+          + 'paste one below and it is stored once, then named by any rental whose repository is gated.'));
+  }
+  const useToken = (id) => {
+    commitField(wizard, 'hfTokenId', id);
+    paintSetup(wizard, wizard.mount, wizard.ctx, wizard.current);
+  };
+  const rows = tokens.map((token) => h('tr', {},
+    h('td', {}, mono(token.id), token.label && token.label !== token.id ? h('div', { class: 'hint' }, token.label) : null),
+    h('td', {}, token.fingerprint
+      ? h('span', { class: 'mono', title: 'Token fingerprint (never the value)' }, truncateMiddle(token.fingerprint, 10, 6))
+      : h('span', { class: 'hint' }, token.hasSecret ? 'stored' : 'no vault entry')),
+    h('td', {}, token.problems.length
+      ? h('span', { class: 'hint' }, token.problems.join(' · '))
+      : h('span', { class: 'hint' }, 'none reported')),
+    h('td', {}, ghostButton('Use this token', () => useToken(token.id)))));
+  return h('div', { class: 'gpu-existing' },
+    h('h3', {}, 'HuggingFace tokens recorded in the vault'),
+    dataTable([
+      { label: 'Token' },
+      { label: 'Vault' },
+      { label: 'Problems' },
+      { label: 'Name it' },
+    ], rows),
+    richHint('A token can be named by rentals on several accounts, and a rental on a public '
+      + 'repository names none. Choosing one here writes nothing; pasting a new one below stores it '
+      + 'when you continue, before the deployment is recorded.'));
 }
 
 function accountResultPanel(wizard) {
@@ -3028,8 +3245,52 @@ async function advance(wizard, ctx) {
   setupGo(wizard, setupHref(next));
 }
 
+/**
+ * Store a token pasted into the model step, and answer the id a probe or deployment should name.
+ *
+ * `undefined` means the write failed and the caller must stop; `null` means there is no token to
+ * name (a public repository); a string is the id to send. The value is posted once and dropped:
+ * it is never put back into the draft, and `hfTokenNew` is cleared so a second Continue cannot
+ * write it twice.
+ */
+async function ensureHfToken(wizard, ctx) {
+  const payload = objectOf(callModel(wizard, 'hfTokenApplyPayload', null, wizard.draft));
+  const chosen = asString(draftGet(wizard.draft, 'hfTokenId')).trim();
+  if (!payload) return chosen || null;
+  wizard.busy = true;
+  paintSetup(wizard, wizard.mount, ctx, wizard.current);
+  try {
+    const result = await api.post('/api/gpu/apply', payload);
+    const token = objectOf(pick(objectOf(result) ?? {}, 'token')) ?? {};
+    const id = asString(pick(token, 'id')).trim()
+      || asString(pick(objectOf(pick(payload, 'token')) ?? {}, 'id')).trim();
+    draftSet(wizard.draft, 'hfTokenNew', '');
+    draftSet(wizard.draft, 'hfTokenNewLabel', '');
+    draftSet(wizard.draft, 'hfTokenId', id);
+    // The recorded list just changed, so the selector must see the new entry without a reload.
+    wizard.hfTokens = [...wizard.hfTokens.filter((t) => t.id !== id), normaliseHfToken({ ...token, id })];
+    wizard.dirty = true;
+    if (ctx && typeof ctx.toast?.success === 'function') ctx.toast.success(`HuggingFace token ${id} stored in the vault.`);
+    return id;
+  } catch (err) {
+    wizard.accountError = err;
+    if (ctx && typeof ctx.toast?.error === 'function') ctx.toast.error('The HuggingFace token was not stored', err);
+    return undefined;
+  } finally {
+    wizard.busy = false;
+    if (wizard.mount) paintSetup(wizard, wizard.mount, wizard.ctx, wizard.current);
+  }
+}
+
 async function storeAccount(wizard, ctx) {
-  const payload = objectOf(callModel(wizard, 'accountApplyPayload', null, wizard.draft));
+  const built = callModel(wizard, 'accountApplyPayload', null, wizard.draft);
+  if (built === null) {
+    // Reusing a recorded account: the step names one and writes nothing. Posting it again would
+    // rewrite a credential the operator already stored.
+    wizard.accountError = null;
+    return true;
+  }
+  const payload = objectOf(built);
   if (!payload) {
     wizard.accountError = new Error(
       'panel/gpu-setup-model.js exports no accountApplyPayload(), so the account step cannot be posted. Nothing was sent.');
@@ -3043,7 +3304,6 @@ async function storeAccount(wizard, ctx) {
     asString(pick(account, 'plan')).trim(),
     asString(pick(account, 'token_id')).trim(),
     asString(pick(account, 'token_secret')),
-    asString(pick(account, 'hf_token')),
     asString(pick(account, 'workspace')),
   ]);
   if (wizard.accountSignature === signature) return true;
@@ -3075,14 +3335,17 @@ async function runProbe(wizard, ctx) {
     if (ctx && typeof ctx.toast?.warning === 'function') ctx.toast.warning('Paste a model repository first.');
     return;
   }
-  const useHfToken = Boolean(asString(draftGet(wizard.draft, 'hfToken')).trim())
-    || boolOf(callModel(wizard, 'requiresHfToken', false, wizard.probe));
+  const tokenId = await ensureHfToken(wizard, ctx);
+  if (tokenId === undefined) return;
   const body = {
     repo,
     revision: asString(draftGet(wizard.draft, 'revision')).trim(),
     account_id: asString(draftGet(wizard.draft, 'accountId')).trim(),
-    use_hf_token: useHfToken,
+    // The token is named by id, not by account: a probe on a gated repo may run before any account
+    // exists, and one token can serve every account.
+    use_hf_token: !tokenId && boolOf(callModel(wizard, 'requiresHfToken', false, wizard.probe)),
   };
+  if (tokenId) body.hf_token_id = tokenId;
   wizard.busy = true;
   wizard.probeError = null;
   paintSetup(wizard, wizard.mount, ctx, wizard.current);
@@ -3113,6 +3376,9 @@ async function submitDeployment(wizard, ctx, { alreadyValidated = false } = {}) 
   paintSetup(wizard, wizard.mount, ctx, wizard.current);
   try {
     refreshSizing(wizard);
+    const tokenId = await ensureHfToken(wizard, ctx);
+    if (tokenId === undefined) return;
+    if (tokenId) draftSet(wizard.draft, 'hfTokenId', tokenId);
     refreshBundle(wizard);
     const payload = objectOf(callModel(wizard, 'applyPayload', null, wizard.draft, wizard.sizing));
     if (!payload) {
@@ -3122,7 +3388,8 @@ async function submitDeployment(wizard, ctx, { alreadyValidated = false } = {}) 
     wizard.applied = objectOf(result) ?? { ok: true };
     wizard.dirty = false;
     draftSet(wizard.draft, 'tokenSecret', '');
-    draftSet(wizard.draft, 'hfToken', '');
+    draftSet(wizard.draft, 'hfTokenNew', '');
+    draftSet(wizard.draft, 'hfTokenNewLabel', '');
     if (ctx && typeof ctx.toast?.success === 'function') {
       ctx.toast.success('Deployment recorded. Run the command below to bring it up.');
     }
@@ -3195,4 +3462,576 @@ async function leaveSetup(wizard, ctx) {
   retractSetupGuard(wizard, ctx);
   setupSession = null;
   ctxNavigate('#/gpu-rentals');
+}
+
+// ---------------------------------------------------------------------------
+// The page's three actions.
+//
+// "Deploy model", "Add Modal account" and "Add HuggingFace token" are the whole page: an account
+// and a token are things an operator records once and reuses, and a deployment is the thing they
+// record repeatedly. The step wizard still exists behind #/gpu-rentals/new/<step> for a first-time
+// operator who wants to be walked through it, but nothing on the page routes through it any more.
+//
+// The three collections are independent on purpose. One account may host several deployments; one
+// model on one card may be recorded under several accounts; a token is not scoped to an account at
+// all, and five accounts may share one token. Nothing here assumes counts match.
+// ---------------------------------------------------------------------------
+
+/** The root the dialogs are appended to (app.js owns it) — the body is the honest fallback. */
+function dialogRoot() {
+  return document.getElementById('dialog-root') ?? document.body;
+}
+
+/** Read the catalog and the recorded rentals into a wizard, or throw the catalog's failure. */
+async function loadWizardSources(wizard) {
+  const [catalogResult, rentalsResult] = await Promise.allSettled([
+    api.get('/api/gpu/catalog'),
+    api.get('/api/gpu/rentals'),
+  ]);
+  if (catalogResult.status === 'rejected') throw catalogResult.reason;
+  wizard.catalog = objectOf(catalogResult.value) ?? {};
+  const rentals = rentalsResult.status === 'fulfilled' ? objectOf(rentalsResult.value) : null;
+  wizard.rentalsError = rentalsResult.status === 'rejected' ? rentalsResult.reason : null;
+  wizard.accounts = listOf(pick(rentals ?? {}, 'accounts', 'rental_accounts')).map(normaliseAccount);
+  wizard.hfTokens = listOf(pick(rentals ?? {}, 'hf_tokens', 'huggingface_tokens')).map(normaliseHfToken);
+}
+
+/** Load the model module for a dialog wizard, or null when it will not load. */
+async function ensureWizardModel(wizard) {
+  if (wizard.mod && typeof wizard.mod.stepList === 'function') return wizard.mod;
+  try {
+    wizard.mod = await import('./gpu-setup-model.js');
+  } catch (err) {
+    wizard.modelError = err;
+    return null;
+  }
+  return wizard.mod;
+}
+
+/** One validated field error list, as the model reports it, for every step at once. */
+function wizardProblems(wizard, stepIds) {
+  const problems = [];
+  for (const stepId of stepIds) {
+    const raw = callModel(wizard, 'validateStep', { ok: true, problems: [], errors: [] },
+      wizard.draft, stepId, wizard.catalog, wizard.accounts);
+    const norm = normalizeValidation(raw);
+    for (const p of norm.problems) problems.push({ step: stepId, field: p.field, message: p.message });
+    for (const e of norm.errors) {
+      problems.push({ step: stepId, field: e?.field ?? null, message: e?.message ?? String(e) });
+    }
+  }
+  return problems;
+}
+
+/** The label a field descriptor carries, for naming a problem in the summary list. */
+function fieldLabel(wizard, name) {
+  if (!name) return null;
+  for (const step of modelSteps(wizard)) {
+    for (const desc of listOf(step.fields)) {
+      if (asString(pick(desc, 'name')) === name) return asString(pick(desc, 'label')) || name;
+    }
+  }
+  return name;
+}
+
+/** Apply a fit suggestion to the draft; the caller repaints. */
+function applySuggestion(wizard, suggestion) {
+  const field = asString(pick(suggestion, 'field')).trim();
+  if (!field) return;
+  draftSet(wizard.draft, field, pick(suggestion, 'value'));
+  wizard.sizing = null;
+  wizard.bundle = null;
+}
+
+const DEPLOY_STEP_IDS = Object.freeze(['platform', 'account', 'model', 'card', 'sizing']);
+
+/** The account a deployment names is the account it bills through; everything else follows. */
+function syncAccountToDraft(wizard) {
+  const d = wizard.draft;
+  const accounts = listOf(wizard.accounts).map(objectOf).filter(Boolean);
+  const platformId = asString(draftGet(d, 'platform')).trim();
+  const chosenId = asString(draftGet(d, 'accountId')).trim();
+  const chosen = accounts.find((a) => sameText(pick(a, 'id'), chosenId)) ?? null;
+  // A recorded account belongs to a platform; naming one on the wrong platform would derive an
+  // endpoint URL for a host the account cannot deploy to.
+  if (chosen && platformId && !sameText(pick(chosen, 'platform'), platformId)) {
+    draftSet(d, 'accountId', '');
+    return;
+  }
+  if (!chosen) return;
+  // The workspace is the account's, not the deployment's: it is half of every URL the account
+  // publishes, so the form must not ask for it a second time and cannot disagree with it.
+  const workspace = asString(pick(chosen, 'workspace')).trim();
+  if (workspace) draftSet(d, 'workspace', workspace);
+  const plan = asString(pick(chosen, 'plan')).trim();
+  if (plan) draftSet(d, 'plan', plan);
+}
+
+/** The fit verdict, and what to change when it does not fit. */
+function deployFitBlock(wizard) {
+  const problems = wizardProblems(wizard, DEPLOY_STEP_IDS);
+  if (problems.length) {
+    return {
+      ok: false,
+      el: h('div', { class: 'gpu-deploy-fit' },
+        errorBlock({
+          message: 'This deployment is not complete yet.',
+          details: problems.map((p) => ({ field: fieldLabel(wizard, p.field), message: p.message })),
+        })),
+    };
+  }
+  const report = objectOf(callModel(wizard, 'fitReport', null, wizard.draft, wizard.sizing, wizard.catalog));
+  if (!report) {
+    return {
+      ok: false,
+      el: h('div', { class: 'gpu-deploy-fit' },
+        errorBlock({ message: 'The fit check is unavailable: gpu-setup-model.js did not return a report.' })),
+    };
+  }
+  if (report.ok !== true) {
+    const suggestions = listOf(report.suggestions);
+    // An unestimated pool is not a refusal: saying "does not fit" would claim a measurement the
+    // panel never made, and no suggestion can be proven sufficient without that measurement. The
+    // deployment is still not recordable, which is why both verdicts return `ok: false`.
+    const known = report.known !== false;
+    return {
+      ok: false,
+      el: h('div', { class: 'gpu-deploy-fit' },
+        errorBlock({
+          message: known
+            ? 'This does not fit on the chosen card.'
+            : 'Whether this deployment fits cannot be checked yet.',
+          details: listOf(report.blockers).map((b) => ({ field: null, message: asString(pick(objectOf(b) ?? {}, 'message')) })),
+        }),
+        h('p', { class: 'hint' }, known
+          ? 'Each of these changes is one the fit check re-ran and found sufficient; nothing else is suggested.'
+          : 'Nothing is recorded until the pool can be estimated; the blocker above names the figure that is missing.'),
+        h('div', { class: 'gpu-actions' }, ...suggestions.map((s) => {
+          const label = asString(pick(objectOf(s) ?? {}, 'label')) || `Set ${asString(pick(s, 'field'))} to ${asString(pick(s, 'value'))}`;
+          const detail = asString(pick(objectOf(s) ?? {}, 'detail'));
+          return ghostButton(label, () => { applySuggestion(wizard, s); wizard.repaint(); }, detail || null);
+        }))),
+    };
+  }
+  const fit = objectOf(report.fit) ?? {};
+  const rows = [
+    ['Card', `${asString(pick(fit, 'gpu')) || '—'}${asNumber(pick(fit, 'gpu_count')) > 1 ? ` ×${asNumber(pick(fit, 'gpu_count'))}` : ''}`],
+    ['Mode', asString(pick(fit, 'mode')) === 'batch'
+      ? `batch of ${asString(pick(wizard.draft, 'batchSize'))} ${pick(wizard.draft, 'batchFill') === 'timeout' ? `(ships after ${asString(pick(wizard.draft, 'batchTimeoutSecs'))}s if not full)` : '(waits until full)'}`
+      : `stream, ${asString(pick(wizard.draft, 'sessions'))} session${asNumber(pick(wizard.draft, 'sessions')) === 1 ? '' : 's'}`],
+    ['KV pool', asNumber(pick(fit, 'pool')) === null ? '—' : `${formatCompact(asNumber(pick(fit, 'pool')))} tokens`],
+    ['Context', asNumber(pick(fit, 'max_model_len')) === null ? '—' : `${asNumber(pick(fit, 'max_model_len'))} tokens`],
+    ['Sessions at that context', asNumber(pick(fit, 'sessions_at_max_len')) === null ? '—' : String(asNumber(pick(fit, 'sessions_at_max_len')))],
+    ['Endpoint', callModel(wizard, 'modalBaseUrl', '', wizard.draft) || 'derived once a card and account are chosen'],
+  ];
+  return {
+    ok: true,
+    el: h('div', { class: 'gpu-deploy-fit gpu-deploy-fit-ok' },
+      h('h3', {}, 'It fits'),
+      kv(rows),
+      h('p', { class: 'hint' },
+        'The sizing is an estimate from the probed architecture unless the catalog records a measurement for this card; vLLM’s startup line is the authority.')),
+  };
+}
+
+/** The body of the deploy window: every step at once, then the verdict and the submit. */
+function paintDeployWindow(wizard, body, ctx, close) {
+  syncAccountToDraft(wizard);
+  refreshSizing(wizard);
+  body.replaceChildren();
+
+  if (wizard.modelError) {
+    body.append(missingSetupModelBlock(wizard.modelError));
+    return;
+  }
+  if (!wizard.accounts.length) {
+    body.append(
+      h('p', { class: 'hint' },
+        'No Modal account is recorded yet. A deployment bills through an account, so one has to exist before a model can be recorded.'),
+      h('div', { class: 'gpu-actions' }, button('Add a Modal account', async () => {
+        close(false);
+        await openAccountDialog(wizard.view, ctx);
+      }, { className: 'btn btn-primary' })));
+    return;
+  }
+
+  for (const step of modelSteps(wizard)) {
+    if (!DEPLOY_STEP_IDS.includes(asString(pick(step, 'id')))) continue;
+    const fields = listOf(pick(step, 'fields'))
+      .filter((desc) => asString(pick(objectOf(desc) ?? {}, 'name')) !== 'accountMode')
+      .map((desc) => fieldRow(wizard, desc))
+      .filter(Boolean);
+    const extras = [];
+    if (asString(pick(step, 'id')) === 'model') {
+      extras.push(probePanel(wizard));
+      if (asString(draftGet(wizard.draft, 'hfTokenId')).trim() || objectOf(wizard.probe)) {
+        extras.push(hfTokensPanel(wizard));
+      }
+    }
+    if (!fields.length && !extras.length) continue;
+    body.append(h('section', { class: 'gpu-deploy-section' },
+      h('h3', {}, asString(pick(step, 'title')) || asString(pick(step, 'id'))),
+      h('p', { class: 'hint' }, asString(pick(step, 'hint'))),
+      ...fields, ...extras));
+  }
+
+  if (wizard.busy) body.append(h('div', { class: 'toolbar' }, spinner(), h('span', { class: 'hint' }, 'Working…')));
+  if (wizard.probeError) body.append(failedEndpoint('POST /api/gpu/probe', wizard.probeError));
+  if (wizard.applyError) body.append(failedEndpoint('POST /api/gpu/apply', wizard.applyError));
+
+  const fit = deployFitBlock(wizard);
+  body.append(fit.el);
+  const ready = fit.ok && !wizard.busy;
+
+  body.append(formActions(
+    ghostButton('Cancel', () => close(false)),
+    button(wizard.busy ? 'Recording…' : 'Record deployment', () => submitDeployWindow(wizard, ctx, body, close), {
+      className: 'btn btn-primary',
+      title: ready ? 'Record this deployment and print the command that brings it up' : 'Fix the problems above first',
+      disabled: !ready,
+    }),
+  ));
+}
+
+/** POST the deployment, then replace the window with what was recorded and how to deploy it. */
+async function submitDeployWindow(wizard, ctx, body, close) {
+  if (wizard.busy) return;
+  wizard.applyError = null;
+  wizard.busy = true;
+  wizard.repaint();
+  try {
+    // A pasted token is written before the deployment that names it, so a failure here leaves no
+    // deployment pointing at a token that was never stored.
+    const tokenId = await ensureHfToken(wizard, ctx);
+    if (tokenId === undefined) return;
+    refreshSizing(wizard);
+    refreshBundle(wizard);
+    const payload = callModel(wizard, 'applyPayload', null, wizard.draft, wizard.sizing);
+    const response = await api.post('/api/gpu/apply', payload);
+    wizard.applied = objectOf(response) ?? {};
+    draftSet(wizard.draft, 'hfTokenNew', '');
+    wizard.dirty = false;
+    paintDeployResult(wizard, body, ctx, close);
+    if (ctx && typeof ctx.toast?.success === 'function') {
+      ctx.toast.success('Deployment recorded. Run the command to bring it up.');
+    }
+    const view = wizard.view;
+    if (view && typeof view.refresh === 'function') await view.refresh(true);
+  } catch (err) {
+    wizard.applyError = err;
+  } finally {
+    wizard.busy = false;
+    if (!wizard.applied) wizard.repaint();
+  }
+}
+
+/** What the record now is: the provider id, the endpoint, and the command that deploys it. */
+function paintDeployResult(wizard, body, ctx, close) {
+  body.replaceChildren();
+  const applied = objectOf(wizard.applied) ?? {};
+  const providerId = asString(pick(applied, 'provider_id')).trim();
+  const bundle = objectOf(wizard.bundle);
+  const filename = asString(pick(bundle ?? {}, 'filename')).trim();
+  const command = asString(pick(bundle ?? {}, 'command')).trim();
+  const baseUrl = asString(pick(bundle ?? {}, 'base_url')).trim()
+    || callModel(wizard, 'modalBaseUrl', '', wizard.draft) || '';
+
+  body.append(
+    h('h3', {}, 'Recorded'),
+    h('p', { class: 'hint' },
+      'The deployment is in the config. Modal publishes no deployment API, so this window cannot bring it up: the command below is the deployment, and it prints the endpoint when it finishes.'),
+    kv([
+      ['Provider id', providerId || '—'],
+      ['App', callModel(wizard, 'modalAppName', '', wizard.draft.accountId, wizard.draft.repo,
+        wizard.draft.mode, wizard.draft.gpu, wizard.draft.gpuCount)],
+      ['Endpoint', baseUrl || 'printed by `modal deploy`'],
+      ['Account', asString(pick(applied, 'account_id')) || asString(draftGet(wizard.draft, 'accountId'))],
+      ['HuggingFace token', asString(draftGet(wizard.draft, 'hfTokenId')) || 'none — the repository is public'],
+    ]),
+  );
+  if (command) {
+    body.append(
+      h('div', { class: 'gpu-deploy-command' },
+        h('div', { class: 'toolbar' }, h('span', { class: 'hint' }, filename || 'modal_app.py'), copyButton(command)),
+        h('pre', { class: 'code' }, command)),
+    );
+  } else if (wizard.bundleError) {
+    body.append(failedEndpoint('GET /api/gpu/bundle', wizard.bundleError));
+  }
+  body.append(h('p', { class: 'hint' },
+    'A gated repository also needs its token mounted in the container: `modal deploy` reads the Modal secret named `manarouter-hf`. '
+    + 'The recorded token id says which token that secret must hold; this file never carries the secret itself.'));
+  body.append(formActions(button('Done', () => close(true), { className: 'btn btn-primary' })));
+}
+
+/** Open the deploy window. */
+async function openDeployDialog(view, ctx) {
+  const wizard = freshWizard();
+  wizard.view = view;
+  const root = dialogRoot();
+  const done = contentDialog(root, 'Deploy a model', (body, close) => {
+    body.append(h('div', { class: 'toolbar' }, spinner(), h('span', { class: 'hint' }, 'Reading the catalog…')));
+    wizard.repaint = () => paintDeployWindow(wizard, body, ctx, close);
+    wizard.mount = body;
+    (async () => {
+      const mod = await ensureWizardModel(wizard);
+      if (!mod) { wizard.repaint(); return; }
+      try {
+        await loadWizardSources(wizard);
+      } catch (err) {
+        body.replaceChildren(errorBlock({
+          message: 'The GPU catalog could not be read, so no card or price can be offered.',
+          details: [{ field: null, message: String(err?.message ?? err) }],
+        }), formActions(ghostButton('Close', () => close(false))));
+        return;
+      }
+      const platformId = firstPlatformId(wizard.catalog);
+      wizard.draft = objectOf(callModel(wizard, 'emptyDraft', null, platformId)) ?? { platform: platformId };
+      // The window reuses an account: creating one is the page's own action, so doing it here too
+      // would be two forms for one record.
+      draftSet(wizard.draft, 'accountMode', 'existing');
+      const first = listOf(wizard.accounts).map(objectOf).filter(Boolean)
+        .find((a) => sameText(pick(a, 'platform'), platformId));
+      if (first) draftSet(wizard.draft, 'accountId', asString(pick(first, 'id')));
+      wizard.repaint();
+    })();
+  });
+  await done;
+  view?.refresh?.(true);
+}
+
+// -- Add a Modal account --------------------------------------------------------------------
+//
+// Shaped like the provider form in #/providers: one labelled field per value, its hint under it, a
+// secret that is written once and only ever shown back as a fingerprint, and problems pinned to the
+// field that caused them.
+async function openAccountDialog(view, ctx) {
+  const mod = await import('./gpu-setup-model.js').catch(() => null);
+  const wizard = freshWizard();
+  wizard.mod = mod ?? {};
+  wizard.view = view;
+  const values = { id: '', label: '', platform: 'modal', plan: 'unknown', workspace: '', tokenId: '', tokenSecret: '' };
+  const root = dialogRoot();
+  const state = { busy: false, error: null, result: null };
+
+  const done = contentDialog(root, 'Add a Modal account', (body, close) => {
+    const fields = h('div', { class: 'form-fields' });
+    const actions = h('div', { class: 'dialog-actions' });
+
+    function textInput(name, { placeholder = '', type = 'text' } = {}) {
+      const input = h('input', {
+        class: 'input', type, name, placeholder, autocomplete: 'off', spellcheck: 'false',
+        oninput: (e) => { values[name] = e.target.value; },
+      });
+      // Both slots, for the same reason fieldRow sets both: applyFieldErrors reads dataset, a
+      // selector reads the attribute.
+      input.dataset.field = name;
+      input.setAttribute('data-field', name);
+      return input;
+    }
+
+    function paint() {
+      body.replaceChildren();
+      if (state.result) {
+        body.append(
+          h('h3', {}, 'Recorded'),
+          kv([
+            ['Account', state.result.id],
+            ['Plan', state.result.plan],
+            ['Workspace', state.result.workspace],
+            ['Vault entry', state.result.vaultId || 'written'],
+            ['Fingerprint', state.result.fingerprint || 'not returned'],
+          ]),
+          h('p', { class: 'hint' },
+            'The credential is in the vault. It is never rendered back, and no response carries it. Deployments now name this account by id.'),
+          formActions(button('Done', () => close(true), { className: 'btn btn-primary' })),
+        );
+        return;
+      }
+      fields.replaceChildren(
+        field('Account id', textInput('id', { placeholder: 'mana-modal' }), {
+          hint: 'A local identifier, and the name of the vault entry. Letters, digits, dashes.',
+        }),
+        field('Label', textInput('label', { placeholder: 'Modal — mana' }), { hint: 'Optional. Shown on the list so two accounts are told apart by something other than an id.' }),
+        field('Platform', h('input', { class: 'input', value: 'modal', readonly: true, disabled: true })),
+        field('Modal workspace', textInput('workspace', { placeholder: 'mana' }), {
+          hint: 'Not a secret: the first half of every endpoint URL this workspace publishes.',
+        }),
+        field('Plan', (() => {
+          const ids = Array.isArray(mod?.PLAN_IDS) ? mod.PLAN_IDS : ['unknown'];
+          const select = h('select', { class: 'input', onchange: (e) => { values.plan = e.target.value; } },
+            ...ids.map((id) => h('option', { value: id, selected: id === values.plan }, PLAN_LABELS[id] ?? id)));
+          select.dataset.field = 'plan';
+          select.setAttribute('data-field', 'plan');
+          return select;
+        })(), { hint: 'Unknown is a real answer and is never rendered as free or as paid.' }),
+        field('Modal proxy token id', textInput('tokenId', { placeholder: 'wk-…', type: 'password' }), {
+          hint: 'The `wk-…` half of the proxy token pair, sent as `Modal-Key`. Stored in the vault.',
+        }),
+        field('Modal proxy token secret', textInput('tokenSecret', { placeholder: 'ws-…', type: 'password' }), {
+          hint: 'The `ws-…` half, sent as `Modal-Secret`. Both halves are written as one entry.',
+        }),
+      );
+      body.append(
+        h('p', { class: 'hint' },
+          'An account is what a deployment bills through. Several deployments may name the same account, and the same model and card may be recorded under several accounts.'),
+        h('p', { class: 'hint' },
+          'The credential is written to the vault once. This window never reads it back and the response carries only a fingerprint.'),
+        fields,
+      );
+      if (state.error) body.append(applyFieldErrors(body, state.error));
+      body.append(formActions(
+        ghostButton('Cancel', () => close(false)),
+        button(state.busy ? 'Saving…' : 'Add account', submit, {
+          className: 'btn btn-primary',
+          disabled: state.busy,
+        }),
+      ));
+    }
+    async function submit() {
+      if (state.busy) return;
+      const missing = [];
+      if (!values.id.trim()) missing.push({ field: 'id', message: 'An account id is required.' });
+      else if (!/^[a-z0-9][a-z0-9._-]*$/i.test(values.id.trim())) missing.push({ field: 'id', message: 'Letters, digits, dots, dashes and underscores; it becomes a vault entry name.' });
+      if (!values.workspace.trim()) missing.push({ field: 'workspace', message: 'The Modal workspace is required: without it no endpoint URL can be derived.' });
+      if (!values.tokenId.trim()) missing.push({ field: 'tokenId', message: 'The proxy token id is required.' });
+      if (!values.tokenSecret.trim()) missing.push({ field: 'tokenSecret', message: 'The proxy token secret is required.' });
+      state.error = null;
+      if (missing.length) {
+        state.error = { message: 'The account is not complete.', details: missing };
+        paint();
+        return;
+      }
+      state.busy = true;
+      paint();
+      try {
+        const payload = { accountMode: 'new', accountId: values.id.trim(), accountLabel: values.label.trim(), platform: 'modal', plan: values.plan, workspace: values.workspace.trim(), tokenId: values.tokenId.trim(), tokenSecret: values.tokenSecret };
+        const wire = callModel(wizard, 'accountApplyPayload', null, payload);
+        const response = objectOf(await api.post('/api/gpu/apply', wire)) ?? {};
+        state.result = {
+          id: asString(pick(response, 'account_id')) || payload.accountId,
+          plan: payload.plan,
+          workspace: payload.workspace,
+          vaultId: asString(pick(objectOf(response.vault) ?? {}, 'secret_id', 'id')),
+          fingerprint: asString(pick(objectOf(response.vault) ?? {}, 'fingerprint')),
+        };
+        values.tokenId = '';
+        values.tokenSecret = '';
+        if (ctx && typeof ctx.toast?.success === 'function') ctx.toast.success('Modal account recorded.');
+        await view?.refresh?.(true);
+      } catch (err) {
+        state.error = err;
+      } finally {
+        state.busy = false;
+        paint();
+      }
+    }
+
+    paint();
+  });
+  await done;
+}
+
+// -- Add a HuggingFace token ----------------------------------------------------------------
+//
+// Independent of the accounts: a token is a credential a gated repository needs, and one token may
+// be named by deployments on every account. Its id is operator-chosen; recording the same id twice
+// replaces the vault value in place, which is how a token is rotated.
+async function openHfTokenDialog(view, ctx) {
+  const mod = await import('./gpu-setup-model.js').catch(() => null);
+  const wizard = freshWizard();
+  wizard.mod = mod ?? {};
+  wizard.view = view;
+  const values = { id: '', label: '', secret: '' };
+  const state = { busy: false, error: null, result: null };
+  const root = dialogRoot();
+
+  const done = contentDialog(root, 'Add a HuggingFace token', (body, close) => {
+    function textInput(name, { placeholder = '', type = 'text' } = {}) {
+      const input = h('input', {
+        class: 'input', type, name, placeholder, autocomplete: 'off', spellcheck: 'false',
+        oninput: (e) => { values[name] = e.target.value; },
+      });
+      // Both slots, for the same reason fieldRow sets both: applyFieldErrors reads dataset, a
+      // selector reads the attribute.
+      input.dataset.field = name;
+      input.setAttribute('data-field', name);
+      return input;
+    }
+
+    function paint() {
+      body.replaceChildren();
+      if (state.result) {
+        body.append(
+          h('h3', {}, 'Recorded'),
+          kv([
+            ['Token', state.result.id],
+            ['Vault entry', state.result.vaultId || `hf:${state.result.id}`],
+            ['Fingerprint', state.result.fingerprint || 'not returned'],
+          ]),
+          h('p', { class: 'hint' },
+            'The value is in the vault under its own entry and is never rendered back. A deployment names the token by id, and only a gated repository needs one.'),
+          formActions(button('Done', () => close(true), { className: 'btn btn-primary' })),
+        );
+        return;
+      }
+      body.append(
+        h('p', { class: 'hint' },
+          'A HuggingFace token is not tied to a Modal account. One token may be named by deployments on several accounts, and a public repository needs none.'),
+        h('p', { class: 'hint' },
+          'The token is written to the vault once, under `hf:<id>`. Recording the same id again replaces the stored value, which is how you rotate it.'),
+        field('Token id', textInput('id', { placeholder: 'hf-main' }), {
+          hint: 'A local identifier chosen here. Deployments name it, so it is what identifies the token.',
+        }),
+        field('Label', textInput('label', { placeholder: 'Personal — read' }), { hint: 'Optional. Shown beside the id so two tokens are told apart.' }),
+        field('Token', textInput('secret', { placeholder: 'hf_…', type: 'password' }), {
+          hint: 'Read-only is enough for a gated repository. The value is written once and never read back.',
+        }),
+      );
+      if (state.error) body.append(applyFieldErrors(body, state.error));
+      body.append(formActions(
+        ghostButton('Cancel', () => close(false)),
+        button(state.busy ? 'Saving…' : 'Add token', submit, { className: 'btn btn-primary', disabled: state.busy }),
+      ));
+    }
+
+    async function submit() {
+      if (state.busy) return;
+      const missing = [];
+      if (!values.id.trim()) missing.push({ field: 'id', message: 'A token id is required: deployments name the token by it.' });
+      else if (!/^[a-z0-9][a-z0-9._-]*$/i.test(values.id.trim())) missing.push({ field: 'id', message: 'Letters, digits, dots, dashes and underscores; it becomes a vault entry name.' });
+      if (!values.secret.trim()) missing.push({ field: 'secret', message: 'The token value is required.' });
+      state.error = null;
+      if (missing.length) {
+        state.error = { message: 'The token is not complete.', details: missing };
+        paint();
+        return;
+      }
+      state.busy = true;
+      paint();
+      try {
+        const wire = callModel(wizard, 'hfTokenApplyPayload', null, {
+          hfTokenNew: values.secret.trim(), hfTokenNewLabel: values.id.trim(), hfTokenId: values.id.trim(),
+        });
+        const response = objectOf(await api.post('/api/gpu/apply', wire)) ?? {};
+        const vault = objectOf(response.vault) ?? {};
+        state.result = {
+          id: values.id.trim(),
+          vaultId: asString(pick(vault, 'secret_id', 'id')),
+          fingerprint: asString(pick(vault, 'fingerprint')),
+        };
+        values.secret = '';
+        if (ctx && typeof ctx.toast?.success === 'function') ctx.toast.success('HuggingFace token recorded.');
+        await view?.refresh?.(true);
+      } catch (err) {
+        state.error = err;
+      } finally {
+        state.busy = false;
+        paint();
+      }
+    }
+
+    paint();
+  });
+  await done;
 }

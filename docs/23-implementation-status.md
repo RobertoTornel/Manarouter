@@ -204,9 +204,10 @@ in the conductor, presentation in the panel, and the request path in the relay.
   host will not let you do; no HTTP, no clock, no verdicts beyond the ones quoted.
 * `crates/manarouter-conductor/src/gpu_api.rs` — **six routes**: `GET /api/gpu/catalog`,
   `GET /api/gpu/lanes`, `POST /api/gpu/probe`, `GET /api/gpu/rentals`, `POST /api/gpu/apply` and
-  `POST /api/gpu/launch-plan`. `apply` is create-only: there is no update or delete route
-  for an account or a deployment, which is why the panel's account step offers an already-stored
-  account (id + stored credential) instead of pretending to edit it.
+  `POST /api/gpu/launch-plan`. `apply` takes one of three actions — `create-account`,
+  `create-hf-token`, `create-deployment` — and is create-only: there is no update or delete route for
+  an account, a token or a deployment, which is why the panel offers an already-stored account by id
+  instead of pretending to edit it.
 * `crates/manarouter-conductor/src/lane_kaggle.rs` — **four lane routes** for the one lane that
   remains: `status`, `run`, `run/{id}`, `runs`. Kaggle is batch only and has no attach route.
 * `panel/gpu-setup-model.js` (pure) and `panel/view-gpu-rentals.js` (the two-mode view).
@@ -218,8 +219,37 @@ in the conductor, presentation in the panel, and the request path in the relay.
 `crates/mr-core/src/gpu/mod.rs` states the split: that tree contains **no HTTP, no filesystem access
 and no clock**, so every number is checkable in a unit test with no network and no GPU.
 
-**What has actually been exercised.** The workspace lib suite is green — 1 661 passed, 0 failed
-(`cargo test --workspace --lib`) — the panel suite is green (334 tests, `node --test
+**Accounts, tokens and deployments are three independent lists, not one ladder.** This was wrong in an
+earlier revision and is worth recording as a correction rather than a feature: the account and the
+deployment were separate structs from the start, but the flow was built as if one account held exactly
+one deployment and one Hugging Face token, which is neither what the operator asked for nor how the
+platform bills. The builder is now many-to-many in both directions — one account bills several
+deployments, the same repository on the same card may be deployed under a second account, and a
+deployment names its Hugging Face token by id from a list that is independent of the account list.
+Re-recording an existing token id replaces its vault value in place (rotation), which is the one
+"update" the surface has.
+
+A deployment's identity is the tuple (account, repository, mode, card, card count), and the provider
+id carries it: `manarouter-rental-<account>-<repo>-<mode>-<card>[-x<count>]`. Two consequences are
+deliberate. Deployments applied before this identity widened keep their old provider ids — nothing is
+renamed under an operator's feet — and the generated Modal app name now ends in the same suffix, so a
+streaming endpoint and a batch endpoint of one model are two apps with two URLs rather than one name
+claiming both.
+
+`batch` mode records how the batch fills: `batch: {size, fill, timeout_secs}` where `fill` is `full`
+(wait until the batch holds `size` items, however long that takes — the operator's explicit choice) or
+`timeout` (ship a short batch after `timeout_secs`). The shape is validated on both halves; an
+inconsistent batch is refused with the field named.
+
+**Known gap on that path.** A recorded token id is not a mounted token: the generated `modal_app.py`
+deliberately carries no secret, so a gated repository needs the operator to create and mount a Modal
+secret (`manarouter-hf`) before its first fetch, and the apply response now warns exactly that when a
+deployment names a token. The next change here is to emit the mount. Likewise, the batch assembler for
+a `batch` deployment is described in the bundle's `mode_note` rather than generated: the file says
+which mode it was applied in and does not pretend to contain the code that accumulates a batch.
+
+**What has actually been exercised.** The workspace suite is green — 1 899 passed, 0 failed, 4
+ignored (`cargo test --workspace`) — the panel suite is green (361 tests, `node --test
 panel/test/*.test.mjs`), and — the part that matters most — a second
 conductor built from this tree was driven over a socket on `127.0.0.1:20999` with its own config and
 state directories, through the real sequence: catalog → probe → create account → create deployment →
