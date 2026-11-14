@@ -324,6 +324,10 @@ unreachable. The first four are fixed in the generator and the fifth in both tem
    `@modal.concurrent(max_inputs=MAX_INPUTS)`, 32 for a streaming bundle (the conductor previously
    defaulted that ceiling to 1, which is the same container-per-request bill) and the batch size for
    a `batch` deployment, which would otherwise deadlock waiting for a batch no container can hold.
+   The panel's bundles also carry `requires_proxy_auth=True`, which is why a call needs the
+   `Modal-Key`/`Modal-Secret` pair: without it the printed URL serves a paid card to anyone who
+   learns it. The conductor's own template still omits that line — an open item, because adding it
+   there without recording the token pair would break a deployment that works today.
 5. Modal measures the 64-character app-name limit on the finished name, prefix included, and rejects
    a name of exactly 64; a long account and repository produced 79 characters and `modal deploy`
    refused it. The slug is now sized against the prefix.
