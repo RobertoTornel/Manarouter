@@ -131,10 +131,13 @@ test('the generated file is a runnable Modal app that serves the OpenAI API from
   assert.match(text, /gpu="RTX-PRO-6000",/);
   assert.match(text, /scaledown_window=60,/);
   assert.match(text, /startup_timeout=900,/);
-  assert.match(text, /@modal\.web_server\(port=8000, requires_proxy_auth=True\)/);
+  assert.match(text, /@modal\.web_server\(port=8000, startup_timeout=1200, requires_proxy_auth=True\)/);
   assert.match(text, /subprocess\.Popen\(\["vllm", "serve", \*VLLM_ARGS\]\)/);
   assert.equal((text.match(/"""/g) ?? []).length, 2, 'the module docstring is the only triple-quoted string');
-  assert.ok(text.endsWith('process.wait()\n'));
+  // A serve() that blocks on its child is not how a @modal.web_server function reports
+  // readiness: the proxy then never forwards a request into an engine that is listening.
+  assert.ok(text.endsWith('subprocess.Popen(["vllm", "serve", *VLLM_ARGS])\n'));
+  assert.doesNotMatch(text, /process\.wait\(\)/);
 });
 
 test('vLLM flags come from the draft and never invent a value', () => {
@@ -155,11 +158,28 @@ test('--revision is emitted only when the draft pins one', () => {
   assert.match(canonical({ revision: 'b32584cc' }).bundle.text, /"--revision", "b32584cc",/);
 });
 
-test('--max-model-len and --max-num-seqs are omitted while they are unset', () => {
+test('an unset max-model-len is omitted, and an unset max-num-seqs takes the fit estimate', () => {
   const { bundle } = canonical({ maxModelLen: null, maxNumSeqs: null });
   assert.doesNotMatch(bundle.text, /--max-model-len/);
-  assert.doesNotMatch(bundle.text, /--max-num-seqs/);
+  // vLLM's own default is 1024 sequences per step, which a hybrid model cannot always admit
+  // (`max_num_seqs (1024) exceeds available Mamba cache blocks (681)`), so a blank field means
+  // the concurrency the fit above says the card holds rather than vLLM's blind default.
+  assert.match(bundle.text, /"--max-num-seqs", "54",/);
   assert.doesNotMatch(bundle.text, /--gpu-memory-utilization", "null/);
+});
+
+test('a cleared or zero sizing field is left out rather than written as zero', () => {
+  // A cleared number field posts `''`; writing it as `0` produced `--max-num-seqs 0`, which vLLM
+  // rejects with "Input should be greater than or equal to 1" — the container then never binds
+  // port 8000 and the deployment pays for a boot that serves nothing.
+  for (const value of ['', '   ', 0, '0', -1, 'nonsense']) {
+    const { bundle } = canonical({ maxModelLen: value, maxNumSeqs: value });
+    assert.doesNotMatch(bundle.text, /--max-model-len/, `max-model-len emitted for ${JSON.stringify(value)}`);
+    assert.doesNotMatch(bundle.text, /"--max-num-seqs", "0",/, `max-num-seqs written as zero for ${JSON.stringify(value)}`);
+    assert.doesNotMatch(bundle.text, /"--max-num-seqs", "-/, `a negative max-num-seqs was written for ${JSON.stringify(value)}`);
+  }
+  const zero = canonical({ maxModelLen: 0, maxNumSeqs: 0 }).bundle.text;
+  assert.doesNotMatch(zero, /", "0",/);
 });
 
 // ---------------------------------------------------------------------------
@@ -458,7 +478,15 @@ test('a streaming bundle keeps vLLM on the public port and generates no assemble
   assert.match(bundle.text, /--port", "8000"/);
   assert.doesNotMatch(bundle.text, /BATCH_SIZE/);
   assert.doesNotMatch(bundle.text, /BatchHandler/);
-  assert.doesNotMatch(bundle.text, /@modal\.concurrent/);
+});
+
+test('a streaming bundle admits more than one input per container', () => {
+  // Modal admits one input per container by default, so a second simultaneous request starts a
+  // second GPU container instead of queueing in the one already warm: ten pollers, ten cards.
+  const { bundle } = canonical({ mode: 'streaming' });
+  assert.match(bundle.text, /^MAX_INPUTS = 32$/m);
+  assert.match(bundle.text, /@modal\.concurrent\(max_inputs=MAX_INPUTS\)/);
+  assert.doesNotMatch(bundle.text, /max_inputs=1\b/);
 });
 
 test('batch notes say the assembler is not a streaming endpoint', () => {

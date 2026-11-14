@@ -28,6 +28,7 @@ const {
   SCALEDOWN_WINDOW_LIMITS,
   STEP_ORDER,
   accountApplyPayload,
+  appSlug,
   applyPayload,
   applyProbe,
   applySizing,
@@ -38,6 +39,7 @@ const {
   hfTokenApplyPayload,
   kvDtypesForGpu,
   maxGpuCountFor,
+  modalAppName,
   modalBaseUrl,
   nextStep,
   normalizeDraft,
@@ -632,6 +634,26 @@ test('the endpoint URL is derived from the workspace and app name, and only an o
   assert.equal(field.required, false, 'an override is optional; the derived URL is the default');
   assert.equal(review.find((f) => f.name === 'endpointUrl').value, derived,
     'the review shows the derived URL, not a blank readout waiting for a paste');
+});
+
+test('a long account and repository are trimmed from the front so the finished app name stays under 64 characters', () => {
+  // Modal refuses a name of 64 characters or more, and it measures the finished name — the
+  // `manarouter-` prefix counts. A long account and repository once produced a 79-character name
+  // and `modal deploy` rejected it, so the budget is spent on the whole name, not just the slug.
+  const repo = `org/${'very-long-model-name-'.repeat(6)}`;
+  const app = modalAppName('an-account-with-a-long-id', repo, 'batch', 'RTX-PRO-6000', 4);
+  assert.ok(app.length < 64, `\`${app}\` is ${app.length} characters and Modal will refuse it`);
+  assert.ok(app.startsWith('manarouter-'), `got \`${app}\``);
+  assert.ok(app.endsWith('-batch-rtx-pro-6000-x4'), `got \`${app}\``);
+  assert.ok(!app.includes('--'), 'trimming a trailing dash must not leave a double dash');
+  // The suffix is what separates two deployments of one checkpoint; truncating the tail would
+  // collapse them onto one name.
+  const streaming = modalAppName('an-account-with-a-long-id', repo, 'streaming', 'RTX-PRO-6000', 4);
+  assert.notEqual(app, streaming);
+  assert.ok(streaming.length < 64);
+  // Short names are untouched by the wider budget.
+  assert.equal(appSlug('mana-modal', 'Qwen/Qwen3-8B', 'streaming', 'RTX-PRO-6000', 1),
+    'rental-mana-modal-qwen3-8b-streaming-rtx-pro-6000');
 });
 
 test('an API token in the proxy-token slot is rejected with the reason', () => {
@@ -1331,7 +1353,10 @@ test('the bundle is a complete runnable modal_app.py plus the command that deplo
   assert.match(bundle.text, /gpu="RTX-PRO-6000"/);
   assert.match(bundle.text, /scaledown_window=60/);
   assert.match(bundle.text, /@modal\.web_server\(port=8000/);
-  assert.match(bundle.text, /process\.wait\(\)/);
+  // The server is spawned and serve() returns; blocking on the child stops Modal's proxy
+  // from ever forwarding a request into an engine that is already listening.
+  assert.match(bundle.text, /subprocess\.Popen\(\["vllm", "serve", \*VLLM_ARGS\]\)/);
+  assert.doesNotMatch(bundle.text, /process\.wait\(\)/);
 });
 
 test('the bundle never emits a credential or a Secret literal', () => {

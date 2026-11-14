@@ -262,14 +262,20 @@ export function deploymentSuffix(mode, gpu, gpuCount) {
   return suffix;
 }
 
+/** The prefix `modalAppName` puts in front of the slug, and the whole name's Modal limit. */
+export const APP_NAME_PREFIX = 'manarouter-';
+export const APP_NAME_MAX = 63;
+
 /**
- * The stable part of the app name: `rental-<account>-<repo-name>-<mode>-<card>`, at most 64
- * characters.
+ * The stable part of the app name: `rental-<account>-<repo-name>-<mode>-<card>`, short enough that
+ * `modalAppName` stays inside Modal's 63-character limit.
  *
  * Mirrors `mr_core::rental::app_slug`. One string identifies both the provider id (built from it
  * in the conductor) and the Modal app, so the preview and the deployed name cannot drift.
  * Truncation eats the account/repository half and never the suffix: the suffix is the only part
- * that tells two deployments of one checkpoint apart.
+ * that tells two deployments of one checkpoint apart. The room is measured on the finished app
+ * name, not the slug, because Modal rejects a name of 64 characters or more — a long account and
+ * repository once produced one and `modal deploy` refused it.
  *
  * @param {string} accountId
  * @param {string} repo
@@ -281,7 +287,7 @@ export function deploymentSuffix(mode, gpu, gpuCount) {
 export function appSlug(accountId, repo, mode, gpu, gpuCount) {
   const name = String(repo ?? '').split('/').filter(Boolean).pop() ?? '';
   const suffix = deploymentSuffix(mode, gpu, gpuCount);
-  const room = Math.max(0, 64 - suffix.length);
+  const room = Math.max(0, APP_NAME_MAX - APP_NAME_PREFIX.length - suffix.length);
   let head = `rental-${slugify(accountId)}-${slugify(name)}`;
   if (head.length > room) head = head.slice(0, room);
   head = head.replace(/-+$/, '');
@@ -2447,6 +2453,7 @@ export function deploymentBundle(draft, sizing, catalog) {
   const cudaPinned = gpuId === 'B300';
   const version = vllmVersion(catalog);
   const clamp = clampScaledown(d.shutdownCooldownSecs);
+  const sizingObj = asObject(sizing ?? d.sizing);
   const gated = d.hfTokenNeeded || requiresHfToken(d.probe) || Boolean(d.hfTokenId || d.hfTokenNew);
   const utilization = toNumber(d.gpuMemoryUtilization) ?? DEFAULT_GPU_MEMORY_UTILIZATION;
   // A batch deployment is not a vLLM flag set: vLLM schedules whatever arrives. The mode's meaning
@@ -2507,8 +2514,24 @@ export function deploymentBundle(draft, sizing, catalog) {
   // selected, and a requantised artefact whose recorded label ("awq") is not its `quant_method`
   // ("compressed-tensors"). The notes below say which case applies; the warning says so too.
   args.push('--kv-cache-dtype', d.kvCacheDtype || 'auto');
-  if (d.maxModelLen != null) args.push('--max-model-len', String(Math.trunc(toNumber(d.maxModelLen) ?? 0)));
-  if (d.maxNumSeqs != null) args.push('--max-num-seqs', String(Math.trunc(toNumber(d.maxNumSeqs) ?? 0)));
+  // Cleared fields arrive as `''`, which `toNumber` reports as null — and vLLM rejects both flags
+  // at zero (`max_num_seqs: Input should be greater than or equal to 1`), so a value that is not a
+  // positive integer is left out rather than written as `0`. The crash this prevents costs a paid
+  // container that boots, fails to bind port 8000, and serves nothing.
+  const maxModelLen = toInteger(toNumber(d.maxModelLen));
+  if (maxModelLen != null && maxModelLen > 0) args.push('--max-model-len', String(maxModelLen));
+  const maxNumSeqs = toInteger(toNumber(d.maxNumSeqs));
+  if (maxNumSeqs != null && maxNumSeqs > 0) {
+    args.push('--max-num-seqs', String(maxNumSeqs));
+  } else {
+    // vLLM's own default is 1024 sequences per step, and on a hybrid model (linear-attention
+    // layers hold one fixed-size recurrent state per sequence) that default can exceed the Mamba
+    // cache blocks the card can hold and kill the engine at startup: "max_num_seqs (1024) exceeds
+    // available Mamba cache blocks (681)". The fit above already says how many sessions this
+    // deployment is being asked to hold, so a blank field means that figure rather than 1024.
+    const estimatedSeqs = toInteger(toNumber(sizingObj.max_num_seqs_effective));
+    if (estimatedSeqs != null && estimatedSeqs > 0) args.push('--max-num-seqs', String(estimatedSeqs));
+  }
   args.push('--gpu-memory-utilization', String(utilization));
   if (gpuCount > 1) args.push('--tensor-parallel-size', String(gpuCount));
   args.push('--host', '0.0.0.0', '--port', String(servingPort));
@@ -2524,6 +2547,7 @@ export function deploymentBundle(draft, sizing, catalog) {
     `    gpu=${pyString(gpuCount > 1 ? `${bundleGpuId}:${gpuCount}` : bundleGpuId)},`,
     `    scaledown_window=${clamp.seconds},`,
     `    startup_timeout=900,`,
+    `    timeout=60 * 60,`,
     `    volumes={"/root/.cache/huggingface": hf_cache},`,
     ...(gated ? [`    secrets=[modal.Secret.from_name(${pyString(secretName)})],`] : []),
     ')',
@@ -2657,7 +2681,7 @@ export function deploymentBundle(draft, sizing, catalog) {
   const serveSurface = mode === 'batch'
     ? [
       '@modal.concurrent(max_inputs=BATCH_SIZE)',
-      '@modal.web_server(port=8000, requires_proxy_auth=True)',
+      '@modal.web_server(port=8000, startup_timeout=1200, requires_proxy_auth=True)',
       'def serve():',
       '    # vLLM owns VLLM_PORT and the assembler owns 8000; Modal proxies 8000 at the app URL.',
       '    subprocess.Popen(["vllm", "serve", *VLLM_ARGS])',
@@ -2668,11 +2692,15 @@ export function deploymentBundle(draft, sizing, catalog) {
       '',
     ]
     : [
-      '@modal.web_server(port=8000, requires_proxy_auth=True)',
+      '@modal.concurrent(max_inputs=MAX_INPUTS)',
+      '@modal.web_server(port=8000, startup_timeout=1200, requires_proxy_auth=True)',
       'def serve():',
       '    # vLLM owns port 8000; Modal proxies it at the app\'s *.modal.run URL.',
-      '    process = subprocess.Popen(["vllm", "serve", *VLLM_ARGS])',
-      '    process.wait()',
+      // Spawn the server and return: a serve() that blocks on the child is not how a
+      // @modal.web_server function reports readiness, and the container then never receives
+      // a forwarded request. vLLM outlives this function for as long as Modal keeps the
+      // container (scaledown_window), and dies with it.
+      '    subprocess.Popen(["vllm", "serve", *VLLM_ARGS])',
       '',
     ];
 
@@ -2703,10 +2731,20 @@ export function deploymentBundle(draft, sizing, catalog) {
     'vllm_image = (',
     '    modal.Image.debian_slim(python_version="3.12")',
     `    .pip_install("vllm==${version}")`,
-    '    .env({"HF_HOME": "/root/.cache/huggingface", "VLLM_USE_V1": "1"})',
+    // vLLM 0.24's sampler JIT-compiles a flashinfer kernel even in text-only mode, and this image
+    // has no CUDA toolkit (`Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't
+    // exist`), which kills the engine while it profiles. The sampler is optional; the flag off.
+    '    .env({"HF_HOME": "/root/.cache/huggingface", "VLLM_USE_V1": "1", "VLLM_USE_FLASHINFER_SAMPLER": "0"})',
     ')',
     '',
     ...batchConstants,
+    ...(mode === 'batch' ? [] : [
+      '# Modal admits one input per container by default, and a second simultaneous request then',
+      '# starts a second GPU container rather than queueing in the one already warm. vLLM queues',
+      '# inside its own server, so this container admits the traffic instead of paying per caller.',
+      'MAX_INPUTS = 32',
+      '',
+    ]),
     'VLLM_ARGS = [',
     ...argLines,
     ']',

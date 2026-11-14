@@ -259,7 +259,7 @@ one-second timeout shipped the two requests that had arrived after that second. 
 `ast.parse`s for both a batch and a streaming bundle.
 
 **What has actually been exercised.** The workspace suite is green — 1 904 passed, 0 failed, 4
-ignored (`cargo test --workspace`) — the panel suite is green (371 tests, `node --test
+ignored (`cargo test --workspace`) — the panel suite is green (374 tests, `node --test
 panel/test/*.test.mjs`), and — the part that matters most — a second
 conductor built from this tree was driven over a socket on `127.0.0.1:20999` with its own config and
 state directories, through the real sequence: catalog → probe → create account → create deployment →

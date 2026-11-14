@@ -134,8 +134,17 @@ pub fn modal_app_name(shape: DeploymentShape<'_>) -> String {
     format!("manarouter-{}", app_slug(shape))
 }
 
-/// The stable part of the app name: `rental-<account>-<repo-name>-<mode>-<card>`, at most 64
-/// characters.
+/// The prefix [`modal_app_name`] puts in front of the slug.
+pub const APP_NAME_PREFIX: &str = "manarouter-";
+
+/// Modal's own limit: a name must be shorter than 64 characters. The margin is deliberate — a
+/// name of exactly 64 is rejected, and the limit is measured on the finished app name, not the
+/// slug. A long account and repository once produced a 79-character name and `modal deploy`
+/// refused it.
+pub const APP_NAME_MAX: usize = 63;
+
+/// The stable part of the app name: `rental-<account>-<repo-name>-<mode>-<card>`, short enough
+/// that [`modal_app_name`] stays inside [`APP_NAME_MAX`].
 ///
 /// Provider ids use this shape too (`Provider::id` is built from it in the conductor), so one
 /// string identifies both the provider and the Modal app. Truncation eats the account/repository
@@ -144,7 +153,7 @@ pub fn app_slug(shape: DeploymentShape<'_>) -> String {
     let name = shape.repo.rsplit('/').next().unwrap_or(shape.repo);
     let head = format!("rental-{}-{}", slugify(shape.account_id), slugify(name));
     let suffix = shape.suffix();
-    let room = 64usize.saturating_sub(suffix.len());
+    let room = APP_NAME_MAX.saturating_sub(APP_NAME_PREFIX.len() + suffix.len());
     let mut slug = head;
     if slug.len() > room {
         slug.truncate(room);
@@ -883,6 +892,17 @@ impl RentalDeployment {
                 ));
             }
         }
+        if let Some(seqs) = self.max_num_seqs {
+            if seqs == 0 {
+                // vLLM refuses `--max-num-seqs 0` at argument validation
+                // (`Input should be greater than or equal to 1`) and the container then never
+                // binds its port, so the deployment pays for a boot that serves nothing.
+                out.push((
+                    "max_num_seqs".to_string(),
+                    "max_num_seqs must be at least 1; omit it to let vLLM choose".to_string(),
+                ));
+            }
+        }
         if let Some(cooldown) = self.shutdown_cooldown_secs {
             let range = crate::gpu::catalog::modal_scaledown_window();
             if cooldown < range.min_seconds || cooldown > range.max_seconds {
@@ -1404,6 +1424,23 @@ mod tests {
     }
 
     #[test]
+    fn zero_max_num_seqs_is_a_problem_because_vllm_refuses_it_at_startup() {
+        // Recorded in the wild: `--max-num-seqs 0` fails vLLM's own argument validation
+        // ("Input should be greater than or equal to 1"), so the container never binds its port
+        // and Modal reports a startup timeout on a paid GPU. None means "let vLLM choose".
+        let mut d = RentalDeployment::new("a", "org/repo", "L40S");
+        d.max_num_seqs = Some(1);
+        assert!(d.problems().is_empty(), "{:?}", d.problems());
+        d.max_num_seqs = Some(0);
+        let problems = d.problems();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].0, "max_num_seqs");
+        assert!(problems[0].1.contains("at least 1"), "{:?}", problems[0]);
+        d.max_num_seqs = None;
+        assert!(d.problems().is_empty());
+    }
+
+    #[test]
     fn a_card_that_cannot_run_the_quant_is_a_hardware_problem_not_a_form_error() {
         // T4 tops out at compute capability 7.5, below the 8.9 that native FP8 GEMM needs.
         let mut d = RentalDeployment::new("a", "org/repo", "T4");
@@ -1615,7 +1652,15 @@ mod tests {
             gpu_count: 4,
         };
         let slug = app_slug(shape);
-        assert!(slug.len() <= 64, "`{slug}` is {} characters", slug.len());
+        let app = modal_app_name(shape);
+        // Modal measures the limit on the finished name, prefix included: a 64-character name is
+        // rejected outright, and a long account and repository once produced a 79-character one.
+        assert!(
+            app.len() < 64,
+            "`{app}` is {} characters and Modal will refuse it",
+            app.len()
+        );
+        assert!(app.starts_with(APP_NAME_PREFIX), "got `{app}`");
         assert!(slug.ends_with("-batch-rtx-pro-6000-x4"), "got `{slug}`");
         assert!(!slug.contains("--"));
     }
