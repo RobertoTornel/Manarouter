@@ -129,7 +129,19 @@ pub const SNAPSHOT_MAGIC: [u8; 8] = *b"MROUTES1";
 /// instead of "no such model" — a typo and a checkbox need different fixes. A v9 frame carries no
 /// such list, so a hidden model would be reported as nonexistent; rebuilding from authored config
 /// is the only way to recover it.
-pub const SNAPSHOT_VERSION: u32 = 10;
+///
+/// Version 22 adds the capability tags for audio translation, image editing and variations,
+/// moderation, video, realtime, the vector-store/container/fine-tuning/eval management surfaces and
+/// Search (tags 11 through 21). A v10 reader that reached one of those records would fail inside
+/// the tag decoder with only a byte offset to show for it; the version mismatch at the frame header
+/// makes it reject the whole snapshot and rebuild from authored config instead.
+///
+/// The constant is deliberately kept **greater than every capability tag**, not merely one past the
+/// previous version. That keeps the header check a complete guard for readers of this build too: a
+/// capability appended later without a version bump would otherwise pass the header and fail only
+/// when the decoder reached its tag. The test `the_snapshot_version_stays_ahead_of_every_capability_tag`
+/// enforces the invariant.
+pub const SNAPSHOT_VERSION: u32 = 22;
 
 /// Current on-disk database schema version.
 ///

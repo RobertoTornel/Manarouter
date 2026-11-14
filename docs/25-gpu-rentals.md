@@ -431,7 +431,7 @@ Every dollar figure the batch lane reports is a report. A report does not stop a
 also carry a ceiling:
 
 ```json
-{"input_file_id": "file-…", "endpoint": "/v1/chat/completions",
+{"input_file_id": "file_…", "endpoint": "/v1/chat/completions",
  "completion_window": "24h", "max_cost_usd": 2.50}
 ```
 
@@ -493,8 +493,11 @@ still sending a valid upload. A form with no `file` part is refused with `invali
 so is a second `file` part — one upload is one file.
 
 The filename is metadata. It is recorded next to the file id and is never used to open a path, so a
-name containing `../` cannot reach outside the state directory. `purpose` must be `batch`; the refusal
-names the purpose it got, because `fine-tune` is the mistake people make.
+name containing `../` cannot reach outside the state directory. `purpose` may be `batch`,
+`fine-tune`, or absent, which the lane treats as `batch`; any other value is refused with
+`invalid_request_error` naming the purpose it got. A `fine-tune` file is stored exactly like a batch
+file — same bytes, same 32 MiB cap — and is staged to a trainer by the fine-tuning job rather than by
+this lane.
 
 Both shapes were exercised against the running relay with the same input file, and the result of the
 form upload was read back from `/v1/files/{id}/content` byte for byte, which is the only way to know
@@ -528,6 +531,28 @@ between a batch delaying an interactive request by one item and an interactive r
 operator a killed generation. The lane picks the first, and an operator who wants interactive traffic
 always to win lowers the worker count rather than trusting a scheduler this build does not have.
 
+## 13. Fine-tuning on the same card
+
+Serving and fine-tuning are two apps, not two modes of one. The reference trainer in
+[deploy/modal-finetune/](../deploy/modal-finetune/README.md) is a single Modal app on the same
+`RTX-PRO-6000` string — 96 GB at $3.0312/hr per container, the same card §1 describes — but its
+container trains instead of serving: `transformers`, `peft` and `trl` on a `modal.Volume` at
+`/state`, with `@modal.concurrent(max_inputs=1)` and a 30-minute startup allowance. It declares
+itself as a `modal-vllm` provider with `capabilities: ["fine-tuning", "chat", "models"]`, so the relay
+routes `POST /v1/fine_tuning/jobs`, the job by id, its `events` and `checkpoints`, and `pause`,
+`resume`, `cancel` to it, and stages a training file uploaded to the relay's own store as multipart
+with `purpose=fine-tune`. What it does not do is serve chat and train at once: chat is refused with
+`409` while a job is active and the model cache is evicted when a new job starts, which is the honest
+shape for a card that cannot hold both.
+
+Two constraints belong here because they are easy to forget when the numbers look cheap. The hourly
+rate is per container that is *running*; an idle deployment costs nothing after `scaledown_window`,
+which is why `modal app list` is the spend check and why the cost line in §10 is about a batch, not
+about a fleet. And the app has never been deployed: its 61 tests run CPU-only against stubs, so the
+code is a design that compiles, not a training run with a measured duration. A first real job is
+where the per-step time, the memory headroom on a 1.5B base model, and the volume's throughput become
+facts rather than estimates.
+
 ## See also
 
 - [research/ARCHITECTURE-gpu-rentals.md](research/ARCHITECTURE-gpu-rentals.md) — the frozen interface:
@@ -542,3 +567,5 @@ always to win lowers the worker count rather than trusting a scheduler this buil
 - [research/huggingface-discovery.md](research/huggingface-discovery.md) — anonymous metadata,
   gated detection, and the `base_model` workaround.
 - [research/requantize-recipes.md](research/requantize-recipes.md) — the commands behind §4.2.
+- [deploy/modal-finetune/README.md](../deploy/modal-finetune/README.md) — the reference fine-tuning
+  server: routes, state layout, environment, deployment, and its own limitations.

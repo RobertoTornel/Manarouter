@@ -43,6 +43,46 @@ The **Models** view distinguishes discovered from hand-entered metadata explicit
 must never overwrite what a human typed. If the two ever disagreed and the panel did not say which
 was which, the operator would have no way to know why their edit vanished.
 
+### The capability editor
+
+The provider form carries a fieldset of twenty-two checkboxes, one per client surface the provider is
+allowed to serve, under four group headings — Text, Audio, Images and video, Other. What is ticked
+here is what the relay's capability gate reads: a route whose capability no step declares is refused
+with `404 unsupported_endpoint` before anything is dialled (`docs/29-openai-surface.md`). The
+checkboxes are therefore the difference between a provider that serves one family and one that
+merely tolerates being asked.
+
+A new provider starts at `chat, models`, which is the same pair `Provider::capabilities` defaults to
+in `crates/mr-core/src/model.rs`; the four single-family templates in `catalog/providers.toml`
+(`fish-audio`, `elevenlabs`, `deepgram`, `stability-ai`) fill in their own set from a preset. Unticking
+every box is refused inline on the attempt that would have saved it, with the message naming the
+field, rather than being written as an empty list that nothing can route to. The same form is used to
+edit, and the provider drawer shows the declared list as a row, so an operator can see at a glance
+that a provider speaks audio and nothing else.
+
+The panel's spellings are the kebab-case ones the configuration file and the snapshot use
+(`audio-transcription`), while the relay logs the dotted ones (`audio.transcription`); both parse,
+because `Capability::parse` accepts either and the CLI's `--capability` choices are generated from the
+same enum. A test in `panel/test/capabilities.test.mjs` pins the panel's twenty-two ids, and their
+order, against `Capability::ALL`, so a variant added to the enum without a checkbox fails CI instead
+of silently defaulting a provider to no capability at all.
+
+The fieldset itself does not grey anything out: all twenty-two boxes are tickable whatever dialect is
+selected, and a capability the chosen dialect cannot express is refused by the validator on save with
+a message naming the capability and the dialect — `the Anthropic Messages dialect has no
+images.generations endpoint`. Keeping the rule in one place
+(`Provider::dialect_mismatches` in `crates/mr-core/src/model.rs`, exhaustive over `Capability`) is what
+stops the panel's idea of what a dialect serves from drifting away from the binary's. Every preset
+carries a list the validator accepts, and a test pins each preset that names a catalogue provider to
+that provider's own list, so the two cannot drift apart in silence.
+
+Five presets are labelled more briefly than the catalogue names them, so the test carries an explicit
+name-to-id map for those: Google Gemini is `gemini`, Codex is `openai-codex`, Copilot is
+`github-copilot`, Antigravity is `antigravity` and Z Code is `zcode`. The map pins their capability
+lists, not their base URLs, because those hosts are chosen by the OAuth flow rather than typed by the
+operator. Only Custom and Modal vLLM have no catalogue entry to compare against; Custom is deliberately
+empty, and Modal vLLM declares the pair its deployed app actually serves.
+
 ### Paging and bulk model actions
 
 The Models filters are applied before anything is drawn: provider, source, a case-insensitive

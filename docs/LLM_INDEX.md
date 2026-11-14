@@ -63,6 +63,13 @@ measured baseline of an existing Javascript router on the development machine �
 | Add a dialect or translator | `crates/mr-dialects/src/lib.rs`, `docs/24-provider-dialects.md`, `docs/18-api-reference.md` |
 | Connect Cursor, or answer "can we route to Cursor?" | `docs/providers/cursor.md` — Cursor is a client of the relay, not a provider; the protocol record is `docs/research/cursor-cli-inference.md` |
 | Work on the batch lane (`/v1/files`, `/v1/batches`) | `crates/manarouter-relay/src/batch.rs` (the whole lane, in one module), `docs/18-api-reference.md` §"The batch lane" for the wire contract, `docs/25-gpu-rentals.md` §2, §10, §11 and §12 for why it is shaped that way |
+| Add, change or refuse an OpenAI endpoint | `docs/29-openai-surface.md` first — it says whether the route is proxied, served here, or refused, and why; then `docs/18-api-reference.md` for the wire shape, `crates/manarouter-relay/src/server.rs` (`router`, `route_kind_for`, `default_path`) and the module that owns it |
+| Work on stored responses (`/v1/responses/{id}`) | `crates/manarouter-relay/src/responses.rs` |
+| Work on uploads (`/v1/uploads`) | `crates/manarouter-relay/src/uploads.rs` |
+| Work on vector stores or retrieval (`/v1/vector_stores`, `POST /v1/search`) | `crates/manarouter-relay/src/vector_stores.rs` |
+| Work on the realtime websocket | `crates/manarouter-relay/src/realtime.rs` |
+| Work on evals (`/v1/evals`) | `crates/manarouter-relay/src/evals.rs` |
+| Work on fine-tuning | `docs/29-openai-surface.md` §fine-tuning, the fine-tuning routes and training-file staging in `crates/manarouter-relay/src/server.rs`, and the reference trainer in `deploy/modal-finetune/` |
 | Change combo behaviour | `docs/06-combos.md`, `docs/07-hedged-race.md`, `crates/mr-core/src/model.rs` |
 | Work on the hedged race | `docs/07-hedged-race.md` — read all of it; the semantics are counterintuitive |
 | Change account/key selection | `docs/05-key-selection.md`, `crates/mr-core/src/dialect.rs` (`KeyStrategy`) |
@@ -70,7 +77,7 @@ measured baseline of an existing Javascript router on the development machine �
 | Add an OAuth platform | `docs/14-oauth-adding-a-platform.md`, `docs/omniroute-reference.md` |
 | Touch credentials or secrets | `docs/21-security.md` — read before writing any code |
 | Change the configuration schema | `docs/03-configuration.md` §1 first — unknown-key preservation is mandatory |
-| Change the snapshot format | `docs/04-routing-snapshot.md` — a format change requires a version bump; the current version is **8** |
+| Change the snapshot format | `docs/04-routing-snapshot.md` — a format change requires a version bump; the current version is **22**, which is the highest capability tag plus one (`crates/mr-core/src/lib.rs`) |
 | Change model naming, reasoning levels, or `/v1/models` | `docs/18-api-reference.md` §"Model addressing", `docs/04-routing-snapshot.md` §5-§7, `crates/mr-core/src/snapshot.rs` (`compile`, `explain_miss`) |
 | Work on the panel | `docs/15-web-panel.md`, `docs/01-architecture.md` §5 |
 | Migrate from OmniRoute | `docs/17-migrating-from-omniroute.md` |
@@ -460,7 +467,8 @@ trigger.
     { "path": "docs/21-security.md", "purpose": "Threat model, the vault, cookie prohibition, ToS posture", "read_when": "before writing credential code" },
     { "path": "docs/22-sync-design.md", "purpose": "The intended cross-instance sync design; v1 implements nothing", "read_when": "touching ids, revisions or tombstones" },
     { "path": "docs/23-implementation-status.md", "purpose": "What actually runs today, with the command that checks each claim", "read_when": "before claiming a feature is implemented" },
-    { "path": "docs/24-provider-dialects.md", "purpose": "The ten wire dialects: what each upstream speaks, which client routes reach it, and what the relay translates", "read_when": "adding a dialect or tracing a translation" },
+    { "path": "docs/24-provider-dialects.md", "purpose": "The eleven wire dialects: what each upstream speaks, which client routes reach it, and what the relay translates", "read_when": "adding a dialect or tracing a translation" },
+    { "path": "docs/29-openai-surface.md", "purpose": "The OpenAI-compatible surface as a whole: which routes are proxied, served here or refused, the capability gate that decides it, and what each family does", "read_when": "adding, changing or debugging a route, or explaining why one is refused" },
     { "path": "docs/combo-cookbook.md", "purpose": "Copy-pasteable combo configurations for common goals", "read_when": "building a combo" },
     { "path": "docs/credits.md", "purpose": "Attribution for the quota fetchers derived from OmniRoute", "read_when": "checking licensing or provenance" },
     { "path": "docs/providers/README.md", "purpose": "How the provider catalogue works and how to add an entry", "read_when": "adding a provider" },

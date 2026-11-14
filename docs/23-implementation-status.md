@@ -105,6 +105,51 @@ discarded and the account became unusable, in the reference as well as here. The
 interactive re-login and nothing in the repository can repair it. See
 [the Codex "move, not a copy" warning](17-migrating-from-omniroute.md#warning-for-codex-this-is-a-move-not-a-copy).
 
+### 1.1 The OpenAI-compatible surface — mounted, gated, and tested without a provider
+
+`docs/29-openai-surface.md` classifies every route of the OpenAI-compatible API this project serves:
+which family answers locally, which is proxied, and which is refused because there is nothing honest
+to answer it with. The short form, with the evidence:
+
+| Family | Routes | What answers | Tests |
+|---|---|---|---|
+| Text | `/v1/chat/completions`, `/v1/responses` and its four sub-routes, `/v1/messages`, `count_tokens` | proxied through the step loop; Responses and Anthropic are translated per dialect | 196 in `server::tests` |
+| Models | list, retrieve, delete | the compiled snapshot; nothing is forwarded | same |
+| Audio | speech, transcriptions, translations | proxied, multipart forwarded as multipart | same |
+| Realtime | `/v1/realtime` (WebSocket), `client_secrets`, `calls` | proxied; the socket is pumped frame by frame, not buffered | 18 in `realtime::tests` |
+| Images, video, embeddings, moderations | the ten generation and inspection paths | proxied | `server::tests` |
+| Files and uploads | `/v1/files` (+ content), `/v1/uploads` (+ parts, complete, cancel) | local state under `state_dir()` | 25 in `batch::tests`, 12 in `uploads::tests` |
+| Batches | submit, list, retrieve, cancel | the lane, dispatching each item through the ordinary request path | 25 in `batch::tests` |
+| Vector stores and search | the seven store routes plus `/v1/search` | local chunks and cosine ranking; the embedding call goes through the relay's own `/v1/embeddings` | 31 in `vector_stores::tests` |
+| Stored responses | retrieve, delete, cancel, input items | local, recorded from the proxied answer when the client asked for it | 13 in `responses::tests` |
+| Fine-tuning | jobs, pause/resume/cancel, events, checkpoints | proxied; `training_file`/`validation_file` are staged to the provider first | `server::tests` |
+| Evals | definitions and runs | local; a run dispatches each item through the relay and grades locally (`string_check`) or with a grader model (`label_model`) | 22 in `evals::tests` |
+| Containers | create, list, retrieve, delete | **refused** with `501 unsupported_endpoint`, unless a provider declares `containers` | `server::tests` |
+
+The gate is the part that makes small providers usable. A route that needs a model resolves a step
+and asks whether that step's provider declares the capability the route needs — 22 `Capability`
+variants against 19 `RouteKind`s — and when none does, the answer is `404 unsupported_endpoint`
+naming the route and the capability (`crates/manarouter-relay/src/server.rs:2042-2053`). A provider
+that offers only speech, or only embeddings, therefore works for exactly those routes instead of
+failing at translation time on a shape it never promised. Families that answer from local state —
+files, uploads, batches, evals, stored responses and the vector-store routes themselves — need no
+provider and consult no capability. The one outbound call a vector store makes is the embedding
+request the store's text requires, and that is resolved to a provider declaring `Embeddings`
+(`crates/manarouter-relay/src/vector_stores.rs:1804-1828`).
+
+Two tests hold the registration together. `the_documented_route_list_is_the_one_registered` asks the
+**mounted** router for all 51 documented paths and fails on axum's own empty 404, so a path in
+`docs/18-api-reference.md` that nothing mounts is a test failure rather than a client's mystery;
+`no_path_is_registered_twice` calls `router(state)`, because a duplicate registration panics inside
+`Router::merge` and would otherwise be a startup crash discovered in production.
+
+The fine-tuning staging path is the one piece with a seam worth naming: the body shaper's signature
+returns `Bytes`, not a `Result`, so it cannot refuse a request. When the upload it makes fails, it
+logs the reason and forwards the job still naming the local file id — the provider then refuses the
+job on a file it cannot resolve, and that refusal is the truthful one. An id the relay does not hold
+is passed through untouched for the same reason: it may be a file the client uploaded straight to the
+provider.
+
 ## 2. What running it found
 
 Reading the code did not find these; starting the binary did.
@@ -422,9 +467,39 @@ accounts came back; those lanes and the shared `lane_vault.rs` helper were remov
 never used it — its credential is the `kaggle` CLI's own login, not a lane secret — so no lane
 credential is stored today. [26-gpu-lanes.md](26-gpu-lanes.md) §9 records the removal.
 
-Test totals: `cargo test -p manarouter-conductor --lib` → 23 `gpu_api` tests, 11 Kaggle (all
-passing). `cargo test --workspace --lib` → 1 661 passing. `node --test panel/test/*.test.mjs` → 334
-passing.
+Test totals on this revision: `cargo test -p manarouter-conductor --lib` → 38 `gpu_api` tests and
+11 Kaggle tests, all passing. `cargo test --workspace --lib` → 1 936 passing; `cargo test
+--workspace` → 2 040 passing with 4 ignored (the reference-vault refresh test and three quota
+doctests marked `no_run`). `node --test panel/test/*.test.mjs` → 381 passing and
+`node --test panel-lab/test/*.test.mjs` → 334 passing.
+
+The gate for the OpenAI surface work was `cargo fmt --all -- --check`, `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo test --workspace`, and the two Node suites above, all clean on
+this tree. The release-profile run, the installer test and `tests/smoke_e2e.py` listed in §1 were not
+re-run for it; nothing in this work touches installation or the serving path's startup.
+
+### 4.2 What the OpenAI surface guarantees, and how each guarantee is held
+
+Five properties are worth stating because each one is a place where a plausible implementation would
+have lied:
+
+* **A batch item is not a bypass.** Every item is dispatched through `attempt_step`, so routing,
+  dialect translation, account selection, cooldowns, fallbacks and the capability gate all apply. A
+  batch cannot reach a provider that a live request could not.
+* **A failed fine-tuning upload stays failed.** The job is forwarded naming the local id and the
+  provider's refusal is returned; the relay never substitutes an id it did not receive, and never
+  reports a job as started when no file reached the trainer.
+* **A stored response is only stored when it is whole.** `asked_to_store` reads the request for
+  `store: true`; `record_while_streaming` records on a clean end of stream and on nothing else, so a
+  client that hangs up, an answer that overflows 8 MiB, and an upstream error leave no record — a
+  truncated stored response would be a lie the next reader could not detect.
+* **A file's name never becomes a path.** File and part paths are derived from relay-minted ids; the
+  client's filename is metadata copied into the record and echoed back in the file object, so a name
+  containing `../` cannot address anything outside the state directory
+  (`crates/manarouter-relay/src/batch.rs:2360-2361`).
+* **`/v1/search` is decided before anything is looked up.** A body naming `model` is handed to
+  `dispatch_internal` byte for byte, so the gate answers exactly as it would for a socket request; a
+  body without one is local retrieval and must name a store. `model` wins when both are present.
 
 ## 5. Claims that remain unverified or false
 
@@ -442,6 +517,18 @@ passing.
 * That all mock fault fields are effective: control and request-local patch endpoints are wired, but
   a subset of fault knobs still needs implementation/coverage.
 * That the latency budget is enforced. `tools/bench/` has a harness that fails over budget, but it is deliberately not a CI gate.
+* That any family added for OpenAI surface parity has been exercised against a live vendor. Every
+  test behind §1.1 uses a fake upstream or a local socket, so what is verified is the wire shape —
+  paths, bodies, status codes — not any provider's acceptance of it. The realtime pump has never
+  carried a real audio session; the fine-tuning staging path has never been pointed at a real
+  provider's file API; no eval run has been graded by a real grader model; and
+  `deploy/modal-finetune/` (61 tests) has never been deployed, so the reference trainer is a design
+  that compiles, not a training run that happened. Each of those is a live test away, and the honest
+  reading of the current state is "the route is mounted and its shape is pinned", not "the feature
+  works end to end".
+* That vector-store retrieval has been measured. Chunking is character-based (a named limitation in
+  `crates/manarouter-relay/src/vector_stores.rs`), scores are cosine in `[-1, 1]` rather than
+  OpenAI's scale, and no store has been filled at a size where the linear scan would matter.
 * That the panel's hedge editor round-trips through the backend **in a browser**. The wire form is
   now correct and pinned twice: `panel/format.js` (`parseWinnerFail`/`buildWinnerFail`) emits and
   accepts the internally tagged shape (`{"mode":"rerun-excluding","max_rounds":2}`) that

@@ -155,6 +155,156 @@ pub fn scan_request_head(body: &[u8]) -> RequestHead {
     out
 }
 
+/// The `boundary` parameter of a `multipart/form-data` content type.
+///
+/// Returns `None` for any other media type, and for a multipart type with no usable boundary —
+/// in both cases there is nothing to scan and the body is forwarded exactly as the client sent it.
+/// The value is used only to search for delimiters in the body, never to construct a header, but
+/// it is still bounded because a pathological content type should cost a constant amount of work.
+pub fn multipart_boundary(content_type: &str) -> Option<&str> {
+    let (media_type, parameters) = content_type.split_once(';')?;
+    if !media_type
+        .trim()
+        .eq_ignore_ascii_case("multipart/form-data")
+    {
+        return None;
+    }
+    for parameter in parameters.split(';') {
+        let Some((name, value)) = parameter.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("boundary") {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(value);
+        return (!value.is_empty() && value.len() <= 200).then_some(value);
+    }
+    None
+}
+
+/// Locate the `model` form field in a `multipart/form-data` body.
+///
+/// The audio and image endpoints take their parameters as form fields rather than JSON keys, so
+/// the JSON scanner has nothing to read. This walks the multipart framing only far enough to find
+/// the part whose `Content-Disposition` name is `model`, and returns the byte range of its value
+/// **inside the original body**. The body is never re-encoded: everything the client sent,
+/// boundary and binary payload included, is forwarded upstream untouched.
+///
+/// The scan is deliberately forgiving about the framing (transport padding, a preamble, an
+/// unquoted `name=model`) and unforgiving about the value: a part with no disposition name, or a
+/// `model` part with an empty value, is not a route. Malformed framing yields `None`, which leaves
+/// the request to fail with the same "no readable model field" a JSON body without a model gets.
+pub fn scan_multipart_model(body: &[u8], boundary: &str) -> Option<Range> {
+    use memchr::memmem;
+
+    let mut delimiter = Vec::with_capacity(boundary.len() + 2);
+    delimiter.extend_from_slice(b"--");
+    delimiter.extend_from_slice(boundary.as_bytes());
+    let mut content_marker = Vec::with_capacity(delimiter.len() + 2);
+    content_marker.extend_from_slice(b"\r\n");
+    content_marker.extend_from_slice(&delimiter);
+
+    let mut pos = 0;
+    while let Some(found) = memmem::find(&body[pos..], &delimiter) {
+        let start = pos + found;
+        // A delimiter only counts at the start of a line. Without this, a boundary string that
+        // happened to occur inside a file's bytes would be mistaken for framing.
+        if start > 0 && body[start - 1] != b'\n' {
+            pos = start + delimiter.len();
+            continue;
+        }
+        let mut cursor = start + delimiter.len();
+        // The closing delimiter ends the body; no part after it can carry the model.
+        if body.get(cursor..cursor + 2) == Some(b"--") {
+            return None;
+        }
+        // Transport padding is legal after a delimiter and before the line break.
+        while matches!(body.get(cursor), Some(b' ' | b'\t')) {
+            cursor += 1;
+        }
+        if body.get(cursor..cursor + 2) == Some(b"\r\n") {
+            cursor += 2;
+        } else if body.get(cursor) == Some(&b'\n') {
+            cursor += 1;
+        } else {
+            pos = cursor;
+            continue;
+        }
+
+        // `cursor` is now the first header byte. The blank line ends the header block; a part
+        // with no headers at all starts with that blank line.
+        let headers_end = memmem::find(&body[cursor..], b"\r\n\r\n").map(|i| cursor + i);
+        let headers_end = headers_end?;
+        let headers = &body[cursor..headers_end];
+        let content_start = headers_end + 4;
+        // The part's content ends at the CRLF that precedes the next delimiter. Searching for
+        // that exact sequence rather than a bare CRLF keeps the value correct even when the
+        // payload itself contains line breaks (a JSON or text attachment, for instance).
+        let content_end =
+            memmem::find(&body[content_start..], &content_marker).map(|i| content_start + i);
+        let content_end = content_end?;
+
+        if headers_carry_model_field(headers) {
+            let mut value_start = content_start;
+            let mut value_end = content_end;
+            while value_start < value_end && body[value_start].is_ascii_whitespace() {
+                value_start += 1;
+            }
+            while value_end > value_start && body[value_end - 1].is_ascii_whitespace() {
+                value_end -= 1;
+            }
+            return (value_start < value_end).then_some(Range {
+                start: value_start,
+                end: value_end,
+            });
+        }
+        // Continue after this part's content, so a delimiter inside a file cannot be mistaken
+        // for the start of the next part.
+        pos = content_end;
+    }
+    None
+}
+
+/// Whether a part's header block names the `model` form field.
+fn headers_carry_model_field(headers: &[u8]) -> bool {
+    for line in headers.split(|b| *b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|b| *b == b':') else {
+            continue;
+        };
+        let (name, value) = line.split_at(colon);
+        if !name
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"content-disposition")
+        {
+            continue;
+        }
+        let Ok(value) = std::str::from_utf8(&value[1..]) else {
+            return false;
+        };
+        for parameter in value.split(';').skip(1) {
+            let Some((name, value)) = parameter.split_once('=') else {
+                continue;
+            };
+            if !name.trim().eq_ignore_ascii_case("name") {
+                continue;
+            }
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or(value);
+            return value == MODEL_KEY;
+        }
+        return false;
+    }
+    false
+}
+
 /// Find a top-level string field in a JSON object body.
 ///
 /// Returns the byte range of the **decoded** value only when no escape sequences are present, and
@@ -981,5 +1131,139 @@ mod tests {
         body.extend(std::iter::repeat_n(b'x', 200_000));
         body.extend_from_slice(br#""}],"model":"big-model"}"#);
         assert_eq!(model_of(&body).as_deref(), Some("big-model"));
+    }
+
+    // --- The multipart scan ------------------------------------------------------------------
+    //
+    // The audio and image endpoints take their parameters as form fields, so the model is not a
+    // JSON key. These pin the two properties the relay depends on: the model is found wherever the
+    // client put it, and the value returned is a range into the body — never a re-encoding of it.
+
+    fn part(boundary: &str, name: &str, value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n")
+                .as_bytes(),
+        );
+        out.extend_from_slice(value);
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    fn body_of(boundary: &str, parts: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, value) in parts {
+            out.extend_from_slice(&part(boundary, name, value));
+        }
+        out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        out
+    }
+
+    #[test]
+    fn a_multipart_content_type_yields_its_boundary() {
+        assert_eq!(
+            multipart_boundary("multipart/form-data; boundary=abc123"),
+            Some("abc123")
+        );
+        assert_eq!(
+            multipart_boundary("multipart/form-data; boundary=\"abc123\""),
+            Some("abc123")
+        );
+        // Case and spacing are not part of the value, and a parameter may come before or after.
+        assert_eq!(
+            multipart_boundary("Multipart/Form-Data;charset=utf-8; Boundary = abc123"),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn a_content_type_that_is_not_multipart_has_no_boundary() {
+        assert_eq!(multipart_boundary("application/json"), None);
+        // A multipart type with no boundary has nothing to scan for, and the body is forwarded as
+        // the client sent it.
+        assert_eq!(multipart_boundary("multipart/form-data"), None);
+        assert_eq!(multipart_boundary("multipart/form-data; boundary="), None);
+        assert_eq!(
+            multipart_boundary("application/x-www-form-urlencoded"),
+            None
+        );
+        // An empty header (no content type at all) is not an error either.
+        assert_eq!(multipart_boundary(""), None);
+    }
+
+    #[test]
+    fn the_model_is_found_after_a_file_part_with_binary_content() {
+        const BOUNDARY: &str = "x";
+        let binary: &[u8] = &[0xff, 0xd8, 0x00, 0x0a, 0x0d, 0x80];
+        let body = body_of(
+            BOUNDARY,
+            &[
+                ("file", binary),
+                ("language", b"en"),
+                ("model", b"p/whisper"),
+            ],
+        );
+        let range = scan_multipart_model(&body, BOUNDARY).expect("the model part");
+        assert_eq!(&body[range.start..range.end], b"p/whisper");
+        // The body was never rewritten: the range is a view into the client's own bytes.
+        assert_eq!(
+            body.len(),
+            body_of(
+                BOUNDARY,
+                &[
+                    ("file", binary),
+                    ("language", b"en"),
+                    ("model", b"p/whisper")
+                ]
+            )
+            .len()
+        );
+    }
+
+    #[test]
+    fn a_body_with_no_model_part_has_no_model() {
+        const BOUNDARY: &str = "x";
+        let body = body_of(BOUNDARY, &[("file", b"data"), ("language", b"en")]);
+        assert_eq!(scan_multipart_model(&body, BOUNDARY), None);
+        // An empty `model` value is not a route either: the request must fail the same way a JSON
+        // body with no model does, rather than resolve an empty name.
+        let body = body_of(BOUNDARY, &[("model", b"")]);
+        assert_eq!(scan_multipart_model(&body, BOUNDARY), None);
+    }
+
+    #[test]
+    fn a_boundary_string_inside_a_file_is_not_mistaken_for_framing() {
+        const BOUNDARY: &str = "x";
+        // The file's bytes contain the delimiter sequence mid-line, followed by a fake `model`
+        // part. Only a delimiter at the start of a line is framing, so the real model must win.
+        let mut file = Vec::new();
+        file.extend_from_slice(b"before --x\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nnot-a-model\r\n after");
+        let body = body_of(BOUNDARY, &[("file", &file), ("model", b"real-model")]);
+        let range = scan_multipart_model(&body, BOUNDARY).expect("the real model part");
+        assert_eq!(&body[range.start..range.end], b"real-model");
+    }
+
+    #[test]
+    fn a_truncated_multipart_body_has_no_model_rather_than_a_wrong_one() {
+        const BOUNDARY: &str = "x";
+        let full = body_of(BOUNDARY, &[("model", b"p/whisper")]);
+        // Cut inside the value: the part never ends, so there is no model to read.
+        assert_eq!(
+            scan_multipart_model(&full[..full.len() - 6], BOUNDARY),
+            None
+        );
+        // A closing delimiter with no parts at all.
+        assert_eq!(scan_multipart_model(b"--x--\r\n", BOUNDARY), None);
+    }
+
+    #[test]
+    fn an_unquoted_or_uppercase_disposition_name_still_names_the_model() {
+        const BOUNDARY: &str = "x";
+        let body = format!(
+            "--{BOUNDARY}\r\ncontent-disposition: form-data; name=model\r\n\r\np/whisper\r\n--{BOUNDARY}--\r\n"
+        )
+        .into_bytes();
+        let range = scan_multipart_model(&body, BOUNDARY).expect("the model part");
+        assert_eq!(&body[range.start..range.end], b"p/whisper");
     }
 }

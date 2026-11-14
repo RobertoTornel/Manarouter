@@ -360,6 +360,71 @@ pub enum Capability {
     Reasoning = 9,
     /// Image input is accepted (vision).
     Vision = 10,
+    /// `POST /v1/audio/translations`
+    ///
+    /// Translating speech into English text is a separate route from transcribing it in its own
+    /// language: a provider may implement one without the other, and the distinction is what
+    /// stops a transcription-only provider from being offered a translation request it will
+    /// reject only after the audio has been uploaded.
+    AudioTranslation = 11,
+    /// `POST /v1/images/edits`
+    ///
+    /// Editing takes an existing image plus a prompt (and optionally a mask). It is separate from
+    /// generation because the request body is multipart and the upstream may support one route
+    /// without the other.
+    ImagesEdits = 12,
+    /// `POST /v1/images/variations`
+    ///
+    /// Variations take one image and produce alternatives. Providers that edit images do not
+    /// necessarily offer variations, so the panel must be able to tell an operator which of the
+    /// two a given upstream actually serves.
+    ImagesVariations = 13,
+    /// `POST /v1/moderations`
+    Moderations = 14,
+    /// The video job surface: `POST /v1/videos` to submit, `GET /v1/videos/{id}` for status and
+    /// `GET /v1/videos/{id}/content` for the rendered bytes.
+    ///
+    /// One capability covers all three routes because a provider either accepts video jobs or it
+    /// does not; polling and downloading a job it accepted are not separately optional.
+    Video = 15,
+    /// The Realtime API's WebRTC entry points: `POST /v1/realtime/client_secrets` and
+    /// `POST /v1/realtime/calls`.
+    ///
+    /// The websocket upgrade itself is not a route this gateway proxies; these two POSTs are the
+    /// HTTP handshake a client makes before it speaks the realtime protocol.
+    Realtime = 16,
+    /// `/v1/vector_stores` and its files and search sub-resources.
+    ///
+    /// The relay answers this family itself, from its own store
+    /// (`crates/manarouter-relay/src/vector_stores.rs`), so it has no [`RouteKind`] and never
+    /// reaches a provider: retrieval is local and only the embedding call inside it is proxied. The
+    /// capability is therefore a catalogue statement — "this upstream also hosts a vector-store
+    /// family of its own" — and declaring it changes nothing on this relay's request path.
+    VectorStores = 17,
+    /// `/v1/containers` and its files sub-resource.
+    ///
+    /// A management surface like [`Capability::VectorStores`]: the relay refuses the family rather
+    /// than pretending to run a sandbox, so the capability records whether an upstream offers one,
+    /// and a request is proxied only where a step declares it.
+    Containers = 18,
+    /// `/v1/fine_tuning/jobs` and its events and checkpoints sub-resources.
+    ///
+    /// A management surface like [`Capability::VectorStores`], with one difference that matters: a
+    /// provider that declares it really does run the training, and the relay stages the training
+    /// file into that provider's own file namespace before it creates the job.
+    FineTuning = 19,
+    /// `/v1/evals` and its runs and output-items sub-resources.
+    ///
+    /// Served here, like [`Capability::VectorStores`]: an eval is a local record of requests this
+    /// relay made, so there is nothing for a provider to declare and nothing to gate.
+    Evals = 20,
+    /// `POST /v1/search`
+    ///
+    /// Two shapes under one path: a body naming a `model` is proxied to a provider that hosts a
+    /// search endpoint, and a body naming a vector store is answered locally by retrieval. It is
+    /// OpenAI-only as a proxied route in this build: no other dialect here has a search surface, so
+    /// declaring it on one is a configuration error rather than a guess the validator lets through.
+    Search = 21,
 }
 
 impl Capability {
@@ -367,9 +432,9 @@ impl Capability {
     ///
     /// This is **not** the configuration or panel wire form. Those go through `serde`, whose
     /// `kebab-case` rename produces `audio-transcription`, `audio-speech` and
-    /// `images-generations`. The dotted spellings returned here are accepted on input by
-    /// [`Capability::parse`] and appear in validation messages, but are deliberately not what
-    /// gets written to `config.json`.
+    /// `images-generations`. The diagnostic spellings returned here are dotted where the route
+    /// family has a dotted form and hyphenated otherwise; both spellings are accepted on input by
+    /// [`Capability::parse`], but the serde form is what gets written to `config.json`.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Chat => "chat",
@@ -383,6 +448,17 @@ impl Capability {
             Self::ToolCalling => "tool-calling",
             Self::Reasoning => "reasoning",
             Self::Vision => "vision",
+            Self::AudioTranslation => "audio.translation",
+            Self::ImagesEdits => "images.edits",
+            Self::ImagesVariations => "images.variations",
+            Self::Moderations => "moderations",
+            Self::Video => "video",
+            Self::Realtime => "realtime",
+            Self::VectorStores => "vector-stores",
+            Self::Containers => "containers",
+            Self::FineTuning => "fine-tuning",
+            Self::Evals => "evals",
+            Self::Search => "search",
         }
     }
 
@@ -405,29 +481,97 @@ impl Capability {
             "tool-calling" | "tools" | "function-calling" => Self::ToolCalling,
             "reasoning" | "thinking" => Self::Reasoning,
             "vision" | "image-input" => Self::Vision,
+            "audio.translation" | "audio-translation" | "translation" => Self::AudioTranslation,
+            "images.edits" | "images-edits" | "image-edit" => Self::ImagesEdits,
+            "images.variations" | "images-variations" | "image-variation" => Self::ImagesVariations,
+            "moderations" | "moderation" => Self::Moderations,
+            "video" | "videos" | "video-generation" => Self::Video,
+            "realtime" | "real-time" | "realtime-api" => Self::Realtime,
+            "vector-stores" | "vector.stores" | "vector-store" => Self::VectorStores,
+            "containers" | "container" => Self::Containers,
+            "fine-tuning" | "fine.tuning" | "finetuning" => Self::FineTuning,
+            "evals" | "eval" | "evaluations" => Self::Evals,
+            "search" | "web-search" => Self::Search,
             _ => return None,
         })
+    }
+
+    /// The client routes this capability lets a provider serve.
+    ///
+    /// The inverse of [`RouteKind::capability`]. Most capabilities map to exactly one route; the
+    /// video and realtime families map to three and two respectively because the capability is
+    /// what a provider declares while the routes are what a client calls. Three kinds of
+    /// capability return an empty slice: the model features that are not routes at all
+    /// ([`Capability::ToolCalling`], [`Capability::Reasoning`], [`Capability::Vision`]), and the two
+    /// families this relay serves itself from local state ([`Capability::VectorStores`],
+    /// [`Capability::Evals`]).
+    pub const fn routes(self) -> &'static [RouteKind] {
+        match self {
+            Self::Chat => &[RouteKind::ChatCompletions],
+            Self::Responses => &[RouteKind::Responses],
+            Self::Embeddings => &[RouteKind::Embeddings],
+            Self::AudioTranscription => &[RouteKind::AudioTranscription],
+            Self::AudioSpeech => &[RouteKind::AudioSpeech],
+            Self::ImagesGenerations => &[RouteKind::ImagesGenerations],
+            Self::Models => &[RouteKind::Models],
+            Self::Messages => &[RouteKind::Messages, RouteKind::CountTokens],
+            Self::AudioTranslation => &[RouteKind::AudioTranslation],
+            Self::ImagesEdits => &[RouteKind::ImagesEdits],
+            Self::ImagesVariations => &[RouteKind::ImagesVariations],
+            Self::Moderations => &[RouteKind::Moderations],
+            Self::Video => &[
+                RouteKind::VideoCreate,
+                RouteKind::VideoRetrieve,
+                RouteKind::VideoContent,
+            ],
+            Self::Realtime => &[RouteKind::RealtimeClientSecrets, RouteKind::RealtimeCalls],
+            Self::ToolCalling | Self::Reasoning | Self::Vision => &[],
+            Self::VectorStores | Self::Containers | Self::FineTuning | Self::Evals => &[],
+            Self::Search => &[RouteKind::Search],
+        }
     }
 
     /// The capability that a given client route requires.
     ///
     /// Used by the relay to reject a route before dialling upstream, and by the panel to warn
-    /// that a provider cannot serve a combo step.
+    /// that a provider cannot serve a combo step. It delegates to [`RouteKind::capability`] so
+    /// the two directions cannot disagree; [`Capability::routes`] is the readable inverse.
     pub const fn for_route(route: RouteKind) -> Self {
-        match route {
-            RouteKind::ChatCompletions => Self::Chat,
-            RouteKind::Responses => Self::Responses,
-            RouteKind::Embeddings => Self::Embeddings,
-            RouteKind::AudioTranscription => Self::AudioTranscription,
-            RouteKind::AudioSpeech => Self::AudioSpeech,
-            RouteKind::ImagesGenerations => Self::ImagesGenerations,
-            RouteKind::Models => Self::Models,
-            RouteKind::Messages | RouteKind::CountTokens => Self::Messages,
-        }
+        route.capability()
     }
 
     /// The capabilities every provider is assumed to have unless configured otherwise.
     pub const BASELINE: [Capability; 1] = [Capability::Chat];
+
+    /// Every capability, in discriminant order.
+    ///
+    /// The snapshot stores a capability as its discriminant cast to `u8`, so this array is also
+    /// the tag order. Tests walk it instead of a hand-written list, which is what makes a new
+    /// variant impossible to add without the tag decoder and the dialect matrix seeing it.
+    pub const ALL: [Capability; 22] = [
+        Self::Chat,
+        Self::Responses,
+        Self::Embeddings,
+        Self::AudioTranscription,
+        Self::AudioSpeech,
+        Self::ImagesGenerations,
+        Self::Models,
+        Self::Messages,
+        Self::ToolCalling,
+        Self::Reasoning,
+        Self::Vision,
+        Self::AudioTranslation,
+        Self::ImagesEdits,
+        Self::ImagesVariations,
+        Self::Moderations,
+        Self::Video,
+        Self::Realtime,
+        Self::VectorStores,
+        Self::Containers,
+        Self::FineTuning,
+        Self::Evals,
+        Self::Search,
+    ];
 }
 
 /// Which client-facing endpoint a request arrived on.
@@ -456,6 +600,26 @@ pub enum RouteKind {
     Messages = 7,
     /// `POST /v1/messages/count_tokens`
     CountTokens = 8,
+    /// `POST /v1/audio/translations`
+    AudioTranslation = 9,
+    /// `POST /v1/images/edits`
+    ImagesEdits = 10,
+    /// `POST /v1/images/variations`
+    ImagesVariations = 11,
+    /// `POST /v1/moderations`
+    Moderations = 12,
+    /// `POST /v1/videos`
+    VideoCreate = 13,
+    /// `GET /v1/videos/{id}`
+    VideoRetrieve = 14,
+    /// `GET /v1/videos/{id}/content`
+    VideoContent = 15,
+    /// `POST /v1/realtime/client_secrets`
+    RealtimeClientSecrets = 16,
+    /// `POST /v1/realtime/calls`
+    RealtimeCalls = 17,
+    /// `POST /v1/search`
+    Search = 18,
 }
 
 impl RouteKind {
@@ -469,17 +633,59 @@ impl RouteKind {
             | Self::AudioTranscription
             | Self::AudioSpeech
             | Self::ImagesGenerations
-            | Self::Models => Dialect::OpenAi,
+            | Self::Models
+            | Self::AudioTranslation
+            | Self::ImagesEdits
+            | Self::ImagesVariations
+            | Self::Moderations
+            | Self::VideoCreate
+            | Self::VideoRetrieve
+            | Self::VideoContent
+            | Self::RealtimeClientSecrets
+            | Self::RealtimeCalls
+            | Self::Search => Dialect::OpenAi,
             Self::Messages | Self::CountTokens => Dialect::Anthropic,
+        }
+    }
+
+    /// The capability a provider must declare to serve this route.
+    ///
+    /// This is the single source of truth for the route-to-capability direction: the older
+    /// [`Capability::for_route`] spelling delegates here, and [`Capability::routes`] is the
+    /// readable inverse. Keeping one match instead of two is what makes it impossible for the
+    /// relay's admission check and the panel's warning to disagree about, say, whether a video
+    /// status poll needs the video capability.
+    pub const fn capability(self) -> Capability {
+        match self {
+            Self::ChatCompletions => Capability::Chat,
+            Self::Responses => Capability::Responses,
+            Self::Embeddings => Capability::Embeddings,
+            Self::AudioTranscription => Capability::AudioTranscription,
+            Self::AudioSpeech => Capability::AudioSpeech,
+            Self::ImagesGenerations => Capability::ImagesGenerations,
+            Self::Models => Capability::Models,
+            Self::Messages | Self::CountTokens => Capability::Messages,
+            Self::AudioTranslation => Capability::AudioTranslation,
+            Self::ImagesEdits => Capability::ImagesEdits,
+            Self::ImagesVariations => Capability::ImagesVariations,
+            Self::Moderations => Capability::Moderations,
+            Self::VideoCreate | Self::VideoRetrieve | Self::VideoContent => Capability::Video,
+            Self::RealtimeClientSecrets | Self::RealtimeCalls => Capability::Realtime,
+            Self::Search => Capability::Search,
         }
     }
 
     /// Whether this route carries a request body at all.
     ///
-    /// `GET /v1/models` does not, which lets the relay skip body handling entirely.
+    /// `GET /v1/models` does not, and neither do the two video reads: retrieving a job and
+    /// downloading its content are `GET`s with the id in the path. Skipping body handling for
+    /// them matters because `/v1/videos/{id}/content` answers with video bytes, not JSON.
     #[inline]
     pub const fn has_request_body(self) -> bool {
-        !matches!(self, Self::Models)
+        !matches!(
+            self,
+            Self::Models | Self::VideoRetrieve | Self::VideoContent
+        )
     }
 
     /// Whether this route can be usefully raced between providers.
@@ -495,10 +701,20 @@ impl RouteKind {
         )
     }
 
-    /// Whether a response to this route is expected to be `text/event-stream` when streaming.
+    /// Whether a response to this route can be `text/event-stream` when the client asks to stream.
+    ///
+    /// The three generative text routes are the only ones: everything else answers with one JSON
+    /// object (embeddings, models, moderations, a video job), audio bytes, image bytes or a video
+    /// file, none of which a client reads as an event stream. This is a narrower set than
+    /// [`Self::has_request_body`] and, today, the same set as [`Self::is_hedgeable`] — the two are
+    /// kept separate because a route can be hedgeable without being streamable and vice versa, and
+    /// a future route is likely to be one and not the other.
     #[inline]
     pub const fn is_sse_capable(self) -> bool {
-        !matches!(self, Self::Models | Self::CountTokens)
+        matches!(
+            self,
+            Self::ChatCompletions | Self::Responses | Self::Messages
+        )
     }
 
     /// The stable identifier used in config and the panel.
@@ -513,6 +729,16 @@ impl RouteKind {
             Self::Models => "models",
             Self::Messages => "messages",
             Self::CountTokens => "messages.count-tokens",
+            Self::AudioTranslation => "audio.translations",
+            Self::ImagesEdits => "images.edits",
+            Self::ImagesVariations => "images.variations",
+            Self::Moderations => "moderations",
+            Self::VideoCreate => "video.create",
+            Self::VideoRetrieve => "video.retrieve",
+            Self::VideoContent => "video.content",
+            Self::RealtimeClientSecrets => "realtime.client-secrets",
+            Self::RealtimeCalls => "realtime.calls",
+            Self::Search => "search",
         }
     }
 
@@ -533,11 +759,21 @@ impl RouteKind {
             Self::Models => "models",
             Self::Messages => "messages",
             Self::CountTokens => "count-tokens",
+            Self::AudioTranslation => "audio-translation",
+            Self::ImagesEdits => "images-edits",
+            Self::ImagesVariations => "images-variations",
+            Self::Moderations => "moderations",
+            Self::VideoCreate => "video-create",
+            Self::VideoRetrieve => "video-retrieve",
+            Self::VideoContent => "video-content",
+            Self::RealtimeClientSecrets => "realtime-client-secrets",
+            Self::RealtimeCalls => "realtime-calls",
+            Self::Search => "search",
         }
     }
 
     /// Every route, for exhaustive tests and the panel's routing table.
-    pub const ALL: [RouteKind; 9] = [
+    pub const ALL: [RouteKind; 19] = [
         Self::ChatCompletions,
         Self::Responses,
         Self::Embeddings,
@@ -547,6 +783,16 @@ impl RouteKind {
         Self::Models,
         Self::Messages,
         Self::CountTokens,
+        Self::AudioTranslation,
+        Self::ImagesEdits,
+        Self::ImagesVariations,
+        Self::Moderations,
+        Self::VideoCreate,
+        Self::VideoRetrieve,
+        Self::VideoContent,
+        Self::RealtimeClientSecrets,
+        Self::RealtimeCalls,
+        Self::Search,
     ];
 }
 
@@ -1345,6 +1591,47 @@ mod tests {
         assert!(!RouteKind::Embeddings.is_hedgeable());
         assert!(!RouteKind::ImagesGenerations.is_hedgeable());
         assert!(!RouteKind::AudioSpeech.is_hedgeable());
+        for route in [
+            RouteKind::AudioTranslation,
+            RouteKind::ImagesEdits,
+            RouteKind::ImagesVariations,
+            RouteKind::Moderations,
+            RouteKind::VideoCreate,
+            RouteKind::VideoRetrieve,
+            RouteKind::VideoContent,
+            RouteKind::RealtimeClientSecrets,
+            RouteKind::RealtimeCalls,
+            RouteKind::Search,
+        ] {
+            assert!(
+                !route.is_hedgeable(),
+                "new route {route:?} must not be hedged"
+            );
+        }
+    }
+
+    #[test]
+    fn only_text_routes_can_answer_with_an_event_stream() {
+        // `is_sse_capable` used to be "everything except the two body-less routes", which claimed
+        // that an audio clip, an image, a video file and a moderation verdict could arrive as
+        // `text/event-stream`. They cannot: each is one body of its own media type. The three text
+        // routes are the only ones a client may stream, and the assertion is written as an
+        // exhaustive walk so a new variant has to make a decision here.
+        assert!(RouteKind::ChatCompletions.is_sse_capable());
+        assert!(RouteKind::Responses.is_sse_capable());
+        assert!(RouteKind::Messages.is_sse_capable());
+        for route in RouteKind::ALL {
+            if matches!(
+                route,
+                RouteKind::ChatCompletions | RouteKind::Responses | RouteKind::Messages
+            ) {
+                continue;
+            }
+            assert!(
+                !route.is_sse_capable(),
+                "{route:?} does not answer with an event stream, whatever the client asked for"
+            );
+        }
     }
 
     #[test]
@@ -1397,6 +1684,23 @@ mod tests {
         assert!(!RouteKind::Models.has_request_body());
         assert!(RouteKind::ChatCompletions.has_request_body());
         assert!(RouteKind::CountTokens.has_request_body());
+        // The two video reads carry the job id in the path and answer with JSON and video bytes
+        // respectively; only the submit route has a body.
+        for route in [RouteKind::VideoRetrieve, RouteKind::VideoContent] {
+            assert!(!route.has_request_body(), "{route:?}");
+        }
+        for route in [
+            RouteKind::AudioTranslation,
+            RouteKind::ImagesEdits,
+            RouteKind::ImagesVariations,
+            RouteKind::Moderations,
+            RouteKind::VideoCreate,
+            RouteKind::RealtimeClientSecrets,
+            RouteKind::RealtimeCalls,
+            RouteKind::Search,
+        ] {
+            assert!(route.has_request_body(), "{route:?}");
+        }
     }
 
     #[test]
@@ -1678,7 +1982,18 @@ mod tests {
             (RouteKind::Models, "models"),
             (RouteKind::Messages, "messages"),
             (RouteKind::CountTokens, "count-tokens"),
+            (RouteKind::AudioTranslation, "audio-translation"),
+            (RouteKind::ImagesEdits, "images-edits"),
+            (RouteKind::ImagesVariations, "images-variations"),
+            (RouteKind::Moderations, "moderations"),
+            (RouteKind::VideoCreate, "video-create"),
+            (RouteKind::VideoRetrieve, "video-retrieve"),
+            (RouteKind::VideoContent, "video-content"),
+            (RouteKind::RealtimeClientSecrets, "realtime-client-secrets"),
+            (RouteKind::RealtimeCalls, "realtime-calls"),
+            (RouteKind::Search, "search"),
         ];
+        assert_eq!(RouteKind::ALL.len(), 19);
         assert_eq!(
             expected.len(),
             RouteKind::ALL.len(),
@@ -1687,6 +2002,79 @@ mod tests {
         for (route, key) in expected {
             assert_eq!(route.as_config_key(), key, "{route:?}");
         }
+    }
+
+    #[test]
+    fn every_capability_round_trips_through_both_spellings() {
+        // `ALL` is the exhaustive list, so this covers every variant rather than the handful a
+        // hand-written test would name. A tag renumbering or a parser drift shows up here for the
+        // variant that caused it.
+        assert_eq!(Capability::ALL.len(), 22);
+        for capability in Capability::ALL {
+            assert_eq!(
+                Capability::parse(capability.as_str()),
+                Some(capability),
+                "{capability:?}"
+            );
+            let wire = serde_json::to_value(capability).expect("serialize capability");
+            let wire = wire.as_str().expect("capabilities serialise as strings");
+            assert_eq!(
+                Capability::parse(wire),
+                Some(capability),
+                "{capability:?} does not accept its serde spelling `{wire}`"
+            );
+            assert_eq!(
+                serde_json::from_str::<Capability>(&format!("\"{wire}\"")).expect("deserialize"),
+                capability
+            );
+        }
+        // The append-only spellings are pinned literally: a rename here would silently invalidate
+        // every provider entry and saved config that uses one.
+        for (text, expected) in [
+            ("audio.translation", Capability::AudioTranslation),
+            ("audio-translation", Capability::AudioTranslation),
+            ("images.edits", Capability::ImagesEdits),
+            ("images-edits", Capability::ImagesEdits),
+            ("images.variations", Capability::ImagesVariations),
+            ("images-variations", Capability::ImagesVariations),
+            ("moderations", Capability::Moderations),
+            ("video", Capability::Video),
+            ("realtime", Capability::Realtime),
+            ("vector-stores", Capability::VectorStores),
+            ("containers", Capability::Containers),
+            ("fine-tuning", Capability::FineTuning),
+            ("evals", Capability::Evals),
+            ("search", Capability::Search),
+        ] {
+            assert_eq!(Capability::parse(text), Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn routes_and_capabilities_agree_in_both_directions() {
+        // The two directions are maintained for different callers — route -> capability for the
+        // relay's admission check, capability -> routes for the catalogue — so they are walked
+        // against each other instead of trusted. `ALL` keeps this exhaustive.
+        for capability in Capability::ALL {
+            for route in capability.routes() {
+                assert_eq!(
+                    Capability::for_route(*route),
+                    capability,
+                    "{route:?} claims to need {capability:?}"
+                );
+            }
+        }
+        for route in RouteKind::ALL {
+            assert!(
+                route.capability().routes().contains(&route),
+                "{route:?} is missing from {:?}.routes()",
+                route.capability()
+            );
+        }
+        // Video and realtime are the only multi-route capabilities; pin their size so a route
+        // added to either family later has to make a deliberate decision about the mapping.
+        assert_eq!(Capability::Video.routes().len(), 3);
+        assert_eq!(Capability::Realtime.routes().len(), 2);
     }
 
     #[test]

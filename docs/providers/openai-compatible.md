@@ -104,17 +104,61 @@ OpenAI provider is not.
 
 ## Capabilities to declare honestly
 
+The capability list is what the relay's gate reads before it dials anything: a route whose capability
+no step declares is refused with `404 unsupported_endpoint` naming the route and the capability, and
+the provider never sees the request. The full list is twenty-two entries — the text ones are these:
+
 | Capability | Declare when |
 |---|---|
 | `chat` | `/v1/chat/completions` works. |
 | `responses` | `/v1/responses` works. Separate from `chat`, because many providers have one and not the other. |
 | `embeddings` | `/v1/embeddings` works. |
+| `models` | `GET /models` works, so the relay can discover this provider's models instead of relying on catalogue seeds. |
 | `tool-calling` | The provider accepts a `tools` array **and** returns valid `tool_calls`. |
 | `vision` | The provider accepts image content parts. |
 | `reasoning` | The provider exposes reasoning output or an effort control. |
 
+…and the rest are one per endpoint family: `audio-transcription`, `audio-speech`,
+`audio-translation`, `images-generations`, `images-edits`, `images-variations`, `moderations`,
+`video`, `realtime`, `search`, plus `vector-stores`, `containers`, `fine-tuning` and `evals` for the
+management surfaces. `docs/29-openai-surface.md` has the table that maps each one to the routes it
+covers, and `docs/18-api-reference.md` has the wire shape of every route.
+
 Declaring a capability the provider does not have does not make it work; it makes the router attempt
-something that fails. Declaring too few is the safer error, because the router simply does not try.
+something that fails. Declaring too few is the safer error, because the router simply does not try,
+and says so in one sentence naming the missing capability instead of forwarding a request the
+upstream would answer with an unreadable 404.
+
+### A provider that serves one endpoint family
+
+fish.audio is the case that made this concrete: it speaks an OpenAI-shaped request for
+`/v1/audio/speech` and nothing else, so there is no `/chat/completions` to point a text combo at. Such
+a provider is a complete configuration, not a half-configured one:
+
+```json
+{
+  "id": "fish-audio",
+  "dialect": "open-ai",
+  "base_url": "https://api.fish.audio",
+  "capabilities": ["audio-speech"],
+  "route_overrides": { "audio-speech": "v1/tts" }
+}
+```
+
+Three things make it work rather than merely validate. The capability list contains only
+`audio-speech`, so the text routes are refused before a socket is opened. `route_overrides` carries
+the one deviation from the dialect's default path — fish.audio's TTS is at `/v1/tts`, not
+`/v1/audio/speech`. And no `models` capability is declared, because the provider has no model list to
+discover; the catalogue seeds the model id instead.
+
+The shipped catalogue carries four of these, one per family: `fish-audio` and `elevenlabs`
+(audio speech), `deepgram` (audio transcription) and `stability-ai` (image generation), and a test in
+`crates/mr-core/src/catalog.rs` pins each one's list to exactly its own family. Pointing a text combo
+at one of them is accepted when the combo is written — the provider is a valid provider — and then
+refused per request with the gate's `404 unsupported_endpoint`, because no step in that combo has a
+provider that declares `chat`. That is deliberate: the same provider can serve `/v1/audio/speech`
+perfectly while being the wrong target for `/v1/chat/completions`, so the answer belongs to the
+request that asks, not to the configuration step that cannot know which route will be used.
 
 ## Fingerprint headers
 

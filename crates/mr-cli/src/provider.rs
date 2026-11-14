@@ -118,21 +118,14 @@ pub struct AddArgs {
     pub total_timeout_ms: Option<u64>,
 }
 
-/// Capability spellings; `Capability` has no `ALL` const, so this list is written out and held by
-/// a test against the enum's serde labels.
-pub(crate) const CAPABILITY_CHOICES: [&str; 11] = [
-    "chat",
-    "responses",
-    "embeddings",
-    "audio-transcription",
-    "audio-speech",
-    "images-generations",
-    "models",
-    "messages",
-    "tool-calling",
-    "reasoning",
-    "vision",
-];
+/// Capability spellings offered in "expected one of" errors and shell completion, in enum order.
+///
+/// Built from [`Capability::ALL`] and the serde label rather than written out by hand: a capability
+/// appended to the enum cannot then be missing from the CLI's help, even though
+/// [`Capability::parse`] would already have accepted it.
+pub(crate) fn capability_choices() -> Vec<String> {
+    Capability::ALL.iter().map(serde_label).collect()
+}
 
 /// Run a provider subcommand.
 pub async fn run(cmd: ProviderCmd, ctx: &Ctx) -> Result<(), CliError> {
@@ -328,7 +321,7 @@ pub(crate) fn resolve_add(a: &AddArgs) -> Result<Provider, CliError> {
         let cap: Capability = parse_choice(
             "--capability",
             cap,
-            &CAPABILITY_CHOICES.map(str::to_owned),
+            &capability_choices(),
             Capability::parse,
         )?;
         if !p.capabilities.contains(&cap) {
@@ -1296,35 +1289,17 @@ mod tests {
     }
 
     #[test]
-    fn capability_choices_match_the_enum_serde_labels() {
-        for variant in [
-            Capability::Chat,
-            Capability::Responses,
-            Capability::Embeddings,
-            Capability::AudioTranscription,
-            Capability::AudioSpeech,
-            Capability::ImagesGenerations,
-            Capability::Models,
-            Capability::Messages,
-            Capability::ToolCalling,
-            Capability::Reasoning,
-            Capability::Vision,
-        ] {
-            let label = serde_json::to_value(variant)
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .to_owned();
-            assert!(
-                CAPABILITY_CHOICES.contains(&label.as_str()),
-                "{label} missing from CAPABILITY_CHOICES"
-            );
-            assert!(
-                Capability::parse(&label).is_some(),
-                "{label} must parse back"
-            );
+    fn capability_choices_follow_the_enum() {
+        // The list is generated, so the useful assertions are that it covers every variant in
+        // order, that each label is the config-file spelling, and that both the serde label and
+        // `as_str` parse back to the variant they came from.
+        let choices = capability_choices();
+        assert_eq!(choices.len(), Capability::ALL.len());
+        for (choice, capability) in choices.iter().zip(Capability::ALL) {
+            assert_eq!(choice, &serde_label(&capability));
+            assert_eq!(Capability::parse(choice), Some(capability));
+            assert_eq!(Capability::parse(capability.as_str()), Some(capability));
         }
-        assert_eq!(CAPABILITY_CHOICES.len(), 11);
     }
 
     #[test]

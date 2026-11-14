@@ -994,27 +994,32 @@ impl Provider {
         let mut out = Vec::new();
         let wants = |c: Capability| self.capabilities.contains(&c);
         match self.dialect {
+            // OpenAI is the reference surface: every capability in this build, Search included, is
+            // one of its routes, so there is nothing it can claim that it cannot serve.
+            Dialect::OpenAi => {}
             // ZCode's plan surface is the same Messages endpoint and nothing else, so the same
             // complaints apply. Its count-tokens route is answered locally rather than proxied, so
             // `messages` covers a client that counts through it.
+            //
+            // "Text" here means an endpoint that takes a prompt and returns tokens. Vision is text
+            // on the wire (image input, token output), while every other non-Messages family —
+            // embeddings, audio, images, moderation, video, realtime and the management surfaces
+            // appended in this build — has no equivalent on the Messages API at all.
             Dialect::Anthropic | Dialect::Zcode => {
-                if wants(Capability::Embeddings) {
-                    out.push(
-                        "the Anthropic Messages dialect has no embeddings endpoint".to_string(),
-                    );
-                }
-                if wants(Capability::AudioTranscription) || wants(Capability::AudioSpeech) {
-                    out.push("the Anthropic Messages dialect has no audio endpoints".to_string());
+                for c in Capability::ALL {
+                    if wants(c) && !is_text_capability(c) {
+                        out.push(format!(
+                            "the Anthropic Messages dialect has no {} endpoint",
+                            c.as_str()
+                        ));
+                    }
                 }
             }
+            // Codex serves the Responses API. It shares OpenAI's text-generation vocabulary but
+            // none of the endpoint families around it, including the ones appended in this build.
             Dialect::Codex => {
-                for c in [
-                    Capability::Embeddings,
-                    Capability::AudioTranscription,
-                    Capability::AudioSpeech,
-                    Capability::ImagesGenerations,
-                ] {
-                    if wants(c) {
+                for c in Capability::ALL {
+                    if wants(c) && !is_text_capability(c) {
                         out.push(format!(
                             "the Codex dialect only serves the Responses API, not {}",
                             c.as_str()
@@ -1022,8 +1027,14 @@ impl Provider {
                     }
                 }
             }
-            Dialect::CommandCodeGo if wants(Capability::Embeddings) => {
-                out.push("the Command Code dialect has no embeddings endpoint".to_string());
+            // Command Code's alpha/generate envelope carries a prompt and nothing else. It had no
+            // embeddings endpoint before this build and gained no audio, image, video or management
+            // surface with it.
+            Dialect::CommandCodeGo => {
+                if wants(Capability::Embeddings) {
+                    out.push("the Command Code dialect has no embeddings endpoint".to_string());
+                }
+                push_openai_only_mismatches(&mut out, self);
             }
             Dialect::ModalVllm => {
                 for c in [
@@ -1040,10 +1051,104 @@ impl Provider {
                         ));
                     }
                 }
+                push_openai_only_mismatches(&mut out, self);
             }
-            _ => {}
+            // These dialects speak their vendor's own protocol (or, for Copilot and Cursor, the
+            // agent's). None of the endpoint families appended in this build has an equivalent
+            // there, so they are refused while the families each dialect already served keep
+            // whatever rule they had — that is a separate, older question.
+            Dialect::Google
+            | Dialect::GoogleAiStudio
+            | Dialect::Antigravity
+            | Dialect::Copilot
+            | Dialect::Cursor => {
+                push_openai_only_mismatches(&mut out, self);
+            }
         }
         out
+    }
+}
+
+/// Whether a capability is a prompt-in, tokens-out endpoint.
+///
+/// This is the boundary the Messages dialects and Codex are described by: everything that is not
+/// one of these has a request or response body the dialect cannot build, so claiming it would only
+/// surface as an opaque upstream error. The match is exhaustive on purpose — appending a capability
+/// forces a decision about which side of the line it falls on rather than defaulting to "text".
+fn is_text_capability(capability: Capability) -> bool {
+    match capability {
+        Capability::Chat
+        | Capability::Responses
+        | Capability::Models
+        | Capability::Messages
+        | Capability::ToolCalling
+        | Capability::Reasoning
+        | Capability::Vision => true,
+        Capability::Embeddings
+        | Capability::AudioTranscription
+        | Capability::AudioSpeech
+        | Capability::ImagesGenerations
+        | Capability::AudioTranslation
+        | Capability::ImagesEdits
+        | Capability::ImagesVariations
+        | Capability::Moderations
+        | Capability::Video
+        | Capability::Realtime
+        | Capability::VectorStores
+        | Capability::Containers
+        | Capability::FineTuning
+        | Capability::Evals
+        | Capability::Search => false,
+    }
+}
+
+/// Whether a capability belongs to an endpoint family only the OpenAI dialect serves.
+///
+/// These are the capabilities appended in the build that introduced the audio-translation,
+/// image-edit, moderation, video, realtime and management routes, plus Search. No other dialect
+/// compiled in here has a route for any of them. The match is exhaustive so that appending another
+/// capability cannot silently become "accepted by every dialect": it has to be classified here.
+fn is_openai_only_capability(capability: Capability) -> bool {
+    match capability {
+        Capability::AudioTranslation
+        | Capability::ImagesEdits
+        | Capability::ImagesVariations
+        | Capability::Moderations
+        | Capability::Video
+        | Capability::Realtime
+        | Capability::VectorStores
+        | Capability::Containers
+        | Capability::FineTuning
+        | Capability::Evals
+        | Capability::Search => true,
+        Capability::Chat
+        | Capability::Responses
+        | Capability::Embeddings
+        | Capability::AudioTranscription
+        | Capability::AudioSpeech
+        | Capability::ImagesGenerations
+        | Capability::Models
+        | Capability::Messages
+        | Capability::ToolCalling
+        | Capability::Reasoning
+        | Capability::Vision => false,
+    }
+}
+
+/// Append a complaint for every OpenAI-only capability a non-OpenAI provider claims.
+///
+/// Kept as one function so every dialect that shares this rule names itself in the same place; the
+/// message includes the dialect so an operator staring at a provider list knows which entry to
+/// repair.
+fn push_openai_only_mismatches(out: &mut Vec<String>, provider: &Provider) {
+    for capability in Capability::ALL {
+        if provider.capabilities.contains(&capability) && is_openai_only_capability(capability) {
+            out.push(format!(
+                "the {} dialect has no {} endpoint",
+                provider.dialect.as_str(),
+                capability.as_str()
+            ));
+        }
     }
 }
 
@@ -2109,6 +2214,101 @@ mod tests {
             .dialect_capability_mismatches()
             .iter()
             .any(|s| s.contains("images.generations")));
+    }
+
+    #[test]
+    fn every_dialect_rejects_exactly_its_unsupported_capabilities() {
+        // A literal table rather than a walk over the implementation: the question is which
+        // combinations this build promises to serve, and the test should state that promise on its
+        // own. `Capability::ALL` and `Dialect::ALL` keep the walk exhaustive in both directions.
+        let new_capabilities = [
+            Capability::AudioTranslation,
+            Capability::ImagesEdits,
+            Capability::ImagesVariations,
+            Capability::Moderations,
+            Capability::Video,
+            Capability::Realtime,
+            Capability::VectorStores,
+            Capability::Containers,
+            Capability::FineTuning,
+            Capability::Evals,
+            Capability::Search,
+        ];
+        let with_new = |existing: &[Capability]| -> Vec<Capability> {
+            existing.iter().copied().chain(new_capabilities).collect()
+        };
+        let text_and_audio_free = [
+            Capability::Embeddings,
+            Capability::AudioTranscription,
+            Capability::AudioSpeech,
+            Capability::ImagesGenerations,
+        ];
+        let rejected: Vec<(Dialect, Vec<Capability>)> = vec![
+            (Dialect::OpenAi, Vec::new()),
+            (Dialect::Anthropic, with_new(&text_and_audio_free)),
+            (Dialect::Zcode, with_new(&text_and_audio_free)),
+            (Dialect::Codex, with_new(&text_and_audio_free)),
+            (Dialect::CommandCodeGo, with_new(&[Capability::Embeddings])),
+            (
+                Dialect::ModalVllm,
+                with_new(&[
+                    Capability::Responses,
+                    Capability::Embeddings,
+                    Capability::AudioTranscription,
+                    Capability::AudioSpeech,
+                    Capability::ImagesGenerations,
+                ]),
+            ),
+            (Dialect::Google, with_new(&[])),
+            (Dialect::GoogleAiStudio, with_new(&[])),
+            (Dialect::Antigravity, with_new(&[])),
+            (Dialect::Copilot, with_new(&[])),
+            (Dialect::Cursor, with_new(&[])),
+        ];
+
+        assert_eq!(
+            rejected.len(),
+            Dialect::ALL.len(),
+            "every dialect needs exactly one row"
+        );
+        for dialect in Dialect::ALL {
+            let rows: Vec<_> = rejected.iter().filter(|(row, _)| *row == dialect).collect();
+            assert_eq!(rows.len(), 1, "{dialect:?} must have exactly one row");
+            let (_, unsupported) = rows[0];
+            for capability in Capability::ALL {
+                let mut provider = Provider::new("audit", dialect, "https://example.invalid/v1");
+                provider.capabilities = vec![capability];
+                let mismatches = provider.dialect_capability_mismatches();
+                assert_eq!(
+                    !mismatches.is_empty(),
+                    unsupported.contains(&capability),
+                    "{dialect:?} + {capability:?} should be {}: {mismatches:?}",
+                    if unsupported.contains(&capability) {
+                        "rejected"
+                    } else {
+                        "accepted"
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_audio_only_provider_is_valid() {
+        // Endpoint-specialised providers such as fish-audio and elevenlabs declare no chat
+        // capability at all. That is a complete configuration, not an error: validation must not
+        // assume that a provider has to serve `/chat/completions` to be worth saving.
+        let mut provider = Provider::new("fish-audio", Dialect::OpenAi, "https://api.fish.audio");
+        provider.capabilities = vec![Capability::AudioSpeech];
+        provider.accounts.push(Account::new("default"));
+        assert!(
+            provider.validate().is_empty(),
+            "an audio-only provider must validate cleanly: {:?}",
+            provider.validate()
+        );
+        assert!(provider.supports(RouteKind::AudioSpeech));
+        assert!(!provider.supports(RouteKind::ChatCompletions));
+        assert!(!provider.supports(RouteKind::Models));
     }
 
     #[test]

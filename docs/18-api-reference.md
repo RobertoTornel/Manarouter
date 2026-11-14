@@ -16,24 +16,104 @@ Both ports are configurable and both changes apply on **next restart**
 
 ### Routes
 
+Every path the relay mounts is listed here. A test asks each one of the mounted router and fails
+if a documented path answers axum's empty 404, so a row in this table is a route that exists.
+
+**Text and models.**
+
 | Method | Path | Shape |
 |---|---|---|
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
 | `POST` | `/v1/responses` | OpenAI Responses |
-| `POST` | `/v1/embeddings` | OpenAI Embeddings |
-| `POST` | `/v1/audio/transcriptions` | OpenAI, multipart |
-| `POST` | `/v1/audio/speech` | OpenAI, returns audio |
-| `POST` | `/v1/images/generations` | OpenAI Images |
+| `GET` | `/v1/responses/{id}` | Retrieve a stored response |
+| `POST` | `/v1/responses/{id}/cancel` | Cancel a background response |
+| `DELETE` | `/v1/responses/{id}` | Delete a stored response |
+| `GET` | `/v1/responses/{id}/input_items` | The input items a stored response was built from |
+| `POST` | `/v1/messages` | **Anthropic** Messages |
+| `POST` | `/v1/messages/count_tokens` | **Anthropic** token counting — counted upstream for an Anthropic provider, estimated locally (and marked with `x-manarouter-count-tokens-estimate: true`) for any other |
 | `GET` | `/v1/models` | OpenAI Models, served from the compiled snapshot |
-| `POST` `GET` | `/v1/files` | OpenAI Files (upload, list) — the batch lane's input files |
+| `GET` | `/v1/models/{model}` | One model, by the same name a request would use (the id may contain slashes, so it is a wildcard path) |
+| `DELETE` | `/v1/models/{model}` | OpenAI's delete: local configuration is not a provider resource, so this removes nothing and says so |
+
+**Modalities.**
+
+| Method | Path | Shape |
+|---|---|---|
+| `POST` | `/v1/embeddings` | OpenAI Embeddings |
+| `POST` | `/v1/moderations` | OpenAI Moderations |
+| `POST` | `/v1/audio/speech` | OpenAI speech, returns audio |
+| `POST` | `/v1/audio/transcriptions` | OpenAI transcription, multipart |
+| `POST` | `/v1/audio/translations` | OpenAI translation, multipart |
+| `GET` | `/v1/realtime` | OpenAI Realtime over a WebSocket: the socket is accepted and **pumped**, so frames cross the relay as they are rather than being buffered |
+| `POST` | `/v1/realtime/client_secrets` | OpenAI Realtime ephemeral credentials |
+| `POST` | `/v1/realtime/calls` | OpenAI Realtime calls, including the SDP offer form |
+| `POST` | `/v1/images/generations` | OpenAI Images |
+| `POST` | `/v1/images/edits` | OpenAI Images, multipart |
+| `POST` | `/v1/images/variations` | OpenAI Images, multipart |
+| `POST` | `/v1/videos` | OpenAI video creation |
+| `GET` | `/v1/videos/{id}` | Video status |
+| `GET` | `/v1/videos/{id}/content` | The rendered video bytes |
+
+**Files, uploads and batches.**
+
+| Method | Path | Shape |
+|---|---|---|
+| `POST` `GET` | `/v1/files` | OpenAI Files (upload, list) — the batch lane's input files and fine-tuning's training data |
 | `GET` `DELETE` | `/v1/files/{id}` | OpenAI Files (retrieve, delete) |
 | `GET` | `/v1/files/{id}/content` | The stored bytes |
+| `POST` `GET` | `/v1/uploads` | OpenAI resumable uploads (create, list) |
+| `POST` | `/v1/uploads/{id}/parts` | One part of a resumable upload |
+| `POST` | `/v1/uploads/{id}/complete` | Assemble the parts into a file |
+| `POST` | `/v1/uploads/{id}/cancel` | Abandon the upload |
 | `POST` `GET` | `/v1/batches` | OpenAI Batches (submit, list) |
 | `GET` | `/v1/batches/{id}` | OpenAI Batches (retrieve, with `usage`) |
 | `POST` | `/v1/batches/{id}/cancel` | OpenAI Batches (cancel) |
-| `POST` | `/v1/messages` | **Anthropic** Messages |
-| `POST` | `/v1/messages/count_tokens` | **Anthropic** token counting — counted upstream for an Anthropic provider, estimated locally (and marked with `x-manarouter-count-tokens-estimate: true`) for any other |
+
+**Retrieval.** Vector stores keep their contents in the relay's own state, and `/v1/search` answers
+either from a vector store or by sending the query to a model, depending on what the body names.
+
+| Method | Path | Shape |
+|---|---|---|
+| `POST` `GET` | `/v1/vector_stores` | Create, list |
+| `POST` `GET` `DELETE` | `/v1/vector_stores/{id}` | Retrieve, modify, delete |
+| `POST` `GET` | `/v1/vector_stores/{id}/files` | Attach a file, list the attached ones |
+| `GET` `DELETE` | `/v1/vector_stores/{id}/files/{file_id}` | One attached file |
+| `POST` `GET` | `/v1/vector_stores/{id}/file_batches` | Batch attachment (add, list) |
+| `GET` | `/v1/vector_stores/{id}/file_batches/{batch_id}` | One attachment batch |
+| `POST` | `/v1/vector_stores/{id}/search` | Search inside one store |
+| `POST` | `/v1/search` | Search across stores, or a model-backed search when the body carries `model` |
+
+**Jobs, evaluations and containers.**
+
+| Method | Path | Shape |
+|---|---|---|
+| `POST` `GET` | `/v1/fine_tuning/jobs` | Create, list |
+| `GET` `POST` | `/v1/fine_tuning/jobs/{id}` and `/{id}/cancel`, `/{id}/pause`, `/{id}/resume` | The job by id, and the three transitions |
+| `GET` | `/v1/fine_tuning/jobs/{id}/events`, `/{id}/checkpoints` | The job's event log and its checkpoints |
+| `POST` `GET` | `/v1/containers` | Create, list — **refused locally**, see below |
+| `GET` `DELETE` | `/v1/containers/{id}` | Retrieve, delete |
+| `POST` `GET` | `/v1/evals` | Create, list |
+| `GET` `POST` `DELETE` | `/v1/evals/{id}` | Retrieve, update, delete |
+| `POST` `GET` | `/v1/evals/{id}/runs` | Create, list runs |
+| `GET` `POST` | `/v1/evals/{id}/runs/{run_id}` | One run, and its `cancel` |
+
+**Liveness and control.**
+
+| Method | Path | Shape |
+|---|---|---|
 | `GET` | `/healthz` | Liveness. **Never routed upstream.** |
+| `GET` | `/control/probe` | Diagnostic probe of the routing table |
+| `GET` | `/control/activity` | The last few combo decisions, for the panel's live view |
+
+Three of these families need a sentence more than a row. A **container** is not something the relay
+can host: it refuses `POST /v1/containers` with `501 unsupported_endpoint` and proxies the family only
+when a configured provider declares the `containers` capability. **Vector stores, files, uploads,
+batches, evaluations and stored responses** are served from local state, so their capabilities are
+never consulted on the request path. **Every other route** is gated: the resolved step's provider must
+declare the capability the route needs, and a provider that declares nothing but chat and models
+answers `404 unsupported_endpoint` naming the missing capability. Small providers are the reason the
+gate exists — `fish.audio` speaks audio and nothing else — and
+[29-openai-surface.md](29-openai-surface.md) is the classification of all of it, family by family.
 
 `/healthz` is deliberately not a model route. A health check that can be satisfied by a model
 provider is a health check that reports the provider's health, not the router's — and when the
@@ -414,8 +494,12 @@ section is the wire contract.
 
 **Upload.** `POST /v1/files` accepts `multipart/form-data` (`purpose=batch`, `file=@input.jsonl`) and,
 for a shell client that would rather not build an envelope, a raw body with `?filename=…&purpose=batch`
-in the query string. `purpose` must be `batch`; anything else is refused with the purpose it got, since
-`fine-tune` is the mistake people make. The filename is metadata and never becomes a path. The stored
+in the query string. `purpose` is `batch` or `fine-tune`, or absent, which means `batch`; any other
+value is refused with the purpose it got. A `fine-tune` file is stored exactly like a batch file and
+is staged to the provider by the fine-tuning route below. The filename is metadata and never becomes
+a path. The stored bytes are returned by `GET /v1/files/{id}/content`, which is how an operator checks
+what the lane actually received — and the cap is 32 MiB per file, the lane's own limit rather than
+OpenAI's 512 MB, because a file is held in memory while it is validated and written. The stored
 bytes are returned by `GET /v1/files/{id}/content`, which is how an operator checks what the lane
 actually received.
 

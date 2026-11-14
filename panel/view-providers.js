@@ -152,6 +152,58 @@ export function buildRedirectPaste(p, ctx, session) {
 // into a save-time error, which is how the pre-rename `command-code` spelling was caught. The Rust
 // test `the_panel_offers_only_dialects_this_binary_deserialises` pins this list.
 const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm', 'cursor', 'zcode'];
+// Must list exactly the capability spellings the backend *deserialises* (mr-core `dialect.rs`,
+// serde kebab-case) and in the enum's order: `panel/test/capabilities.test.mjs` pins the ids to
+// the Rust variants. A checkbox spelling the server refuses turns "Create provider" into a
+// save-time error, and a capability the panel omits cannot be declared at all.
+const CAPABILITIES = [
+  { id: 'chat', label: 'Chat', group: 'Text', hint: 'Answers conversational requests on `POST /v1/chat/completions`.' },
+  { id: 'responses', label: 'Responses', group: 'Text', hint: 'Serves the newer stateful `POST /v1/responses` route.' },
+  { id: 'embeddings', label: 'Embeddings', group: 'Text', hint: 'Turns text into vectors for `POST /v1/embeddings`.' },
+  { id: 'audio-transcription', label: 'Speech to text', group: 'Audio', hint: 'Transcribes uploaded audio on `POST /v1/audio/transcriptions`.' },
+  { id: 'audio-speech', label: 'Text to speech', group: 'Audio', hint: 'Speaks text as audio for `POST /v1/audio/speech`.' },
+  { id: 'images-generations', label: 'Image generation', group: 'Images and video', hint: 'Generates images on `POST /v1/images/generations`.' },
+  { id: 'models', label: 'Models', group: 'Text', hint: 'Lists the provider’s models for `GET /v1/models`.' },
+  { id: 'messages', label: 'Messages', group: 'Text', hint: 'Accepts Anthropic-shaped `POST /v1/messages` requests.' },
+  { id: 'tool-calling', label: 'Tool calling', group: 'Text', hint: 'Honours tools and functions in a chat request and returns their calls.' },
+  { id: 'reasoning', label: 'Reasoning', group: 'Text', hint: 'Can emit thinking or reasoning content alongside the answer.' },
+  { id: 'vision', label: 'Vision', group: 'Text', hint: 'Accepts image input in prompts.' },
+  { id: 'audio-translation', label: 'Audio translation', group: 'Audio', hint: 'Translates uploaded speech into English text on `POST /v1/audio/translations`.' },
+  { id: 'images-edits', label: 'Image edits', group: 'Images and video', hint: 'Edits an existing image with a prompt on `POST /v1/images/edits`.' },
+  { id: 'images-variations', label: 'Image variations', group: 'Images and video', hint: 'Produces alternatives from one image on `POST /v1/images/variations`.' },
+  { id: 'moderations', label: 'Moderations', group: 'Other', hint: 'Classifies content on `POST /v1/moderations`.' },
+  { id: 'video', label: 'Video', group: 'Images and video', hint: 'Accepts video jobs through `/v1/videos` and serves their status and rendered bytes.' },
+  { id: 'realtime', label: 'Realtime', group: 'Audio', hint: 'Opens the Realtime handshake on `POST /v1/realtime/client_secrets` and `/v1/realtime/calls`.' },
+  { id: 'vector-stores', label: 'Vector stores', group: 'Other', hint: 'Manages `/v1/vector_stores` and its files and search sub-resources.' },
+  { id: 'containers', label: 'Containers', group: 'Other', hint: 'Manages `/v1/containers` and its files sub-resource.' },
+  { id: 'fine-tuning', label: 'Fine-tuning', group: 'Other', hint: 'Manages `/v1/fine_tuning/jobs` and their events and checkpoints.' },
+  { id: 'evals', label: 'Evals', group: 'Other', hint: 'Manages `/v1/evals`, its runs and output items.' },
+  { id: 'search', label: 'Search', group: 'Other', hint: 'Answers hosted web search on `POST /v1/search`.' },
+];
+// The headings the capability editor renders, in the order it renders them. `chat` and `models`
+// are what a plain text provider needs, which is why the Text group says so once instead of
+// repeating it on both rows; the other groups exist for upstreams that serve one extra modality
+// (Fish Audio: speech only; Deepgram: transcription only) or one management surface.
+const CAPABILITY_GROUPS = [
+  { id: 'Text', hint: 'What a plain text provider needs: Chat and Models. Add the rest only when the upstream actually serves them.' },
+  { id: 'Audio', hint: 'Transcription, translation, speech and realtime are separate upstream routes; tick only the ones this provider offers.' },
+  { id: 'Images and video', hint: 'Generation, editing, variations and video are separate upstream routes; tick only what this provider serves.' },
+  { id: 'Other', hint: 'Management surfaces and hosted extras. None of these is needed for ordinary chat traffic.' },
+];
+// The same pair `default_capabilities()` in mr-core fills in when a provider's `capabilities` key
+// is absent. A hand-edited config can also carry an empty array, which the server refuses, so the
+// form treats that as absent too rather than presenting an unticked provider it cannot save.
+const DEFAULT_CAPABILITIES = ['chat', 'models'];
+
+/// Filter a Set/array of wire ids through the table's order, dropping ids this panel does not
+/// know. Stable order keeps saves diff-clean. Dropping rather than throwing is deliberate: a
+/// stale panel must not send a spelling this binary's server cannot deserialise, and one stale
+/// id is no reason to lose the operator's other ticks.
+function capabilityIds(selected) {
+  const wanted = new Set(selected ?? []);
+  return CAPABILITIES.filter((capability) => wanted.has(capability.id)).map((capability) => capability.id);
+}
+
 const KEY_STRATEGIES = ['priority', 'round-robin', 'random', 'least-used'];
 // What a refusal parks: the credential (every model), that model on the credential, or that model
 // on every credential of the provider. Widening past `account` is only right when the upstream
@@ -251,38 +303,45 @@ function storeIdList(key, ids) {
 // endpoints, but remain suggestions: account-specific gateways or a deliberate proxy can differ.
 // Provider presets, split into two clearly separated categories so that NVIDIA NIM, Codex,
 // Copilot, Antigravity and Command Code (developer platforms / enterprise endpoints) are never
-// mixed together with the standard OpenAI/Anthropic LLM APIs.
-// Selecting one pre-fills dialect, base URL, and auth kind. You still need to add an account
-// with the actual API key afterward (the panel never stores plaintext keys).
+// mixed together with the standard OpenAI/Anthropic LLM APIs and the single-endpoint media APIs.
+// Selecting one pre-fills dialect, base URL, auth kind, capabilities and, where the catalog names
+// one, the route override that makes an OpenAI-shaped dialect hit the real endpoint. You still
+// need to add an account with the actual API key afterward (the panel never stores plaintext
+// keys).
 const PROVIDER_PRESETS = {
-  // Standard LLM APIs — bearer auth, OpenAI/Anthropic-shaped endpoints.
+  // Standard APIs — bearer/header auth, OpenAI/Anthropic-shaped endpoints. The last four are the
+  // catalog capability-gated media upstreams: exactly one capability each, never chat.
   providers: [
     { name: 'Custom (manual)', dialect: 'open-ai', baseUrl: '', auth: 'bearer', hint: 'No defaults; set the dialect, base URL, and auth manually.' },
-    { name: 'OpenAI', dialect: 'open-ai', baseUrl: 'https://api.openai.com/v1', auth: 'bearer', hint: 'api.openai.com. Add your OpenAI API key as an account secret after saving.' },
-    { name: 'OpenRouter', dialect: 'open-ai', baseUrl: 'https://openrouter.ai/api/v1', auth: 'bearer', hint: 'openrouter.ai. Add your OpenRouter API key as an account secret after saving.' },
-    { name: 'Groq', dialect: 'open-ai', baseUrl: 'https://api.groq.com/openai/v1', auth: 'bearer', hint: 'groq.com. Add your Groq API key as an account secret after saving.' },
-    { name: 'Together AI', dialect: 'open-ai', baseUrl: 'https://api.together.xyz/v1', auth: 'bearer', hint: 'together.xyz. Add your Together API key as an account secret after saving.' },
-    { name: 'Mistral', dialect: 'open-ai', baseUrl: 'https://api.mistral.ai/v1', auth: 'bearer', hint: 'mistral.ai. Add your Mistral API key as an account secret after saving.' },
-    { name: 'DeepSeek', dialect: 'open-ai', baseUrl: 'https://api.deepseek.com/v1', auth: 'bearer', hint: 'deepseek.com. Add your DeepSeek API key as an account secret after saving.' },
-    { name: 'Fireworks AI', dialect: 'open-ai', baseUrl: 'https://api.fireworks.ai/inference/v1', auth: 'bearer', hint: 'fireworks.ai. Add your Fireworks API key as an account secret after saving.' },
-    { name: 'Perplexity', dialect: 'open-ai', baseUrl: 'https://api.perplexity.ai', auth: 'bearer', hint: 'perplexity.ai. Add your Perplexity API key as an account secret after saving.' },
-    { name: 'Cohere', dialect: 'open-ai', baseUrl: 'https://api.cohere.com/compatibility/v1', auth: 'bearer', hint: 'cohere.com, OpenAI-compatibility surface. Add your Cohere API key as an account secret after saving.' },
-    { name: 'Anthropic', dialect: 'anthropic', baseUrl: 'https://api.anthropic.com/v1', auth: 'bearer', hint: 'api.anthropic.com. Add your Anthropic API key as an account secret after saving.' },
-    { name: 'Google Gemini', dialect: 'google-ai-studio', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', auth: 'api-key-header', authHeader: 'x-goog-api-key', hint: 'The public Gemini API at generativelanguage.googleapis.com, reached with an AI Studio API key. Add the key as an account secret after saving; this endpoint wants it in the x-goog-api-key header.' },
+    { name: 'OpenAI', dialect: 'open-ai', baseUrl: 'https://api.openai.com/v1', auth: 'bearer', capabilities: ['chat', 'responses', 'embeddings', 'audio-transcription', 'audio-speech', 'images-generations', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'api.openai.com. Add your OpenAI API key as an account secret after saving.' },
+    { name: 'OpenRouter', dialect: 'open-ai', baseUrl: 'https://openrouter.ai/api/v1', auth: 'bearer', capabilities: ['chat', 'responses', 'embeddings', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'openrouter.ai. Add your OpenRouter API key as an account secret after saving.' },
+    { name: 'Groq', dialect: 'open-ai', baseUrl: 'https://api.groq.com/openai/v1', auth: 'bearer', capabilities: ['chat', 'models', 'audio-transcription', 'audio-speech', 'tool-calling', 'reasoning'], hint: 'groq.com. Add your Groq API key as an account secret after saving.' },
+    { name: 'Together AI', dialect: 'open-ai', baseUrl: 'https://api.together.xyz/v1', auth: 'bearer', capabilities: ['chat', 'embeddings', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'together.xyz. Add your Together API key as an account secret after saving.' },
+    { name: 'Mistral', dialect: 'open-ai', baseUrl: 'https://api.mistral.ai/v1', auth: 'bearer', capabilities: ['chat', 'embeddings', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'mistral.ai. Add your Mistral API key as an account secret after saving.' },
+    { name: 'DeepSeek', dialect: 'open-ai', baseUrl: 'https://api.deepseek.com/v1', auth: 'bearer', capabilities: ['chat', 'responses', 'models', 'tool-calling', 'reasoning'], hint: 'deepseek.com. Add your DeepSeek API key as an account secret after saving.' },
+    { name: 'Fireworks AI', dialect: 'open-ai', baseUrl: 'https://api.fireworks.ai/inference/v1', auth: 'bearer', capabilities: ['chat', 'embeddings', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'fireworks.ai. Add your Fireworks API key as an account secret after saving.' },
+    { name: 'Perplexity', dialect: 'open-ai', baseUrl: 'https://api.perplexity.ai', auth: 'bearer', capabilities: ['chat', 'models', 'tool-calling', 'reasoning'], hint: 'perplexity.ai. Add your Perplexity API key as an account secret after saving.' },
+    { name: 'Cohere', dialect: 'open-ai', baseUrl: 'https://api.cohere.com/compatibility/v1', auth: 'bearer', capabilities: ['chat', 'embeddings', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'cohere.com, OpenAI-compatibility surface. Add your Cohere API key as an account secret after saving.' },
+    { name: 'Anthropic', dialect: 'anthropic', baseUrl: 'https://api.anthropic.com/v1', auth: 'bearer', capabilities: ['messages', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'api.anthropic.com. Add your Anthropic API key as an account secret after saving.' },
+    { name: 'Google Gemini', dialect: 'google-ai-studio', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', auth: 'api-key-header', capabilities: ['chat', 'embeddings', 'models', 'tool-calling', 'reasoning', 'vision'], authHeader: 'x-goog-api-key', hint: 'The public Gemini API at generativelanguage.googleapis.com, reached with an AI Studio API key. Add the key as an account secret after saving; this endpoint wants it in the x-goog-api-key header.' },
+    { name: 'Fish Audio', dialect: 'open-ai', baseUrl: 'https://api.fish.audio', auth: 'bearer', capabilities: ['audio-speech'], routeOverrides: { 'audio-speech': 'v1/tts' }, hint: 'Speech synthesis only, on /v1/tts. Add your Fish Audio API key as an account secret after saving. The upstream body still uses Fish voice references rather than the OpenAI voice field.' },
+    { name: 'ElevenLabs', dialect: 'open-ai', baseUrl: 'https://api.elevenlabs.io', auth: 'header', authName: 'xi-api-key', authPrefix: '', capabilities: ['audio-speech'], hint: 'Speech synthesis only, sent with the xi-api-key header. The catalog marks the endpoint UNCERTAIN: synthesis lives under /v1/text-to-speech/{voice_id}, and a static route override cannot carry a per-request voice id.' },
+    { name: 'Deepgram', dialect: 'open-ai', baseUrl: 'https://api.deepgram.com', auth: 'header', authName: 'Authorization', authPrefix: 'Token ', capabilities: ['audio-transcription'], routeOverrides: { 'audio-transcription': 'v1/listen' }, hint: 'Transcription only, on /v1/listen. The Authorization header carries the key with a Token prefix; add the key as an account secret after saving.' },
+    { name: 'Stability AI', dialect: 'open-ai', baseUrl: 'https://api.stability.ai', auth: 'bearer', capabilities: ['images-generations'], routeOverrides: { 'images-generations': 'v1/stable-image/generate/core' }, hint: 'Image generation only, on /v1/stable-image/generate/core. Add your Stability AI API key as an account secret after saving; the upstream body is multipart rather than the OpenAI JSON shape.' },
   ],
   // Developer platforms and enterprise endpoints — OAuth or dedicated infrastructure,
-  // visually separated from the standard LLM APIs above.
+  // visually separated from the standard APIs above.
   platforms: [
-    { name: 'NVIDIA NIM', dialect: 'open-ai', baseUrl: 'https://integrate.api.nvidia.com/v1', auth: 'bearer', hint: 'NVIDIA NIM inference endpoints. Add your NVIDIA API key as an account secret after saving.' },
-    { name: 'Codex', dialect: 'codex', baseUrl: 'https://chatgpt.com/backend-api/codex', auth: 'oauth', platform: 'openai-codex', hint: 'OpenAI Codex — OAuth sign-in from the panel.' },
-    { name: 'Copilot', dialect: 'copilot', baseUrl: 'https://api.githubcopilot.com', auth: 'oauth', platform: 'github-copilot', hint: 'GitHub Copilot — OAuth sign-in from the panel.' },
-    { name: 'Antigravity', dialect: 'antigravity', baseUrl: 'https://cloudcode-pa.googleapis.com', auth: 'oauth', platform: 'antigravity', hint: 'Google Antigravity / Cloud Code — OAuth sign-in from the panel.' },
-    { name: 'Cursor', dialect: 'cursor', baseUrl: 'https://api2.cursor.sh', auth: 'oauth', platform: 'cursor', hint: 'Cursor — OAuth sign-in from the panel. The sign-in finishes in Cursor’s own tab and the panel learns of it by polling, so nothing is ever pasted back here.' },
-    { name: 'Z Code', dialect: 'zcode', baseUrl: 'https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1', auth: 'oauth', platform: 'zcode', hint: 'Z.ai coding plan — sign in with the ZCode desktop app’s own login flow; the link opens at zcode.z.ai and the panel waits for the browser.' },
-    { name: 'Command Code', dialect: 'command-code-go', baseUrl: 'https://api.commandcode.ai', auth: 'bearer', hint: 'Command Code — bearer auth.' },
+    { name: 'NVIDIA NIM', dialect: 'open-ai', baseUrl: 'https://integrate.api.nvidia.com/v1', auth: 'bearer', capabilities: ['chat', 'embeddings', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'NVIDIA NIM inference endpoints. Add your NVIDIA API key as an account secret after saving.' },
+    { name: 'Codex', dialect: 'codex', baseUrl: 'https://chatgpt.com/backend-api/codex', auth: 'oauth', platform: 'openai-codex', capabilities: ['responses', 'tool-calling', 'reasoning', 'vision'], hint: 'OpenAI Codex — OAuth sign-in from the panel.' },
+    { name: 'Copilot', dialect: 'copilot', baseUrl: 'https://api.githubcopilot.com', auth: 'oauth', platform: 'github-copilot', capabilities: ['chat', 'responses', 'messages', 'embeddings', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'GitHub Copilot — OAuth sign-in from the panel.' },
+    { name: 'Antigravity', dialect: 'antigravity', baseUrl: 'https://cloudcode-pa.googleapis.com', auth: 'oauth', platform: 'antigravity', capabilities: ['chat', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'Google Antigravity / Cloud Code — OAuth sign-in from the panel.' },
+    { name: 'Cursor', dialect: 'cursor', baseUrl: 'https://api2.cursor.sh', auth: 'oauth', platform: 'cursor', capabilities: ['chat'], hint: 'Cursor — OAuth sign-in from the panel. The sign-in finishes in Cursor’s own tab and the panel learns of it by polling, so nothing is ever pasted back here.' },
+    { name: 'Z Code', dialect: 'zcode', baseUrl: 'https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1', auth: 'oauth', platform: 'zcode', capabilities: ['messages', 'tool-calling', 'reasoning'], hint: 'Z.ai coding plan — sign in with the ZCode desktop app’s own login flow; the link opens at zcode.z.ai and the panel waits for the browser.' },
+    { name: 'Command Code', dialect: 'command-code-go', baseUrl: 'https://api.commandcode.ai', auth: 'bearer', capabilities: ['chat', 'models', 'tool-calling', 'reasoning'], hint: 'Command Code — bearer auth.' },
     { name: 'Modal vLLM', dialect: 'modal-vllm', baseUrl: '', auth: 'modal', hint: 'Enter your Modal app’s HTTPS public URL (for example https://your-app--serve.modal.run). Add the Modal Token ID.Token Secret as the account secret after saving; the panel sends it as Modal-Key and Modal-Secret headers.' },
-    { name: 'OpenCode Zen', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/v1', auth: 'bearer', hint: 'OpenCode Console, pay-as-you-go. Needs a funded key: the free models are refused outside the OpenCode client, so they cannot be routed from here.' },
-    { name: 'OpenCode Go', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/go/v1', auth: 'bearer', hint: 'OpenCode Go subscription tier. Every request needs an x-opencode-session header, which this provider will not add for you — set it as a static header. Only the models your plan lists will answer; sync them from this host.' },
+    { name: 'OpenCode Zen', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/v1', auth: 'bearer', capabilities: ['chat', 'responses', 'models', 'tool-calling', 'reasoning'], hint: 'OpenCode Console, pay-as-you-go. Needs a funded key: the free models are refused outside the OpenCode client, so they cannot be routed from here.' },
+    { name: 'OpenCode Go', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/go/v1', auth: 'bearer', capabilities: ['chat', 'responses', 'models', 'tool-calling', 'reasoning'], hint: 'OpenCode Go subscription tier. Every request needs an x-opencode-session header, which this provider will not add for you — set it as a static header. Only the models your plan lists will answer; sync them from this host.' },
   ],
 };
 
@@ -1533,9 +1592,14 @@ export async function renderProviders(mount, ctx) {
     modelSection.append(buildModelForm(p));
     body.append(modelSection);
 
-    // Base URL, auth and note follow Models so the provider's main content stays easy to scan.
+    // Base URL, capabilities, auth and note follow Models so the provider's main content stays
+    // easy to scan.
+    const declaredCapabilities = Array.isArray(p.capabilities) && p.capabilities.length
+      ? p.capabilities
+      : DEFAULT_CAPABILITIES;
     body.append(h('section', {}, h('h3', {}, 'Connection details'), kv([
       ['base URL', h('span', { class: 'mono' }, p.base_url ?? '—')],
+      ['capabilities', h('span', { class: 'mono' }, declaredCapabilities.join(', '))],
       ['auth', authLabel(p.auth)],
       ['key strategy', h('span', { class: 'mono' }, p.key_strategy ?? 'priority')],
       ['cooldown scope', h('span', { class: 'mono' }, p.cooldown_scope ?? 'account')],
@@ -2794,7 +2858,7 @@ export async function renderProviders(mount, ctx) {
     const dialectIn = h('select', { class: 'input', 'data-field': 'dialect' },
       ...DIALECTS.map((d) => h('option', { value: d, selected: (p?.dialect ?? 'open-ai') === d }, d)));
     const presetSel = h('select', { class: 'input', 'data-field': 'preset', 'aria-label': 'Provider preset' },
-      h('optgroup', { label: 'Standard LLM APIs' },
+      h('optgroup', { label: 'Standard & media APIs' },
         ...PROVIDER_PRESETS.providers.map((p) => h('option', { value: p.name, selected: isEdit ? false : p.name === 'Custom (manual)' }, p.name))),
       h('optgroup', { label: 'Platforms & enterprise' },
         ...PROVIDER_PRESETS.platforms.map((p) => h('option', { value: p.name, selected: isEdit ? false : false }, p.name))));
@@ -2851,10 +2915,12 @@ export async function renderProviders(mount, ctx) {
     }
     renderAuthParams();
 
-    // Preset behavior: applying a preset sets dialect, base URL, and auth kind. A preset that
-    // names `authHeader` also sets the header, because an auth kind alone is not enough to be
-    // usable: `api-key-header` defaults to `x-api-key`, and Gemini wants `x-goog-api-key`, so a
-    // preset that only picked the kind would fill the form in with a header that is refused.
+    // Preset behavior: applying a preset sets dialect, base URL, auth kind, the header fields
+    // that auth kind reads, and the capability ticks. A preset that names `authHeader` also sets
+    // the header, because an auth kind alone is not enough to be usable: `api-key-header`
+    // defaults to `x-api-key`, and Gemini wants `x-goog-api-key`, so a preset that only picked the
+    // kind would fill the form in with a header that is refused. The same is true of `header`
+    // auth, which needs both the header name and its prefix (Deepgram: Authorization + `Token `).
     presetSel.addEventListener('change', () => {
       const preset = [
         ...PROVIDER_PRESETS.providers,
@@ -2870,6 +2936,18 @@ export async function renderProviders(mount, ctx) {
         // login, it is a promise the panel cannot keep.
         if (preset.platform) authPlatform.value = preset.platform;
         if (preset.authHeader) authHeader.value = preset.authHeader;
+        // `header` presets carry both fields in the catalog. Reset when a preset does not name
+        // them, so switching from Deepgram to ElevenLabs cannot leave Deepgram's Token prefix on
+        // ElevenLabs' xi-api-key header.
+        authName.value = preset.authName ?? '';
+        authPrefix.value = preset.authPrefix ?? '';
+        // Replace rather than add: switching from Fish Audio to OpenAI must drop audio-speech,
+        // and a preset with no capability list keeps the server default the form already shows.
+        applyPresetCapabilities(
+          Array.isArray(preset.capabilities) && preset.capabilities.length > 0
+            ? preset.capabilities
+            : DEFAULT_CAPABILITIES,
+        );
         renderAuthParams();
       }
       presetHint.textContent = preset.hint;
@@ -2878,6 +2956,42 @@ export async function renderProviders(mount, ctx) {
       ...PROVIDER_PRESETS.providers,
       ...PROVIDER_PRESETS.platforms,
     ].find((pr) => pr.name === presetSel.value)?.hint ?? '';
+
+    // On edit, tick exactly what the server sent; on create — and when an older provider arrives
+    // without the key, or with the empty array a hand-edited config can carry — mirror the
+    // server's `default_capabilities()` instead of showing an unsaveable empty form.
+    const initialCapabilities = isEdit && Array.isArray(p.capabilities) && p.capabilities.length > 0
+      ? new Set(p.capabilities)
+      : new Set(DEFAULT_CAPABILITIES);
+    const capabilityBoxes = new Map();
+    // `field` is the class applyFieldErrors anchors to, so its message can be pinned directly
+    // under this fieldset. `toggle` is the checkbox counterpart of `field()`: the hint sits on
+    // its own line under the row.
+    const capabilityFieldset = h('fieldset', { class: 'plain field', 'data-field': 'capabilities' },
+      h('legend', {}, 'Capabilities'));
+    for (const group of CAPABILITY_GROUPS) {
+      capabilityFieldset.append(
+        h('h4', { style: 'margin:12px 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:var(--tx3);' }, group.id),
+        h('p', { class: 'hint', style: 'margin:0 0 6px;' }, group.hint));
+      for (const capability of CAPABILITIES) {
+        if (capability.group !== group.id) continue;
+        const checkbox = toggle(capability.label, {
+          hint: capability.hint,
+          checked: initialCapabilities.has(capability.id),
+        });
+        checkbox.input.setAttribute('data-capability', capability.id);
+        capabilityBoxes.set(capability.id, checkbox.input);
+        capabilityFieldset.append(checkbox.row);
+      }
+    }
+
+    // Defined after the boxes but called from the preset handler above, which only runs after the
+    // form is built. A preset replaces the whole tick set: adding to it would leave the previous
+    // provider's modalities ticked, and the resulting provider would claim routes it cannot serve.
+    function applyPresetCapabilities(ids) {
+      const wanted = new Set(ids);
+      for (const [id, input] of capabilityBoxes) input.checked = wanted.has(id);
+    }
 
     const timeouts = h('div', { class: 'grid-fields' });
     const tFields = {};
@@ -2962,6 +3076,7 @@ export async function renderProviders(mount, ctx) {
       })),
       field('Base URL', baseUrl),
       baseUrlSuggestion,
+      capabilityFieldset,
       h('fieldset', { class: 'plain' }, h('legend', {}, 'Auth'), authSel, authBox, authWarn),
       h('fieldset', { class: 'plain' }, h('legend', {}, 'Timeouts'), timeouts),
       budgetSettings,
@@ -2978,6 +3093,18 @@ export async function renderProviders(mount, ctx) {
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       clearFieldErrors(form);
+      const selectedCapabilities = capabilityIds(
+        [...capabilityBoxes].filter(([, input]) => input.checked).map(([id]) => id),
+      );
+      if (selectedCapabilities.length === 0) {
+        applyFieldErrors(form, {
+          details: [{
+            field: 'capabilities',
+            message: 'A provider with no capabilities can serve nothing. Tick at least one.',
+          }],
+        });
+        return;
+      }
       // Refused here as well as in the conductor, on purpose: the server's refusal is the rule,
       // and this is the version that can pin the reason under the field instead of a toast about
       // a provider that was never created.
@@ -2993,6 +3120,10 @@ export async function renderProviders(mount, ctx) {
       }
       save.disabled = true;
       save.textContent = 'Saving…';
+      const selectedPreset = [
+        ...PROVIDER_PRESETS.providers,
+        ...PROVIDER_PRESETS.platforms,
+      ].find((preset) => preset.name === presetSel.value);
       const payload = isEdit
         ? { ...p } // preserve everything the form does not show (headers, models, extra…)
         : {};
@@ -3000,6 +3131,15 @@ export async function renderProviders(mount, ctx) {
       payload.label = labelIn.value || null;
       payload.dialect = dialectIn.value;
       payload.base_url = baseUrl.value.trim();
+      // The create form has no route-override editor, but an OpenAI-shaped media preset is only
+      // usable with the catalog's path override. Send it only on create: an edit payload began as
+      // `{ ...p }` and already preserves whatever route_overrides the provider has.
+      if (!isEdit && selectedPreset?.routeOverrides) {
+        payload.route_overrides = { ...selectedPreset.routeOverrides };
+      }
+      // Always assign the key, including on edit where payload began as `{ ...p }`: assignment
+      // replaces the old array instead of merging it, so an unticked capability really goes away.
+      payload.capabilities = selectedCapabilities;
       payload.note = note.value || null;
       payload.key_strategy = keyStrat.value;
       payload.cooldown_scope = cooldownScope.value;

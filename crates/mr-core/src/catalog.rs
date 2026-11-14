@@ -610,6 +610,38 @@ mod tests {
     }
 
     #[test]
+    fn the_single_family_templates_declare_only_their_own_family() {
+        // `fish-audio`, `elevenlabs`, `deepgram` and `stability-ai` are in the catalogue because a
+        // client may want one family from a provider that serves nothing else. If one of them
+        // gained `chat`, an operator reading the catalogue would reasonably point a text combo at
+        // an audio API and get an upstream 404 that looks like a bug in this relay rather than a
+        // misconfiguration, so the declaration is pinned here and not only in the TOML.
+        let expected: &[(&str, Capability)] = &[
+            ("fish-audio", Capability::AudioSpeech),
+            ("elevenlabs", Capability::AudioSpeech),
+            ("deepgram", Capability::AudioTranscription),
+            ("stability-ai", Capability::ImagesGenerations),
+        ];
+        let catalog = shipped();
+        for (id, capability) in expected {
+            let template = catalog
+                .providers
+                .iter()
+                .find(|provider| provider.id == *id)
+                .unwrap_or_else(|| panic!("{id} is missing from the shipped catalogue"));
+            assert_eq!(
+                template.capabilities,
+                vec![*capability],
+                "{id} must declare exactly {capability:?} and nothing else",
+            );
+            assert!(
+                !template.capabilities.contains(&Capability::Chat),
+                "{id} serves no chat endpoint, so declaring chat would route text into a wall",
+            );
+        }
+    }
+
+    #[test]
     fn the_shipped_catalogue_parses_and_is_not_empty() {
         let catalog = shipped();
         assert!(

@@ -186,18 +186,115 @@ test('a preset that names a catalog provider agrees with the catalog', () => {
   for (const block of toml.split('[[providers]]').slice(1)) {
     const label = block.match(/^label = "([^"]*)"/m);
     const baseUrl = block.match(/^base_url = "([^"]*)"/m);
-    if (label && baseUrl) catalog.set(label[1], baseUrl[1]);
+    const capabilityLine = block.match(/^capabilities = \[(.*?)\]/m)?.[1] ?? '';
+    const capabilities = [...capabilityLine.matchAll(/"([^"]*)"/g)].map((match) => match[1]);
+    if (label && baseUrl) catalog.set(label[1], { baseUrl: baseUrl[1], capabilities });
   }
   // The catalog records the prefix a dialect appends its route path to, and the panel records
   // what a person types. They may differ by a trailing `/v1` (DeepSeek documents both), so the
   // check is that one is a path prefix of the other rather than that they are identical.
   const agrees = (a, b) => a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+  // Presets whose panel label is shorter than the catalog's, or whose base URL is a different
+  // host for the same product. The capability list is what is pinned here; the base URL is not,
+  // because these hosts are chosen by the OAuth flow rather than typed by the operator.
+  const ALIASES = new Map([
+    ['Google Gemini', 'gemini'],
+    ['Codex', 'openai-codex'],
+    ['Copilot', 'github-copilot'],
+    ['Antigravity', 'antigravity'],
+    ['Z Code', 'zcode'],
+  ]);
+  const byId = new Map();
+  for (const block of toml.split('[[providers]]').slice(1)) {
+    const id = block.match(/^id = "([^"]*)"/m);
+    const capabilityLine = block.match(/^capabilities = \[(.*?)\]/m)?.[1] ?? '';
+    if (id) {
+      byId.set(id[1], [...capabilityLine.matchAll(/"([^"]*)"/g)].map((match) => match[1]));
+    }
+  }
   for (const preset of all) {
+    const aliased = ALIASES.get(preset.name);
+    if (aliased !== undefined) {
+      assert.deepEqual(
+        [...(preset.capabilities ?? [])],
+        byId.get(aliased),
+        `${preset.name} declares ${JSON.stringify(preset.capabilities ?? [])} in the panel but `
+          + `catalog provider ${aliased} declares ${JSON.stringify(byId.get(aliased))}`,
+      );
+      continue;
+    }
     const documented = catalog.get(preset.name);
     if (documented === undefined) continue;
     assert.ok(
-      agrees(preset.baseUrl, documented),
-      `${preset.name} is ${preset.baseUrl} in the panel but ${documented} in catalog/providers.toml`,
+      agrees(preset.baseUrl, documented.baseUrl),
+      `${preset.name} is ${preset.baseUrl} in the panel but ${documented.baseUrl} in catalog/providers.toml`,
+    );
+    // Capabilities are the other half of what a preset fills in. A preset that omits them makes
+    // the form fall back to `chat, models`, so a panel-created OpenAI provider silently refuses
+    // `/v1/responses`, `/v1/embeddings`, the audio routes and image generation — routes the
+    // catalog says that provider serves. Pinning the list to the catalog keeps the two in step:
+    // a provider the panel offers is the provider the compiled catalog describes.
+    assert.deepEqual(
+      [...(preset.capabilities ?? [])],
+      documented.capabilities,
+      `${preset.name} declares ${JSON.stringify(preset.capabilities ?? [])} in the panel but `
+        + `${JSON.stringify(documented.capabilities)} in catalog/providers.toml`,
+    );
+  }
+});
+
+test('the four capability-gated media presets copy their catalog template', () => {
+  const toml = readFileSync(join(repo, 'catalog/providers.toml'), 'utf8');
+  const templates = new Map();
+  for (const block of toml.split('[[providers]]').slice(1)) {
+    const id = block.match(/^id = "([^"]*)"/m)?.[1];
+    const label = block.match(/^label = "([^"]*)"/m)?.[1];
+    const baseUrl = block.match(/^base_url = "([^"]*)"/m)?.[1];
+    if (!id || !label || !baseUrl) continue;
+    const dialect = block.match(/^dialect = "([^"]*)"/m)?.[1];
+    const auth = block.match(/^auth = \{([^}]*)\}/m)?.[1] ?? '';
+    const authType = auth.match(/type = "([^"]*)"/)?.[1];
+    const authName = auth.match(/name = "([^"]*)"/)?.[1] ?? '';
+    const authPrefix = auth.match(/prefix = "([^"]*)"/)?.[1] ?? '';
+    const capabilityLine = block.match(/^capabilities = \[(.*?)\]/m)?.[1] ?? '';
+    const capabilities = [...capabilityLine.matchAll(/"([^"]*)"/g)].map((match) => match[1]);
+    const routeBlock = block.match(/^\[providers\.route_overrides\]\n([\s\S]*?)(?=\n\[\[|$)/m);
+    const routeOverrides = {};
+    for (const line of (routeBlock?.[1] ?? '').split('\n')) {
+      const route = line.match(/^([a-z][a-z0-9-]*) = "([^"]*)"/);
+      if (route) routeOverrides[route[1]] = route[2];
+    }
+    templates.set(id, { id, label, dialect, baseUrl, authType, authName, authPrefix, capabilities, routeOverrides });
+  }
+
+  // Pinned by id on purpose: these four are the catalog's capability-gated media templates, and
+  // a rename there should fail here rather than silently drop the preset coverage. The panel
+  // maps to them by label, which is the only name both files share.
+  const ids = ['fish-audio', 'elevenlabs', 'deepgram', 'stability-ai'];
+  assert.deepEqual(
+    ids.filter((id) => !templates.has(id)),
+    [],
+    'catalog/providers.toml lost one of the capability-gated media templates',
+  );
+  for (const id of ids) {
+    const template = templates.get(id);
+    const preset = all.find((item) => item.name === template.label);
+    assert.ok(preset, `catalog provider ${id} (${template.label}) has no panel preset`);
+    assert.equal(preset.dialect, template.dialect, `${preset.name} dialect drifted from the catalog`);
+    assert.equal(preset.baseUrl, template.baseUrl, `${preset.name} base URL drifted from the catalog`);
+    assert.equal(preset.auth, template.authType, `${preset.name} auth kind drifted from the catalog`);
+    assert.equal(preset.authName ?? '', template.authName, `${preset.name} header name drifted from the catalog`);
+    assert.equal(preset.authPrefix ?? '', template.authPrefix, `${preset.name} header prefix drifted from the catalog`);
+    assert.equal(template.capabilities.length, 1, `${template.label} is not single-capability in the catalog`);
+    assert.deepEqual(
+      [...preset.capabilities],
+      template.capabilities,
+      `${preset.name} capability ticks disagree with catalog/providers.toml`,
+    );
+    assert.deepEqual(
+      { ...(preset.routeOverrides ?? {}) },
+      template.routeOverrides,
+      `${preset.name} route overrides disagree with catalog/providers.toml`,
     );
   }
 });

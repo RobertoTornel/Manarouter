@@ -34,7 +34,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::body::Body as AxumBody;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -43,16 +43,16 @@ use axum::Router;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, BodyStream, StreamBody};
-use mr_core::dialect::{AuthKind, Dialect, InputModality, ReasoningLevel, RouteKind};
+use mr_core::dialect::{AuthKind, Capability, Dialect, InputModality, ReasoningLevel, RouteKind};
 use mr_core::ids::ProviderId;
 use mr_core::oauth::platform as oauth_platform;
 use mr_core::oauth::refresh::Refresher;
 use mr_core::secret::Vault;
-use mr_core::snapshot::{Resolution, StepPlan};
+use mr_core::snapshot::{AccountPlan, ProviderPlan, Resolution, StepPlan};
 
 use mr_dialects::{translate_request, TranslateCtx};
 
-use crate::model_scan::{scan_request_head, RequestHead};
+use crate::model_scan::{multipart_boundary, scan_multipart_model, scan_request_head, RequestHead};
 use crate::proxy::{self, ProxyEndpoint};
 use crate::recovery::RerunFactory;
 use crate::select::{self, Health};
@@ -166,11 +166,36 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/responses", any(dispatch_openai))
         .route("/v1/embeddings", any(dispatch_openai))
         .route("/v1/audio/transcriptions", any(dispatch_openai))
+        .route("/v1/audio/translations", any(dispatch_openai))
         .route("/v1/audio/speech", any(dispatch_openai))
         .route("/v1/images/generations", any(dispatch_openai))
+        .route("/v1/images/edits", any(dispatch_openai))
+        .route("/v1/images/variations", any(dispatch_openai))
+        .route("/v1/moderations", any(dispatch_openai))
+        // Videos: the create names its model in the body and goes through the ordinary path; the
+        // two reads name the render by id in the path, so they are addressed by capability.
+        .route("/v1/videos", any(dispatch_openai))
+        .route("/v1/videos/{*rest}", any(video_read))
+        .route("/v1/realtime/client_secrets", post(realtime_session))
+        .route("/v1/realtime/calls", post(realtime_session))
+        // Fine-tuning is a job API: the client names no model, so every path in the family is
+        // addressed by capability. `/v1/search` is deliberately **not** mounted here — the
+        // vector-store module owns it and merges its own router; registering it twice makes
+        // `Router::merge` panic at startup.
+        .route("/v1/fine_tuning/jobs", any(fine_tuning))
+        .route("/v1/fine_tuning/jobs/{*rest}", any(fine_tuning))
+        .route("/v1/containers", any(containers))
+        .route("/v1/containers/{*rest}", any(containers))
         .route("/v1/messages", any(dispatch_anthropic))
         .route("/v1/messages/count_tokens", any(dispatch_anthropic))
         .route("/v1/models", any(list_models))
+        // A model id in the listing is `provider/model`, which contains a `/`, so the wildcard is
+        // the only parameter shape that can name every listed model. It does not shadow
+        // `/v1/models`, which has no trailing segment.
+        .route(
+            "/v1/models/{*model}",
+            get(retrieve_model).delete(delete_model),
+        )
         // The batch lane. OpenAI's file and batch surfaces, mounted on the same listener because a
         // batch is submitted with the same client key that calls a model. Axum 0.8 spells a path
         // parameter `{id}`, not `:id`.
@@ -191,6 +216,16 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/batches/{id}/cancel", post(crate::batch::cancel_batch))
         .route("/control/probe", post(control_probe))
         .route("/control/activity", get(control_activity))
+        // The families that keep their own state rather than forwarding it. Each module owns its
+        // paths and returns a router without state; merging them before `.with_state` is what lets
+        // one listener answer both halves. `Router::merge` panics on a path registered twice, so a
+        // duplicate is a startup failure with a line number rather than a silently shadowed route —
+        // which is why `/v1/search` lives in `vector_stores` alone and is not repeated above.
+        .merge(crate::responses::routes())
+        .merge(crate::uploads::routes())
+        .merge(crate::evals::routes())
+        .merge(crate::vector_stores::routes())
+        .merge(crate::realtime::routes())
         .with_state(state)
 }
 
@@ -528,6 +563,764 @@ async fn list_models(State(app): State<AppState>, headers: HeaderMap) -> Respons
     )
 }
 
+/// `GET /v1/models/{model}`.
+///
+/// One row of exactly the listing `GET /v1/models` serves, found by id. Building the row from the
+/// same function is what keeps the two routes consistent: a name the list shows is a name this
+/// route returns, with the same shape, the same `owned_by` and the same `manarouter` metadata, and
+/// a name the list does not show is a 404. The listing is compiled from the snapshot, so no provider
+/// is contacted and this cannot be slow because a provider is down.
+async fn retrieve_model(
+    State(app): State<AppState>,
+    Path(model): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let presented = presented_key(&headers);
+    let auth = authenticate_request(&app.relay, app.no_key_required, presented.as_deref());
+    if !auth.is_allowed() {
+        return auth_error(&auth, Dialect::OpenAi);
+    }
+
+    let table = app.relay.table();
+    // A wildcard capture may keep the separator that the route pattern consumed; the listing never
+    // contains it, so the name is compared without it either way.
+    let model = model.strip_prefix('/').unwrap_or(&model);
+    match model_listing(&table.snapshot)
+        .into_iter()
+        .find(|row| row.get("id").and_then(|id| id.as_str()) == Some(model))
+    {
+        Some(row) => json_response(StatusCode::OK, row),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            Dialect::OpenAi,
+            "model_not_found",
+            &format!("the model \"{model}\" does not exist"),
+        ),
+    }
+}
+
+/// `DELETE /v1/models/{model}`.
+///
+/// OpenAI's surface allows this for a **fine-tuned** model, where deleting it removes the fine-tune
+/// at the provider that owns it. Manarouter can create a fine-tune job, but it keeps no record of
+/// which listed model came from one, and a base model cannot be deleted anywhere, so there is
+/// nothing this route could honestly delete. Answering locally says so; forwarding the DELETE would
+/// ask a provider to remove a model the operator configured by hand, which is not a request a proxy
+/// should invent.
+///
+/// TODO(fine-tuning): to forward this the relay would need (1) a `RouteKind` for the delete — none
+/// exists, and inventing one changes the capability table — (2) the model name carried in the path
+/// rather than a JSON body, which `requested_model` and the step scan do not read, and (3) a
+/// persisted record of which listed model is a fine-tune of which provider model. Until all three
+/// exist, the local refusal below is the truthful answer.
+async fn delete_model(
+    State(app): State<AppState>,
+    Path(model): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let presented = presented_key(&headers);
+    let auth = authenticate_request(&app.relay, app.no_key_required, presented.as_deref());
+    if !auth.is_allowed() {
+        return auth_error(&auth, Dialect::OpenAi);
+    }
+
+    let table = app.relay.table();
+    let model = model.strip_prefix('/').unwrap_or(&model);
+    // An unknown name is a 404, the same as the read route: saying "this model is not a fine-tune"
+    // about a model that does not exist would be a second, less useful error.
+    if !model_listing(&table.snapshot)
+        .iter()
+        .any(|row| row.get("id").and_then(|id| id.as_str()) == Some(model))
+    {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            Dialect::OpenAi,
+            "model_not_found",
+            &format!("the model \"{model}\" does not exist"),
+        );
+    }
+
+    error_response(
+        StatusCode::BAD_REQUEST,
+        Dialect::OpenAi,
+        "invalid_request_error",
+        "deleting a model is only possible for a fine-tuned model on a provider that serves fine-tuning, and this model is not one",
+    )
+}
+
+/// What a [`BodyShaper`] may see about the attempt it is shaping a body for.
+///
+/// Every field is unread today, because both shapers are the identity. They are not speculative:
+/// they are exactly the inputs a staging implementation needs, and they are handed over on every
+/// attempt so filling the seam does not change this file's plumbing.
+#[allow(dead_code)]
+///
+/// It is the whole attempt, not just the bytes: a shaper that stages something upstream needs the
+/// provider's address, the account's credential and proxy, and the same upstream client every other
+/// request uses — otherwise it would have to guess at auth, placeholders or egress, and guess wrong.
+struct ShapeTarget<'a> {
+    /// The shared state, for the upstream client and the vault.
+    app: &'a AppState,
+    /// The provider that will run the request.
+    provider: &'a ProviderPlan,
+    /// The step whose base URL, timeouts and model id describe how to reach it.
+    step: &'a StepPlan,
+    /// The account the request will be sent as, whose placeholders the URL was built with.
+    account: &'a AccountPlan,
+    /// The account's API key, when it has one. An OAuth account authenticates through headers that
+    /// [`upstream_headers`] has already applied; a shaper that needs to dial the provider itself
+    /// must do the same, and `credential` is `None` for it.
+    credential: Option<&'a str>,
+    /// The proxy this attempt egresses through, when one is configured.
+    proxy: Option<&'a ProxyEndpoint>,
+}
+
+/// A body shaper's answer: the bytes to send, possibly after an upstream round trip.
+type ShapedBody<'a> = Pin<Box<dyn Future<Output = Bytes> + Send + 'a>>;
+
+/// The one place a capability-addressed body is turned into the body the provider receives.
+///
+/// It is `async` because the honest implementations are: staging a training file means uploading it
+/// to the provider and substituting the id that comes back. It is a plain function pointer so the
+/// set of behaviours is closed and visible at the call sites, rather than a boxed closure chosen at
+/// runtime.
+type BodyShaper = for<'a> fn(Bytes, ShapeTarget<'a>) -> ShapedBody<'a>;
+
+/// Send the body exactly as the client sent it.
+fn passthrough_body<'a>(body: Bytes, _target: ShapeTarget<'a>) -> ShapedBody<'a> {
+    Box::pin(async move { body })
+}
+
+/// The fields a fine-tuning request names its training data with.
+const FINE_TUNING_FILE_FIELDS: [&str; 2] = ["training_file", "validation_file"];
+
+/// The largest answer `/v1/files` may send back while a file is being staged.
+///
+/// The answer is an object with an id in it. The cap exists so a provider that answers an upload with
+/// a stream of something cannot hold the relay's task open while it is buffered.
+const MAX_STAGE_ANSWER_BYTES: usize = 64 * 1024;
+
+/// The fine-tuning seam: the one place a fine-tuning request body becomes the provider's body.
+///
+/// A fine-tuning job names its data by a **provider** file id. The relay serves `/v1/files` itself, so
+/// the id a client gets back is a local one (`file_…`) that no upstream can resolve. Staging closes
+/// that gap: each id that names a file this relay holds is uploaded to the resolved step's
+/// `/v1/files` as multipart with `purpose=fine-tune`, the id that comes back replaces it in the body,
+/// and the job is created against bytes the provider can actually read. The body bytes are otherwise
+/// untouched — every other field of the request reaches the provider exactly as the client wrote it.
+///
+/// What it deliberately does **not** do:
+///
+/// * An id the relay does not hold is left alone. It may be a file the client uploaded to the
+///   provider directly, which is a perfectly good way to use this route, and rewriting it would break
+///   a request that works.
+/// * A failed upload leaves the local id in place and logs why. The shaper's answer is the body to
+///   send and nothing else — it cannot turn the request into a relay error — so the alternative to
+///   forwarding is dropping the request, and a provider's own "unknown file" 400 names the id and is
+///   at least true about where the problem is.
+/// * An account whose credential is not a header (`OAuth`, `QueryParam`) is not staged: the upload
+///   needs the same authentication the job would, and a second authentication scheme invented here
+///   would be a different credential path from the one the operator configured. The job request is
+///   forwarded as it arrived.
+///
+/// It is called once per attempt, immediately before the request is built.
+fn fine_tuning_body<'a>(body: Bytes, target: ShapeTarget<'a>) -> ShapedBody<'a> {
+    Box::pin(stage_fine_tuning_files(body, target))
+}
+
+/// Rewrite the training-data ids in a fine-tuning body to the ids the provider assigned them.
+async fn stage_fine_tuning_files(body: Bytes, target: ShapeTarget<'_>) -> Bytes {
+    let Some(mut request) = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .filter(serde_json::Value::is_object)
+    else {
+        return body;
+    };
+    let mut staged = false;
+    for field in FINE_TUNING_FILE_FIELDS {
+        let Some(local_id) = request
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        // Not one of ours: a provider file id the client already has, and the provider is the only
+        // party that can resolve it.
+        let Some(bytes) = target.app.batch.file_bytes(&local_id).await else {
+            continue;
+        };
+        let filename = target
+            .app
+            .batch
+            .file_name(&local_id)
+            .unwrap_or_else(|| format!("{local_id}.jsonl"));
+        match upload_training_file(&target, &filename, bytes).await {
+            Ok(provider_id) => {
+                request[field] = serde_json::Value::String(provider_id);
+                staged = true;
+            }
+            Err(reason) => tracing::warn!(
+                field,
+                file = %local_id,
+                %reason,
+                "a training file could not be staged; the provider is being asked for a local id"
+            ),
+        }
+    }
+    if !staged {
+        return body;
+    }
+    serde_json::to_vec(&request)
+        .map(Bytes::from)
+        .unwrap_or(body)
+}
+
+/// `POST /v1/files` on the resolved step, as multipart, returning the id it assigned.
+async fn upload_training_file(
+    target: &ShapeTarget<'_>,
+    filename: &str,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    let Some(credential) = target.credential else {
+        return Err("the account has no credential to authenticate the upload with".to_owned());
+    };
+    if matches!(
+        target.step.auth,
+        AuthKind::OAuth { .. } | AuthKind::QueryParam { .. }
+    ) {
+        return Err(
+            "this account's authentication cannot be presented on a file upload".to_owned(),
+        );
+    }
+    let Some(url) = build_url(target.step, UpstreamPath::Dialect("/v1/files")) else {
+        return Err("the provider's base URL is empty".to_owned());
+    };
+    let boundary = format!("manarouter-{}", mr_core::ids::new_id());
+    let mut payload = Vec::with_capacity(bytes.len() + 512);
+    payload.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nfine-tune\r\n"
+        )
+        .as_bytes(),
+    );
+    payload.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/jsonl\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    payload.extend_from_slice(&bytes);
+    payload.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let content_type = HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}"))
+        .map_err(|_| "the multipart boundary is not a valid header value".to_owned())?;
+    let mut client_headers = HeaderMap::new();
+    client_headers.insert(axum::http::header::CONTENT_TYPE, content_type);
+    client_headers.insert(
+        axum::http::header::ACCEPT,
+        HeaderValue::from_static("application/json"),
+    );
+    let head = RequestHead {
+        model: None,
+        stream: None,
+        n: None,
+    };
+    let request = UpstreamRequest {
+        method: Method::POST,
+        url,
+        headers: upstream_headers(
+            target.provider,
+            target.step,
+            Some(credential),
+            &client_headers,
+            &head,
+            false,
+            None,
+            &[],
+        ),
+        proxy: target.proxy.cloned(),
+        body: Bytes::from(payload),
+        http2: target.provider.http2,
+        connect_timeout: Duration::from_millis(target.step.connect_timeout_ms),
+        // An upload spends its time in the request body, not in the provider's thinking: the answer
+        // starts only after the last byte arrives, so the first-byte deadline must not be the
+        // generation timeout applied to a request that is still being written.
+        ttfb_timeout: Duration::from_millis(target.step.ttfb_timeout_ms.max(300_000)),
+        total_timeout: Some(Duration::from_millis(
+            target.step.total_timeout_ms.max(600_000),
+        )),
+    };
+    let response = target
+        .app
+        .relay
+        .upstream()
+        .send(request)
+        .await
+        .map_err(|error| format!("the upload could not be sent: {error}"))?;
+    let status = response.status;
+    let answer = http_body_util::Limited::new(response.body, MAX_STAGE_ANSWER_BYTES)
+        .collect()
+        .await
+        .map_err(|error| format!("the upload's answer could not be read: {error}"))?
+        .to_bytes();
+    if !status.is_success() {
+        return Err(format!(
+            "the provider answered {status} to the upload: {}",
+            String::from_utf8_lossy(&answer[..answer.len().min(512)])
+        ));
+    }
+    let answer: serde_json::Value = serde_json::from_slice(&answer)
+        .map_err(|_| "the upload's answer was not JSON".to_owned())?;
+    answer
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "the upload's answer carried no file id".to_owned())
+}
+
+/// One parameter from a query string.
+///
+/// Only `provider` is ever read, and only as a provider slug, so a full percent-decoder would be
+/// more machinery than the single caller needs.
+fn query_provider(query: Option<&str>) -> Option<String> {
+    let query = query?;
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == "provider" && !value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+/// The OpenAI routes whose `model` field is optional, and the capability a provider must declare to
+/// serve them when a client leaves it out.
+///
+/// Each of these has a documented default that the *provider* applies: `omni-moderation-latest` for
+/// moderations, `dall-e-2` for image edits and variations. A client that omits the field is asking
+/// for that default, so the honest answer is to forward the request to a provider that declares the
+/// capability and let it apply its own default — refusing with "no model" would be a 400 on a route
+/// this router advertises.
+///
+/// The list is deliberately exactly three routes, matched on the route kind rather than on a path
+/// prefix, and every other route keeps the 400: chat, responses, embeddings, audio and video all
+/// require a model, and substituting one there would be a lie about what ran.
+fn model_optional_capability(route: RouteKind) -> Option<Capability> {
+    match route {
+        RouteKind::Moderations => Some(Capability::Moderations),
+        RouteKind::ImagesEdits => Some(Capability::ImagesEdits),
+        RouteKind::ImagesVariations => Some(Capability::ImagesVariations),
+        _ => None,
+    }
+}
+
+/// Forward a request whose provider is chosen by **capability** rather than by a model name.
+///
+/// Some surfaces name no model in a field the router can read: a fine-tuning job is addressed by
+/// the path, a video render by an id in the path, a realtime session by a nested `session.model`
+/// the body scanner deliberately does not descend into. `dispatch_routed` cannot serve those — it
+/// requires a readable `model` and resolves a step from it — so this is the second, narrower path:
+///
+/// 1. the provider is the first configured one that declares `capability`, or the one named by
+///    `?provider=`;
+/// 2. its account is chosen by the same `select::account_candidates` the model-bound path uses, so
+///    a key strategy, a cooldown and a per-model restriction all behave identically;
+/// 3. the URL is built from the step's base URL and the client's own path, so a base that already
+///    carries `/v1` does not get a second one;
+/// 4. the body is the client's bytes, optionally shaped by `shape` (see [`fine_tuning_body`]), and
+///    is **never** translated: these are OpenAI-shaped management routes, and a provider that
+///    declares the capability is expected to speak them;
+/// 5. the upstream's status and body are returned as they are, streamed, with hop-by-hop headers
+///    dropped by [`build_response`]. A provider's own error about a job is the client's answer.
+///
+/// No provider declaring the capability is a `404 unsupported_endpoint` naming it, never a 500 and
+/// never a chat fallback: the same rule the capability gate applies to model-bound routes.
+///
+/// A failure to connect is reported, not used to cool an account down. A management route runs once
+/// per job rather than once per token, so a cooldown bought here would take an account out of
+/// rotation for chat traffic on the strength of one administrative request.
+async fn forward_to_capability(
+    app: AppState,
+    capability: Capability,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: AxumBody,
+    shape: BodyShaper,
+) -> Response {
+    let presented = presented_key(&headers);
+    let auth = authenticate_request(&app.relay, app.no_key_required, presented.as_deref());
+    if !auth.is_allowed() {
+        return auth_error(&auth, Dialect::OpenAi);
+    }
+
+    let bytes = match read_body(body, MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(e) => return e.into_response(),
+    };
+    // Scanned, not parsed: the only thing wanted from it is whether the client asked for a stream,
+    // which decides the `accept` header the upstream sees.
+    let head = scan_request_head(&bytes);
+
+    forward_with_bytes(
+        &app, capability, method, uri, headers, bytes, head, shape, None,
+    )
+    .await
+}
+
+/// The part of [`forward_to_capability`] that runs once the body is in hand.
+///
+/// Split out because one caller already has the bytes: a route whose `model` is optional reaches
+/// this path from `dispatch_routed`, after authentication, body reading, the head scan and quota
+/// admission have all happened. Reading the body a second time is not possible, and doing the first
+/// three again would be wrong — the request is already admitted and must be billed as one request.
+///
+/// `ticket` is that admission. It is passed on to [`build_response`] so the response's bytes and
+/// usage are accounted to it exactly as they would be on the model-bound path; when this function
+/// refuses or fails, dropping it settles the admission with no usage.
+#[allow(clippy::too_many_arguments)]
+async fn forward_with_bytes(
+    app: &AppState,
+    capability: Capability,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    bytes: Bytes,
+    head: RequestHead,
+    shape: BodyShaper,
+    ticket: Option<Arc<crate::quota::QuotaTicket>>,
+) -> Response {
+    let app = app.clone();
+    let mut ticket = ticket;
+    let table = app.relay.table();
+    let wanted = query_provider(uri.query());
+    let health = app.health.view();
+    let now_ms = mr_core::ids::now_millis().max(0) as u64;
+
+    let mut targets: Vec<(&ProviderPlan, &StepPlan)> = Vec::new();
+    for provider in table.snapshot.providers() {
+        if !provider.capabilities.contains(&capability) {
+            continue;
+        }
+        if wanted
+            .as_deref()
+            .is_some_and(|wanted| provider.id.as_str() != wanted)
+        {
+            continue;
+        }
+        // A provider's first step is its canonical address: base URL, dialect, auth and timeouts.
+        // Which *model* the step carries is irrelevant here, because the route names none — it is
+        // only the vehicle the snapshot uses to describe "how to reach this provider".
+        if let Some(step) = provider.steps.first() {
+            targets.push((provider, step));
+        }
+    }
+    if targets.is_empty() {
+        let detail = match wanted.as_deref() {
+            Some(wanted) => format!(
+                "no provider named {wanted:?} declares the {} capability",
+                capability.as_str()
+            ),
+            None => format!(
+                "the route {} requires the {} capability, and no provider declares it",
+                uri.path(),
+                capability.as_str()
+            ),
+        };
+        return error_response(
+            StatusCode::NOT_FOUND,
+            Dialect::OpenAi,
+            "unsupported_endpoint",
+            &detail,
+        );
+    }
+
+    let mut last_failure: Option<Response> = None;
+    for (provider, step) in targets {
+        let counter = table.advance_account_rr(step);
+        let candidates = select::account_candidates(
+            provider,
+            provider.key_strategy,
+            counter,
+            &health,
+            now_ms,
+            &step.model,
+        );
+        let mut usable = Vec::new();
+        for account in candidates {
+            match account_credential(&app, step, account).await {
+                AccountCredential::Usable {
+                    credential,
+                    oauth_headers,
+                    ..
+                } => usable.push((account, credential, oauth_headers)),
+                AccountCredential::Unusable(_) => continue,
+                AccountCredential::VaultUnreadable(e) => {
+                    // A vault that cannot be decrypted fails every account the same way, so it is
+                    // reported as the relay's problem rather than as this account's.
+                    tracing::error!(error = %e, "the credential vault could not be read");
+                    return error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Dialect::OpenAi,
+                        "server_error",
+                        "the credential vault could not be read, so no account's credential could be used",
+                    );
+                }
+            }
+        }
+        if usable.is_empty() {
+            last_failure = Some(error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                Dialect::OpenAi,
+                "no_usable_accounts",
+                &format!(
+                    "no account for `{}` has a usable credential; attach one with \
+                     `mr account add {} --secret-stdin`",
+                    provider.id, provider.id
+                ),
+            ));
+            continue;
+        }
+
+        for (account, credential, oauth_headers) in usable {
+            // The client's own path, treated as a dialect path so `build_url` performs the same
+            // version reconciliation it performs for every other route: a base URL ending in
+            // `/v1` does not produce `/v1/v1/...`, and a base without one gets it added.
+            let Some(built_url) = build_url(step, UpstreamPath::Dialect(uri.path())) else {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    Dialect::OpenAi,
+                    "upstream_error",
+                    &format!("provider {:?} has no usable base URL", provider.id.as_str()),
+                );
+            };
+            let url = match mr_core::placeholders::substitute(&built_url, &account.placeholders) {
+                Ok(url) => url,
+                Err(problem) => {
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        Dialect::OpenAi,
+                        "account_placeholder_unfilled",
+                        &format!(
+                            "provider {:?} account {:?}: {}",
+                            provider.id.as_str(),
+                            account.label.as_deref().unwrap_or(account.id.as_str()),
+                            problem.message()
+                        ),
+                    );
+                }
+            };
+            let proxy = match resolve_proxy(&app, &table.snapshot, provider, account) {
+                Ok(choice) => choice,
+                Err(message) => {
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        Dialect::OpenAi,
+                        "proxy_error",
+                        &message,
+                    );
+                }
+            };
+            // Shaped before the request is built, because a shaper may itself dial the provider
+            // (staging a file) and the body it returns is what this attempt sends.
+            let shaped = shape(
+                bytes.clone(),
+                ShapeTarget {
+                    app: &app,
+                    provider,
+                    step,
+                    account,
+                    credential: credential.as_deref(),
+                    proxy: proxy.as_ref().map(|choice| &choice.endpoint),
+                },
+            )
+            .await;
+            let request = UpstreamRequest {
+                method: method.clone(),
+                url,
+                headers: upstream_headers(
+                    provider,
+                    step,
+                    credential.as_deref(),
+                    &headers,
+                    &head,
+                    false,
+                    None,
+                    &oauth_headers,
+                ),
+                proxy: proxy.map(|choice| choice.endpoint),
+                body: shaped,
+                http2: provider.http2,
+                connect_timeout: Duration::from_millis(step.connect_timeout_ms),
+                ttfb_timeout: Duration::from_millis(step.ttfb_timeout_ms),
+                total_timeout: (step.total_timeout_ms > 0)
+                    .then(|| Duration::from_millis(step.total_timeout_ms)),
+            };
+            match app.relay.upstream().send(request).await {
+                Ok(response) => {
+                    if response.status.is_success() {
+                        app.health.record_success(
+                            step.provider_id.as_str(),
+                            account.id.as_str(),
+                            &step.model,
+                        );
+                        return build_response(response, ticket.take());
+                    }
+                    // The account was refused rather than the job: a sibling account of the same
+                    // provider may serve it, exactly as it would for a chat request.
+                    if matches!(
+                        response.status,
+                        StatusCode::UNAUTHORIZED
+                            | StatusCode::FORBIDDEN
+                            | StatusCode::TOO_MANY_REQUESTS
+                    ) {
+                        tracing::warn!(
+                            provider = %provider.id,
+                            status = %response.status,
+                            "the capability-addressed request was refused for this account"
+                        );
+                        continue;
+                    }
+                    return build_response(response, ticket.take());
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        provider = %provider.id,
+                        error = %error,
+                        "the capability-addressed upstream request failed"
+                    );
+                    last_failure = Some(error_response(
+                        StatusCode::BAD_GATEWAY,
+                        Dialect::OpenAi,
+                        "upstream_error",
+                        &format!(
+                            "provider {:?} could not be reached: {error}",
+                            provider.id.as_str()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    last_failure.unwrap_or_else(|| {
+        error_response(
+            StatusCode::BAD_GATEWAY,
+            Dialect::OpenAi,
+            "upstream_error",
+            "no provider that declares this capability could be reached",
+        )
+    })
+}
+
+/// `POST|GET /v1/fine_tuning/jobs` and every job sub-resource.
+async fn fine_tuning(
+    State(app): State<AppState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: AxumBody,
+) -> Response {
+    forward_to_capability(
+        app,
+        Capability::FineTuning,
+        method,
+        uri,
+        headers,
+        body,
+        fine_tuning_body,
+    )
+    .await
+}
+
+/// `GET /v1/videos/{id}` and `GET /v1/videos/{id}/content`.
+///
+/// The create is model-bound and goes through `dispatch_openai`; these two name the render by id in
+/// the path, so they are capability-addressed. The content read is binary and is forwarded as bytes
+/// with the provider's own content type — [`build_response`] drops `content-length` and streams.
+async fn video_read(
+    State(app): State<AppState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: AxumBody,
+) -> Response {
+    forward_to_capability(
+        app,
+        Capability::Video,
+        method,
+        uri,
+        headers,
+        body,
+        passthrough_body,
+    )
+    .await
+}
+
+/// `POST /v1/realtime/client_secrets` and `POST /v1/realtime/calls`.
+///
+/// The model these sessions name lives inside `session`, which the scanner does not descend into,
+/// so the provider is chosen by capability. The response is an SDP answer or a secret bundle: both
+/// are forwarded byte for byte.
+async fn realtime_session(
+    State(app): State<AppState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: AxumBody,
+) -> Response {
+    forward_to_capability(
+        app,
+        Capability::Realtime,
+        method,
+        uri,
+        headers,
+        body,
+        passthrough_body,
+    )
+    .await
+}
+
+/// `/v1/containers` and its sub-resources.
+///
+/// Refused with `501 unsupported_endpoint` unless a provider declares `Containers`: this router does
+/// not run containers itself, so the only honest answer without such a provider is that the endpoint
+/// is not supported here. With one, the request is forwarded like any other capability-addressed
+/// route.
+async fn containers(
+    State(app): State<AppState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: AxumBody,
+) -> Response {
+    let declares = app
+        .relay
+        .table()
+        .snapshot
+        .providers()
+        .iter()
+        .any(|provider| provider.capabilities.contains(&Capability::Containers));
+    if !declares {
+        return error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            Dialect::OpenAi,
+            "unsupported_endpoint",
+            "the route containers requires the containers capability, and no provider declares it: \
+             this router does not run containers itself, so it serves this surface only by proxying \
+             to a provider that does",
+        );
+    }
+    forward_to_capability(
+        app,
+        Capability::Containers,
+        method,
+        uri,
+        headers,
+        body,
+        passthrough_body,
+    )
+    .await
+}
+
 /// Apply a step's reasoning level to an outgoing body, and retarget the model id.
 ///
 /// Returns `Ok(None)` when nothing had to change, which is the common case for a request that
@@ -549,6 +1342,41 @@ async fn list_models(State(app): State<AppState>, headers: HeaderMap) -> Respons
 /// `reasoning_effort` is being more specific than a level suffix can be, and quietly replacing it
 /// would make the same request mean different things depending on whether it arrived through a
 /// model alias.
+/// Whether the bytes about to go upstream may be read as JSON.
+///
+/// Every rewrite the relay performs on a body — the reasoning merge, the modality model retarget,
+/// asking an OpenAI upstream for stream usage — has to parse it, and a parse is only legitimate if
+/// the body is JSON. Multipart audio and image uploads and raw binary bodies are forwarded byte for
+/// byte; parsing one would either fail the request or corrupt it.
+///
+/// The client's `Content-Type` decides, because it is the only statement about the body the relay
+/// has before reading it:
+///
+/// * A translated body is JSON by construction, whatever the client sent. Dialect translation
+///   already refused anything it could not parse.
+/// * A JSON media type (`application/json`, `text/json`, anything ending in `+json`) commits the
+///   sender to JSON. A malformed body under this label is a client error the relay reports, not a
+///   binary body it silently forwards.
+/// * A media type that is not JSON is a statement that the body is not JSON, and it is never
+///   parsed.
+/// * No content type is no statement at all, so the body is probed: a body that parses as JSON is
+///   treated as JSON, preserving the behaviour clients that omit the header have always had, and
+///   anything else is left alone.
+fn outgoing_is_json(headers: &HeaderMap, translated: bool, body: &[u8]) -> bool {
+    if translated {
+        return true;
+    }
+    let Some(value) = headers.get("content-type").and_then(|v| v.to_str().ok()) else {
+        return serde_json::from_slice::<serde_json::Value>(body).is_ok();
+    };
+    let media_type = value.split(';').next().unwrap_or_default().trim();
+    media_type.eq_ignore_ascii_case("application/json")
+        || media_type.eq_ignore_ascii_case("text/json")
+        || media_type
+            .get(media_type.len().saturating_sub(5)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case("+json"))
+}
+
 fn apply_reasoning_level(
     outgoing: &[u8],
     step: &StepPlan,
@@ -786,6 +1614,55 @@ struct DispatchRequest {
     pre_admitted: Option<String>,
 }
 
+/// Run a request through the ordinary dispatch path from inside this process.
+///
+/// A few of the router's own features need a model answer they are not themselves: a vector store
+/// embeds a query, and an eval asks a model a question. Those are the relay's own requests, not a
+/// client's, so they arrive already authorised — there is no client key to present and nothing to
+/// meter — and they take the same provider selection, retries and translation as any other call.
+///
+/// The caller supplies the JSON body; the path decides the dialect pivot exactly as it does for a
+/// socket request. Errors come back as the response they would have been, so a caller can pass an
+/// upstream failure straight through instead of inventing a second error shape.
+pub(crate) async fn dispatch_internal(
+    app: &AppState,
+    method: Method,
+    path: &str,
+    body: Vec<u8>,
+) -> Response {
+    let uri: Uri = match path.parse() {
+        Ok(uri) => uri,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Dialect::OpenAi,
+                "internal_error",
+                "the router built a request path it cannot parse",
+            );
+        }
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    dispatch_routed(
+        DispatchRequest {
+            app: app.clone(),
+            client_dialect: Dialect::OpenAi,
+            method,
+            uri,
+            headers,
+            body: AxumBody::from(body),
+            pre_authorized: true,
+            pre_admitted: None,
+        },
+        0,
+        None,
+    )
+    .await
+}
+
 async fn dispatch(
     app: AppState,
     client_dialect: Dialect,
@@ -942,7 +1819,21 @@ async fn dispatch_routed(
     };
 
     // --- The model field, without parsing the JSON. ---
-    let head = scan_request_head(&bytes);
+    //
+    // A multipart body has no JSON object to scan: audio transcriptions and image edits carry their
+    // parameters as form fields. The `model` part is located in the same bytes that will be
+    // forwarded, and nothing about the body is rewritten, so the boundary, the file and every other
+    // field reach the upstream exactly as the client sent them.
+    let mut head = scan_request_head(&bytes);
+    if head.model.is_none() {
+        if let Some(boundary) = headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .and_then(multipart_boundary)
+        {
+            head.model = scan_multipart_model(&bytes, boundary);
+        }
+    }
     let scan_done = started.elapsed();
 
     // --- Quota admission, before anything is sent upstream. ---
@@ -1002,6 +1893,24 @@ async fn dispatch_routed(
     let route = route_kind_for(uri.path());
 
     let Some(model_name) = requested_model(&head, &bytes) else {
+        // Three routes make `model` optional, and a client that omits it is asking for the
+        // provider's documented default rather than making an unanswerable request. Those are
+        // forwarded by capability, with the bytes already read and the admission already taken, so
+        // the request is billed once and the body is not read twice.
+        if let Some(capability) = model_optional_capability(route) {
+            return forward_with_bytes(
+                &app,
+                capability,
+                method,
+                uri,
+                headers,
+                bytes,
+                head,
+                passthrough_body,
+                ticket,
+            )
+            .await;
+        }
         return error_response(
             StatusCode::BAD_REQUEST,
             client_dialect,
@@ -1109,6 +2018,40 @@ async fn dispatch_routed(
         }
         (None, None) => Vec::new(),
     };
+
+    // --- The capability gate. ---
+    //
+    // A provider declares which client surfaces it serves, and a model it hosts is only reachable
+    // through those surfaces. A route whose capability no step's provider declares is not dialled:
+    // the upstream would answer with a 404 that blames the model for a feature the operator never
+    // configured, and falling back to chat would answer in a shape the client cannot read. The
+    // honest answer is that this endpoint is unsupported here.
+    //
+    // A step whose provider is missing from the snapshot is kept, so the mid-flight skip can report
+    // the stale snapshot instead of disguising it as a missing capability.
+    let declared_steps = steps.len();
+    let steps: Vec<&StepPlan> = steps
+        .into_iter()
+        .filter(|step| {
+            table
+                .snapshot
+                .providers()
+                .get(step.provider_index as usize)
+                .is_none_or(|provider| provider.capabilities.contains(&route.capability()))
+        })
+        .collect();
+    if steps.is_empty() && declared_steps > 0 {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            client_dialect,
+            "unsupported_endpoint",
+            &format!(
+                "the route {} requires the {} capability, and no step's provider declares it",
+                route.as_str(),
+                Capability::for_route(route).as_str()
+            ),
+        );
+    }
 
     if steps.is_empty() {
         return error_response(
@@ -1517,6 +2460,8 @@ enum SkipCause {
     NoUsableAccount,
     /// The step's provider declares it cannot carry the request's input modality.
     UnsupportedModality,
+    /// The step's provider does not declare the capability this route requires.
+    UnsupportedCapability,
     /// The step's base URL and route path do not form an absolute URL.
     UnbuildableUrl,
 }
@@ -1531,6 +2476,9 @@ impl SkipCause {
             SkipCause::NoUsableAccount => "no account for this model is usable right now",
             SkipCause::UnsupportedModality => {
                 "the route cannot carry this input modality and has no usable default"
+            }
+            SkipCause::UnsupportedCapability => {
+                "the provider does not declare the capability this route requires"
             }
             SkipCause::UnbuildableUrl => {
                 "the provider's base URL did not form an absolute URL for this route"
@@ -1967,6 +2915,17 @@ async fn attempt_step(
             cause: SkipCause::ProviderMissing,
         };
     };
+    // The gate before the loop dropped every incapable step it could see, but a hedged participant
+    // or a rerun can still arrive here. Skipping rather than dialling keeps the request honest and
+    // degrades to the next step instead of failing it: the provider would answer in a shape this
+    // route is not.
+    if !provider.capabilities.contains(&route.capability()) {
+        return Attempt::Skip {
+            sticky_cleared,
+            fallback_target: fallback_target.take(),
+            cause: SkipCause::UnsupportedCapability,
+        };
+    }
 
     // --- The token-counting route, when this step's upstream cannot count. ---
     //
@@ -2136,14 +3095,17 @@ async fn attempt_step(
             ),
             None => (bytes.clone(), false, None, None, false),
         };
+    // Does any rewrite below have the right to parse this body at all? A multipart upload or a
+    // binary response body is forwarded verbatim, and every pass that assumes JSON is skipped.
+    let inspect_json = outgoing_is_json(headers, translated_body, &outgoing);
     // Ask for usage on streams. An OpenAI-compatible upstream reports none unless it is asked, and
     // the relay then records the request as costing zero tokens — which the quota layer sums as
     // zero, so every token cap silently stops binding for streamed traffic. Only a body that is
     // already streaming is touched.
-    if matches!(step.dialect, Dialect::OpenAi | Dialect::Copilot) {
+    if inspect_json && matches!(step.dialect, Dialect::OpenAi | Dialect::Copilot) {
         outgoing = with_stream_usage(outgoing);
     }
-    if step.dialect == Dialect::Antigravity {
+    if step.dialect == Dialect::Antigravity && inspect_json {
         match inject_antigravity_project(&outgoing, oauth_tokens.as_ref()) {
             Ok(body) => outgoing = body.into(),
             Err(message) => {
@@ -2159,6 +3121,27 @@ async fn attempt_step(
         }
     }
 
+    // --- The model field, when the JSON merge below will not reach it. ---
+    //
+    // A multipart body is forwarded as it was uploaded, so the resolved model cannot be written
+    // into it by the JSON merge. The `model` part was located during the route scan, and only that
+    // value is replaced: the boundary, the audio, the file name and every other field are copied
+    // through unchanged, so a request for a model the provider serves under another name reaches
+    // the provider with that name rather than with the relay's composite one.
+    if !inspect_json {
+        if let Some(range) = head.model {
+            let current = range.slice(bytes);
+            if current != step.model.as_bytes() {
+                let mut retargeted =
+                    Vec::with_capacity(bytes.len() + step.model.len() - current.len());
+                retargeted.extend_from_slice(&bytes[..range.start]);
+                retargeted.extend_from_slice(step.model.as_bytes());
+                retargeted.extend_from_slice(&bytes[range.end..]);
+                outgoing = retargeted.into();
+            }
+        }
+    }
+
     // --- The reasoning level, applied to the bytes that actually go upstream. ---
     //
     // This runs *after* translation so it lands on the upstream's own shape: an OpenAI client
@@ -2166,65 +3149,72 @@ async fn attempt_step(
     // It also runs on the passthrough path, where `outgoing` is still the client's own bytes —
     // which is exactly why the rewrite is a merge rather than a re-encode, and why it retargets
     // the `model` field in the same pass.
-    match apply_reasoning_level(&outgoing, step, translated_body, level_override) {
-        Ok(Some(body)) => outgoing = body.into(),
-        Ok(None) => {}
-        Err(message) => {
-            return Attempt::Fatal {
-                response: error_response(
-                    StatusCode::BAD_REQUEST,
-                    client_dialect,
-                    "invalid_request_error",
-                    &message,
-                ),
-            };
+    if inspect_json {
+        match apply_reasoning_level(&outgoing, step, translated_body, level_override) {
+            Ok(Some(body)) => outgoing = body.into(),
+            Ok(None) => {}
+            Err(message) => {
+                return Attempt::Fatal {
+                    response: error_response(
+                        StatusCode::BAD_REQUEST,
+                        client_dialect,
+                        "invalid_request_error",
+                        &message,
+                    ),
+                };
+            }
         }
     }
 
-    // Modality detection runs on the translated upstream shape, so the same helper can inspect
-    // both passthrough and cross-dialect requests. Only a differing configured default changes
-    // the model field; the request content is never dropped or rewritten.
-    let mut modality_body: serde_json::Value = match serde_json::from_slice(&outgoing) {
-        Ok(body) => body,
-        Err(_) => {
-            return Attempt::Fatal {
-                response: error_response(
-                    StatusCode::BAD_REQUEST,
-                    client_dialect,
-                    "invalid_request_error",
-                    "the request body must be valid JSON to inspect its modalities",
-                ),
-            };
-        }
-    };
-    match crate::upstream::rewrite_model_for_modalities(
-        &mut modality_body,
-        |modality| step.accepts_modality(modality),
-        table.snapshot.routing_defaults(),
-    ) {
-        Ok(Some(target)) => {
-            // This route cannot carry the request's modality. The next step of the combo may
-            // be able to, so the step is skipped rather than failed. The configured default
-            // is remembered and used after the loop, where a *complete* reroute is possible:
-            // the target is resolved against the same snapshot, with its own provider,
-            // account, credential, URL, dialect and headers.
-            fallback_target = Some(target);
-            return Attempt::Skip {
-                sticky_cleared,
-                fallback_target: fallback_target.take(),
-                cause: SkipCause::UnsupportedModality,
-            };
-        }
-        Ok(None) => {}
-        Err(error) => {
-            return Attempt::Fatal {
-                response: error_response(
-                    StatusCode::BAD_REQUEST,
-                    client_dialect,
-                    "invalid_request_error",
-                    &error.with_model(&step.model).to_string(),
-                ),
-            };
+    // A body that is not JSON has no top-level `model` to rewrite and no content array to inspect.
+    // It is on its way upstream exactly as the client wrote it, so the pass is skipped rather than
+    // turned into the 400 a parse failure would produce for a multipart or binary upload.
+    if inspect_json {
+        // Modality detection runs on the translated upstream shape, so the same helper can inspect
+        // both passthrough and cross-dialect requests. Only a differing configured default changes
+        // the model field; the request content is never dropped or rewritten.
+        let mut modality_body: serde_json::Value = match serde_json::from_slice(&outgoing) {
+            Ok(body) => body,
+            Err(_) => {
+                return Attempt::Fatal {
+                    response: error_response(
+                        StatusCode::BAD_REQUEST,
+                        client_dialect,
+                        "invalid_request_error",
+                        "the request body must be valid JSON to inspect its modalities",
+                    ),
+                };
+            }
+        };
+        match crate::upstream::rewrite_model_for_modalities(
+            &mut modality_body,
+            |modality| step.accepts_modality(modality),
+            table.snapshot.routing_defaults(),
+        ) {
+            Ok(Some(target)) => {
+                // This route cannot carry the request's modality. The next step of the combo may
+                // be able to, so the step is skipped rather than failed. The configured default
+                // is remembered and used after the loop, where a *complete* reroute is possible:
+                // the target is resolved against the same snapshot, with its own provider,
+                // account, credential, URL, dialect and headers.
+                fallback_target = Some(target);
+                return Attempt::Skip {
+                    sticky_cleared,
+                    fallback_target: fallback_target.take(),
+                    cause: SkipCause::UnsupportedModality,
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Attempt::Fatal {
+                    response: error_response(
+                        StatusCode::BAD_REQUEST,
+                        client_dialect,
+                        "invalid_request_error",
+                        &error.with_model(&step.model).to_string(),
+                    ),
+                };
+            }
         }
     }
 
@@ -2613,6 +3603,21 @@ async fn attempt_step(
             let response_translated = translated_body || step.dialect == Dialect::Cursor;
             let client_response =
                 build_client_response(ctx, response_translated, response, ticket).await;
+            // A stored response is recorded on its way out, not after: the body is a stream, and the
+            // relay only sees its bytes once. Skipped for a translated answer, whose bytes are this
+            // relay's dialect rather than the provider's object.
+            let client_response = if route == RouteKind::Responses
+                && !response_translated
+                && crate::responses::asked_to_store(&initial_body)
+            {
+                crate::responses::record_while_streaming(
+                    app.clone(),
+                    initial_body.to_vec(),
+                    client_response,
+                )
+            } else {
+                client_response
+            };
             Attempt::Answer(match budget_lease {
                 Some(mut lease) => {
                     lease.mark_success();
@@ -4108,6 +5113,19 @@ fn default_path(dialect: Dialect, route: RouteKind) -> &'static str {
             RouteKind::AudioSpeech => "/v1/audio/speech",
             RouteKind::ImagesGenerations => "/v1/images/generations",
             RouteKind::Models => "/v1/models",
+            RouteKind::AudioTranslation => "/v1/audio/translations",
+            RouteKind::ImagesEdits => "/v1/images/edits",
+            RouteKind::ImagesVariations => "/v1/images/variations",
+            RouteKind::Moderations => "/v1/moderations",
+            RouteKind::VideoCreate => "/v1/videos",
+            // The family prefix only: a read names its render by id in the path, and that path is
+            // the client's own, so the capability-addressed proxy forwards it verbatim rather than
+            // building it from this default. Naming a concrete job here would send every poll to
+            // the same non-existent video.
+            RouteKind::VideoRetrieve | RouteKind::VideoContent => "/v1/videos",
+            RouteKind::RealtimeClientSecrets => "/v1/realtime/client_secrets",
+            RouteKind::RealtimeCalls => "/v1/realtime/calls",
+            RouteKind::Search => "/v1/search",
             // An Anthropic client is translated, so the translator names the path. These are the
             // fallback for a request that was not translated.
             RouteKind::Messages | RouteKind::CountTokens => "/v1/chat/completions",
@@ -4301,16 +5319,47 @@ fn upstream_headers(
 /// The fallback is Chat Completions because that is the route an unknown path cannot have reached:
 /// `router()` registers an explicit list, and a path outside it is a 404 before this is called.
 fn route_kind_for(path: &str) -> RouteKind {
+    // Exact paths first: a path that is exactly a route can never be confused with a prefix of a
+    // sibling, and reading them in one table is what makes "every registered route maps to its own
+    // kind" checkable at a glance.
     match path {
-        "/v1/responses" => RouteKind::Responses,
-        "/v1/embeddings" => RouteKind::Embeddings,
-        "/v1/audio/transcriptions" => RouteKind::AudioTranscription,
-        "/v1/audio/speech" => RouteKind::AudioSpeech,
-        "/v1/images/generations" => RouteKind::ImagesGenerations,
-        "/v1/messages" => RouteKind::Messages,
-        "/v1/messages/count_tokens" => RouteKind::CountTokens,
-        _ => RouteKind::ChatCompletions,
+        "/v1/chat/completions" => return RouteKind::ChatCompletions,
+        "/v1/responses" => return RouteKind::Responses,
+        "/v1/embeddings" => return RouteKind::Embeddings,
+        "/v1/audio/transcriptions" => return RouteKind::AudioTranscription,
+        "/v1/audio/translations" => return RouteKind::AudioTranslation,
+        "/v1/audio/speech" => return RouteKind::AudioSpeech,
+        "/v1/images/generations" => return RouteKind::ImagesGenerations,
+        "/v1/images/edits" => return RouteKind::ImagesEdits,
+        "/v1/images/variations" => return RouteKind::ImagesVariations,
+        "/v1/moderations" => return RouteKind::Moderations,
+        "/v1/models" => return RouteKind::Models,
+        "/v1/messages" => return RouteKind::Messages,
+        "/v1/messages/count_tokens" => return RouteKind::CountTokens,
+        "/v1/videos" => return RouteKind::VideoCreate,
+        "/v1/realtime/client_secrets" => return RouteKind::RealtimeClientSecrets,
+        "/v1/realtime/calls" => return RouteKind::RealtimeCalls,
+        "/v1/search" => return RouteKind::Search,
+        _ => {}
     }
+
+    // Paths that carry an id after a fixed prefix. Videos are the only family whose *read* is
+    // addressed by id in the path rather than by a model in the body, so the suffix decides between
+    // the metadata read and the binary content read.
+    if let Some(rest) = path.strip_prefix("/v1/videos/") {
+        let rest = rest.trim_end_matches('/');
+        if !rest.is_empty() {
+            return match rest.strip_suffix("/content") {
+                Some(id) if !id.is_empty() && !id.contains('/') => RouteKind::VideoContent,
+                _ => RouteKind::VideoRetrieve,
+            };
+        }
+    }
+
+    // Anything else is a chat-completions request. The fallback is deliberate rather than an error:
+    // a client may spell the chat path with a trailing slash, and a 404 for a path the router does
+    // not serve is produced by axum's own fallback, not by this function guessing wrong.
+    RouteKind::ChatCompletions
 }
 
 /// Apply a provider's auth to the outgoing headers.
@@ -6861,9 +7910,22 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             (RouteKind::Responses, "/v1/responses"),
             (RouteKind::Embeddings, "/v1/embeddings"),
             (RouteKind::AudioTranscription, "/v1/audio/transcriptions"),
+            (RouteKind::AudioTranslation, "/v1/audio/translations"),
             (RouteKind::AudioSpeech, "/v1/audio/speech"),
             (RouteKind::ImagesGenerations, "/v1/images/generations"),
+            (RouteKind::ImagesEdits, "/v1/images/edits"),
+            (RouteKind::ImagesVariations, "/v1/images/variations"),
+            (RouteKind::Moderations, "/v1/moderations"),
             (RouteKind::Models, "/v1/models"),
+            (RouteKind::VideoCreate, "/v1/videos"),
+            (RouteKind::VideoRetrieve, "/v1/videos"),
+            (RouteKind::VideoContent, "/v1/videos"),
+            (
+                RouteKind::RealtimeClientSecrets,
+                "/v1/realtime/client_secrets",
+            ),
+            (RouteKind::RealtimeCalls, "/v1/realtime/calls"),
+            (RouteKind::Search, "/v1/search"),
             // An Anthropic client is translated, so the translator names the path; the default
             // is only the fallback.
             (RouteKind::Messages, "/v1/chat/completions"),
@@ -7321,11 +8383,41 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             route_kind_for("/v1/audio/transcriptions"),
             RouteKind::AudioTranscription
         );
+        assert_eq!(
+            route_kind_for("/v1/audio/translations"),
+            RouteKind::AudioTranslation
+        );
         assert_eq!(route_kind_for("/v1/audio/speech"), RouteKind::AudioSpeech);
         assert_eq!(
             route_kind_for("/v1/images/generations"),
             RouteKind::ImagesGenerations
         );
+        assert_eq!(route_kind_for("/v1/images/edits"), RouteKind::ImagesEdits);
+        assert_eq!(
+            route_kind_for("/v1/images/variations"),
+            RouteKind::ImagesVariations
+        );
+        assert_eq!(route_kind_for("/v1/moderations"), RouteKind::Moderations);
+        assert_eq!(route_kind_for("/v1/videos"), RouteKind::VideoCreate);
+        // A video read carries the id in the path; the suffix decides between the metadata read and
+        // the binary content read.
+        assert_eq!(
+            route_kind_for("/v1/videos/video_123"),
+            RouteKind::VideoRetrieve
+        );
+        assert_eq!(
+            route_kind_for("/v1/videos/video_123/content"),
+            RouteKind::VideoContent
+        );
+        assert_eq!(
+            route_kind_for("/v1/realtime/client_secrets"),
+            RouteKind::RealtimeClientSecrets
+        );
+        assert_eq!(
+            route_kind_for("/v1/realtime/calls"),
+            RouteKind::RealtimeCalls
+        );
+        assert_eq!(route_kind_for("/v1/search"), RouteKind::Search);
         assert_eq!(route_kind_for("/v1/messages"), RouteKind::Messages);
         assert_eq!(
             route_kind_for("/v1/messages/count_tokens"),
@@ -7719,25 +8811,106 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(parsed["status"], "ok");
     }
 
-    #[test]
-    fn the_documented_route_list_is_the_one_registered() {
-        // A route that is documented but not registered is a 404 that reads as a client bug. This is
-        // the list from `docs/18-api-reference.md`.
+    #[tokio::test]
+    async fn the_documented_route_list_is_the_one_registered() {
+        // A route that is documented but not registered is a 404 that reads as a client bug. Every
+        // path in `docs/18-api-reference.md` is therefore asked of the **mounted router**, and each
+        // must answer something other than axum's own empty 404 — which is what an unregistered path
+        // produces. A 401, a 405, a 400 or a JSON 404 all prove the path reached a handler, and that
+        // is the whole claim: this list is about mounting, not about what each route then does.
         let documented = [
+            // Liveness and the control plane.
             "/healthz",
+            "/control/probe",
+            "/control/activity",
+            // Text.
             "/v1/chat/completions",
             "/v1/responses",
-            "/v1/embeddings",
-            "/v1/audio/transcriptions",
-            "/v1/audio/speech",
-            "/v1/images/generations",
+            "/v1/responses/{id}",
+            "/v1/responses/{id}/cancel",
+            "/v1/responses/{id}/input_items",
             "/v1/messages",
             "/v1/messages/count_tokens",
+            // Models.
             "/v1/models",
+            "/v1/models/{*model}",
+            // The modalities.
+            "/v1/embeddings",
+            "/v1/moderations",
+            "/v1/audio/transcriptions",
+            "/v1/audio/translations",
+            "/v1/audio/speech",
+            "/v1/images/generations",
+            "/v1/images/edits",
+            "/v1/images/variations",
+            "/v1/videos",
+            "/v1/videos/{*rest}",
+            "/v1/realtime",
+            "/v1/realtime/client_secrets",
+            "/v1/realtime/calls",
+            // Files, resumable uploads and batches.
+            "/v1/files",
+            "/v1/files/{id}",
+            "/v1/files/{id}/content",
+            "/v1/uploads",
+            "/v1/uploads/{id}/parts",
+            "/v1/uploads/{id}/complete",
+            "/v1/uploads/{id}/cancel",
+            "/v1/batches",
+            "/v1/batches/{id}",
+            "/v1/batches/{id}/cancel",
+            // Vector stores and retrieval.
+            "/v1/vector_stores",
+            "/v1/vector_stores/{id}",
+            "/v1/vector_stores/{id}/files",
+            "/v1/vector_stores/{id}/files/{file_id}",
+            "/v1/vector_stores/{id}/file_batches",
+            "/v1/vector_stores/{id}/file_batches/{batch_id}",
+            "/v1/vector_stores/{id}/search",
+            "/v1/search",
+            // Jobs.
+            "/v1/fine_tuning/jobs",
+            "/v1/fine_tuning/jobs/{*rest}",
+            "/v1/containers",
+            "/v1/containers/{*rest}",
+            "/v1/evals",
+            "/v1/evals/{id}",
+            "/v1/evals/{id}/runs",
+            "/v1/evals/{id}/runs/{run_id}",
         ];
-        assert_eq!(documented.len(), 10);
-        assert!(documented.contains(&"/healthz"));
-        assert!(documented.contains(&"/v1/messages/count_tokens"));
+        // Every documented family is in the list exactly once, so a path added to the router and
+        // forgotten here is caught by the count rather than by a reader noticing.
+        assert_eq!(documented.len(), 51);
+        let mut unique = documented.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), documented.len(), "a path is listed twice");
+
+        let state = state_over(Vec::new(), Vec::new());
+        for template in documented {
+            let path = template
+                .replace("{*model}", "open-ai/gpt-4o-mini")
+                .replace("{*rest}", "x")
+                .replace("{run_id}", "run-1")
+                .replace("{batch_id}", "vsb-1")
+                .replace("{file_id}", "file-1")
+                .replace("{id}", "x");
+            let (status, body) = call_router(&state, Method::GET, &path, Vec::new()).await;
+            assert!(
+                status != StatusCode::NOT_FOUND || !body.is_empty(),
+                "{template} is documented but nothing is mounted there (axum answered an empty 404)"
+            );
+        }
+    }
+
+    #[test]
+    fn no_path_is_registered_twice() {
+        // `Router::merge` and `Router::route` both panic on a duplicate path, so the mount itself is
+        // the test: this call would abort the process rather than fail the assertion. It exists
+        // because the families are merged from five modules plus this file, and `/v1/search` in
+        // particular belongs to exactly one of them.
+        let state = state_over(Vec::new(), Vec::new());
+        let _ = router(state);
     }
 
     #[test]
@@ -9728,6 +10901,10 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     fn count_tokens_state(dialect: Dialect, base_url: &str) -> AppState {
         let mut provider = provider_serving("p", base_url, "m", &[InputModality::Text]);
         provider.dialect = dialect;
+        // The route this fixture serves is count-tokens, which the Messages capability covers.
+        // Without the declaration the capability gate answers `unsupported_endpoint` before any
+        // upstream is dialled, which is the behaviour the gate's own tests pin.
+        provider.capabilities = vec![Capability::Messages];
         let config = mr_core::config::Config {
             providers: vec![provider],
             ..Default::default()
@@ -11705,6 +12882,995 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(
             crate::reasoning::find_closest_effort("Low", &candidates),
             Some("low".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The capability gate, the model read/delete routes, and byte-for-byte multipart forwarding
+    // -----------------------------------------------------------------------------------------
+
+    /// A relay over exactly the given providers and combos, with the credential the fixture
+    /// accounts name.
+    fn state_over(
+        providers: Vec<mr_core::model::Provider>,
+        combos: Vec<mr_core::model::Combo>,
+    ) -> AppState {
+        let config = mr_core::config::Config {
+            providers,
+            combos,
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let vault = Arc::new(opened);
+
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        }
+    }
+
+    /// A provider declaring exactly the capabilities a test means it to declare.
+    fn provider_with_capabilities(
+        id: &str,
+        base_url: &str,
+        model: &str,
+        capabilities: &[Capability],
+    ) -> mr_core::model::Provider {
+        let mut provider = provider_serving(id, base_url, model, &[InputModality::Text]);
+        provider.capabilities = capabilities.to_vec();
+        provider
+    }
+
+    #[tokio::test]
+    async fn a_route_no_step_declares_is_an_unsupported_endpoint_and_is_never_dialled() {
+        let (url, seen) = fake_upstream().await;
+        // The default capability set is [Chat, Models]: the model is reachable, embeddings are not.
+        let provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+        let state = state_over(vec![provider], Vec::new());
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/embeddings"),
+            HeaderMap::new(),
+            AxumBody::from(r#"{"model":"p/m","input":"hello"}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = body_text(response).await;
+        assert!(body.contains("unsupported_endpoint"), "{body}");
+        assert!(
+            body.contains(
+                "the route embeddings requires the embeddings capability, and no step's provider \
+                 declares it"
+            ),
+            "{body}"
+        );
+        // The refusal is the whole answer: the provider never sees a request it would have failed
+        // with a shape the client could not read.
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a provider that does not declare the capability was dialled anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_declares_the_capability_serves_the_route() {
+        let (url, seen) = fake_upstream().await;
+        let provider = provider_with_capabilities(
+            "p",
+            &url,
+            "m",
+            &[Capability::Chat, Capability::Models, Capability::Embeddings],
+        );
+        let state = state_over(vec![provider], Vec::new());
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/embeddings"),
+            HeaderMap::new(),
+            AxumBody::from(r#"{"model":"p/m","input":"hello"}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_combo_reaches_the_capable_step_when_the_first_one_cannot_serve_the_route() {
+        let (incapable_url, incapable_seen) = fake_upstream().await;
+        let (capable_url, capable_seen) = fake_upstream().await;
+        let incapable = provider_with_capabilities(
+            "incapable",
+            &incapable_url,
+            "chat-only",
+            &[Capability::Chat, Capability::Models],
+        );
+        let capable = provider_with_capabilities(
+            "capable",
+            &capable_url,
+            "embedding",
+            &[Capability::Chat, Capability::Models, Capability::Embeddings],
+        );
+        let mut combo = mr_core::model::Combo::new(
+            "mixed",
+            mr_core::model::ComboStep::new("incapable", "chat-only"),
+        );
+        combo
+            .steps
+            .push(mr_core::model::ComboStep::new("capable", "embedding"));
+        let state = state_over(vec![incapable, capable], vec![combo]);
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/embeddings"),
+            HeaderMap::new(),
+            AxumBody::from(r#"{"model":"mixed","input":"hello"}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            incapable_seen.lock().unwrap().is_empty(),
+            "the step whose provider does not declare embeddings was dialled"
+        );
+        assert_eq!(
+            capable_seen.lock().unwrap().len(),
+            1,
+            "the capable step did not receive the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_model_read_route_returns_the_row_the_listing_shows() {
+        let (url, _seen) = fake_upstream().await;
+        let provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+        let combo = mr_core::model::Combo::new("both", mr_core::model::ComboStep::new("p", "m"));
+        let state = state_over(vec![provider], vec![combo]);
+        let listing = model_listing(&state.relay.table().snapshot);
+
+        // A provider's model is listed as `provider/model`, and the read route answers with that
+        // exact row — the same id, the same `owned_by`, the same `manarouter` metadata.
+        let response = retrieve_model(
+            State(state.clone()),
+            Path("p/m".to_owned()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let row: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        let listed = listing
+            .iter()
+            .find(|row| row["id"] == "p/m")
+            .expect("the listing shows the provider's model");
+        assert_eq!(&row, listed);
+
+        // A combo resolves to the combo's own name, exactly as the list shows it.
+        let response = retrieve_model(
+            State(state.clone()),
+            Path("both".to_owned()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let row: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(row["id"], "both");
+
+        // A name the list does not show is a 404 naming the model, not an empty 200.
+        let response =
+            retrieve_model(State(state), Path("p/nope".to_owned()), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = body_text(response).await;
+        assert!(body.contains("model_not_found"), "{body}");
+        assert!(body.contains("p/nope"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_model_delete_route_refuses_honestly_and_leaves_the_model_alone() {
+        let (url, _seen) = fake_upstream().await;
+        let provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+        let state = state_over(vec![provider], Vec::new());
+
+        let response = delete_model(
+            State(state.clone()),
+            Path("p/m".to_owned()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_text(response).await;
+        assert!(body.contains("invalid_request_error"), "{body}");
+        assert!(
+            body.contains("deleting a model is only possible for a fine-tuned model"),
+            "{body}"
+        );
+        // The refusal is local: the model is still in the listing.
+        assert!(model_listing(&state.relay.table().snapshot)
+            .iter()
+            .any(|row| row["id"] == "p/m"));
+
+        // An unknown name is the same 404 the read route gives, rather than a claim about what
+        // kind of model it is.
+        let response =
+            delete_model(State(state), Path("p/nope".to_owned()), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(body_text(response).await.contains("model_not_found"));
+    }
+
+    /// A fake upstream that records the exact bytes and content type of every request.
+    #[allow(clippy::type_complexity)]
+    async fn raw_upstream() -> (
+        String,
+        Arc<std::sync::Mutex<Vec<(Option<String>, Vec<u8>)>>>,
+    ) {
+        let seen: Arc<std::sync::Mutex<Vec<(Option<String>, Vec<u8>)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(move |headers: HeaderMap, body: Bytes| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let content_type = headers
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                sink.lock().unwrap().push((content_type, body.to_vec()));
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    r#"{"text":"ok"}"#,
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn a_multipart_body_reaches_the_upstream_byte_for_byte_with_its_content_type() {
+        const BOUNDARY: &str = "manarouter-test-boundary";
+        // Bytes that are not valid UTF-8 anywhere: a body read as a string, or re-encoded, would
+        // not survive this part.
+        let binary: Vec<u8> = vec![0xff, 0xd8, 0x00, 0x01, 0x80, b'n', 0x0a, 0x0d, 0xfe];
+        let multipart = |model: &[u8]| {
+            let mut body = Vec::new();
+            body.extend_from_slice(
+                format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n")
+                    .as_bytes(),
+            );
+            body.extend_from_slice(model);
+            body.extend_from_slice(b"\r\n");
+            body.extend_from_slice(
+                format!(
+                    "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; \
+                     filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(&binary);
+            body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+            body
+        };
+
+        let (url, seen) = raw_upstream().await;
+        let provider = provider_with_capabilities(
+            "p",
+            &url,
+            "whisper",
+            &[
+                Capability::Chat,
+                Capability::Models,
+                Capability::AudioTranscription,
+            ],
+        );
+        let state = state_over(vec![provider], Vec::new());
+
+        let sent = multipart(b"p/whisper");
+        let mut sent_headers = HeaderMap::new();
+        sent_headers.insert(
+            "content-type",
+            format!("multipart/form-data; boundary={BOUNDARY}")
+                .parse()
+                .unwrap(),
+        );
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/audio/transcriptions"),
+            sent_headers,
+            AxumBody::from(sent),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let (content_type, body) = &seen[0];
+        assert_eq!(
+            content_type.as_deref(),
+            Some("multipart/form-data; boundary=manarouter-test-boundary"),
+            "the multipart content type did not reach the upstream"
+        );
+        // The only difference from what the client sent is the model value: the client names the
+        // model as the listing does, and the upstream only understands its own id. Every other
+        // byte — the boundary, the file, the binary payload — is the client's.
+        assert_eq!(
+            body,
+            &multipart(b"whisper"),
+            "the multipart body was not forwarded byte for byte"
+        );
+        assert!(
+            body.windows(binary.len()).any(|window| window == binary),
+            "the binary part was corrupted on the way upstream"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Capability-addressed forwarding: the routes that name no model in a field we can read
+    // -----------------------------------------------------------------------------------------
+
+    /// A fake upstream that records the method, the path and the exact body of every request, and
+    /// answers with one fixed status and body.
+    #[allow(clippy::type_complexity)]
+    async fn recording_upstream(
+        status: StatusCode,
+        answer: &'static str,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>,
+    ) {
+        let seen: Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(move |method: Method, uri: Uri, body: Bytes| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push((
+                    method.as_str().to_owned(),
+                    uri.path().to_string(),
+                    body.to_vec(),
+                ));
+                (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    answer,
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// One request through the **mounted router**, so a test also proves the path is registered and
+    /// that its wildcard shape captures what it should.
+    async fn call_router(
+        app: &AppState,
+        method: Method,
+        uri: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, String) {
+        use tower::ServiceExt;
+
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(AxumBody::from(body))
+            .expect("a request");
+        let response = router(app.clone())
+            .oneshot(request)
+            .await
+            .expect("the router answered");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// A fake upstream that answers a file upload with an id and records everything it is sent, so a
+    /// test can see both the staging request and the job request that follows it.
+    #[allow(clippy::type_complexity)]
+    async fn staging_upstream() -> (
+        String,
+        Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>,
+    ) {
+        let seen: Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(move |method: Method, uri: Uri, body: Bytes| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let path = uri.path().to_string();
+                sink.lock().unwrap().push((
+                    method.as_str().to_owned(),
+                    path.clone(),
+                    body.to_vec(),
+                ));
+                if path.ends_with("/files") {
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"id":"file-upstream-1","object":"file","purpose":"fine-tune"}"#,
+                    )
+                } else {
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"id":"ftjob-1","status":"queued"}"#,
+                    )
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn a_fine_tuning_job_stages_its_training_file_with_the_provider() {
+        let (url, seen) = staging_upstream().await;
+        let provider = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        let state = state_over(vec![provider], Vec::new());
+        let training = b"{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}\n".to_vec();
+        let stored = match state
+            .batch
+            .put_file(
+                training.clone(),
+                Some("train.jsonl".to_owned()),
+                Some("fine-tune".to_owned()),
+            )
+            .await
+        {
+            Ok(file) => file,
+            Err(_) => panic!("the lane refused a fine-tune file"),
+        };
+        let local_id = stored["id"].as_str().expect("a file id").to_owned();
+        let sent =
+            format!(r#"{{"model":"gpt-4o-mini","training_file":"{local_id}","suffix":"mine"}}"#);
+        let (status, answer) = call_router(
+            &state,
+            Method::POST,
+            "/v1/fine_tuning/jobs",
+            sent.into_bytes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "the upload and the job: {seen:?}");
+        // The upload: multipart, the lane's bytes, and the purpose OpenAI requires for training data.
+        let (method, path, upload) = &seen[0];
+        assert_eq!(method, "POST");
+        assert!(path.ends_with("/files"), "{path}");
+        let upload = String::from_utf8_lossy(upload);
+        assert!(
+            upload.contains("name=\"purpose\"\r\n\r\nfine-tune"),
+            "{upload}"
+        );
+        assert!(
+            upload.contains("name=\"file\"; filename=\"train.jsonl\""),
+            "{upload}"
+        );
+        assert!(upload.contains("content\":\"hi\""), "{upload}");
+        // The job: the local id is gone, and the provider's id is what it is asked to train on.
+        let (method, path, job) = &seen[1];
+        assert_eq!(method, "POST");
+        assert!(path.ends_with("/fine_tuning/jobs"), "{path}");
+        let job: serde_json::Value = serde_json::from_slice(job).expect("a JSON body");
+        assert_eq!(job["training_file"], "file-upstream-1");
+        assert_eq!(job["model"], "gpt-4o-mini");
+        assert_eq!(job["suffix"], "mine");
+        assert!(!job.to_string().contains(&local_id), "{job}");
+    }
+
+    #[tokio::test]
+    async fn a_fine_tuning_job_naming_a_file_the_relay_does_not_hold_is_forwarded_untouched() {
+        // A client may have uploaded its data to the provider directly; that id is the provider's to
+        // resolve, and rewriting it here would break a request that works.
+        let (url, seen) =
+            recording_upstream(StatusCode::OK, r#"{"id":"ftjob-2","status":"queued"}"#).await;
+        let provider = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        let state = state_over(vec![provider], Vec::new());
+
+        let sent = r#"{"model":"gpt-4o-mini","training_file":"file-theirs"}"#;
+        let (status, answer) = call_router(
+            &state,
+            Method::POST,
+            "/v1/fine_tuning/jobs",
+            sent.as_bytes().to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "no upload is attempted: {seen:?}");
+        assert_eq!(seen[0].2, sent.as_bytes(), "the body is the client's own");
+    }
+
+    #[tokio::test]
+    async fn a_fine_tuning_job_reaches_the_provider_that_declares_the_capability() {
+        let (url, seen) =
+            recording_upstream(StatusCode::OK, r#"{"id":"ftjob-1","status":"queued"}"#).await;
+        let provider = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        let state = state_over(vec![provider], Vec::new());
+
+        let sent = r#"{"model":"gpt-4o-mini","training_file":"file-abc","suffix":"mine"}"#;
+        let (status, answer) = call_router(
+            &state,
+            Method::POST,
+            "/v1/fine_tuning/jobs",
+            sent.as_bytes().to_vec(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(answer.contains("ftjob-1"), "{answer}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the job was not sent exactly once");
+        assert_eq!(seen[0].0, "POST");
+        // The base URL carries no version and the client's path does, and it appears exactly once.
+        assert_eq!(seen[0].1, "/v1/fine_tuning/jobs");
+        // The seam is the identity: this router stages no training files, so rewriting
+        // `training_file` would send the provider an id it cannot resolve.
+        assert_eq!(String::from_utf8_lossy(&seen[0].2), sent);
+    }
+
+    #[tokio::test]
+    async fn a_fine_tuning_route_no_provider_declares_is_an_unsupported_endpoint() {
+        let (url, seen) = recording_upstream(StatusCode::OK, "{}").await;
+        // The default capability set is [Chat, Models], so this provider serves chat but no jobs.
+        let provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+        let state = state_over(vec![provider], Vec::new());
+
+        let (status, answer) = call_router(
+            &state,
+            Method::POST,
+            "/v1/fine_tuning/jobs",
+            br#"{"model":"m","training_file":"file-abc"}"#.to_vec(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(answer.contains("unsupported_endpoint"), "{answer}");
+        assert!(
+            answer.contains(
+                "the route /v1/fine_tuning/jobs requires the fine-tuning capability, and no \
+                 provider declares it"
+            ),
+            "{answer}"
+        );
+        // No chat fallback and no dial: the refusal is local.
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fine_tuning_sub_resource_keeps_its_id_and_its_method() {
+        let (url, seen) =
+            recording_upstream(StatusCode::OK, r#"{"object":"list","data":[]}"#).await;
+        let provider = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        let state = state_over(vec![provider], Vec::new());
+
+        let (status, _) = call_router(
+            &state,
+            Method::GET,
+            "/v1/fine_tuning/jobs/ftjob-1/events?limit=5",
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "GET");
+        // The id and the sub-resource are the client's path, not a default: there is no `RouteKind`
+        // for a fine-tuning job, so nothing else could have supplied them.
+        assert_eq!(seen[0].1, "/v1/fine_tuning/jobs/ftjob-1/events");
+        assert!(
+            seen[0].2.is_empty(),
+            "a GET gained a body on the way upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_named_provider_serves_a_capability_addressed_route() {
+        let (first_url, first_seen) = recording_upstream(StatusCode::OK, r#"{"id":"first"}"#).await;
+        let (second_url, second_seen) =
+            recording_upstream(StatusCode::OK, r#"{"id":"second"}"#).await;
+        let state = state_over(
+            vec![
+                provider_with_capabilities("a", &first_url, "m", &[Capability::FineTuning]),
+                provider_with_capabilities("b", &second_url, "m", &[Capability::FineTuning]),
+            ],
+            Vec::new(),
+        );
+
+        let (status, answer) = call_router(
+            &state,
+            Method::POST,
+            "/v1/fine_tuning/jobs?provider=b",
+            br#"{"model":"m","training_file":"file-abc"}"#.to_vec(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(answer.contains("second"), "{answer}");
+        assert!(
+            first_seen.lock().unwrap().is_empty(),
+            "the first provider was dialled despite ?provider=b"
+        );
+        assert_eq!(second_seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_video_read_is_addressed_by_capability_because_the_path_names_the_render() {
+        let (url, seen) = recording_upstream(StatusCode::OK, "binary-render-bytes").await;
+        let provider = provider_with_capabilities("p", &url, "m", &[Capability::Video]);
+        let state = state_over(vec![provider], Vec::new());
+
+        // A read carries no body and no model field: it can only be routed by capability.
+        let (status, answer) = call_router(
+            &state,
+            Method::GET,
+            "/v1/videos/video_1/content",
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(answer, "binary-render-bytes");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "GET");
+        assert_eq!(seen[0].1, "/v1/videos/video_1/content");
+    }
+
+    #[tokio::test]
+    async fn a_realtime_session_is_addressed_by_capability() {
+        let (url, seen) = recording_upstream(StatusCode::OK, r#"{"value":"ek_1"}"#).await;
+        let provider = provider_with_capabilities("p", &url, "m", &[Capability::Realtime]);
+        let state = state_over(vec![provider], Vec::new());
+
+        // The model lives inside `session`, which the scanner does not descend into, so this
+        // request has no readable `model` and still reaches the provider that declares realtime.
+        let sent = r#"{"session":{"type":"realtime","model":"gpt-realtime"}}"#;
+        let (status, answer) = call_router(
+            &state,
+            Method::POST,
+            "/v1/realtime/client_secrets",
+            sent.as_bytes().to_vec(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(answer.contains("ek_1"), "{answer}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1, "/v1/realtime/client_secrets");
+        assert_eq!(String::from_utf8_lossy(&seen[0].2), sent);
+    }
+
+    #[tokio::test]
+    async fn a_fine_tuned_model_name_a_provider_advertises_is_readable() {
+        // A fine-tune id is an ordinary model id as far as this router is concerned: once the
+        // provider advertises it (`mr models sync` records it), it is in the listing, and the read
+        // route answers for it because it answers from the listing. No special case, and no claim
+        // about a fine-tune the provider has not told us about.
+        let (url, _) = recording_upstream(StatusCode::OK, "{}").await;
+        let id = "p/ft:gpt-4o-mini:acme::abc123";
+        let provider = provider_serving(
+            "p",
+            &url,
+            "ft:gpt-4o-mini:acme::abc123",
+            &[InputModality::Text],
+        );
+        let state = state_over(vec![provider], Vec::new());
+
+        assert!(
+            model_listing(&state.relay.table().snapshot)
+                .iter()
+                .any(|row| row["id"] == id),
+            "the advertised fine-tune is not in the listing"
+        );
+        let response = retrieve_model(State(state), Path(id.to_owned()), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let row: serde_json::Value =
+            serde_json::from_str(&body_text(response).await).expect("a JSON row");
+        assert_eq!(row["id"], id);
+    }
+
+    #[tokio::test]
+    async fn the_containers_surface_is_refused_until_a_provider_serves_it() {
+        let (url, seen) = recording_upstream(StatusCode::OK, "{}").await;
+        let plain = provider_serving("p", &url, "m", &[InputModality::Text]);
+        let state = state_over(vec![plain], Vec::new());
+
+        let (status, answer) =
+            call_router(&state, Method::POST, "/v1/containers", b"{}".to_vec()).await;
+
+        // 501, not 404: the endpoint exists in OpenAI's surface and this router does not implement
+        // it, which is a different statement from "no route here".
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(answer.contains("unsupported_endpoint"), "{answer}");
+        assert!(answer.contains("containers"), "{answer}");
+        assert!(seen.lock().unwrap().is_empty());
+
+        // With a provider that does serve containers, the same request is proxied.
+        let serving = provider_with_capabilities("p", &url, "m", &[Capability::Containers]);
+        let state = state_over(vec![serving], Vec::new());
+        let (status, _) = call_router(&state, Method::POST, "/v1/containers", b"{}".to_vec()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Routes whose `model` is optional: a documented default the provider applies
+    // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_model_less_image_edit_reaches_a_provider_that_serves_image_edits() {
+        const BOUNDARY: &str = "manarouter-model-less";
+        let binary: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x00, 0xff, 0x0a, 0x0d];
+        // No `model` part at all: the client is relying on the documented `dall-e-2` default.
+        let mut sent = Vec::new();
+        sent.extend_from_slice(
+            format!(
+                "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n\
+                 a cat\r\n"
+            )
+            .as_bytes(),
+        );
+        sent.extend_from_slice(
+            format!(
+                "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"image\"; \
+                 filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        sent.extend_from_slice(&binary);
+        sent.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+
+        let (url, seen) = raw_upstream().await;
+        let provider = provider_with_capabilities("p", &url, "m", &[Capability::ImagesEdits]);
+        let state = state_over(vec![provider], Vec::new());
+
+        let mut sent_headers = HeaderMap::new();
+        sent_headers.insert(
+            "content-type",
+            format!("multipart/form-data; boundary={BOUNDARY}")
+                .parse()
+                .unwrap(),
+        );
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/images/edits"),
+            sent_headers,
+            AxumBody::from(sent.clone()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the edit was not forwarded exactly once");
+        let (content_type, body) = &seen[0];
+        assert_eq!(
+            content_type.as_deref(),
+            Some("multipart/form-data; boundary=manarouter-model-less"),
+            "the multipart content type did not reach the upstream"
+        );
+        // Nothing to rewrite: there is no model field, so every byte is the client's.
+        assert_eq!(
+            body, &sent,
+            "the multipart body was not forwarded byte for byte"
+        );
+        assert!(
+            body.windows(binary.len()).any(|window| window == binary),
+            "the binary part was corrupted on the way upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_less_moderation_is_forwarded_to_the_provider_that_serves_moderations() {
+        let (url, seen) = recording_upstream(StatusCode::OK, r#"{"results":[]}"#).await;
+        let provider = provider_with_capabilities("p", &url, "m", &[Capability::Moderations]);
+        let state = state_over(vec![provider], Vec::new());
+
+        let sent = r#"{"input":"hello"}"#;
+        let (status, _) = call_router(
+            &state,
+            Method::POST,
+            "/v1/moderations",
+            sent.as_bytes().to_vec(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the moderation was not forwarded exactly once"
+        );
+        assert_eq!(seen[0].1, "/v1/moderations");
+        // The provider applies its own default model; the router invents nothing.
+        assert_eq!(String::from_utf8_lossy(&seen[0].2), sent);
+    }
+
+    #[tokio::test]
+    async fn a_model_less_image_edit_with_no_capable_provider_is_an_unsupported_endpoint() {
+        let (url, seen) = recording_upstream(StatusCode::OK, "{}").await;
+        // [Chat, Models]: the provider serves chat, not image edits.
+        let provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+        let state = state_over(vec![provider], Vec::new());
+
+        let (status, answer) =
+            call_router(&state, Method::POST, "/v1/images/edits", b"{}".to_vec()).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(answer.contains("unsupported_endpoint"), "{answer}");
+        assert!(
+            answer.contains(
+                "the route /v1/images/edits requires the images.edits capability, and no provider \
+                 declares it"
+            ),
+            "{answer}"
+        );
+        assert!(seen.lock().unwrap().is_empty(), "the refusal is local");
+    }
+
+    #[tokio::test]
+    async fn a_model_less_chat_request_is_still_refused() {
+        let (url, seen) = recording_upstream(StatusCode::OK, "{}").await;
+        let provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+        let state = state_over(vec![provider], Vec::new());
+
+        let (status, answer) = call_router(
+            &state,
+            Method::POST,
+            "/v1/chat/completions",
+            br#"{"messages":[{"role":"user","content":"hi"}]}"#.to_vec(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            // The body is JSON, so the quoted word arrives escaped; match around it.
+            answer.contains("the request body has no readable") && answer.contains("model"),
+            "{answer}"
+        );
+        // A model is required here, and substituting one would be a lie about what ran.
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_the_three_routes_with_a_documented_default_accept_a_missing_model() {
+        // Every route kind, with the path the router serves it on. This is the list a later route
+        // cannot quietly join: the three optional ones are named here, and everything else must
+        // still answer "no readable model".
+        let routes: [(RouteKind, &str); 19] = [
+            (RouteKind::ChatCompletions, "/v1/chat/completions"),
+            (RouteKind::Responses, "/v1/responses"),
+            (RouteKind::Embeddings, "/v1/embeddings"),
+            (RouteKind::AudioTranscription, "/v1/audio/transcriptions"),
+            (RouteKind::AudioTranslation, "/v1/audio/translations"),
+            (RouteKind::AudioSpeech, "/v1/audio/speech"),
+            (RouteKind::ImagesGenerations, "/v1/images/generations"),
+            (RouteKind::ImagesEdits, "/v1/images/edits"),
+            (RouteKind::ImagesVariations, "/v1/images/variations"),
+            (RouteKind::Moderations, "/v1/moderations"),
+            (RouteKind::Models, "/v1/models"),
+            (RouteKind::Messages, "/v1/messages"),
+            (RouteKind::CountTokens, "/v1/messages/count_tokens"),
+            (RouteKind::VideoCreate, "/v1/videos"),
+            (RouteKind::VideoRetrieve, "/v1/videos/video_1"),
+            (RouteKind::VideoContent, "/v1/videos/video_1/content"),
+            (
+                RouteKind::RealtimeClientSecrets,
+                "/v1/realtime/client_secrets",
+            ),
+            (RouteKind::RealtimeCalls, "/v1/realtime/calls"),
+            (RouteKind::Search, "/v1/search"),
+        ];
+
+        let (url, seen) = recording_upstream(StatusCode::OK, "{}").await;
+        let provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+        let state = state_over(vec![provider], Vec::new());
+
+        for (kind, path) in routes {
+            assert_eq!(route_kind_for(path), kind, "{path} is not {kind:?}");
+            let response = dispatch(
+                state.clone(),
+                Dialect::OpenAi,
+                Method::POST,
+                Uri::from_static(path),
+                HeaderMap::new(),
+                AxumBody::from("{}"),
+            )
+            .await;
+            match model_optional_capability(kind) {
+                Some(capability) => {
+                    // Optional: forwarded, so the answer is the missing capability, not a 400.
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::NOT_FOUND,
+                        "{path} should be forwarded by capability"
+                    );
+                    let body = body_text(response).await;
+                    assert!(body.contains("unsupported_endpoint"), "{body}");
+                    assert!(
+                        body.contains(capability.as_str()),
+                        "{path} did not name {capability:?}: {body}"
+                    );
+                }
+                None => {
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::BAD_REQUEST,
+                        "{path} accepted a request with no model"
+                    );
+                    let body = body_text(response).await;
+                    assert!(
+                        body.contains("the request body has no readable") && body.contains("model"),
+                        "{path}: {body}"
+                    );
+                }
+            }
+        }
+
+        // Exactly three, and no dial happened for any of them.
+        assert_eq!(
+            [
+                RouteKind::Moderations,
+                RouteKind::ImagesEdits,
+                RouteKind::ImagesVariations,
+            ]
+            .iter()
+            .filter(|kind| model_optional_capability(**kind).is_some())
+            .count(),
+            3
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a model-less route dialled"
         );
     }
 }

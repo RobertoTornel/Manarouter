@@ -50,14 +50,28 @@ configuration — a file that still contains one fails loudly (`dialect.rs:36-44
 
 ### A dialect is not a capability, and not a provider
 
-A **capability** is a route, not a model feature: `chat`, `responses`, `embeddings`,
-`audio-transcription`, `audio-speech`, `images-generations`, `models`, `messages`, `tool-calling`,
-`reasoning`, `vision` (`dialect.rs:153-176`). Capabilities are declared per provider and per model
-and are what the panel uses to grey out combinations that cannot work (`dialect.rs:148-149`). They
-do **not** gate the relay's request path — nothing in the relay's selection or dispatch reads a
-provider's capability list. What actually decides whether a request can be served is the dialect
-pairing, and it refuses with a `400` that names both dialects rather than forwarding a body the
-upstream will reject with a confusing error (`crates/mr-dialects/src/lib.rs:144-156`).
+A **capability** is a route, not a model feature: `chat`, `responses`, `embeddings`, the three audio
+routes, the three image routes, `models`, `messages`, `moderations`, `video`, `realtime`, `search`,
+and the management families (`vector-stores`, `containers`, `fine-tuning`, `evals`) — twenty-two in
+all, plus `tool-calling`, `reasoning` and `vision`, which are model features rather than routes and
+so are never consulted when a request arrives (`dialect.rs`). `RouteKind::capability` is the single
+mapping from route to capability and `Capability::routes` is its inverse, walked in both directions
+by a test so the two cannot disagree.
+
+Capabilities are declared per provider — and per model, for the three feature ones — and are what the
+panel's checkboxes write. Unlike in earlier builds they **do** gate the relay's request path: a step
+whose provider does not declare the route's capability is dropped before it is dialled, and a request
+whose every step was dropped is refused with `404 unsupported_endpoint` naming the route and the
+capability it needed. That is what lets a provider which serves one family (`fish-audio`,
+`deepgram`, `stability-ai`, `voyage`) sit in the same catalogue as a full OpenAI-compatible one
+without ever being handed a body it cannot read. `docs/29-openai-surface.md` has the gate's contract
+and the class of every route.
+
+The dialect pairing is a separate check, and it still refuses with a `400` that names both dialects
+rather than forwarding a body the upstream will reject with a confusing error
+(`crates/mr-dialects/src/lib.rs:144-156`). A capability the dialect cannot express is refused when
+the provider is saved, not when a request arrives — see the mismatch table in
+`crates/mr-core/src/model.rs` and the test that walks every dialect against every capability.
 
 ### The pivot
 
@@ -152,8 +166,10 @@ base's, so a base ending in `/v1` and a value of `v1/responses` give `…/v1/res
 `deepseek` and `perplexity` entries both record `chat-completions = "chat/completions"`.
 
 The key is the route the **client** called, in its kebab-case spelling (`chat-completions`,
-`responses`, `embeddings`, `audio-transcription`, `audio-speech`, `images-generations`, `models`,
-`messages`, `count-tokens`) — `RouteKind::as_config_key()`. A key of `/v1/chat/completions` never
+`responses`, `embeddings`, `audio-transcription`, `audio-speech`, `audio-translation`,
+`images-generations`, `images-edits`, `images-variations`, `moderations`, `models`, `messages`,
+`count-tokens`, `video-create`, `video-retrieve`, `video-content`, `realtime-client-secrets`,
+`realtime-calls`, `search`) — `RouteKind::as_config_key()`. A key of `/v1/chat/completions` never
 matches, and the relay logs a warning naming the provider when it finds one.
 
 ### The default path is per dialect **and** per client route
@@ -167,8 +183,21 @@ the endpoint that belongs to it:
 | `/v1/responses` | `/v1/responses` |
 | `/v1/embeddings` | `/v1/embeddings` |
 | `/v1/audio/transcriptions` | `/v1/audio/transcriptions` |
+| `/v1/audio/translations` | `/v1/audio/translations` |
 | `/v1/audio/speech` | `/v1/audio/speech` |
 | `/v1/images/generations` | `/v1/images/generations` |
+| `/v1/images/edits` | `/v1/images/edits` |
+| `/v1/images/variations` | `/v1/images/variations` |
+| `/v1/moderations` | `/v1/moderations` |
+| `POST /v1/videos` | `/v1/videos` |
+| `GET /v1/videos/{id}` and `/content` | `/v1/videos`, with the id and `/content` appended by the proxy |
+| `POST /v1/realtime/client_secrets` | `/v1/realtime/client_secrets` |
+| `POST /v1/realtime/calls` | `/v1/realtime/calls` |
+| `POST /v1/search` | `/v1/search` |
+
+The two id-carrying video routes name only the family prefix, because the id belongs to the job the
+client is polling and a concrete path here would send every poll to the same non-existent video; the
+capability-addressed proxy appends it.
 
 The Anthropic dialect has two: `/v1/messages` for the Messages route and
 `/v1/messages/count_tokens` for the token-counting route. The other dialects have one each
@@ -211,7 +240,7 @@ match (`crates/mr-dialects/src/google.rs:67-93`).
 
 **On the wire.** OpenAI's public API surface: `/v1/chat/completions`, `/v1/responses`,
 `/v1/embeddings`, `/v1/audio/*`, `/v1/images/generations`, `/v1/models` (`dialect.rs:18-22`). This is
-the baseline — by far the largest group of providers speak it, and 195 of the 207 shipped templates
+the baseline — by far the largest group of providers speak it, and 199 of the 212 shipped templates
 use it.
 
 **Who can reach it.** Every client route. The OpenAI dialect is the client dialect of every route

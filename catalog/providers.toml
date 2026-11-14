@@ -335,6 +335,55 @@ capabilities = ["embeddings"]
 note = "Embeddings only (the Foundation API). Reader and rerank endpoints are not modelled."
 
 # ---------------------------------------------------------------------------------------------
+# Single-endpoint media providers — one capability each, never chat
+# ---------------------------------------------------------------------------------------------
+
+[[providers]]
+id = "fish-audio"
+label = "Fish Audio"
+dialect = "open-ai"
+base_url = "https://api.fish.audio"
+auth = { type = "bearer" }
+capabilities = ["audio-speech"]
+note = "Speech synthesis only. The endpoint is /v1/tts rather than the OpenAI dialect's /v1/audio/speech, and the JSON body carries Fish's own voice reference instead of OpenAI's `voice` field, so the route is overridden here and the relay still has to translate the body."
+
+[providers.route_overrides]
+audio-speech = "v1/tts"
+
+[[providers]]
+id = "elevenlabs"
+label = "ElevenLabs"
+dialect = "open-ai"
+base_url = "https://api.elevenlabs.io"
+auth = { type = "header", name = "xi-api-key" }
+capabilities = ["audio-speech"]
+note = "UNCERTAIN: speech synthesis lives at /v1/text-to-speech/{voice_id}, and the voice id is a path segment that a static route override cannot express. This entry records the credential shape and the capability; serving it needs a per-route voice id first."
+
+[[providers]]
+id = "deepgram"
+label = "Deepgram"
+dialect = "open-ai"
+base_url = "https://api.deepgram.com"
+auth = { type = "header", name = "Authorization", prefix = "Token " }
+capabilities = ["audio-transcription"]
+note = "Transcription only. Deepgram authenticates with `Authorization: Token …` and listens at POST /v1/listen with the model in the query string, so the OpenAI dialect's path is overridden and the model has to be carried as a query parameter."
+
+[providers.route_overrides]
+audio-transcription = "v1/listen"
+
+[[providers]]
+id = "stability-ai"
+label = "Stability AI"
+dialect = "open-ai"
+base_url = "https://api.stability.ai"
+auth = { type = "bearer" }
+capabilities = ["images-generations"]
+note = "Image generation only, at POST /v1/stable-image/generate/core. The route is overridden from the OpenAI dialect's /images/generations, but the body is multipart rather than OpenAI JSON, so the relay still has to adapt it."
+
+[providers.route_overrides]
+images-generations = "v1/stable-image/generate/core"
+
+# ---------------------------------------------------------------------------------------------
 # Local / self-hosted runtimes — loopback defaults, no credential required
 # ---------------------------------------------------------------------------------------------
 
@@ -1922,7 +1971,6 @@ note = "UNCERTAIN: recorded from the reference router's registry, not confirmed 
 # Not shipped, deliberately
 # ---------------------------------------------------------------------------------------------
 # kiro               — AWS CodeWhisperer event-stream protocol; no Dialect can express it.
-# fishaudio          — bespoke TTS surface; the research records no HTTP chat base.
 # auggie             — non-HTTP (CLI/stdio) transport.
 # cloudflare-playground — cf_agent RPC over WebSocket, no key.
 # codex-app-server, devin-cli-agentic — local app servers, not upstream providers.

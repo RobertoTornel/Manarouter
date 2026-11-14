@@ -3280,6 +3280,17 @@ fn capability_from_tag(tag: u8) -> Result<Capability> {
         8 => Capability::ToolCalling,
         9 => Capability::Reasoning,
         10 => Capability::Vision,
+        11 => Capability::AudioTranslation,
+        12 => Capability::ImagesEdits,
+        13 => Capability::ImagesVariations,
+        14 => Capability::Moderations,
+        15 => Capability::Video,
+        16 => Capability::Realtime,
+        17 => Capability::VectorStores,
+        18 => Capability::Containers,
+        19 => Capability::FineTuning,
+        20 => Capability::Evals,
+        21 => Capability::Search,
         _ => {
             return Err(Error::Snapshot(format!(
                 "snapshot contains unknown capability tag {tag}"
@@ -3869,6 +3880,43 @@ mod tests {
         let before = config.routing_digest();
         config.providers[0].cooldown_scope = CooldownScope::Account;
         assert_ne!(config.routing_digest(), before);
+    }
+
+    #[test]
+    fn every_capability_tag_round_trips() {
+        // The encoder writes `*capability as u8`; `capability_from_tag` is the only decoder. A
+        // capability appended without a tag arm would encode fine and then fail to load, which is
+        // the worst time to find out, so the whole of `ALL` is walked here.
+        for (tag, capability) in (0u8..).zip(Capability::ALL) {
+            assert_eq!(capability as u8, tag, "{capability:?} moved off its tag");
+            assert_eq!(
+                capability_from_tag(tag).expect("known tag decodes"),
+                capability,
+                "tag {tag}"
+            );
+        }
+        // The first unused tag must be refused rather than guessed at: mapping it to a default
+        // would route with a capability the operator never configured.
+        let first_unknown = Capability::ALL.len() as u8;
+        assert!(capability_from_tag(first_unknown).is_err());
+        assert!(capability_from_tag(u8::MAX).is_err());
+    }
+
+    #[test]
+    fn the_snapshot_version_stays_ahead_of_every_capability_tag() {
+        // The version check at the frame header is the only thing that stops an older reader from
+        // decoding tags it does not know. Keeping the version above the whole tag range makes that
+        // check complete: a reader whose version equals a tag it might meet must never accept the
+        // frame, or it would pass the header and fail mid-decode with a byte offset for a diagnosis.
+        let highest = Capability::ALL
+            .iter()
+            .map(|capability| *capability as u8)
+            .max()
+            .expect("Capability::ALL is not empty");
+        assert!(
+            SNAPSHOT_VERSION > u32::from(highest),
+            "SNAPSHOT_VERSION {SNAPSHOT_VERSION} must exceed the highest capability tag {highest}"
+        );
     }
 
     #[test]

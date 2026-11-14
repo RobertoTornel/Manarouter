@@ -7,7 +7,7 @@
 > capability list that disagrees fails the build. The prose under the tables is written by hand and
 > is not checked.
 
-207 provider templates ship. Each row names the `Dialect` the relay uses, the base URL it sends to,
+212 provider templates ship. Each row names the `Dialect` the relay uses, the base URL it sends to,
 and the `AuthKind` it authenticates with. Entries whose `note` field flags uncertainty are marked
 **UNCERTAIN** and explained below the tables.
 
@@ -17,7 +17,7 @@ implementation this project mirrors. An entry derived that way is marked **UNCER
 the provider publishes its own documentation, that is the authority. See
 [the reference notes](../omniroute-reference.md) and [the credits](../credits.md).
 
-The 207 includes providers that need no credential at all — the loopback locals — and providers
+The 212 includes providers that need no credential at all — the loopback locals — and providers
 Manarouter covers that the reference router did not. It is **not** the same figure as the 28
 credentialed providers carried over from OmniRoute, which [the migration
 document](../17-migrating-from-omniroute.md#why-the-provider-count-is-not-what-the-plan-said)
@@ -27,7 +27,7 @@ many of OmniRoute's credentialed providers could be carried across.
 
 ## Templated base URLs: `{account_id}` and `{account}`
 
-Two of the 207 entries cannot spell their base URL without knowing something about *one particular
+Two of the 212 entries cannot spell their base URL without knowing something about *one particular
 account*, so their `base_url` carries a placeholder:
 
 | id | base URL | name |
@@ -162,6 +162,7 @@ route override carries one.
 | `coze` ⚠ | Coze | `open-ai` | `https://api.coze.com/v1` | `bearer` | chat, models, tool-calling |
 | `crof` ⚠ | CrofAI | `open-ai` | `https://crof.ai/v1` | `bearer` | chat, models, tool-calling |
 | `dahl` ⚠ | Dahl | `open-ai` | `https://inference.dahl.global/v1` | `bearer` | chat, models, tool-calling |
+| `deepgram` | Deepgram | `open-ai` | `https://api.deepgram.com` | `header` (Authorization) | audio-transcription |
 | `deepinfra` | DeepInfra | `open-ai` | `https://api.deepinfra.com/v1/openai` | `bearer` | chat, embeddings, models, tool-calling, reasoning, vision |
 | `deepseek` | DeepSeek | `open-ai` | `https://api.deepseek.com` | `bearer` | chat, responses, models, tool-calling, reasoning |
 | `dgrid` ⚠ | DGrid | `open-ai` | `https://api.dgrid.ai/v1` | `bearer` | chat, models, tool-calling |
@@ -170,11 +171,13 @@ route override carries one.
 | `doubao` ⚠ | Doubao | `open-ai` | `https://ark.cn-beijing.volces.com/api/v3` | `bearer` | chat, models, tool-calling |
 | `dxnt` ⚠ | DXNT / DX Token | `open-ai` | `https://www.dxnt.com/v1` | `bearer` | chat, models, tool-calling |
 | `electronhub` ⚠ | Electron Hub | `open-ai` | `https://api.electronhub.ai/v1` | `bearer` | chat, models, tool-calling |
+| `elevenlabs` ⚠ | ElevenLabs | `open-ai` | `https://api.elevenlabs.io` | `header` (xi-api-key) | audio-speech |
 | `eurouter` ⚠ | EURouter | `open-ai` | `https://api.eurouter.ai/v1` | `bearer` | chat, models, tool-calling |
 | `factory` ⚠ | Factory | `open-ai` | `https://api.factory.ai/v1` | `bearer` | chat, models, tool-calling |
 | `fastrouter` ⚠ | FastRouter | `open-ai` | `https://api.fastrouter.ai/api/v1` | `bearer` | chat, models, tool-calling |
 | `featherless-ai` ⚠ | Featherless AI | `open-ai` | `https://api.featherless.ai/v1` | `bearer` | chat, models, tool-calling |
 | `fireworks` | Fireworks AI | `open-ai` | `https://api.fireworks.ai/inference/v1` | `bearer` | chat, embeddings, models, tool-calling, reasoning, vision |
+| `fish-audio` | Fish Audio | `open-ai` | `https://api.fish.audio` | `bearer` | audio-speech |
 | `free-ai` ⚠ | Free.ai | `open-ai` | `https://api.free.ai/v1` | `bearer` | chat, models |
 | `freeaiapikey` | FreeAIAPIKey | `open-ai` | `https://api.freeaiapikey.com/v1` | `bearer` | chat, models, tool-calling, reasoning |
 | `freebuff` ⚠ | Freebuff | `open-ai` | `https://www.codebuff.com/api/v1` | `bearer` | chat, models, tool-calling |
@@ -280,6 +283,7 @@ route override carries one.
 | `snowflake` ⚠ | Snowflake Cortex | `open-ai` | `https://{account}.snowflakecomputing.com/api/v2` | `bearer` | chat, models, tool-calling |
 | `sparkdesk` ⚠ | SparkDesk | `open-ai` | `https://spark-api-open.xf-yun.com/v1` | `bearer` | chat, models, tool-calling |
 | `speka` ⚠ | Speka AI | `open-ai` | `https://speka.me/v1` | `bearer` | chat, models, tool-calling |
+| `stability-ai` | Stability AI | `open-ai` | `https://api.stability.ai` | `bearer` | images-generations |
 | `stepfun` ⚠ | StepFun | `open-ai` | `https://api.stepfun.com/v1` | `bearer` | chat, models, tool-calling |
 | `sumopod` ⚠ | SumoPod | `open-ai` | `https://ai.sumopod.com/v1` | `bearer` | chat, models, tool-calling |
 | `synthetic` ⚠ | Synthetic | `open-ai` | `https://api.synthetic.new/openai/v1` | `bearer` | chat, models, tool-calling |

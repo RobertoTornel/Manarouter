@@ -1219,22 +1219,21 @@ impl BatchLane {
         Ok(meta)
     }
 
-    /// `POST /v1/files`.
-    async fn put_file(
+    /// Store a file and return the object a client sees.
+    ///
+    /// Shared by `POST /v1/files` and by the resumable upload surface, which assembles its parts and
+    /// hands the result here so that a file completed by upload is the same record as a file posted
+    /// in one request — same id shape, same fields, same retrievability. The *purpose* restriction
+    /// lives in the HTTP handler (`require_supported_purpose`) rather than here: `batch` and
+    /// `fine-tune` both start from a file, and the lane's job is to store bytes, not to police what a
+    /// client intends to do with them.
+    pub(crate) async fn put_file(
         &self,
         bytes: Vec<u8>,
         filename: Option<String>,
         purpose: Option<String>,
     ) -> Result<Value, Refusal> {
         let purpose = purpose.unwrap_or_else(|| "batch".to_owned());
-        if purpose != "batch" {
-            return Err(Refusal::bad_request(
-                "invalid_request_error",
-                format!(
-                    "purpose \"{purpose}\" is not supported by this lane; a batch input file must be uploaded with purpose \"batch\""
-                ),
-            ));
-        }
         match self.publish_file(bytes, filename, &purpose).await {
             Ok(meta) => Ok(meta.view()),
             Err(error) => Err(Refusal::internal(format!(
@@ -1254,8 +1253,21 @@ impl BatchLane {
         self.file(id).map(|meta| meta.view())
     }
 
+    /// The filename a client uploaded a file under, when it gave one.
+    ///
+    /// Fine-tuning staging sends the bytes on to a provider, and the name the operator chose is the
+    /// name the provider's own file listing should show. It is never load-bearing: a file without a
+    /// name is uploaded as `<id>.jsonl`.
+    pub(crate) fn file_name(&self, id: &str) -> Option<String> {
+        self.file(id).and_then(|meta| meta.filename)
+    }
+
     /// `GET /v1/files/{id}/content`.
-    async fn file_bytes(&self, id: &str) -> Option<Vec<u8>> {
+    ///
+    /// Public within the crate because fine-tuning staging needs the same bytes: a training file
+    /// this lane stored is the file the provider must be sent, and reading it through a second path
+    /// would be a second definition of "where a file's bytes live".
+    pub(crate) async fn file_bytes(&self, id: &str) -> Option<Vec<u8>> {
         self.file(id)?;
         read_async(self.file_body_path(id)).await.ok()
     }
@@ -2279,14 +2291,17 @@ fn parse_input(bytes: &[u8]) -> Result<Vec<BatchItem>, Refusal> {
 // --- A refusal the client sees --------------------------------------------------------------
 
 /// A refusal from the batch lane, in the shape the relay's error responses take.
-struct Refusal {
+///
+/// Shared with the router's other local surfaces (uploads, vector stores, responses, fine-tuning)
+/// so that every one of them answers an error in the same envelope as the request path.
+pub(crate) struct Refusal {
     status: StatusCode,
     code: &'static str,
     message: String,
 }
 
 impl Refusal {
-    fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             code,
@@ -2294,7 +2309,7 @@ impl Refusal {
         }
     }
 
-    fn not_found(what: &str, id: &str) -> Self {
+    pub(crate) fn not_found(what: &str, id: &str) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             code: "invalid_request_error",
@@ -2302,7 +2317,7 @@ impl Refusal {
         }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal_error",
@@ -2310,7 +2325,24 @@ impl Refusal {
         }
     }
 
-    fn into_response(self) -> Response {
+    /// A refusal with a status the three constructors above do not cover.
+    ///
+    /// Used by surfaces that share this envelope but answer with a status of their own — a vector
+    /// store with no embedder is `409`, an attach past the chunk cap is `413` — so that every error
+    /// on the relay still has the same shape.
+    pub(crate) fn with_status(
+        status: StatusCode,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn into_response(self) -> Response {
         crate::server::error_response(self.status, Dialect::OpenAi, self.code, &self.message)
     }
 }
@@ -2363,9 +2395,34 @@ pub async fn create_file(
         };
         (bytes.to_vec(), params.filename, params.purpose)
     };
+    if let Err(refusal) = require_supported_purpose(purpose.as_deref()) {
+        return refusal.into_response();
+    }
     match app.batch.put_file(bytes, filename, purpose).await {
         Ok(view) => crate::server::json_response(StatusCode::OK, view),
         Err(refusal) => refusal.into_response(),
+    }
+}
+
+/// A file uploaded to this lane must declare a purpose the lane can serve.
+///
+/// Two purposes are served, because two families start from a file: `batch` (a JSONL of requests,
+/// read line by line when a job runs) and `fine-tune` (a JSONL of examples, stored here and staged
+/// into a provider's own `/v1/files` when a job is created — see `server::fine_tuning_body`). A file
+/// with any other purpose would be accepted and then have nothing that could ever read it, so it is
+/// refused at the door with the two purposes named.
+///
+/// The check sits at the HTTP layer, not in [`BatchLane::put_file`], because the resumable upload
+/// surface completes into the same function after its own longer-lived session has been created.
+fn require_supported_purpose(purpose: Option<&str>) -> Result<(), Refusal> {
+    match purpose {
+        None | Some("batch") | Some("fine-tune") => Ok(()),
+        Some(purpose) => Err(Refusal::bad_request(
+            "invalid_request_error",
+            format!(
+                "purpose \"{purpose}\" is not supported here; a file must be uploaded with purpose \"batch\" or \"fine-tune\""
+            ),
+        )),
     }
 }
 
@@ -3972,17 +4029,33 @@ mod tests {
             file_id.as_str()
         );
 
-        // Only a batch input file is served here, and the refusal names the purpose it got.
-        let refused = match lane
+        // The lane itself stores any purpose, because the upload surface completes files through
+        // the same call. The purpose it will serve is enforced at the HTTP layer, and a fine-tune
+        // file is one of the two it must accept: a fine-tuning job is created from one.
+        let staged = match lane
             .put_file(body.clone(), None, Some("fine-tune".to_owned()))
             .await
         {
-            Ok(_) => panic!("a fine-tune file was accepted"),
+            Ok(stored) => stored,
+            Err(refusal) => panic!("a fine-tune file was refused: {}", refusal.message),
+        };
+        assert_eq!(staged["purpose"], "fine-tune");
+        match require_supported_purpose(Some("fine-tune")) {
+            Ok(()) => {}
+            Err(refusal) => panic!("fine-tune was not a served purpose: {}", refusal.message),
+        }
+
+        // A purpose nothing here can read is refused, and the refusal names what was asked for and
+        // what is served, so a client is not left guessing which spelling would work.
+        let refused = match require_supported_purpose(Some("assistants")) {
+            Ok(()) => panic!("a purpose no family here serves was accepted"),
             Err(refusal) => refusal,
         };
         assert_eq!(refused.status, StatusCode::BAD_REQUEST);
         assert!(
-            refused.message.contains("fine-tune") && refused.message.contains("purpose \"batch\""),
+            refused.message.contains("assistants")
+                && refused.message.contains("\"batch\"")
+                && refused.message.contains("\"fine-tune\""),
             "{}",
             refused.message
         );

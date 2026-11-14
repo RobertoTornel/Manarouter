@@ -130,16 +130,20 @@ fn split_patterns(values: &[String]) -> Vec<String> {
     out
 }
 
-/// `--allow-routes` spellings: the serde kebab form first (that is what `parse_choice` offers as
-/// the documented choice list), then the dotted `RouteKind::as_str` form the relay's `permits`
-/// actually compares against, then the obvious colloquialisms.
+/// `--allow-routes` spellings: the dotted `RouteKind::as_str` form the relay's `permits` actually
+/// compares against, the kebab `as_config_key` form the REST surface uses, then the obvious
+/// colloquialisms.
+///
+/// Both canonical forms are matched through [`RouteKind::ALL`] rather than listed by hand, so a
+/// route appended to the enum is accepted here without another edit — and `images-edits`,
+/// `video-create`, `realtime-calls` and `search` work for the same reason.
 fn parse_route(raw: &str) -> Option<RouteKind> {
-    let lower = raw.trim().to_ascii_lowercase();
+    let lower = raw.trim().to_ascii_lowercase().replace(['_', ' '], "-");
     RouteKind::ALL
         .iter()
         .copied()
-        .find(|r| r.as_str() == lower)
-        .or_else(|| match lower.replace(['_', ' '], "-").as_str() {
+        .find(|r| r.as_str() == lower || r.as_config_key() == lower)
+        .or(match lower.as_str() {
             "chat" | "chat-completions" | "completions" => Some(RouteKind::ChatCompletions),
             "response" | "responses" | "responses-api" => Some(RouteKind::Responses),
             "embedding" | "embeddings" => Some(RouteKind::Embeddings),
@@ -568,6 +572,39 @@ mod tests {
         let err = build_key(&cfg, &args).unwrap_err();
         assert_eq!(err.exit, E::Usage, "{err}");
         assert!(err.message.contains("chat-completions"), "{}", err.message);
+    }
+
+    #[test]
+    fn every_route_is_accepted_in_both_canonical_spellings() {
+        for route in RouteKind::ALL {
+            assert_eq!(
+                parse_route(route.as_str()),
+                Some(route),
+                "dotted spelling {}",
+                route.as_str()
+            );
+            assert_eq!(
+                parse_route(route.as_config_key()),
+                Some(route),
+                "kebab spelling {}",
+                route.as_config_key()
+            );
+            // `parse_choice` normalises underscores, and so does `parse_route`; an operator who
+            // writes the config key with underscores should not be refused.
+            assert_eq!(
+                parse_route(&route.as_config_key().replace('-', "_")),
+                Some(route)
+            );
+        }
+        // The spellings named in the CLI help must keep working.
+        for (raw, expected) in [
+            ("images-edits", RouteKind::ImagesEdits),
+            ("video-create", RouteKind::VideoCreate),
+            ("realtime-calls", RouteKind::RealtimeCalls),
+            ("search", RouteKind::Search),
+        ] {
+            assert_eq!(parse_route(raw), Some(expected), "{raw}");
+        }
     }
 
     #[test]
