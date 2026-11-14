@@ -2449,6 +2449,19 @@ export function deploymentBundle(draft, sizing, catalog) {
   const clamp = clampScaledown(d.shutdownCooldownSecs);
   const gated = d.hfTokenNeeded || requiresHfToken(d.probe) || Boolean(d.hfTokenId || d.hfTokenNew);
   const utilization = toNumber(d.gpuMemoryUtilization) ?? DEFAULT_GPU_MEMORY_UTILIZATION;
+  // A batch deployment is not a vLLM flag set: vLLM schedules whatever arrives. The mode's meaning
+  // lives in the serving layer this file generates (the assembler below), so the batch shape has to
+  // reach the text, not only the record.
+  const mode = d.mode === 'batch' ? 'batch' : 'streaming';
+  const batchSize = Math.max(1, Math.trunc(toNumber(d.batchSize) ?? 1));
+  const batchFill = d.batchFill === 'timeout' ? 'timeout' : 'full';
+  const batchTimeout = Math.max(1, Math.trunc(toNumber(d.batchTimeoutSecs) ?? 1));
+  // At least one full batch has to be admissible, or "wait until it is full" can never complete:
+  // Modal's default is one concurrent input per container, which would make the assembler deadlock
+  // by design.
+  const batchInputs = Math.max(1, batchSize);
+  // vLLM owns its own port in batch mode so the assembler can own the public one.
+  const servingPort = mode === 'batch' ? 8001 : 8000;
   // The same derivation the conductor records as the provider's base_url, so the app this file
   // deploys and the URL the panel shows cannot drift apart.
   const appName = modalAppName(d.accountId, d.repo, d.mode, d.gpu, d.gpuCount);
@@ -2498,7 +2511,7 @@ export function deploymentBundle(draft, sizing, catalog) {
   if (d.maxNumSeqs != null) args.push('--max-num-seqs', String(Math.trunc(toNumber(d.maxNumSeqs) ?? 0)));
   args.push('--gpu-memory-utilization', String(utilization));
   if (gpuCount > 1) args.push('--tensor-parallel-size', String(gpuCount));
-  args.push('--host', '0.0.0.0', '--port', '8000');
+  args.push('--host', '0.0.0.0', '--port', String(servingPort));
 
   const argLines = [];
   for (let i = 0; i < args.length; i += 2) {
@@ -2515,6 +2528,153 @@ export function deploymentBundle(draft, sizing, catalog) {
     ...(gated ? [`    secrets=[modal.Secret.from_name(${pyString(secretName)})],`] : []),
     ')',
   ];
+
+  // In batch mode the public port belongs to the assembler and vLLM keeps an internal one, so the
+  // file says both: what the batch is, and who owns which port. The assembler is stdlib-only
+  // (threads, queue, urllib, http.server) on purpose: it has to run in whatever image vLLM runs in,
+  // and every extra import is one more way for a paid container to fail at boot.
+  const batchConstants = mode === 'batch'
+    ? [
+      `BATCH_SIZE = ${batchSize}`,
+      batchFill === 'timeout'
+        ? `# A batch that has not filled after ${batchTimeout} seconds ships anyway; a half-full batch still goes out.`
+        : '# This batch waits until it is full, however long that takes: that is the policy chosen for it.',
+      `BATCH_TIMEOUT = ${batchFill === 'timeout' ? `${batchTimeout}.0` : 'None'}`,
+      '',
+      'VLLM_PORT = 8001',
+      '',
+      'import json',
+      'import queue',
+      'import threading',
+      'import time',
+      'import urllib.error',
+      'import urllib.request',
+      'from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer',
+      '',
+      'UPSTREAM = "http://127.0.0.1:%d" % VLLM_PORT',
+      'PENDING = queue.Queue()',
+      '',
+      '',
+      'def _post(body):',
+      '    request = urllib.request.Request(',
+      '        UPSTREAM + "/v1/chat/completions",',
+      '        data=body,',
+      '        headers={"Content-Type": "application/json"},',
+      '        method="POST",',
+      '    )',
+      '    try:',
+      '        with urllib.request.urlopen(request) as answer:',
+      '            return answer.status, answer.headers.get("Content-Type"), answer.read()',
+      '    except urllib.error.HTTPError as error:',
+      '        return error.code, error.headers.get("Content-Type"), error.read()',
+      '    except Exception as error:  # a dead upstream must still answer its waiters',
+      '        return 502, "application/json", json.dumps({"error": str(error)}).encode()',
+      '',
+      '',
+      'def _wait_until_serving():',
+      '    # A cold container loads weights for minutes; dispatching before vLLM answers only turns',
+      '    # that wait into a batch of failed requests.',
+      '    while True:',
+      '        try:',
+      '            with urllib.request.urlopen(UPSTREAM + "/v1/models", timeout=5):',
+      '                return',
+      '        except Exception:',
+      '            time.sleep(5.0)',
+      '',
+      '',
+      'def _assemble():',
+      '    _wait_until_serving()',
+      '    while True:',
+      '        batch = [PENDING.get()]',
+      '        if BATCH_SIZE > 1:',
+      '            if BATCH_TIMEOUT is None:',
+      '                while len(batch) < BATCH_SIZE:',
+      '                    batch.append(PENDING.get())',
+      '            else:',
+      '                deadline = time.monotonic() + BATCH_TIMEOUT',
+      '                while len(batch) < BATCH_SIZE:',
+      '                    left = deadline - time.monotonic()',
+      '                    if left <= 0:',
+      '                        break',
+      '                    try:',
+      '                        batch.append(PENDING.get(timeout=left))',
+      '                    except queue.Empty:',
+      '                        break',
+      '        answers = [None] * len(batch)',
+      '',
+      '        def run(index, request_body):',
+      '            answers[index] = _post(request_body)',
+      '',
+      '        threads = [',
+      '            threading.Thread(target=run, args=(index, body))',
+      '            for index, (body, _) in enumerate(batch)',
+      '        ]',
+      '        for thread in threads:',
+      '            thread.start()',
+      '        for thread in threads:',
+      '            thread.join()',
+      '        for (_, slot), answer in zip(batch, answers):',
+      '            slot["answer"] = answer',
+      '            slot["done"].set()',
+      '',
+      '',
+      'class BatchHandler(BaseHTTPRequestHandler):',
+      '    def log_message(self, *args):',
+      '        pass',
+      '',
+      '    def _reply(self, status, content_type, payload):',
+      '        self.send_response(status)',
+      '        self.send_header("Content-Type", content_type or "application/json")',
+      '        self.send_header("Content-Length", str(len(payload)))',
+      '        self.end_headers()',
+      '        self.wfile.write(payload)',
+      '',
+      '    def _proxy_get(self, path):',
+      '        with urllib.request.urlopen(UPSTREAM + path) as answer:',
+      '            self._reply(answer.status, answer.headers.get("Content-Type"), answer.read())',
+      '',
+      '    def do_GET(self):',
+      '        if self.path == "/v1/models":',
+      '            self._proxy_get(self.path)',
+      '        else:',
+      '            self._reply(404, "application/json", b\'{"error":"not found"}\')',
+      '',
+      '    def do_POST(self):',
+      '        if self.path != "/v1/chat/completions":',
+      '            self._reply(404, "application/json", b\'{"error":"not found"}\')',
+      '            return',
+      '        length = int(self.headers.get("Content-Length") or 0)',
+      '        body = self.rfile.read(length)',
+      '        slot = {"done": threading.Event(), "answer": None}',
+      '        PENDING.put((body, slot))',
+      '        slot["done"].wait()',
+      '        status, content_type, payload = slot["answer"]',
+      '        self._reply(status, content_type, payload)',
+      '',
+    ]
+    : [];
+
+  const serveSurface = mode === 'batch'
+    ? [
+      '@modal.concurrent(max_inputs=BATCH_SIZE)',
+      '@modal.web_server(port=8000, requires_proxy_auth=True)',
+      'def serve():',
+      '    # vLLM owns VLLM_PORT and the assembler owns 8000; Modal proxies 8000 at the app URL.',
+      '    subprocess.Popen(["vllm", "serve", *VLLM_ARGS])',
+      '    threading.Thread(target=_assemble, daemon=True).start()',
+      '    server = ThreadingHTTPServer(("0.0.0.0", 8000), BatchHandler)',
+      '    server.daemon_threads = True',
+      '    server.serve_forever()',
+      '',
+    ]
+    : [
+      '@modal.web_server(port=8000, requires_proxy_auth=True)',
+      'def serve():',
+      '    # vLLM owns port 8000; Modal proxies it at the app\'s *.modal.run URL.',
+      '    process = subprocess.Popen(["vllm", "serve", *VLLM_ARGS])',
+      '    process.wait()',
+      '',
+    ];
 
   const lines = [
     '"""modal_app.py — generated by Manarouter\'s GPU setup flow.',
@@ -2546,18 +2706,14 @@ export function deploymentBundle(draft, sizing, catalog) {
     '    .env({"HF_HOME": "/root/.cache/huggingface", "VLLM_USE_V1": "1"})',
     ')',
     '',
+    ...batchConstants,
     'VLLM_ARGS = [',
     ...argLines,
     ']',
     '',
     '',
     ...decorator,
-    '@modal.web_server(port=8000, requires_proxy_auth=True)',
-    'def serve():',
-    '    # vLLM owns port 8000; Modal proxies it at the app\'s *.modal.run URL.',
-    '    process = subprocess.Popen(["vllm", "serve", *VLLM_ARGS])',
-    '    process.wait()',
-    '',
+    ...serveSurface,
   ];
 
   notes.push(...[
@@ -2616,6 +2772,12 @@ export function deploymentBundle(draft, sizing, catalog) {
   }
   if (asObject(sizing ?? d.sizing).method === 'unavailable') {
     notes.push('No KV estimate was available when this bundle was generated, so the provider will need its kv_pool_tokens from vLLM\'s startup line.');
+  }
+
+  if (mode === 'batch') {
+    notes.push(`Batch mode is carried by the assembler in this file: /v1/chat/completions holds requests until ${batchSize} have arrived${batchFill === 'timeout' ? `, or until ${batchTimeout} seconds have passed, whichever comes first` : ', however long that takes'}, then sends them to vLLM in one wave and returns the responses in the order they were queued.`);
+    notes.push('The assembler is one FastAPI app in this same file, behind @modal.asgi_app(); vLLM listens on 8001 and the assembler owns 8000. @modal.concurrent(max_inputs=BATCH_SIZE) is required, not decorative: Modal admits one input per container by default, and a batch that can never be full would wait for a request that is not allowed to arrive.');
+    notes.push('A request that asks for `stream: true` is answered with the batch\'s finished body in one piece rather than an incremental stream, because the batch is dispatched and awaited as a whole. Ask for a streaming deployment if token-by-token delivery matters.');
   }
 
   return { filename: 'modal_app.py', text: lines.join('\n'), command: 'modal deploy modal_app.py', notes, warnings };

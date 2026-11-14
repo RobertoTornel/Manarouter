@@ -2264,14 +2264,14 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
     let bundle = deployment_bundle(&provider_id, &deployment, gpu);
     deployment.bundle_id = Some(bundle.id.clone());
 
-    // A recorded token id is not a mounted token. The bundle deliberately carries no secret, so a
-    // gated repository needs the operator to mount one in Modal; say that now rather than letting
-    // the first fetch inside the container discover it.
+    // A recorded token id is not a token in the container. The bundle mounts the Modal secret by
+    // name and never carries the value, so the secret has to exist before the first deploy; say
+    // that now rather than letting the first fetch inside the container discover it.
     if deployment.hf_token.is_some() {
         warnings.push(
-            "the generated app does not mount a Hugging Face secret: create one with `modal \
-             secret create manarouter-hf HF_TOKEN=...` and add it to the image before the first \
-             fetch, or a gated repository will fail to load"
+            "the generated app mounts the Hugging Face secret `manarouter-hf`: create it before \
+             the first deploy with `modal secret create manarouter-hf HF_TOKEN=...`, or the \
+             container will fail to resolve the secret and a gated repository will not load"
                 .to_owned(),
         );
     }
@@ -2381,6 +2381,124 @@ struct Bundle {
     command: String,
 }
 
+/// The batch assembler this file generates for `mode: batch`.
+///
+/// vLLM schedules whatever arrives and never holds a request back waiting for a fuller batch, so
+/// "a batch of N" is not a vLLM flag: it is this queue. It is stdlib-only on purpose — it has to run
+/// in whatever image vLLM runs in, and every extra import is one more way for a paid container to
+/// fail at boot. The panel's generator emits the same layer for the same reason, in the same words.
+const BATCH_ASSEMBLER: &str = r#"
+VLLM_PORT = 8001
+
+import json
+import queue
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+UPSTREAM = "http://127.0.0.1:%d" % VLLM_PORT
+PENDING = queue.Queue()
+
+
+def _post(body):
+    request = urllib.request.Request(
+        UPSTREAM + "/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request) as answer:
+            return answer.status, answer.headers.get("Content-Type"), answer.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.headers.get("Content-Type"), error.read()
+    except Exception as error:  # a dead upstream must still answer its waiters
+        return 502, "application/json", json.dumps({"error": str(error)}).encode()
+
+
+def _wait_until_serving():
+    # A cold container loads weights for minutes; dispatching before vLLM answers only turns
+    # that wait into a batch of failed requests.
+    while True:
+        try:
+            with urllib.request.urlopen(UPSTREAM + "/v1/models", timeout=5):
+                return
+        except Exception:
+            time.sleep(5.0)
+
+
+def _assemble():
+    _wait_until_serving()
+    while True:
+        batch = [PENDING.get()]
+        if BATCH_SIZE > 1:
+            if BATCH_TIMEOUT is None:
+                while len(batch) < BATCH_SIZE:
+                    batch.append(PENDING.get())
+            else:
+                deadline = time.monotonic() + BATCH_TIMEOUT
+                while len(batch) < BATCH_SIZE:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    try:
+                        batch.append(PENDING.get(timeout=left))
+                    except queue.Empty:
+                        break
+        answers = [None] * len(batch)
+
+        def run(index, request_body):
+            answers[index] = _post(request_body)
+
+        threads = [
+            threading.Thread(target=run, args=(index, body))
+            for index, (body, _) in enumerate(batch)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        for (_, slot), answer in zip(batch, answers):
+            slot["answer"] = answer
+            slot["done"].set()
+
+
+class BatchHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _reply(self, status, content_type, payload):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type or "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _proxy_get(self, path):
+        with urllib.request.urlopen(UPSTREAM + path) as answer:
+            self._reply(answer.status, answer.headers.get("Content-Type"), answer.read())
+
+    def do_GET(self):
+        if self.path == "/v1/models":
+            self._proxy_get(self.path)
+        else:
+            self._reply(404, "application/json", b'{"error":"not found"}')
+
+    def do_POST(self):
+        if self.path != "/v1/chat/completions":
+            self._reply(404, "application/json", b'{"error":"not found"}')
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length)
+        slot = {"done": threading.Event(), "answer": None}
+        PENDING.put((body, slot))
+        slot["done"].wait()
+        status, content_type, payload = slot["answer"]
+        self._reply(status, content_type, payload)
+"#;
+
 /// Render `modal_app.py` for a deployment.
 ///
 /// Nothing in `mr_core` generates this file, so it is generated here. Every interpolation is
@@ -2430,14 +2548,14 @@ fn deployment_bundle(provider_id: &str, deployment: &RentalDeployment, gpu: &Gpu
         None => String::new(),
     };
 
-    // What the recorded mode means for this file, in the file. A batch deployment is a plain vLLM
-    // server like any other; the layer that groups requests into a batch of `size` is not generated
-    // here, and saying so beats a comment that implies otherwise.
+    // What the recorded mode means for this file, in the file. A batch deployment gets the queue
+    // that decides when a batch ships, and the file says so; a streaming deployment keeps serving
+    // vLLM directly.
     let mode_note = match (deployment.mode, deployment.batch) {
         (RentalMode::Batch, Some(batch)) => {
             let when = match batch.fill {
                 BatchFill::Full => format!(
-                    "waits until {} requests have arrived",
+                    "waits until {} requests have arrived, however long that takes",
                     batch.size
                 ),
                 BatchFill::Timeout => format!(
@@ -2446,20 +2564,73 @@ fn deployment_bundle(provider_id: &str, deployment: &RentalDeployment, gpu: &Gpu
                 ),
             };
             format!(
-                "# Mode: batch — one batch holds {} requests and {when}.\n\
-                 # UNCERTAIN: this file serves vLLM directly; the dispatcher that groups requests\n\
-                 # into that batch is the serving layer's, and this build does not generate it.\n",
-                batch.size
+                "# Mode: batch — one batch holds {size} requests and {when}.\n\
+                 # The queue below is that batch: /v1/chat/completions holds each request until the\n\
+                 # batch is ready, sends the whole batch to vLLM on 127.0.0.1:8001, and answers every\n\
+                 # request with its own response. This is this endpoint's own queue, not the relay's\n\
+                 # batch lane: the lane submits items to a provider, this collects callers.\n\
+                 # max_inputs=BATCH_SIZE is required, not decorative: Modal admits one input per\n\
+                 # container by default, and a batch that can never be full would wait for a request\n\
+                 # that is not allowed to arrive.\n",
+                size = batch.size,
+                when = when
             )
         }
         (RentalMode::Batch, None) => {
-            "# Mode: batch, with no recorded batch shape.\n".to_owned()
+            "# Mode: batch, with no recorded batch shape, so no assembler is generated and this file\n\
+             # serves vLLM directly. Record a batch size and fill policy to get the queue.\n"
+                .to_owned()
         }
         (RentalMode::Streaming, _) => format!(
             "# Mode: streaming — several sessions may share this card; the server schedules up to\n\
              # MAX_NUM_SEQS ({max_seqs}) sequences per step and admits the rest as KV cache frees.\n"
         ),
     };
+
+    // The assembler, when this deployment has a batch to assemble, and the two lines that differ
+    // between a batch app and a streaming one.
+    let (batch_block, max_inputs, vllm_port_arg, serve_tail) =
+        match (deployment.mode, deployment.batch) {
+            (RentalMode::Batch, Some(batch)) => {
+                let timeout = match batch.fill {
+                    BatchFill::Full => "None".to_owned(),
+                    BatchFill::Timeout => format!("{}.0", batch.timeout_secs.unwrap_or(0)),
+                };
+                let head = format!("BATCH_SIZE = {}\nBATCH_TIMEOUT = {}\n", batch.size, timeout);
+                (
+                    format!("\n{head}{BATCH_ASSEMBLER}"),
+                    "BATCH_SIZE".to_owned(),
+                    "str(VLLM_PORT)".to_owned(),
+                    "    threading.Thread(target=_assemble, daemon=True).start()\n\
+                 \x20   server = ThreadingHTTPServer((\"0.0.0.0\", 8000), BatchHandler)\n\
+                 \x20   server.daemon_threads = True\n\
+                 \x20   server.serve_forever()"
+                        .to_owned(),
+                )
+            }
+            _ => (
+                String::new(),
+                "MAX_NUM_SEQS".to_owned(),
+                "\"8000\"".to_owned(),
+                "    subprocess.Popen(args)".to_owned(),
+            ),
+        };
+
+    // A gated repository needs a token inside the container, and the only place a token may live is
+    // a Modal secret the operator created. The file names it and mounts it; it never contains it.
+    let secret_decl = if deployment.hf_token.is_some() {
+        "\n# The token itself lives in this Modal secret, never in this file.\n\
+         HF_SECRET = modal.Secret.from_name(\"manarouter-hf\")\n"
+            .to_owned()
+    } else {
+        String::new()
+    };
+    let secret_arg = if deployment.hf_token.is_some() {
+        "\n    secrets=[HF_SECRET],".to_owned()
+    } else {
+        String::new()
+    };
+
     let text = format!(
         r#"# Generated by Manarouter (POST /api/gpu/apply) for provider `{provider_id}`.
 #
@@ -2474,7 +2645,7 @@ fn deployment_bundle(provider_id: &str, deployment: &RentalDeployment, gpu: &Gpu
 {mode_note}import subprocess
 
 import modal
-
+{secret_decl}
 APP_NAME = {app_name}
 MODEL = {model}
 GPU = {gpu}
@@ -2487,15 +2658,15 @@ app = modal.App(APP_NAME)
 # The vLLM server image. `add_python=None` keeps the image's own entrypoint off the path so the
 # process this function starts is the only server on the port.
 image = modal.Image.from_registry("vllm/vllm-openai:latest", add_python=None)
-
+{batch_block}
 
 @app.function(
     image=image,
     gpu=GPU,
     scaledown_window=SCALEDOWN_WINDOW,
-    timeout=60 * 60,
+    timeout=60 * 60,{secret_arg}
 )
-@modal.concurrent(max_inputs=MAX_NUM_SEQS)
+@modal.concurrent(max_inputs={max_inputs})
 @modal.web_server(port=8000, startup_timeout=60 * 20)
 def serve() -> None:
     args = [
@@ -2505,11 +2676,11 @@ def serve() -> None:
         "--host",
         "0.0.0.0",
         "--port",
-        "8000",
+        {vllm_port_arg},
         "--served-model-name",
         MODEL,
 {quant_args}{kv_args}{max_len_args}{max_seqs_args}    ]
-    subprocess.Popen(args)
+{serve_tail}
 "#,
         filename = "modal_app.py",
         mode_note = mode_note,
@@ -2524,6 +2695,12 @@ def serve() -> None:
         kv_args = kv_args,
         max_len_args = max_len_args,
         max_seqs_args = max_seqs_args,
+        batch_block = batch_block,
+        max_inputs = max_inputs,
+        vllm_port_arg = vllm_port_arg,
+        serve_tail = serve_tail,
+        secret_decl = secret_decl,
+        secret_arg = secret_arg,
     );
 
     // `PlatformSpec::deployment.has_detach_flag` is false for Modal, so the command is plain
@@ -3342,6 +3519,99 @@ mod tests {
     }
 
     #[test]
+    fn a_streaming_bundle_serves_vllm_on_the_public_port_and_generates_no_assembler() {
+        let deployment = RentalDeployment::new("acc", "Qwen/Qwen3.8-27B", "H100");
+        let gpu = gpu_by_id("H100").expect("H100 is in the catalog");
+        let bundle = deployment_bundle("rental-acc-qwen38", &deployment, gpu);
+        assert!(!bundle.text.contains("BATCH_SIZE"));
+        assert!(!bundle.text.contains("BatchHandler"));
+        assert!(bundle.text.contains("\"--port\",\n        \"8000\","));
+        assert!(bundle.text.contains("subprocess.Popen(args)"));
+        assert!(bundle.text.contains("max_inputs=MAX_NUM_SEQS"));
+    }
+
+    #[test]
+    fn a_batch_bundle_generates_the_queue_that_decides_when_a_batch_ships() {
+        let mut deployment = RentalDeployment::new("acc", "Qwen/Qwen3.8-27B", "H100");
+        deployment.mode = RentalMode::Batch;
+        deployment.batch = Some(BatchShape {
+            size: 8,
+            fill: BatchFill::Full,
+            timeout_secs: None,
+        });
+        let gpu = gpu_by_id("H100").expect("H100 is in the catalog");
+        let bundle = deployment_bundle("rental-acc-qwen38", &deployment, gpu);
+
+        assert!(bundle.text.contains("BATCH_SIZE = 8\n"), "{}", bundle.text);
+        assert!(bundle.text.contains("BATCH_TIMEOUT = None\n"));
+        // vLLM keeps an internal port so the assembler can own the one Modal proxies.
+        assert!(bundle.text.contains("VLLM_PORT = 8001"));
+        assert!(bundle.text.contains("\"--port\",\n        str(VLLM_PORT),"));
+        assert!(bundle.text.contains("def _assemble():"));
+        assert!(bundle
+            .text
+            .contains("class BatchHandler(BaseHTTPRequestHandler):"));
+        assert!(bundle
+            .text
+            .contains("ThreadingHTTPServer((\"0.0.0.0\", 8000), BatchHandler)"));
+        // A batch that can never be admitted would wait for a request Modal will not let in.
+        assert!(bundle.text.contains("max_inputs=BATCH_SIZE"));
+        assert!(!bundle.text.contains("max_inputs=MAX_NUM_SEQS"));
+        // The old text admitted the queue was missing; the generated file must not say that now.
+        assert!(!bundle.text.contains("UNCERTAIN"));
+        assert!(!bundle.text.contains("does not generate it"));
+        assert!(bundle.text.contains("however long that takes"));
+    }
+
+    #[test]
+    fn a_timed_batch_bundle_ships_what_arrived_when_the_timeout_expires() {
+        let mut deployment = RentalDeployment::new("acc", "Qwen/Qwen3.8-27B", "H100");
+        deployment.mode = RentalMode::Batch;
+        deployment.batch = Some(BatchShape {
+            size: 4,
+            fill: BatchFill::Timeout,
+            timeout_secs: Some(45),
+        });
+        let gpu = gpu_by_id("H100").expect("H100 is in the catalog");
+        let bundle = deployment_bundle("rental-acc-qwen38", &deployment, gpu);
+
+        assert!(bundle.text.contains("BATCH_SIZE = 4\n"), "{}", bundle.text);
+        assert!(bundle.text.contains("BATCH_TIMEOUT = 45.0\n"));
+        assert!(bundle.text.contains("half-full batch still goes out"));
+        assert!(bundle
+            .text
+            .contains("deadline = time.monotonic() + BATCH_TIMEOUT"));
+    }
+
+    #[test]
+    fn a_gated_deployment_mounts_the_secret_by_name_and_embeds_no_token() {
+        let mut deployment =
+            RentalDeployment::new("acc", "orcarouter/Qwen3.8-27B-Uncensored", "H100");
+        deployment.hf_token = Some("hf-token-1".to_owned());
+        let gpu = gpu_by_id("H100").expect("H100 is in the catalog");
+        let bundle = deployment_bundle("rental-acc-qwen38", &deployment, gpu);
+
+        assert!(bundle
+            .text
+            .contains("HF_SECRET = modal.Secret.from_name(\"manarouter-hf\")"));
+        assert!(bundle.text.contains("    secrets=[HF_SECRET],"));
+        // The secret's name is the only thing the file may know about it.
+        assert!(!bundle.text.contains("modal.Secret("));
+        assert!(!bundle.text.contains("HF_TOKEN="));
+        assert!(!bundle.text.contains("hf-token-1"));
+    }
+
+    #[test]
+    fn a_public_deployment_mounts_no_secret() {
+        let deployment = RentalDeployment::new("acc", "Qwen/Qwen3.8-27B", "H100");
+        let gpu = gpu_by_id("H100").expect("H100 is in the catalog");
+        let bundle = deployment_bundle("rental-acc-qwen38", &deployment, gpu);
+        assert!(!bundle.text.contains("modal.Secret"));
+        assert!(!bundle.text.contains("secrets="));
+        assert!(!bundle.text.contains("HF_SECRET"));
+    }
+
+    #[test]
     fn the_generated_python_quotes_each_argument_exactly_once() {
         // This bundle is text an operator pastes into `modal deploy`. `py_str` already returns a
         // quoted literal, so wrapping it in another pair produced `""fp8""`: plausible-looking
@@ -4141,14 +4411,14 @@ mod tests {
         // One token, two accounts: both name the same id, and neither account owns it.
         assert_eq!(first["deployment"]["hf_token"], json!("hub-main"));
         assert_eq!(second["deployment"]["hf_token"], json!("hub-main"));
-        // The id is recorded; the value is not, and the bundle cannot mount it, so the response says
-        // so instead of implying the container already has the token.
+        // The id is recorded; the value is not. The bundle mounts the secret by name, so the
+        // response says the secret has to exist rather than implying the container has the token.
         let warnings = first["warnings"].as_array().expect("warnings array");
         assert!(
-            warnings.iter().any(|warning| warning
-                .as_str()
-                .is_some_and(|text| text.contains("does not mount a Hugging Face secret"))),
-            "a deploy naming a token warns that mounting it is still a Modal step: {warnings:?}"
+            warnings.iter().any(|warning| warning.as_str().is_some_and(
+                |text| text.contains("mounts the Hugging Face secret `manarouter-hf`")
+            )),
+            "a deploy naming a token says the secret it mounts must exist: {warnings:?}"
         );
 
         let config = state.current_config().await;

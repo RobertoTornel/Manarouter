@@ -216,10 +216,11 @@ offering the recorded tokens by id and a "new token" path that writes `hf:<id>` 
 and the deployment records the token *id*, never the value.
 
 One consequence has to be said plainly: recording the id does not put the token in the container. The
-generated `modal_app.py` carries no secret by design, so a gated repository needs the operator to
-mount a Modal secret (`manarouter-hf`) before the first fetch; the apply response warns about this
-whenever a token is named. Until that mount is added to the generator, a gated deployment needs one
-hand edit after `modal deploy`.
+generated `modal_app.py` mounts the Modal secret `manarouter-hf` by name whenever the deployment names
+a token, and never carries the value itself, so a gated repository needs the operator to create that
+secret once (`modal secret create manarouter-hf HF_TOKEN=...`) before the first deploy; the apply
+response warns about this whenever a token is named. No hand edit of the generated file is needed —
+only the one-time secret.
 
 **And a gated repository is not the end of the sizing story.** A quantised repository usually names
 its unquantised base (`cardData.base_model`), and the base is usually public. Fetching the base's

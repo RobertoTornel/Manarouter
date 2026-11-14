@@ -35,7 +35,8 @@ differ, the contract is the intent and this list is the truth.
   Face token is its own record at `hf:<id>`, named by each deployment that needs it (§3.4), and
   re-recording an id rotates the value in place rather than creating a second token.
 * Batch deployments record `BatchShape` (`size`, `fill`, `timeout_secs`) and the fill policy is
-  reflected in the generated bundle's `mode_note`; the batch assembler itself is not generated.
+  reflected in the generated bundle's `mode_note`; the bundle also carries the assembler that
+  enforces it (§3.2).
 * The panel's `#/gpu-rentals` page is three actions over one list — `Deploy model`,
   `Add Modal account`, `Add HuggingFace token` — with the fit check inside the deploy window. The
   step wizard behind `#/gpu-rentals/new/<step>` remains for a first-time walkthrough.
@@ -240,6 +241,18 @@ without a duration, a duration without the timeout policy, and a `fill` value it
 fill policy never changes the fit calculation: a batch is judged against `batch.size`, a streaming
 deployment against `sessions`.
 
+**A batch deployment carries its own queue.** vLLM schedules whatever arrives and never holds a
+request back waiting for a fuller batch, so "a batch of N" is not a vLLM flag: both generators emit
+a stdlib-only assembler into `modal_app.py` when the deployment has a batch shape. vLLM listens on
+`127.0.0.1:8001`; the assembler owns port 8000, holds each `/v1/chat/completions` request until
+`BATCH_SIZE` requests are in hand (`fill: full`, which can wait indefinitely) or until
+`BATCH_TIMEOUT` expires (`fill: timeout`), sends the whole batch to vLLM at once, and answers each
+caller with its own response. The function is declared `@modal.concurrent(max_inputs=BATCH_SIZE)`:
+Modal admits one input per container by default, and a batch that can never be full would wait for
+a request that is not allowed to arrive. A streaming deployment keeps vLLM on port 8000 and
+generates no assembler. `stream: true` is answered with the finished body in one piece — the
+assembler exists for whole-response batching, not for token streaming.
+
 `base_url` is **derived**, never pasted in the normal path. The account records the Modal workspace
 and the deployment's generated app name is deterministic from the shape, so
 `https://<workspace>--<modal-app-name>-serve.modal.run` is computed by one shared derivation used by
@@ -286,14 +299,15 @@ token would be a bundle carrying a secret. The container reads a Modal secret na
 `manarouter-hf`, which the operator creates on their own machine
 (`modal secret create manarouter-hf HF_TOKEN=...`) and whose name the generated file should mount. The
 recorded `hf_token` id says *which* token the deployment expects; mounting it is a deployment-time
-step. **Gap, stated rather than papered over:** the generated `modal_app.py` does not yet add that
-secret to the image, and the bundle's notes do not mention it, so a gated repository deploys and then
-fails on its first fetch until the file is edited by hand. The apply response carries a warning
-saying exactly that (`"... does not mount a Hugging Face secret ..."`) whenever a deployment names a
-token, so the gap is visible at the moment of deployment rather than only in this document. Adding
-the mount is the next piece of work on this path. **UNCERTAIN:** whether the eventual fix should push the secret through the Modal CLI
-instead; that would need the operator's Modal token to have secret-write scope, which the panel does
-not currently assume.
+step. **The mount is generated, the value is not:** the generated `modal_app.py` mounts that secret by
+name — `HF_SECRET = modal.Secret.from_name("manarouter-hf")` and `secrets=[HF_SECRET]` on the
+function — whenever the deployment names a token, so the operator's only remaining step is to create
+the secret once with `modal secret create manarouter-hf HF_TOKEN=...` before the first deploy. The
+token's value is never interpolated into the bundle: a bundle carrying a token would be a bundle
+carrying a secret, and the panel does not assume the operator's Modal token has secret-write scope.
+The apply response still carries a warning whenever a deployment names a token, now saying that the
+secret it mounts must exist (`"... mounts the Hugging Face secret `manarouter-hf` ..."`), so the
+requirement is visible at the moment of deployment rather than only in this document.
 
 **Legacy fallback, kept deliberately.** Files written before this entity existed may hold
 `RentalAccount.hf_secret_ref = Some("rental:<account>:hf")`. A gated probe with no named token falls
@@ -566,11 +580,11 @@ credential bound as its account, the model entry, and the derived budget fields
 `cold_start_ttfb_timeout_ms`) so the relay enforces them with the KV budget already on the request
 path. It also returns the **bundle** (`modal_app.py` text + command) so the wizard can show it.
 
-The bundle is a *streaming* vLLM app. For a `batch` deployment the file still starts vLLM with the
-right flags, and a generated `mode_note` says which mode the deployment was applied in — but the code
-that accumulates a batch and decides when to fire on `fill`/`timeout_secs` is **not generated**. Saying
-so in the note, rather than shipping an app whose docstring implies batching it does not do, is the
-same rule the rest of this document follows: the file is exactly as capable as it claims.
+The bundle is a *streaming* vLLM app unless the deployment is `batch`, in which case the file also
+carries the assembler: a stdlib queue that holds each request until `BATCH_SIZE` requests are in hand
+or `BATCH_TIMEOUT` expires, sends the batch to vLLM on `127.0.0.1:8001` at once, and answers each
+caller with its own response (§3.2). A generated `mode_note` says which mode the deployment was
+applied in and what its fill policy does, so the file is exactly as capable as it claims.
 
 Everything goes through `AppState::commit` (validate → compile → atomic save → install) and the
 vault write is rolled back if commit fails. No secret is ever echoed back; the response carries the

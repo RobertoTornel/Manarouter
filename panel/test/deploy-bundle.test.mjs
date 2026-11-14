@@ -416,3 +416,53 @@ test('the module docstring records the model, the card and that the size is an e
   assert.match(bundle.text, /^Sizing:\s+Manarouter estimate 1784103 KV tokens — an estimate, not vLLM's measurement$/m);
   assert.match(bundle.text, /^Run it with:\s+modal deploy modal_app\.py$/m);
 });
+
+// ---- batch mode ------------------------------------------------------------------------------
+// vLLM schedules whatever arrives; it never holds a request back waiting for a fuller batch. A
+// batch deployment is therefore only real if the generated file carries the queue that decides when
+// a batch ships, which is what these tests pin.
+
+test('a batch bundle carries an assembler and puts vLLM on an internal port', () => {
+  const { bundle } = canonical({ mode: 'batch', batchSize: 8, batchFill: 'full', batchTimeoutSecs: 60 });
+  assert.match(bundle.text, /^BATCH_SIZE = 8$/m);
+  assert.match(bundle.text, /^BATCH_TIMEOUT = None$/m);
+  assert.match(bundle.text, /^VLLM_PORT = 8001$/m);
+  assert.match(bundle.text, /--port", "8001"/);
+  assert.match(bundle.text, /^def _assemble\(\):$/m);
+  assert.match(bundle.text, /^class BatchHandler\(BaseHTTPRequestHandler\):$/m);
+  assert.match(bundle.text, /PENDING\.get\(timeout=left\)/);
+  assert.match(bundle.text, /ThreadingHTTPServer\(\("0\.0\.0\.0", 8000\), BatchHandler\)/);
+});
+
+test('a batch bundle admits at least one whole batch, or "wait until full" can never complete', () => {
+  const { bundle } = canonical({ mode: 'batch', batchSize: 8 });
+  assert.match(bundle.text, /@modal\.concurrent\(max_inputs=BATCH_SIZE\)/);
+  assert.doesNotMatch(bundle.text, /max_inputs=1\b/);
+});
+
+test('a timed batch ships a half-full batch when the timeout expires', () => {
+  const { bundle } = canonical({ mode: 'batch', batchSize: 8, batchFill: 'timeout', batchTimeoutSecs: 45 });
+  assert.match(bundle.text, /^BATCH_TIMEOUT = 45\.0$/m);
+  assert.match(bundle.text, /half-full batch still goes out/);
+  assert.match(bundle.text, /deadline = time\.monotonic\(\) \+ BATCH_TIMEOUT/);
+});
+
+test('a wait-until-full batch says plainly that it may wait indefinitely', () => {
+  const { bundle } = canonical({ mode: 'batch', batchSize: 8, batchFill: 'full' });
+  assert.match(bundle.text, /however long that takes/);
+  assert.ok(bundle.notes.some((n) => n.includes('however long that takes')));
+});
+
+test('a streaming bundle keeps vLLM on the public port and generates no assembler', () => {
+  const { bundle } = canonical({ mode: 'streaming' });
+  assert.match(bundle.text, /--port", "8000"/);
+  assert.doesNotMatch(bundle.text, /BATCH_SIZE/);
+  assert.doesNotMatch(bundle.text, /BatchHandler/);
+  assert.doesNotMatch(bundle.text, /@modal\.concurrent/);
+});
+
+test('batch notes say the assembler is not a streaming endpoint', () => {
+  const { bundle } = canonical({ mode: 'batch', batchSize: 4 });
+  assert.ok(bundle.notes.some((n) => n.includes('assembler in this file')));
+  assert.ok(bundle.notes.some((n) => n.includes('stream: true')));
+});

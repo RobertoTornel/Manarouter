@@ -241,15 +241,25 @@ claiming both.
 `timeout` (ship a short batch after `timeout_secs`). The shape is validated on both halves; an
 inconsistent batch is refused with the field named.
 
-**Known gap on that path.** A recorded token id is not a mounted token: the generated `modal_app.py`
-deliberately carries no secret, so a gated repository needs the operator to create and mount a Modal
-secret (`manarouter-hf`) before its first fetch, and the apply response now warns exactly that when a
-deployment names a token. The next change here is to emit the mount. Likewise, the batch assembler for
-a `batch` deployment is described in the bundle's `mode_note` rather than generated: the file says
-which mode it was applied in and does not pretend to contain the code that accumulates a batch.
+**What the generated file now carries.** A recorded token id is still not a token value: the
+generated `modal_app.py` mounts the Modal secret `manarouter-hf` by name
+(`modal.Secret.from_name("manarouter-hf")` → `secrets=[HF_SECRET]`) whenever the deployment names a
+token, and never interpolates the value. The operator creates that secret once
+(`modal secret create manarouter-hf HF_TOKEN=...`) before the first deploy, and the apply response
+warns exactly that when a deployment names a token. A `batch` deployment also carries its assembler:
+the generated file holds the queue (`BATCH_SIZE`, `BATCH_TIMEOUT`, vLLM on `127.0.0.1:8001`, the
+public port on 8000) that waits for a full batch or for the timeout, sends the whole batch to vLLM at
+once, and answers every caller with its own response. `fill: full` therefore waits indefinitely by
+construction — the operator's stated choice, not a missing timeout — and the file says so.
 
-**What has actually been exercised.** The workspace suite is green — 1 899 passed, 0 failed, 4
-ignored (`cargo test --workspace`) — the panel suite is green (361 tests, `node --test
+**The assembler was executed, not just inspected.** Both generators' output was rendered and run
+against a stub upstream: three requests for a batch of three reached the upstream within a
+millisecond of each other and each caller got its own response, while a batch of eight with a
+one-second timeout shipped the two requests that had arrived after that second. The text also
+`ast.parse`s for both a batch and a streaming bundle.
+
+**What has actually been exercised.** The workspace suite is green — 1 904 passed, 0 failed, 4
+ignored (`cargo test --workspace`) — the panel suite is green (371 tests, `node --test
 panel/test/*.test.mjs`), and — the part that matters most — a second
 conductor built from this tree was driven over a socket on `127.0.0.1:20999` with its own config and
 state directories, through the real sequence: catalog → probe → create account → create deployment →
