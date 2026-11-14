@@ -195,6 +195,15 @@ fn build_quota(body: &Value, balances: &[BalanceInfo]) -> UsageQuota {
             "DeepSeek"
         });
 
+    // A single-currency balance names its unit; a multi-currency one has no single unit to
+    // state, so `unit` stays absent and no consumer can compare the aggregate to dollars.
+    let currencies: std::collections::BTreeSet<String> = balances
+        .iter()
+        .map(|balance| balance.currency.to_uppercase())
+        .collect();
+    if currencies.len() == 1 {
+        quota = quota.with_unit(currencies.into_iter().next().unwrap_or_default());
+    }
     for balance in balances {
         let currency = balance.currency.to_lowercase();
         quota = quota

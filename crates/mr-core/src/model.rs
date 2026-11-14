@@ -316,6 +316,16 @@ pub struct Account {
     /// the normal case: a provider whose base URL has no braces never reads this.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub placeholders: BTreeMap<String, String>,
+    /// Remaining credit in **US dollars**, when the operator declares it.
+    ///
+    /// This is an input to the fine-tuning credit floor, never a spend meter: the router does not
+    /// decrement it, because only the upstream knows what a job cost. When it is absent the relay
+    /// falls back to a **freshly cached** USD balance from quota tracking, so an operator whose
+    /// provider exposes a balance endpoint does not have to repeat the number here. A declared
+    /// value wins over the cache: it is the operator's assertion about an account the router
+    /// cannot otherwise price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_usd: Option<f64>,
     /// Free-form provider-specific fields, for example a Copilot session or a Codex workspace id.
     ///
     /// Kept as an open map so a new provider needs no schema change, and preserved on round-trip
@@ -346,6 +356,7 @@ impl Account {
             quota: Vec::new(),
             proxy: None,
             placeholders: BTreeMap::new(),
+            credit_usd: None,
             extra: BTreeMap::new(),
         }
     }
@@ -919,6 +930,16 @@ impl Provider {
                         a.id
                     ));
                 }
+            }
+            // A negative or non-finite credit would quietly disqualify an account from the
+            // fine-tuning floor, or worse compare as "richer" under a NaN. Refuse it at save time.
+            if a.credit_usd
+                .is_some_and(|credit| !credit.is_finite() || credit < 0.0)
+            {
+                problems.push(format!(
+                    "account {} declares a credit_usd that is not a finite, non-negative number",
+                    a.id
+                ));
             }
         }
         if self.ttfb_timeout_ms == 0 && self.total_timeout_ms == 0 {
@@ -2183,6 +2204,21 @@ mod tests {
         assert!(problems.iter().any(|s| s.contains("must not contain '/'")));
         assert!(problems.iter().any(|s| s.contains("must start with http")));
         assert!(problems.iter().any(|s| s.contains("no accounts")));
+    }
+
+    #[test]
+    fn a_credit_that_is_not_a_finite_non_negative_dollar_amount_is_rejected() {
+        let mut p = provider_with(1);
+        for bad in [f64::NAN, f64::INFINITY, -0.01] {
+            p.accounts[0].credit_usd = Some(bad);
+            assert!(
+                p.validate().iter().any(|s| s.contains("credit_usd")),
+                "{bad} was accepted as a balance"
+            );
+        }
+        // Zero is a declaration, not an absence: it means the operator knows the account is spent.
+        p.accounts[0].credit_usd = Some(0.0);
+        assert!(p.validate().iter().all(|s| !s.contains("credit_usd")));
     }
 
     #[test]

@@ -1992,6 +1992,7 @@ async fn persist_oauth_account(
         quota: Vec::new(),
         proxy: None,
         placeholders: Default::default(),
+        credit_usd: None,
         extra: Default::default(),
     };
     provider.accounts.push(account.clone());

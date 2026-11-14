@@ -545,6 +545,14 @@ with `purpose=fine-tune`. What it does not do is serve chat and train at once: c
 `409` while a job is active and the model cache is evicted when a new job starts, which is the honest
 shape for a card that cannot hold both.
 
+The credit floor in [key selection](05-key-selection.md#the-declared-balance-and-the-one-route-ranked-by-it)
+applies here too, and it does not know that Modal bills the GPU separately: the trainer's account has
+no provider-side balance to probe, so a fresh installation refuses `POST /v1/fine_tuning/jobs` with
+`402 insufficient_credit` until the operator declares one. That is deliberate — the declaration is
+the acknowledgement that this route spends money — and
+`mr account set-credit modal-vllm <account> --usd 15.01` is enough. The number is a floor for choosing
+an account, not a budget; Modal's own spend check remains `modal app list`.
+
 Two constraints belong here because they are easy to forget when the numbers look cheap. The hourly
 rate is per container that is *running*; an idle deployment costs nothing after `scaledown_window`,
 which is why `modal app list` is the spend check and why the cost line in §10 is about a batch, not

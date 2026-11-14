@@ -48,8 +48,8 @@ pub const CREDITS_URL: &str = "https://openrouter.ai/api/v1/credits";
 /// The fetcher id, also stamped onto the `source` field of what it returns.
 pub const SOURCE: &str = OpenRouter::ID;
 
-/// How the USD unit is carried: the ported [`UsageQuota`] has no `currency` field, so the
-/// currency is named in the operator-facing `display_name` instead of being dropped.
+/// How the USD unit is carried: [`UsageQuota::unit`] is what code compares, and the
+/// operator-facing `display_name` repeats it so a person reading a quota chip sees dollars.
 const USD: &str = "USD";
 
 /// OpenRouter's per-key limit and account credit pool.
@@ -227,7 +227,8 @@ fn build_quota(key: Option<&KeyFields>, credits: Option<&CreditsFields>) -> Usag
         let used = limit - remaining;
         let mut quota = UsageQuota::from_usage(used, limit, &fields.limit_reset)
             .with_source(SOURCE)
-            .with_display_name(format!("OpenRouter Key Limit ({USD})"));
+            .with_display_name(format!("OpenRouter Key Limit ({USD})"))
+            .with_unit(USD);
         for detail in fields.details() {
             quota = quota.with_detail(detail);
         }
@@ -240,6 +241,7 @@ fn build_quota(key: Option<&KeyFields>, credits: Option<&CreditsFields>) -> Usag
         UsageQuota::unlimited()
             .with_source(SOURCE)
             .with_display_name(format!("OpenRouter Credits ({USD}, no limit)"))
+            .with_unit(USD)
     } else {
         let balance = credit_balance.expect("has_positive_pool implies a balance");
         let total_credits = credits
@@ -255,6 +257,7 @@ fn build_quota(key: Option<&KeyFields>, credits: Option<&CreditsFields>) -> Usag
         UsageQuota::from_usage(used, total, &reset)
             .with_source(SOURCE)
             .with_display_name(format!("OpenRouter Credits ({USD})"))
+            .with_unit(USD)
     };
     if let Some(fields) = key {
         for detail in fields.details() {

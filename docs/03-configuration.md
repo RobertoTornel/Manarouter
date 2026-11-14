@@ -219,6 +219,16 @@ Provider ids are also part of a secret reference (`provider/<id>/account/<id>`),
 orphans its credential. The CLI refuses to rename a provider that has credentials unless
 `--force` is given.
 
+### `credit_usd` on an account
+
+An account may carry `credit_usd`, a balance the operator knows and the router does not. It is
+optional, must be finite and non-negative, and is used for one decision only: choosing the account
+that starts a fine-tuning job, which requires more than $15 of known credit. It is declared through
+the panel or `mr account add … --credit-usd`, changed with `mr account set-credit … --usd`, and does
+not follow spend — see
+[key selection](05-key-selection.md#the-declared-balance-and-the-one-route-ranked-by-it). An account
+with no such field and no fresh cached USD balance is unknown and cannot start a job.
+
 ### `key_strategy`
 
 How an account is chosen from those that are available. See `docs/05-key-selection.md`.

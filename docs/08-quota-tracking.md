@@ -519,8 +519,13 @@ the provider actually reports reaches the ledger:
   so a slow disk cannot stall a request, and when it is full the drop is recorded and surfaced. Losing
   a usage row is preferable to adding latency to a completion, and pretending the row exists is worse
   than both.
-- **Spend budgets and credit balances are not enforced.** The router can tell you a provider is
-  returning 402; it cannot predict it.
+- **Spend budgets are not enforced, and a credit balance is consulted on one route only.** Ordinary
+  requests can still be refused with a 402 the router did not predict. The exception is starting a
+  fine-tuning job: creation requires more than $15 of *known* credit — an account's declared
+  `credit_usd`, or a USD figure cached from the provider within the last 24 hours — and moves to the
+  next funded account if the provider refuses for money. A job already created belongs to the
+  provider's account and cannot be moved. The rule is in
+  [key selection](05-key-selection.md#the-declared-balance-and-the-one-route-ranked-by-it).
 - **A candidate endpoint list is a guess about paths, not knowledge about a provider.** The nine
   `GET` candidates and the one-token `POST` cover what resellers and gateways commonly serve; a host
   that publishes its allowance somewhere else is not read until the operator adds the path, and one

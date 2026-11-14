@@ -97,6 +97,10 @@ either from a vector store or by sending the query to a model, depending on what
 | `POST` `GET` | `/v1/evals/{id}/runs` | Create, list runs |
 | `GET` `POST` | `/v1/evals/{id}/runs/{run_id}` | One run, and its `cancel` |
 
+Job creation needs an account with more than $15 of known credit, and takes the richest that
+qualifies; the job's other routes are not gated. See
+[key selection](05-key-selection.md#the-declared-balance-and-the-one-route-ranked-by-it).
+
 **Liveness and control.**
 
 | Method | Path | Shape |
@@ -499,9 +503,7 @@ value is refused with the purpose it got. A `fine-tune` file is stored exactly l
 is staged to the provider by the fine-tuning route below. The filename is metadata and never becomes
 a path. The stored bytes are returned by `GET /v1/files/{id}/content`, which is how an operator checks
 what the lane actually received — and the cap is 32 MiB per file, the lane's own limit rather than
-OpenAI's 512 MB, because a file is held in memory while it is validated and written. The stored
-bytes are returned by `GET /v1/files/{id}/content`, which is how an operator checks what the lane
-actually received.
+OpenAI's 512 MB, because a file is held in memory while it is validated and written.
 
 **Submit.** `POST /v1/batches` takes `input_file_id`, `endpoint` (`/v1/chat/completions` is
 the only one this lane runs; any other is refused with `unsupported_endpoint`), `completion_window` (`24h` is the only accepted value, and it is

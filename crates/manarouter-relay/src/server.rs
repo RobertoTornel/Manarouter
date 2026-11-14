@@ -912,6 +912,121 @@ fn model_optional_capability(route: RouteKind) -> Option<Capability> {
     }
 }
 
+/// The least credit, in US cents, that a fine-tuning account may hold and still be asked to
+/// start a job.
+///
+/// Fifteen dollars is a floor on the **balance**, not a spend limit: a training run can outlive
+/// the request that started it, so an account that is about to be refused is worse than no
+/// account at all. "Over fifteen" is strict, because the operator said over.
+const FINE_TUNING_CREDIT_FLOOR_CENTS: u64 = 1_500;
+
+/// How old a cached USD balance may be before it stops counting as a balance.
+///
+/// The conductor refreshes quota on its own schedule and writes to the same SQLite file the relay
+/// reads, so no second fetcher lives here. A day is the longest a balance can plausibly still be
+/// true on an account that has been serving traffic; older than that is **unknown**, never
+/// "zero" and never "spent". An operator who declares `credit_usd` does not depend on this at all.
+const FINE_TUNING_CREDIT_MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Convert a dollar figure to whole cents, refusing anything that is not money.
+fn credit_cents_from_usd(usd: f64) -> Option<u64> {
+    (usd.is_finite() && usd >= 0.0).then(|| (usd * 100.0).round() as u64)
+}
+
+/// What the router knows about one account's remaining credit, in US cents.
+///
+/// A declared [`AccountPlan::credit_cents`] wins, because it is the operator's assertion about an
+/// account the router cannot price. Otherwise the shared quota cache is consulted for a **USD**
+/// balance the provider itself reported. A percentage, a token count, an unlimited plan and a row
+/// older than [`FINE_TUNING_CREDIT_MAX_AGE_MS`] are all *unknown*: an unknown balance never
+/// qualifies an account to start a job the router cannot fund.
+fn known_credit_cents(
+    app: &AppState,
+    provider: &ProviderPlan,
+    account: &AccountPlan,
+    now_ms: i64,
+) -> Option<u64> {
+    if let Some(cents) = account.credit_cents {
+        return Some(cents);
+    }
+    let rows = app
+        .quota_store
+        .provider_quota_state(provider.id.as_str())
+        .ok()?;
+    let row = rows.iter().find(|row| row.account_id == account.id)?;
+    let age = now_ms.saturating_sub(row.fetched_at.as_millis());
+    // A row stamped in the future is a clock disagreement, not fresh knowledge.
+    if !(0..=FINE_TUNING_CREDIT_MAX_AGE_MS).contains(&age) {
+        return None;
+    }
+    cached_usd_credit_cents(&row.payload)
+}
+
+/// Read a USD balance out of a cached quota payload.
+///
+/// The conductor stores the headline quota as `credit` only when it is a reported, limited USD
+/// balance; the window fallback exists for rows written before that object did, and takes the
+/// largest single USD window rather than summing, because two windows may be the same money
+/// described twice.
+fn cached_usd_credit_cents(payload: &str) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let usd = |figure: &serde_json::Value| -> bool {
+        figure.get("unit").and_then(|unit| unit.as_str()) == Some("USD")
+    };
+    let reported = |figure: &serde_json::Value| -> bool {
+        figure.get("unlimited").and_then(|flag| flag.as_bool()) != Some(true)
+            && figure
+                .get("fraction_reported")
+                .and_then(|flag| flag.as_bool())
+                == Some(true)
+    };
+    if let Some(credit) = value.get("credit") {
+        if usd(credit) && reported(credit) {
+            if let Some(cents) = credit
+                .get("remaining")
+                .and_then(|remaining| remaining.as_f64())
+                .and_then(credit_cents_from_usd)
+            {
+                return Some(cents);
+            }
+        }
+    }
+    value
+        .get("windows")
+        .and_then(|windows| windows.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|window| usd(window) && reported(window))
+        .filter_map(|window| {
+            window
+                .get("remaining")
+                .and_then(|remaining| remaining.as_f64())
+                .and_then(credit_cents_from_usd)
+        })
+        .max()
+}
+
+/// Whether this request **starts** a fine-tuning job rather than reading or controlling one.
+///
+/// Only creation spends money up front, and only creation can be moved to another account before
+/// any work exists. A `GET` on the job list must keep its account's view, and a `POST …/cancel`
+/// must reach the account that owns the job.
+fn starts_a_fine_tuning_job(capability: Capability, method: &Method, path: &str) -> bool {
+    capability == Capability::FineTuning
+        && *method == Method::POST
+        && path == "/v1/fine_tuning/jobs"
+}
+
+/// One account the fine-tuning credit floor admitted, paired with the cents it was ranked by.
+type FundedAccount<'a> = (
+    u64,
+    (
+        &'a AccountPlan,
+        Option<String>,
+        Vec<(HeaderName, HeaderValue)>,
+    ),
+);
+
 /// Forward a request whose provider is chosen by **capability** rather than by a model name.
 ///
 /// Some surfaces name no model in a field the router can read: a fine-tuning job is addressed by
@@ -1080,6 +1195,37 @@ async fn forward_with_bytes(
             continue;
         }
 
+        // Starting a fine-tuning job spends money before the client sees anything, and the run
+        // then outlives the request on the account that created it. So creation goes to the
+        // richest funded account, and an account that cannot clear the floor is not asked at all.
+        // Everything else keeps the strategy's order: a chat request is retried somewhere else,
+        // but a created training job cannot be moved.
+        if starts_a_fine_tuning_job(capability, &method, uri.path()) {
+            let mut funded: Vec<FundedAccount<'_>> = usable
+                .drain(..)
+                .filter_map(|entry| {
+                    let cents = known_credit_cents(&app, provider, entry.0, now_ms as i64)?;
+                    (cents > FINE_TUNING_CREDIT_FLOOR_CENTS).then_some((cents, entry))
+                })
+                .collect();
+            funded.sort_by_key(|(cents, _)| std::cmp::Reverse(*cents));
+            usable = funded.into_iter().map(|(_, entry)| entry).collect();
+            if usable.is_empty() {
+                last_failure = Some(error_response(
+                    StatusCode::PAYMENT_REQUIRED,
+                    Dialect::OpenAi,
+                    "insufficient_credit",
+                    &format!(
+                        "no account for `{}` has more than $15.00 of known credit, and starting a \
+                         fine-tuning job requires it; declare a balance with \
+                         `mr account set-credit {} --usd <amount>` or refresh the provider's quota",
+                        provider.id, provider.id
+                    ),
+                ));
+                continue;
+            }
+        }
+
         for (account, credential, oauth_headers) in usable {
             // The client's own path, treated as a dialect path so `build_url` performs the same
             // version reconciliation it performs for every other route: a base URL ending in
@@ -1165,18 +1311,58 @@ async fn forward_with_bytes(
                         return build_response(response, ticket.take());
                     }
                     // The account was refused rather than the job: a sibling account of the same
-                    // provider may serve it, exactly as it would for a chat request.
-                    if matches!(
+                    // provider may serve it, exactly as it would for a chat request. A refusal
+                    // that names money is the same story with a different status: a spent
+                    // account answers 402, or a 400 whose body says credits ran out, and the
+                    // client must never see that while another account can still pay. The dead
+                    // account is cooled so the next request does not pay for the same refusal.
+                    let refusal = response
+                        .body
+                        .first_frame_bytes()
+                        .and_then(|bytes| exhausted_by_body(bytes));
+                    let refused_account = matches!(
                         response.status,
                         StatusCode::UNAUTHORIZED
                             | StatusCode::FORBIDDEN
                             | StatusCode::TOO_MANY_REQUESTS
-                    ) {
+                            | StatusCode::PAYMENT_REQUIRED
+                    ) || refusal.is_some();
+                    if refused_account {
+                        let reason = refusal.map(|(reason, _)| reason).unwrap_or_else(|| {
+                            classify_status(response.status, step.dialect == Dialect::ModalVllm)
+                        });
+                        let wait = refusal
+                            .and_then(|(_, wait)| wait)
+                            .or_else(|| retry_after_ms(&response.headers));
+                        let scope = provider.cooldown_scope;
+                        app.health.cool_down(
+                            &select::cooldown_key(
+                                scope,
+                                provider.id.as_str(),
+                                account.id.as_str(),
+                                &step.model,
+                                reason,
+                            ),
+                            select::cooldown_until(
+                                reason,
+                                app.health.failures(
+                                    scope,
+                                    provider.id.as_str(),
+                                    account.id.as_str(),
+                                    &step.model,
+                                ),
+                                wait,
+                                &app.relay.quota_config(),
+                            ),
+                            reason,
+                        );
                         tracing::warn!(
                             provider = %provider.id,
                             status = %response.status,
+                            reason = ?reason,
                             "the capability-addressed request was refused for this account"
                         );
+                        last_failure = Some(build_response(response, None));
                         continue;
                     }
                     return build_response(response, ticket.take());
@@ -4623,9 +4809,11 @@ fn exhausted_by_body(body: &[u8]) -> Option<(select::CooldownReason, Option<u64>
 /// the plan's quota is spent, which is a statement no retry can change until someone tops up or the
 /// window turns over.
 fn mentions_a_spent_account(message: &str) -> bool {
-    const PHRASES: [&str; 11] = [
+    const PHRASES: [&str; 16] = [
         "insufficient credit",
         "insufficient balance",
+        "insufficient funds",
+        "enough credit",
         "out of credit",
         "no credit",
         "credit balance",
@@ -4635,6 +4823,9 @@ fn mentions_a_spent_account(message: &str) -> bool {
         "quota exceeded",
         "quota exhausted",
         "exceeded your quota",
+        "exceeded your current quota",
+        "spend limit",
+        "credit limit",
     ];
     let lower = message.to_ascii_lowercase();
     PHRASES.iter().any(|phrase| lower.contains(phrase))
@@ -8683,6 +8874,23 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             wait, None,
             "no reset was stated, so the default guess applies"
         );
+    }
+
+    #[test]
+    fn money_wording_from_other_providers_still_cools_the_account() {
+        // Captured shapes from OpenAI-compatible providers: none of them uses the word "credit" the
+        // way the first captured message did, and every one of them is about money rather than the
+        // request. A 400 here is still an account problem, so it must move to another account.
+        for message in [
+            "Your account does not have enough credits to run this request",
+            "You exceeded your current quota, please check your plan and billing details",
+            "Insufficient funds on this account",
+            "The account has reached its spend limit",
+            "Your credit limit has been reached",
+        ] {
+            let body = format!(r#"{{"error":{{"message":"{message}"}}}}"#);
+            assert!(exhausted_by_body(body.as_bytes()).is_some(), "{message}");
+        }
     }
 
     #[test]
@@ -12941,6 +13149,28 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         provider
     }
 
+    /// Declare a balance on a provider's only account, which is what lets it start a job.
+    fn declare_credit(provider: &mut mr_core::model::Provider, usd: f64) {
+        provider.accounts[0].credit_usd = Some(usd);
+    }
+
+    /// An account whose vault reference and declared balance a test can tell apart upstream.
+    fn funded_account(id: &str, secret_ref: &str, usd: f64) -> mr_core::model::Account {
+        let mut account = mr_core::model::Account::new(id);
+        account.secret_ref = Some(secret_ref.to_owned());
+        account.credit_usd = Some(usd);
+        account
+    }
+
+    /// Add a second credential to a fresh state, which `state_over` seeds with only one.
+    fn with_credential(mut state: AppState, secret_ref: &str, secret: &str) -> AppState {
+        Arc::get_mut(&mut state.vault)
+            .expect("a fresh state owns its vault")
+            .put(secret_ref, secret)
+            .expect("the vault accepts a second credential");
+        state
+    }
+
     #[tokio::test]
     async fn a_route_no_step_declares_is_an_unsupported_endpoint_and_is_never_dialled() {
         let (url, seen) = fake_upstream().await;
@@ -13340,6 +13570,39 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         (format!("http://{addr}"), seen)
     }
 
+    /// A fake upstream that records the bearer token it was dialled with and answers through
+    /// `answer`, so a test can see which account was tried, and in what order.
+    #[allow(clippy::type_complexity)]
+    async fn credential_upstream(
+        answer: fn(&str) -> (StatusCode, &'static str),
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(move |headers: HeaderMap| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let token = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("<no authorization>")
+                    .to_owned();
+                sink.lock().unwrap().push(token.clone());
+                let (status, body) = answer(&token);
+                (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body.to_owned(),
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
     /// One request through the **mounted router**, so a test also proves the path is registered and
     /// that its wildcard shape captures what it should.
     async fn call_router(
@@ -13412,7 +13675,8 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     #[tokio::test]
     async fn a_fine_tuning_job_stages_its_training_file_with_the_provider() {
         let (url, seen) = staging_upstream().await;
-        let provider = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        let mut provider = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        declare_credit(&mut provider, 40.0);
         let state = state_over(vec![provider], Vec::new());
         let training = b"{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}\n".to_vec();
         let stored = match state
@@ -13472,7 +13736,8 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         // resolve, and rewriting it here would break a request that works.
         let (url, seen) =
             recording_upstream(StatusCode::OK, r#"{"id":"ftjob-2","status":"queued"}"#).await;
-        let provider = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        let mut provider = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        declare_credit(&mut provider, 40.0);
         let state = state_over(vec![provider], Vec::new());
 
         let sent = r#"{"model":"gpt-4o-mini","training_file":"file-theirs"}"#;
@@ -13494,7 +13759,8 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     async fn a_fine_tuning_job_reaches_the_provider_that_declares_the_capability() {
         let (url, seen) =
             recording_upstream(StatusCode::OK, r#"{"id":"ftjob-1","status":"queued"}"#).await;
-        let provider = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        let mut provider = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        declare_credit(&mut provider, 40.0);
         let state = state_over(vec![provider], Vec::new());
 
         let sent = r#"{"model":"gpt-4o-mini","training_file":"file-abc","suffix":"mine"}"#;
@@ -13579,13 +13845,12 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         let (first_url, first_seen) = recording_upstream(StatusCode::OK, r#"{"id":"first"}"#).await;
         let (second_url, second_seen) =
             recording_upstream(StatusCode::OK, r#"{"id":"second"}"#).await;
-        let state = state_over(
-            vec![
-                provider_with_capabilities("a", &first_url, "m", &[Capability::FineTuning]),
-                provider_with_capabilities("b", &second_url, "m", &[Capability::FineTuning]),
-            ],
-            Vec::new(),
-        );
+        let mut first = provider_with_capabilities("a", &first_url, "m", &[Capability::FineTuning]);
+        declare_credit(&mut first, 40.0);
+        let mut second =
+            provider_with_capabilities("b", &second_url, "m", &[Capability::FineTuning]);
+        declare_credit(&mut second, 40.0);
+        let state = state_over(vec![first, second], Vec::new());
 
         let (status, answer) = call_router(
             &state,
@@ -13602,6 +13867,276 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             "the first provider was dialled despite ?provider=b"
         );
         assert_eq!(second_seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn only_a_reported_usd_balance_is_read_as_credit() {
+        let usd = r#"{"credit":{"remaining":42.5,"total":50.0,"unit":"USD","unlimited":false,"fraction_reported":true},"windows":[]}"#;
+        assert_eq!(cached_usd_credit_cents(usd), Some(4_250));
+
+        // The credit headline beats the windows it summarises.
+        let both = r#"{"credit":{"remaining":42.5,"unit":"USD","unlimited":false,"fraction_reported":true},"windows":[{"remaining":9.0,"unit":"USD","unlimited":false,"fraction_reported":true}]}"#;
+        assert_eq!(cached_usd_credit_cents(both), Some(4_250));
+
+        // No unit: a bare number is not dollars, and comparing it to a dollar floor would be a
+        // guess about what the provider counts.
+        let unitless = r#"{"credit":{"remaining":100000,"unlimited":false,"fraction_reported":true},"windows":[]}"#;
+        assert_eq!(cached_usd_credit_cents(unitless), None);
+
+        // An unlimited plan reports no spendable number, so there is nothing to compare.
+        let unlimited = r#"{"credit":{"remaining":0,"unit":"USD","unlimited":true,"fraction_reported":true},"windows":[]}"#;
+        assert_eq!(cached_usd_credit_cents(unlimited), None);
+
+        // A percentage is a fraction of a total the router does not know.
+        let percent = r#"{"windows":[{"remaining":80.0,"unit":"%","unlimited":false,"fraction_reported":true}]}"#;
+        assert_eq!(cached_usd_credit_cents(percent), None);
+
+        // `remaining: 0` with `fraction_reported: false` is the sentinel for "not reported", not
+        // a declared zero.
+        let unreported = r#"{"windows":[{"remaining":0,"unit":"USD","unlimited":false,"fraction_reported":false}]}"#;
+        assert_eq!(cached_usd_credit_cents(unreported), None);
+
+        // With no headline, the largest known USD window is the best available figure: two windows
+        // may be the same money described twice, so they are not summed.
+        let windows = r#"{"windows":[{"remaining":3.0,"unit":"USD","unlimited":false,"fraction_reported":true},{"remaining":9.5,"unit":"USD","unlimited":false,"fraction_reported":true}]}"#;
+        assert_eq!(cached_usd_credit_cents(windows), Some(950));
+
+        assert_eq!(cached_usd_credit_cents("not json"), None);
+    }
+
+    #[tokio::test]
+    async fn a_fine_tuning_job_is_refused_before_any_dial_when_no_account_is_funded() {
+        let (url, seen) =
+            recording_upstream(StatusCode::OK, r#"{"id":"ftjob-1","status":"queued"}"#).await;
+        // A capability is not a balance: this provider can fine-tune, and the relay cannot tell
+        // that its account has any money, so it must not start a job it cannot pay for.
+        let provider = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        let state = state_over(vec![provider], Vec::new());
+
+        let (status, answer) = call_router(
+            &state,
+            Method::POST,
+            "/v1/fine_tuning/jobs",
+            br#"{"model":"gpt-4o-mini","training_file":"file-abc"}"#.to_vec(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{answer}");
+        assert!(answer.contains("insufficient_credit"), "{answer}");
+        assert!(answer.contains("more than $15.00"), "{answer}");
+        assert!(answer.contains("mr account set-credit p"), "{answer}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the provider was asked to train with an account that cannot be shown to pay"
+        );
+
+        // Reading is not spending: the same unfunded account may list the jobs it already owns.
+        let (status, _) =
+            call_router(&state, Method::GET, "/v1/fine_tuning/jobs", Vec::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fifteen_dollars_is_not_more_than_fifteen_dollars() {
+        let (url, seen) =
+            recording_upstream(StatusCode::OK, r#"{"id":"ftjob-1","status":"queued"}"#).await;
+        let mut poor = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        declare_credit(&mut poor, 15.0);
+        let refused = state_over(vec![poor], Vec::new());
+
+        let (status, answer) = call_router(
+            &refused,
+            Method::POST,
+            "/v1/fine_tuning/jobs",
+            br#"{"model":"m","training_file":"file-abc"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{answer}");
+        assert!(seen.lock().unwrap().is_empty());
+
+        // One cent more is the smallest balance that clears the floor.
+        let mut funded = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        declare_credit(&mut funded, 15.01);
+        let accepted = state_over(vec![funded], Vec::new());
+        let (status, answer) = call_router(
+            &accepted,
+            Method::POST,
+            "/v1/fine_tuning/jobs",
+            br#"{"model":"m","training_file":"file-abc"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert!(answer.contains("ftjob-1"), "{answer}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_created_job_goes_to_the_account_with_the_most_credit() {
+        let (url, seen) =
+            credential_upstream(|_| (StatusCode::OK, r#"{"id":"ftjob-ok","status":"queued"}"#))
+                .await;
+        let mut provider = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        // Configured order is deliberately cheapest-first: the choice must come from the balance,
+        // not from the position in the file.
+        provider.accounts = vec![
+            funded_account("cheap", "cheap-credential", 20.0),
+            funded_account("rich", "rich-credential", 200.0),
+        ];
+        let state = with_credential(
+            state_over(vec![provider], Vec::new()),
+            "cheap-credential",
+            "sk-cheap",
+        );
+        let state = with_credential(state, "rich-credential", "sk-rich");
+
+        let (status, answer) = call_router(
+            &state,
+            Method::POST,
+            "/v1/fine_tuning/jobs",
+            br#"{"model":"m","training_file":"file-abc"}"#.to_vec(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one account starts the job: {seen:?}");
+        assert_eq!(
+            seen[0], "Bearer sk-rich",
+            "the richest account was not used"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spent_account_is_silently_replaced_by_a_funded_sibling() {
+        fn refuses_the_spent_account(token: &str) -> (StatusCode, &'static str) {
+            if token.ends_with("sk-spent") {
+                (
+                    StatusCode::PAYMENT_REQUIRED,
+                    r#"{"error":{"message":"Your credit balance is too low to start a fine-tuning job","code":"insufficient_quota"}}"#,
+                )
+            } else {
+                (StatusCode::OK, r#"{"id":"ftjob-ok","status":"queued"}"#)
+            }
+        }
+
+        let (url, seen) = credential_upstream(refuses_the_spent_account).await;
+        let mut provider = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        // The spent account is the richer one, so it is tried first and the client never learns
+        // that the first attempt happened.
+        provider.accounts = vec![
+            funded_account("spent", "spent-credential", 200.0),
+            funded_account("funded", "funded-credential", 20.0),
+        ];
+        let state = with_credential(
+            state_over(vec![provider], Vec::new()),
+            "spent-credential",
+            "sk-spent",
+        );
+        let state = with_credential(state, "funded-credential", "sk-funded");
+
+        let (status, answer) = call_router(
+            &state,
+            Method::POST,
+            "/v1/fine_tuning/jobs",
+            br#"{"model":"m","training_file":"file-abc"}"#.to_vec(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert!(answer.contains("ftjob-ok"), "{answer}");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "both accounts were tried: {seen:?}");
+        assert_eq!(seen[0], "Bearer sk-spent");
+        assert_eq!(seen[1], "Bearer sk-funded");
+        // The dead account is cooled, so the next request does not pay for the same refusal.
+        assert_eq!(state.health.cooling_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_four_hundred_that_names_credit_moves_the_job_to_another_account() {
+        fn refuses_with_a_body(token: &str) -> (StatusCode, &'static str) {
+            if token.ends_with("sk-spent") {
+                (
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":{"message":"Insufficient credit to start this job","type":"invalid_request_error"}}"#,
+                )
+            } else {
+                (StatusCode::OK, r#"{"id":"ftjob-ok","status":"queued"}"#)
+            }
+        }
+
+        let (url, seen) = credential_upstream(refuses_with_a_body).await;
+        let mut provider = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        provider.accounts = vec![
+            funded_account("spent", "spent-credential", 200.0),
+            funded_account("funded", "funded-credential", 20.0),
+        ];
+        let state = with_credential(
+            state_over(vec![provider], Vec::new()),
+            "spent-credential",
+            "sk-spent",
+        );
+        let state = with_credential(state, "funded-credential", "sk-funded");
+
+        let (status, answer) = call_router(
+            &state,
+            Method::POST,
+            "/v1/fine_tuning/jobs",
+            br#"{"model":"m","training_file":"file-abc"}"#.to_vec(),
+        )
+        .await;
+
+        // A 400 usually means the request was malformed, and must not rotate accounts. This one
+        // names money, which is a fact about the account, so it is the same story as a 402.
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert_eq!(state.health.cooling_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cached_usd_balance_can_fund_a_job_until_it_goes_stale() {
+        let (url, seen) =
+            recording_upstream(StatusCode::OK, r#"{"id":"ftjob-1","status":"queued"}"#).await;
+        let provider = provider_with_capabilities("p", &url, "m", &[Capability::FineTuning]);
+        let account_id = provider.accounts[0].id.clone();
+        let state = state_over(vec![provider], Vec::new());
+        let payload = r#"{"credit":{"remaining":25.0,"total":25.0,"used":0.0,"unit":"USD","unlimited":false,"fraction_reported":true},"windows":[]}"#;
+        let fresh =
+            mr_core::store::ProviderQuotaState::new("p", account_id.clone(), "provider", payload);
+        state.quota_store.put_provider_quota_state(&fresh).unwrap();
+
+        let (status, answer) = call_router(
+            &state,
+            Method::POST,
+            "/v1/fine_tuning/jobs",
+            br#"{"model":"m","training_file":"file-abc"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        // A cached balance is only as fresh as the row says. A day-old figure is not evidence that
+        // the account can pay today, so it stops qualifying.
+        let now = mr_core::ids::Millis::now().as_millis();
+        let mut stale = fresh.clone();
+        stale.fetched_at = mr_core::ids::Millis::from_millis(now - 25 * 60 * 60 * 1000);
+        state.quota_store.put_provider_quota_state(&stale).unwrap();
+
+        let (status, answer) = call_router(
+            &state,
+            Method::POST,
+            "/v1/fine_tuning/jobs",
+            br#"{"model":"m","training_file":"file-abc"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{answer}");
+        assert!(answer.contains("insufficient_credit"), "{answer}");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "a stale balance was treated as current"
+        );
     }
 
     #[tokio::test]

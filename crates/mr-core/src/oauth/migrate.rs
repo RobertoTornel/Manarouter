@@ -1235,6 +1235,7 @@ async fn import_one(
             quota: Vec::new(),
             proxy: None,
             placeholders: Default::default(),
+            credit_usd: None,
             extra: Default::default(),
         });
     }

@@ -863,6 +863,7 @@ mod tests {
             models_deny: Vec::new(),
             proxy: None,
             placeholders: Default::default(),
+            credit_cents: None,
         }
     }
 

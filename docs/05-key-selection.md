@@ -31,13 +31,39 @@ Two facts about that list matter for everything below:
   never evaluates that flag. This is why `AccountState::Disabled` in a live table can only come from a
   change made after the snapshot was compiled — and why that change triggers a recompile instead.
 
-The four strategies are a closed set (`KeyStrategy::ALL`-style exhaustive match), and they share one
-property: **every strategy skips unusable accounts.** The difference between them is only which usable
-account they pick.
+### The declared balance, and the one route ranked by it
+
+`AccountPlan` also carries `credit_cents`, compiled from an account's optional `credit_usd`. It is the
+one figure in account selection that is not a limit the provider reported but a balance the operator
+declared: useful for a provider whose balance the router cannot read (an OpenAI key has no allowance
+endpoint), and the only way to make a fine-tuning job predictable before it is sent.
+
+It matters on exactly one route. `POST /v1/fine_tuning/jobs` spends money before any work exists, and
+the provider answers with a refusal that cannot be turned into a job, so the relay only starts one on
+an account whose known credit is **strictly more than $15.00**, and when several qualify it takes the
+largest. "Known" means the declared `credit_usd`, or else a cached USD balance fetched within the last
+24 hours; an account with neither is unknown, not zero, and does not qualify. The dollars behind that
+comparison are read only from figures that explicitly say `USD` — a percentage window or a bare credit
+count is never treated as money. Reading or controlling a job (`GET`, `events`, `checkpoints`,
+`pause`, `resume`, `cancel`) ignores the balance entirely: those requests spend nothing and must reach
+the account that owns the job.
+
+`credit_usd` is a floor for that one decision, not a spend meter. It is not decremented as requests are
+served, and the router still cannot predict an ordinary request's `402`. What it can do is react: if
+the chosen account refuses for money — a `402`, or a `400` whose body names credits — the relay cools
+that account and tries the next funded sibling before the client sees anything. A job that was already
+created cannot move, because the provider owns it; only the creation request can fail over. Declare a
+balance with `mr account add … --credit-usd <amount>` or change it with
+`mr account set-credit <provider> <account> --usd <amount>`; the panel's account table shows the same
+number and clears it back to unknown.
 
 ---
 
 ## 2. The four strategies
+
+The four strategies are a closed set (`KeyStrategy::ALL`-style exhaustive match), and they share one
+property: **every strategy skips unusable accounts.** The difference between them is only which usable
+account they pick.
 
 | Strategy | Config spelling | Picks | Costs |
 |---|---|---|---|

@@ -21,15 +21,19 @@ mr provider remove <provider> [--force]
 ## Provider accounts and credentials
 
 ```bash
-mr account add <provider> --secret-stdin [--label <label>]
+mr account add <provider> --secret-stdin [--label <label>] [--credit-usd <USD>]
 mr account list <provider>
 mr account enable <provider> <account>
 mr account disable <provider> <account>
 mr account set-priority <provider> <account> <priority>
+mr account set-credit <provider> <account> --usd <USD>
+mr account set-credit <provider> <account> --clear
 mr account remove <provider> <account> [--force]
 ```
 
 Use `--secret-stdin` and paste the upstream credential into standard input in your own terminal, then send EOF. Do not pass real credentials through `--secret <value>` or put them in a command, shell history, or support message. The CLI also accepts `--secret-env <VAR>`, but environment-variable exposure is environment-dependent. See [Security](11-security.md).
+
+`--credit-usd` and `set-credit` declare a balance the router cannot read for itself. The figure is a floor for one decision — starting a fine-tuning job, which requires more than $15 of known credit — not a spend meter, and `--clear` returns the account to "unknown" rather than zero. See [key selection](../05-key-selection.md#the-declared-balance-and-the-one-route-ranked-by-it).
 
 ## Models and combos
 

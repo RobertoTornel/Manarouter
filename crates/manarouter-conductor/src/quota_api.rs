@@ -467,7 +467,22 @@ async fn fetch_and_store(
         .source
         .clone()
         .unwrap_or_else(|| "provider".to_owned());
-    let payload = serde_json::to_string(&json!({"windows": windows, "details": quota.details}))
+    // The headline quota is stored beside the windows only when it is a reported USD balance.
+    // The relay reads this object for the fine-tuning credit floor; a percentage window, an
+    // unlimited plan and an unlabelled count are all "not a dollar balance" and are left out
+    // rather than guessed at. Windows carry their own `unit`, so an old row still deserialises.
+    let mut payload = json!({"windows": windows, "details": quota.details});
+    if quota.unit.as_deref() == Some("USD") && quota.fraction_reported && !quota.unlimited {
+        payload["credit"] = json!({
+            "remaining": quota.remaining,
+            "total": quota.total,
+            "used": quota.used,
+            "unit": "USD",
+            "unlimited": false,
+            "fraction_reported": true,
+        });
+    }
+    let payload = serde_json::to_string(&payload)
         .map_err(|e| format!("could not encode quota snapshot: {e}"))?;
     let row = ProviderQuotaState::new(provider.id.as_str(), account.id.clone(), source, payload);
     state

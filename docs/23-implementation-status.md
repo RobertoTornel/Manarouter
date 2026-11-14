@@ -155,6 +155,12 @@ job on a file it cannot resolve, and that refusal is the truthful one. An id the
 is passed through untouched for the same reason: it may be a file the client uploaded straight to the
 provider.
 
+Job creation is also the one place account selection is ranked by money. The relay starts a job only
+on an account whose known credit is more than $15 — declared `credit_usd`, or a USD balance cached
+within 24 hours — and tries the richest first. A refusal for money cools that account and moves the
+creation to the next funded sibling; a job that already exists cannot move, because it belongs to the
+provider's account.
+
 ## 2. What running it found
 
 Reading the code did not find these; starting the binary did.
@@ -473,8 +479,8 @@ never used it — its credential is the `kaggle` CLI's own login, not a lane sec
 credential is stored today. [26-gpu-lanes.md](26-gpu-lanes.md) §9 records the removal.
 
 Test totals on this revision: `cargo test -p manarouter-conductor --lib` → 38 `gpu_api` tests and
-11 Kaggle tests, all passing. `cargo test --workspace --lib` → 1 937 passing; `cargo test
---workspace` → 2 041 passing with 4 ignored (the reference-vault refresh test and three quota
+11 Kaggle tests, all passing. `cargo test --workspace --lib` → 1 947 passing; `cargo test
+--workspace` → 2 052 passing with 4 ignored (the reference-vault refresh test and three quota
 doctests marked `no_run`). `node --test panel/test/*.test.mjs` → 381 passing and
 `node --test panel-lab/test/*.test.mjs` → 334 passing.
 
@@ -485,7 +491,7 @@ re-run for it; nothing in this work touches installation or the serving path's s
 
 ### 4.2 What the OpenAI surface guarantees, and how each guarantee is held
 
-Five properties are worth stating because each one is a place where a plausible implementation would
+Six properties are worth stating because each one is a place where a plausible implementation would
 have lied:
 
 * **A batch item is not a bypass.** Every item is dispatched through `attempt_step`, so routing,
@@ -494,6 +500,10 @@ have lied:
 * **A failed fine-tuning upload stays failed.** The job is forwarded naming the local id and the
   provider's refusal is returned; the relay never substitutes an id it did not receive, and never
   reports a job as started when no file reached the trainer.
+* **A fine-tuning job is not started on an account that cannot be shown to pay.** Creation requires
+  more than $15 of known credit, read only from a declared balance or a fresh USD figure; a percentage,
+  an unreported window or a missing row is unknown, not zero. A refusal for money is retried on the
+  next funded account rather than returned, and the dead account is cooled.
 * **A stored response is only stored when it is whole.** `asked_to_store` reads the request for
   `store: true`; `record_while_streaming` records on a clean end of stream and on nothing else, so a
   client that hangs up, an answer that overflows 8 MiB, and an upstream error leave no record — a

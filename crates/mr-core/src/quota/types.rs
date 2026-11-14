@@ -83,6 +83,14 @@ pub struct UsageQuota {
     /// Per-currency or per-bucket breakdown, when the upstream gave one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub details: Vec<QuotaDetail>,
+    /// The unit these counts are denominated in, when the upstream said.
+    ///
+    /// `None` is "not stated", never "units": a percentage window and a dollar balance look
+    /// identical once reduced to `used`/`total`/`remaining`, so a consumer that compares two
+    /// accounts' `remaining` **must** require this field and must only treat `"USD"` as dollars.
+    /// The router itself interprets `"USD"` and carries every other value verbatim for display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
 }
 
 impl UsageQuota {
@@ -127,6 +135,7 @@ impl UsageQuota {
             source: None,
             display_name: None,
             details: Vec::new(),
+            unit: None,
         }
     }
 
@@ -168,6 +177,7 @@ impl UsageQuota {
             source: None,
             display_name: None,
             details: Vec::new(),
+            unit: None,
         }
     }
 
@@ -180,6 +190,12 @@ impl UsageQuota {
     /// Record the operator-facing name of the plan or window.
     pub fn with_display_name(mut self, display_name: impl Into<String>) -> Self {
         self.display_name = Some(display_name.into());
+        self
+    }
+
+    /// Record the unit the counts are denominated in (`"USD"`, a token class, …).
+    pub fn with_unit(mut self, unit: impl Into<String>) -> Self {
+        self.unit = Some(unit.into());
         self
     }
 
@@ -261,6 +277,10 @@ pub struct QuotaWindow {
     /// Whether the upstream reported the remaining fraction for this window.
     #[serde(default)]
     pub fraction_reported: bool,
+    /// The unit these counts are denominated in, when the upstream said; same meaning as
+    /// [`UsageQuota::unit`]. A window without a unit cannot be compared with a dollar threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
 }
 
 impl QuotaWindow {
@@ -283,6 +303,7 @@ impl QuotaWindow {
             reset_at: quota.reset_at,
             unlimited: quota.unlimited,
             fraction_reported: quota.fraction_reported,
+            unit: quota.unit.clone(),
         }
     }
 

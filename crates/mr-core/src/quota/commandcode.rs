@@ -196,10 +196,16 @@ pub fn parse_windows(body: &Value) -> Vec<QuotaWindow> {
 /// Turn a parsed window back into the quota the trait returns.
 fn window_quota(window: &QuotaWindow) -> UsageQuota {
     let reset = window.reset_at;
-    if window.fraction_reported {
+    let quota = if window.fraction_reported {
         UsageQuota::from_counts(window.used, window.total, reset)
     } else {
         UsageQuota::from_counts_unreported(window.used, window.total, reset)
+    };
+    // A window that named its unit keeps it, so a later reader is not left guessing whether the
+    // counts are dollars, credits or a percentage. An unnamed unit stays unnamed.
+    match window.unit.clone() {
+        Some(unit) => quota.with_unit(unit),
+        None => quota,
     }
 }
 

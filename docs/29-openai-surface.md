@@ -189,6 +189,16 @@ is chosen by the `fine-tuning` capability — or by `?provider=` — and the job
 its id, its state machine, its checkpoints, its bill. The relay adds no queue and reports no progress
 it did not receive.
 
+Creation is the one request here that costs money before it can succeed, so it is the one request
+whose account is chosen by balance: the relay starts a job only on an account whose known credit is
+more than $15, taking the richest among those that qualify. Known means declared with
+`mr account set-credit … --usd`, or a USD balance cached from the provider within the last 24 hours;
+anything else is unknown and disqualifies the account rather than being guessed at. A `402` — or a
+`400` whose body says the credit ran out — moves the creation to the next funded account silently,
+and cools the one that refused. The rest of the family is not gated: `GET`, `events`, `checkpoints`,
+`pause`, `resume` and `cancel` name a job that already exists and must reach the account holding it.
+A created job cannot be moved, because no other account can continue it.
+
 `training_file` and `validation_file` are the one place the relay must intervene. A client uploads its
 JSONL to the relay's file store, so the id it holds — `file_…` — is the relay's; the provider needs an
 id of its own or the job fails on a file it cannot see. The relay stages those bytes into the

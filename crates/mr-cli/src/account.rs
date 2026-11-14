@@ -56,6 +56,23 @@ pub enum AccountCmd {
         /// New priority; lower numbers are tried first.
         priority: i32,
     },
+    /// Declare the account's remaining credit, in US dollars.
+    ///
+    /// Fine-tuning only starts a job on an account known to hold more than $15, and most
+    /// providers do not publish a dollar balance the router can read. Declaring it here is how an
+    /// OpenAI-style account becomes eligible; `--clear` returns it to "unknown".
+    SetCredit {
+        /// Provider id.
+        provider: String,
+        /// Account id or label.
+        account: String,
+        /// Remaining balance in US dollars, for example `25` or `12.50`.
+        #[arg(long)]
+        usd: Option<f64>,
+        /// Forget the declared balance instead of setting one.
+        #[arg(long, conflicts_with = "usd")]
+        clear: bool,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -83,6 +100,10 @@ pub struct AddArgs {
     /// Email or login this credential belongs to.
     #[arg(long)]
     pub identity: Option<String>,
+    /// Remaining credit in US dollars; fine-tuning only spends an account known to hold more
+    /// than $15.
+    #[arg(long, value_name = "USD")]
+    pub credit_usd: Option<f64>,
 }
 
 /// Run an account subcommand.
@@ -102,6 +123,12 @@ pub async fn run(cmd: AccountCmd, ctx: &Ctx) -> Result<(), CliError> {
             account,
             priority,
         } => set_priority(ctx, &provider, &account, priority),
+        AccountCmd::SetCredit {
+            provider,
+            account,
+            usd,
+            clear,
+        } => set_credit(ctx, &provider, &account, usd, clear),
     }
 }
 
@@ -322,6 +349,10 @@ fn add_with(ctx: &Ctx, args: AddArgs, stdin: impl Read) -> Result<(), CliError> 
         account.weight = weight;
     }
     account.identity = args.identity.clone();
+    if let Some(usd) = args.credit_usd {
+        check_credit_usd(usd)?;
+        account.credit_usd = Some(usd);
+    }
 
     let secret_id = account_secret_id(&provider_id, account.id.as_str());
     let mut vault = ctx.vault()?;
@@ -526,6 +557,55 @@ fn set_priority(
     )
 }
 
+/// Refuse a credit figure that is not money, before anything is written.
+fn check_credit_usd(usd: f64) -> Result<(), CliError> {
+    if !usd.is_finite() || usd < 0.0 {
+        return Err(CliError::validation(
+            "--credit-usd must be a finite, non-negative dollar amount".to_owned(),
+        )
+        .with_detail("for example `--credit-usd 25` or `--credit-usd 12.50`"));
+    }
+    Ok(())
+}
+
+fn set_credit(
+    ctx: &Ctx,
+    provider_id: &str,
+    account_key: &str,
+    usd: Option<f64>,
+    clear: bool,
+) -> Result<(), CliError> {
+    if usd.is_none() && !clear {
+        return Err(CliError::usage(
+            "set-credit needs --usd <amount>, or --clear to forget a declared balance".to_owned(),
+        ));
+    }
+    if let Some(usd) = usd {
+        check_credit_usd(usd)?;
+    }
+    let mut cfg = ctx.load()?;
+    let p = cfg
+        .providers
+        .iter_mut()
+        .find(|p| p.id.as_str() == provider_id)
+        .ok_or_else(|| CliError::not_found(format!("no provider with id `{provider_id}`")))?;
+    let a = find_account_mut(p, account_key)?;
+    let label = a.label.clone().unwrap_or_else(|| a.id.as_str().to_owned());
+    a.credit_usd = usd;
+    let out = ctx.save(&cfg)?;
+    let human = match usd {
+        Some(usd) => {
+            format!("account `{label}` on `{provider_id}` declares a ${usd:.2} credit balance")
+        }
+        None => format!("account `{label}` on `{provider_id}` no longer declares a credit balance"),
+    };
+    ctx.finish(
+        &out,
+        vec![human],
+        serde_json::json!({ "provider": provider_id, "account": label, "credit_usd": usd }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +620,7 @@ mod tests {
             priority: None,
             weight: None,
             identity: None,
+            credit_usd: None,
         }
     }
 
@@ -589,6 +670,17 @@ mod tests {
         a.secret = Some("   ".into());
         let err = read_secret(&a, std::io::empty(), false).unwrap_err();
         assert_eq!(err.exit, crate::output::Exit::Validation);
+    }
+
+    #[test]
+    fn a_credit_amount_is_a_finite_non_negative_dollar_figure() {
+        assert!(check_credit_usd(0.0).is_ok());
+        assert!(check_credit_usd(15.01).is_ok());
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            let err = check_credit_usd(bad).unwrap_err();
+            assert_eq!(err.exit, crate::output::Exit::Validation);
+            assert!(err.message.contains("credit"), "{}", err.message);
+        }
     }
 
     #[test]

@@ -527,6 +527,14 @@ pub struct AccountPlan {
     /// fills the placeholders in at request time, once this account has been chosen. Keeping it
     /// per account is the whole point: one provider, several accounts, several values.
     pub placeholders: std::collections::BTreeMap<String, String>,
+    /// Declared remaining credit in **US cents**, rounded from
+    /// [`crate::model::Account::credit_usd`].
+    ///
+    /// Cents rather than dollars so the fine-tuning floor is an exact integer comparison and this
+    /// plan stays `Eq`: a `f64` in a compiled snapshot would make `AccountPlan` only `PartialEq`
+    /// for a number the router never spends. `None` means the operator declared nothing; it is not
+    /// a zero balance. A declared zero is `Some(0)`.
+    pub credit_cents: Option<u64>,
 }
 
 /// A compiled client key: everything the relay needs to authenticate a request and charge it to
@@ -1725,7 +1733,17 @@ fn account_plan(provider_id: &str, account: &Account) -> AccountPlan {
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
+        credit_cents: account.credit_usd.map(cents_from_usd),
     }
+}
+
+/// Round a dollar amount to whole cents.
+///
+/// `as u64` saturates and a negative value was already refused by validation, but `.max(0.0)`
+/// keeps a plan compiled from a hand-built config from wrapping; the relay treats the result as
+/// "unknown" only when the operator declared nothing at all.
+fn cents_from_usd(usd: f64) -> u64 {
+    (usd * 100.0).round().max(0.0) as u64
 }
 
 /// Build a proxy plan without its disabled configuration metadata.
@@ -2458,6 +2476,10 @@ fn encode_account(encoder: &mut Encoder, account: &AccountPlan) {
         encoder.put_str(name);
         encoder.put_str(value);
     }
+    // Declared credit in whole cents: `u64::MAX` is "not declared", every other value is a
+    // balance. A sentinel rather than a separate presence byte because no real balance is within
+    // 18 quintillion dollars of the maximum.
+    encoder.put_u64(account.credit_cents.unwrap_or(u64::MAX));
 }
 
 /// Encode an auth kind.
@@ -3193,6 +3215,10 @@ fn decode_account(reader: &mut Reader, strings: &[String]) -> Result<AccountPlan
             }
             placeholders
         },
+        credit_cents: match reader.u64()? {
+            u64::MAX => None,
+            cents => Some(cents),
+        },
     })
 }
 
@@ -3880,6 +3906,26 @@ mod tests {
         let before = config.routing_digest();
         config.providers[0].cooldown_scope = CooldownScope::Account;
         assert_ne!(config.routing_digest(), before);
+    }
+
+    #[test]
+    fn a_declared_credit_round_trips_through_the_frame_as_cents() {
+        let mut config = rich_config();
+        // `acc-first` is declared second but sorts first by priority, so the compiled order is not
+        // the authored order — exactly what this assertion is here to pin.
+        config.providers[0].accounts[1].credit_usd = Some(1234.56);
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+        assert_eq!(
+            snapshot.providers()[0].accounts[0].credit_cents,
+            Some(123_456)
+        );
+        let decoded = RoutingSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+        assert_eq!(
+            decoded.providers()[0].accounts[0].credit_cents,
+            Some(123_456)
+        );
+        // Absence is not zero: an unknown balance must not read as a spent account.
+        assert_eq!(decoded.providers()[0].accounts[1].credit_cents, None);
     }
 
     #[test]

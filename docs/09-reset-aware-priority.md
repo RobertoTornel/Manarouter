@@ -91,6 +91,9 @@ because another account would reject the same bytes — but a message that names
 balance is about the account, so a small fixed vocabulary (`insufficient credit`, `payment required`,
 `quota exceeded`, …) promotes it to a quota cooldown. No reset is stated in those bodies, so the
 guess applies and grows with repetition; the vocabulary names no provider, model or error code.
+The same read drives a capability-addressed request that starts a fine-tuning job: a refusal for
+money there cools the account and moves the creation to the next funded sibling, so the client sees
+the second account's answer rather than the first account's bill.
 
 A step's earliest reset is the **minimum** over its accounts, because any one account becoming usable
 makes the step usable again.

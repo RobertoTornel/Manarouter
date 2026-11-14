@@ -1384,6 +1384,7 @@ export async function renderProviders(mount, ctx) {
           h('td', {}, chip(s.label, s.cls, `state: ${s.key}`), quotaChip),
           buildInlineAccountNumber(p, a, 'priority', 'priority'),
           buildInlineAccountNumber(p, a, 'weight', 'weight'),
+          buildInlineAccountCredit(p, a),
           h('td', { class: 'actions' }, toggle, buildInlineAccountPlaceholders(p, a), buildInlineAccountSecret(p, a), del)));
       }
       accSection.append(h('div', { class: 'table-scroll provider-accounts-scroll' },
@@ -1391,7 +1392,9 @@ export async function renderProviders(mount, ctx) {
           h('thead', {}, h('tr', {},
             h('th', { scope: 'col' }, 'ID'), h('th', { scope: 'col' }, 'Label'),
             h('th', { scope: 'col' }, 'State'), h('th', { scope: 'col' }, 'Pri'),
-            h('th', { scope: 'col' }, 'Weight'), h('th', { scope: 'col' }, ''))),
+            h('th', { scope: 'col' }, 'Weight'),
+            h('th', { scope: 'col', title: 'Known credit in US dollars; a fine-tuning job is only started on an account with more than $15' }, 'Credit'),
+            h('th', { scope: 'col' }, ''))),
           accTb)));
     } else {
       accSection.append(emptyState('No accounts.',
@@ -2035,7 +2038,7 @@ export async function renderProviders(mount, ctx) {
       const cancel = h('button', { class: 'btn btn-sm', type: 'button' }, 'Cancel');
 
       const editorRow = h('tr', { class: 'inline-editor' },
-        h('td', { colspan: '6' },
+        h('td', { colspan: '7' },
           h('div', { style: 'display:flex;flex-direction:column;gap:8px;' },
             h('p', { class: 'hint' },
               `Placeholders for ${label}. A base URL may name a value this account owns, such as `,
@@ -2111,6 +2114,89 @@ export async function renderProviders(mount, ctx) {
       await reload(true);
     }, (err) => ctx.toast.error(`Could not update account ${label}`, err),
     { allowNegative: key === 'priority', iconOnly: true });
+  }
+
+  /// The account's **declared** credit, in US dollars.
+  ///
+  /// This is the only balance the panel can set: the cached provider figure lives in the quota
+  /// view and is read-only. Dollars are decimal, so this cannot reuse the integer cell above;
+  /// an empty field clears the declaration and returns the account to "unknown".
+  function buildInlineAccountCredit(p, account) {
+    const slot = `account:${p.id}:${account.id}:credit_usd`;
+    const value = account.credit_usd;
+    const cell = h('td', { class: 'num' });
+
+    const show = (usd) => (usd == null ? '—' : `$${Number(usd).toFixed(2)}`);
+    const renderView = () => {
+      const edit = h('button', {
+        class: 'icon-btn', type: 'button', 'aria-label': 'Edit declared credit in US dollars',
+        title: 'Declared credit in US dollars',
+      }, icon('pencil'));
+      edit.addEventListener('click', () => renderEditor(inlineDrafts.get(slot) ?? (value == null ? '' : String(value))));
+      cell.replaceChildren(h('span', {
+        class: 'mono',
+        title: value == null
+          ? 'No declared credit. Fine-tuning needs more than $15 of known credit.'
+          : 'The balance the operator declared for this account.',
+      }, show(value)), edit);
+    };
+
+    function renderEditor(initial) {
+      const input = h('input', {
+        class: 'input', type: 'number', min: '0', step: '0.01', value: initial,
+        'aria-label': 'Declared credit in US dollars', style: 'width:110px',
+      });
+      const save = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, 'Save');
+      const clear = h('button', { class: 'btn btn-sm', type: 'button' }, 'Clear');
+      const cancel = h('button', { class: 'btn btn-sm', type: 'button' }, 'Cancel');
+      cell.replaceChildren(h('div', {
+        style: 'display:flex;gap:4px;align-items:center;flex-wrap:wrap;min-width:200px;',
+      }, input, save, clear, cancel));
+      input.addEventListener('input', () => inlineDrafts.set(slot, input.value));
+      const restore = () => { inlineDrafts.delete(slot); renderView(); };
+      const persist = async (next) => {
+        save.disabled = true;
+        clear.disabled = true;
+        save.textContent = 'Saving…';
+        try {
+          await api.put(`/api/providers/${encodeURIComponent(p.id)}/accounts/${encodeURIComponent(account.id)}`,
+            { ...account, credit_usd: next });
+          inlineDrafts.delete(slot);
+          ctx.toast.success(next == null
+            ? 'Declared credit cleared; the account reports no known balance.'
+            : `Declared credit set to $${next.toFixed(2)}.`);
+          await reload(true);
+        } catch (err) {
+          save.disabled = false;
+          clear.disabled = false;
+          save.textContent = 'Save';
+          ctx.toast.error('Could not update the declared credit', err);
+        }
+      };
+      save.addEventListener('click', () => {
+        const raw = input.value.trim();
+        if (!raw) {
+          ctx.toast.warning('Enter a dollar amount, or use Clear to forget the declaration.');
+          return;
+        }
+        const number = Number(raw);
+        if (!Number.isFinite(number) || number < 0) {
+          ctx.toast.warning('The declared credit must be a dollar amount, 0 or more.');
+          return;
+        }
+        persist(Math.round(number * 100) / 100);
+      });
+      clear.addEventListener('click', () => persist(null));
+      cancel.addEventListener('click', restore);
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') save.click();
+        if (e.key === 'Escape') restore();
+      });
+    }
+
+    if (inlineDrafts.has(slot)) renderEditor(inlineDrafts.get(slot));
+    else renderView();
+    return cell;
   }
 
   function buildInlineModelNumber(p, model, key, label) {
