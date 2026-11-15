@@ -460,12 +460,27 @@ pub(crate) mod testutil {
     /// Run `f` with `MANAROUTER_CONFIG_DIR` pointing at a fresh temp directory, then restore the
     /// environment and remove the directory — even when `f` panics, so a failed assertion never
     /// leaves the next test looking at the wrong config.
+    ///
+    /// `MANAROUTER_STATE_DIR` moves with it. `Ctx::save` writes the compiled routing snapshot under
+    /// the *state* directory, and `--config-dir` does not move that one, so a test that saved a
+    /// configuration would otherwise overwrite the default installation's `routes.snapshot` with a
+    /// snapshot compiled from its own throwaway config — leaving `mr doctor` reporting a mismatch
+    /// against a file the operator never wrote. `main()` binds the two directories together for the
+    /// same reason; this mirrors it, and an explicit state directory still wins.
     pub(crate) fn with_config_dir<T>(name: &str, f: impl FnOnce(&std::path::Path) -> T) -> T {
         let _guard = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = temp_dir(name);
+        let previous_state = std::env::var_os("MANAROUTER_STATE_DIR");
         std::env::set_var("MANAROUTER_CONFIG_DIR", &dir);
+        if previous_state.is_none() {
+            std::env::set_var("MANAROUTER_STATE_DIR", &dir);
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&dir)));
         std::env::remove_var("MANAROUTER_CONFIG_DIR");
+        match previous_state {
+            Some(previous) => std::env::set_var("MANAROUTER_STATE_DIR", previous),
+            None => std::env::remove_var("MANAROUTER_STATE_DIR"),
+        }
         cleanup(&dir);
         match result {
             Ok(value) => value,
@@ -486,6 +501,24 @@ pub(crate) mod testutil {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_test_run_writes_its_snapshot_inside_its_own_directory() {
+        // `Ctx::save` writes the compiled routing snapshot under the state directory, which
+        // `MANAROUTER_CONFIG_DIR` does not move. If this harness moved only the config directory,
+        // every CLI test that saved a configuration would replace the real installation's
+        // `routes.snapshot` with one compiled from a throwaway config.
+        crate::output::testutil::with_config_dir("state_dir_follows_config_dir", |dir| {
+            let config = mr_core::config::config_dir();
+            let state = mr_core::config::state_dir();
+            assert_eq!(config, dir);
+            assert_eq!(
+                state, dir,
+                "state directory must follow the test's config directory"
+            );
+            assert!(mr_core::config::snapshot_path().starts_with(dir));
+        });
+    }
 
     #[test]
     fn exit_codes_are_the_documented_numbers() {
