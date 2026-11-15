@@ -1328,13 +1328,15 @@ async fn forward_with_bytes(
                             | StatusCode::PAYMENT_REQUIRED
                     ) || refusal.is_some();
                     if refused_account {
-                        let reason = refusal.map(|(reason, _)| reason).unwrap_or_else(|| {
+                        let reason = refusal.map(|refusal| refusal.reason).unwrap_or_else(|| {
                             classify_status(response.status, step.dialect == Dialect::ModalVllm)
                         });
                         let wait = refusal
-                            .and_then(|(_, wait)| wait)
+                            .and_then(|refusal| refusal.wait_ms)
                             .or_else(|| retry_after_ms(&response.headers));
-                        let scope = provider.cooldown_scope;
+                        let scope = refusal
+                            .and_then(|refusal| refusal.scope)
+                            .unwrap_or(provider.cooldown_scope);
                         app.health.cool_down(
                             &select::cooldown_key(
                                 scope,
@@ -3844,9 +3846,9 @@ async fn attempt_step(
             } else {
                 None
             };
-            if let Some((named, wait)) = refusal_wait {
-                reason = named;
-                named_wait = wait.or(named_wait);
+            if let Some(refusal) = refusal_wait {
+                reason = refusal.reason;
+                named_wait = refusal.wait_ms.or(named_wait);
             }
             // A model the *plan* does not include is not a spent account, and the difference is
             // worth two lines: the account keeps serving every other model, so parking it whole
@@ -3914,7 +3916,9 @@ async fn attempt_step(
             let effective_scope = if modal_cold_start || model_unavailable {
                 mr_core::model::CooldownScope::Model
             } else {
-                provider.cooldown_scope
+                refusal_wait
+                    .and_then(|refusal| refusal.scope)
+                    .unwrap_or(provider.cooldown_scope)
             };
             app.health.cool_down(
                 &select::cooldown_key(
@@ -4743,9 +4747,57 @@ fn names_an_unavailable_model(body: &[u8]) -> bool {
         == Some("model_unavailable")
 }
 
-fn exhausted_by_body(body: &[u8]) -> Option<(select::CooldownReason, Option<u64>)> {
+/// What a refusal body says about the account, beyond the status code.
+///
+/// `scope` is the narrow reading the body itself asks for: a refusal that names the plan's limit for
+/// one model leaves the account's other models usable, so the cooldown belongs on that model rather
+/// than on the credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BodyRefusal {
+    reason: select::CooldownReason,
+    wait_ms: Option<u64>,
+    scope: Option<mr_core::model::CooldownScope>,
+}
+
+/// How long a refusal that says the account cannot pay is parked when the body states no reset.
+///
+/// The configured default is a minute, which is the right guess for a throttle: the window turns
+/// over on its own. A balance does not. "Exhausted balance, top up" is a person's job, and probing it
+/// sixty times an hour spends a request on every call to learn the same fact. An hour is long enough
+/// that a locked account stops poisoning requests and short enough that a top-up is noticed the same
+/// afternoon.
+const SPENT_BALANCE_PARK_MS: u64 = 3_600_000;
+
+/// The sentence a refusal carries, whichever envelope it arrived in.
+///
+/// OpenAI and Anthropic nest it under `error.message`; FastAPI-shaped upstreams put it at `detail`;
+/// a few send `error` as the string itself. Reading only the first shape is not a cosmetic gap: a
+/// locked, unpaid account answered `{"detail":"User is locked. Reason: Exhausted balance. …"}` and
+/// because that sentence was invisible the 403 was classified as a failed credential — the wrong
+/// reason, a fifteen-minute park, and a retry that could never succeed.
+fn refusal_text(value: &serde_json::Value) -> &str {
+    let error = value.get("error").unwrap_or(value);
+    [
+        error.get("message"),
+        error.get("detail"),
+        value.get("detail"),
+        value.get("message"),
+        Some(error),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_str)
+    .next()
+    .unwrap_or_default()
+}
+
+fn exhausted_by_body(body: &[u8]) -> Option<BodyRefusal> {
     if let Some(wait) = capacity_refusal(body) {
-        return Some((select::CooldownReason::RateLimited, Some(wait)));
+        return Some(BodyRefusal {
+            reason: select::CooldownReason::RateLimited,
+            wait_ms: Some(wait),
+            scope: None,
+        });
     }
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let error = value.get("error").unwrap_or(&value);
@@ -4779,11 +4831,23 @@ fn exhausted_by_body(body: &[u8]) -> Option<(select::CooldownReason, Option<u64>
     // shape parks a spent account for the configured minute so it can be refused again on the next
     // request. The prose read is only a *signal* when it carries an anchor word ("resets in", "try
     // again in"), so an error message that happens to contain a number is not read as a wait.
-    let message = error
-        .get("message")
-        .and_then(|message| message.as_str())
-        .unwrap_or_default();
+    let message = refusal_text(&value);
     let spoken = seconds.is_none().then(|| stated_wait_ms(message)).flatten();
+    let announced = seconds
+        .map(|s| s.min(86_400).saturating_mul(1000))
+        .or(spoken);
+    // A plan that does not include the model is a refusal about *that model*, not about the
+    // credential: the same account can still serve everything else its plan covers. It is read
+    // before the money phrases because "Upgrade for unlimited Pro model use" is a plan statement
+    // that also names money, and the wider reading would park the whole account for a limit the
+    // plan imposes on one model.
+    if names_a_plan_limit(message) {
+        return Some(BodyRefusal {
+            reason: select::CooldownReason::QuotaExhausted,
+            wait_ms: announced.or(Some(SPENT_BALANCE_PARK_MS)),
+            scope: Some(mr_core::model::CooldownScope::Model),
+        });
+    }
     // A refusal that names money rather than shape is about the account even when it arrives as a
     // 400. Providers do this: a credit balance can run out and come back as a plain `BAD_REQUEST`
     // with a generic code, which reads as "the request is malformed" and is not cooled down, so a
@@ -4792,12 +4856,13 @@ fn exhausted_by_body(body: &[u8]) -> Option<(select::CooldownReason, Option<u64>
     if !exhausted && spoken.is_none() && !spent_account {
         return None;
     }
-    Some((
-        select::CooldownReason::QuotaExhausted,
-        seconds
-            .map(|s| s.min(86_400).saturating_mul(1000))
-            .or(spoken),
-    ))
+    let wait_ms =
+        announced.or_else(|| names_a_spent_balance(message).then_some(SPENT_BALANCE_PARK_MS));
+    Some(BodyRefusal {
+        reason: select::CooldownReason::QuotaExhausted,
+        wait_ms,
+        scope: None,
+    })
 }
 
 /// Whether a message says the account itself cannot pay, rather than the request being wrong.
@@ -4809,7 +4874,27 @@ fn exhausted_by_body(body: &[u8]) -> Option<(select::CooldownReason, Option<u64>
 /// the plan's quota is spent, which is a statement no retry can change until someone tops up or the
 /// window turns over.
 fn mentions_a_spent_account(message: &str) -> bool {
-    const PHRASES: [&str; 16] = [
+    // A quota that comes back on its own is still about the account, but it is not about a balance,
+    // so it is parked by the configured default rather than by the hour.
+    const WINDOWS: [&str; 6] = [
+        "quota exceeded",
+        "quota exhausted",
+        "exceeded your quota",
+        "exceeded your current quota",
+        "spend limit",
+        "credit limit",
+    ];
+    let lower = message.to_ascii_lowercase();
+    names_a_spent_balance(message) || WINDOWS.iter().any(|phrase| lower.contains(phrase))
+}
+
+/// Whether a message says the account's *balance* is gone, rather than a window being spent.
+///
+/// The difference decides the park: a spent window turns over on its own, while a balance only comes
+/// back when a person pays. The list is English and provider-neutral on purpose — it is the small
+/// set of sentences that mean "no money", and it names no vendor, no model and no error code.
+fn names_a_spent_balance(message: &str) -> bool {
+    const PHRASES: [&str; 22] = [
         "insufficient credit",
         "insufficient balance",
         "insufficient funds",
@@ -4820,15 +4905,49 @@ fn mentions_a_spent_account(message: &str) -> bool {
         "billing issue",
         "billing problem",
         "payment required",
-        "quota exceeded",
-        "quota exhausted",
-        "exceeded your quota",
-        "exceeded your current quota",
-        "spend limit",
-        "credit limit",
+        "exhausted balance",
+        "balance exhausted",
+        "balance is exhausted",
+        "no balance",
+        "zero balance",
+        "out of balance",
+        "top up",
+        "add funds",
+        "add credit",
+        "recharge",
+        "user is locked",
+        "account is locked",
     ];
     let lower = message.to_ascii_lowercase();
     PHRASES.iter().any(|phrase| lower.contains(phrase))
+}
+
+/// Whether a message says the plan does not cover the model that was asked for.
+///
+/// This is narrower than a spent account and must be read that way: the same credential keeps
+/// serving the models its plan does include, so the refusal is parked against the one model. Both
+/// halves are required — a plan word and a limit word — because "your plan has been upgraded" and
+/// "this model is not included" are different statements, and only the pair means what it says here.
+fn names_a_plan_limit(message: &str) -> bool {
+    const PLAN: [&str; 5] = [
+        "free plan",
+        "free tier",
+        "your plan",
+        "your current plan",
+        "your subscription",
+    ];
+    const LIMIT: [&str; 7] = [
+        "upgrade to",
+        "upgrade for",
+        "upgrade your",
+        "does not include",
+        "not included in",
+        "is not included",
+        "isn't included",
+    ];
+    let lower = message.to_ascii_lowercase();
+    PLAN.iter().any(|phrase| lower.contains(phrase))
+        && LIMIT.iter().any(|phrase| lower.contains(phrase))
 }
 
 /// A recovery instant the provider states in words rather than in a field.
@@ -8745,12 +8864,12 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         // this, the 429 was classified as a throttle: the account came back after a minute only to
         // be refused again, while a sibling account with quota sat unused.
         let body = br#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"free","resets_at":1795016770,"limit_window_minutes":43200,"resets_in_seconds":1233929}}"#;
-        let (reason, wait) = exhausted_by_body(body).expect("a spent window");
-        assert_eq!(reason, select::CooldownReason::QuotaExhausted);
+        let refusal = exhausted_by_body(body).expect("a spent window");
+        assert_eq!(refusal.reason, select::CooldownReason::QuotaExhausted);
         // The body says ~14 days; the account is parked for the cap of one day instead. Long enough
         // that it stops poisoning requests, short enough that a wrong or stale instant cannot hide a
         // recovered account for a fortnight. Retrying once a day costs one refused request.
-        assert_eq!(wait, Some(86_400_000));
+        assert_eq!(refusal.wait_ms, Some(86_400_000));
     }
 
     #[test]
@@ -8760,9 +8879,9 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         // reads as a throttle and the old code parked a healthy account for the full default
         // minute. The hint is the upstream saying when it can try again.
         let body = br#"{"error":{"type":"server_error","message":"Upstream request failed: [prefill_cap_refused] the cell is at capacity; retry shortly (after 30 s)"}}"#;
-        let (reason, wait) = exhausted_by_body(body).expect("a capacity refusal");
-        assert_eq!(reason, select::CooldownReason::RateLimited);
-        assert_eq!(wait, Some(30_000));
+        let refusal = exhausted_by_body(body).expect("a capacity refusal");
+        assert_eq!(refusal.reason, select::CooldownReason::RateLimited);
+        assert_eq!(refusal.wait_ms, Some(30_000));
     }
 
     #[test]
@@ -8770,15 +8889,15 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         // Naming the marker without naming a delay must not mean "retry immediately": the
         // request was refused, so a cooldown of some length is always the honest answer.
         let body = br#"{"error":{"type":"server_error","message":"[prefill_cap_refused]"}}"#;
-        let (_, wait) = exhausted_by_body(body).expect("a capacity refusal");
-        assert_eq!(wait, Some(30_000));
+        let refusal = exhausted_by_body(body).expect("a capacity refusal");
+        assert_eq!(refusal.wait_ms, Some(30_000));
     }
 
     #[test]
     fn a_capacity_hint_is_capped_like_every_other_wait() {
         let body = br#"[prefill_cap_refused] retry shortly (after 999999 s)"#;
-        let (_, wait) = exhausted_by_body(body).expect("a capacity refusal");
-        assert_eq!(wait, Some(86_400_000));
+        let refusal = exhausted_by_body(body).expect("a capacity refusal");
+        assert_eq!(refusal.wait_ms, Some(86_400_000));
     }
 
     #[test]
@@ -8813,8 +8932,8 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             .as_secs()
             + 600;
         let body = format!(r#"{{"error":{{"type":"usage_limit_reached","resets_at":{future}}}}}"#);
-        let (_, wait) = exhausted_by_body(body.as_bytes()).expect("a spent window");
-        let wait = wait.expect("a wait");
+        let refusal = exhausted_by_body(body.as_bytes()).expect("a spent window");
+        let wait = refusal.wait_ms.expect("a wait");
         assert!(
             (500_000..=600_000).contains(&wait),
             "expected roughly ten minutes, got {wait} ms"
@@ -8825,8 +8944,8 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     fn a_window_longer_than_a_day_is_capped() {
         // The same cap `retry_after_ms` applies: a bogus value must not park an account for a year.
         let body = br#"{"error":{"type":"usage_limit_reached","resets_in_seconds":999999999}}"#;
-        let (_, wait) = exhausted_by_body(body).expect("a spent window");
-        assert_eq!(wait, Some(86_400_000));
+        let refusal = exhausted_by_body(body).expect("a spent window");
+        assert_eq!(refusal.wait_ms, Some(86_400_000));
     }
 
     #[test]
@@ -8837,9 +8956,9 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         // every request in the combo paid for that probe. The sentence says exactly when the account
         // recovers, and a day's quota deserves a day's cooldown.
         let body = br#"{"error":{"message":"You've used today's Free usage. It resets in 13h 24m. Add a usage pack or choose a plan to keep going: https://example.invalid/billing","type":"budget_exceeded","code":"budget_exceeded"}}"#;
-        let (reason, wait) = exhausted_by_body(body).expect("a spent window");
-        assert_eq!(reason, select::CooldownReason::QuotaExhausted);
-        assert_eq!(wait, Some(13 * 3_600_000 + 24 * 60_000));
+        let refusal = exhausted_by_body(body).expect("a spent window");
+        assert_eq!(refusal.reason, select::CooldownReason::QuotaExhausted);
+        assert_eq!(refusal.wait_ms, Some(13 * 3_600_000 + 24 * 60_000));
     }
 
     #[test]
@@ -8848,8 +8967,8 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         // the same: the account is spent until the period turns over. Parsing it as a repeating
         // interval would be a lie the cooldown cannot express.
         let body = br#"{"error":{"message":"Daily quota reached (100%). Resets every 24 hours, or upgrade for more capacity.","limits":{"plan":"free","day":{"percent":100}}}}"#;
-        let (_, wait) = exhausted_by_body(body).expect("a spent window");
-        assert_eq!(wait, Some(86_400_000));
+        let refusal = exhausted_by_body(body).expect("a spent window");
+        assert_eq!(refusal.wait_ms, Some(86_400_000));
     }
 
     #[test]
@@ -8868,12 +8987,68 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         // code is the generic `BAD_REQUEST`, so it used to be classified as the client's fault: no
         // cooldown, no account switch, one useless upstream round trip on every request.
         let body = br#"{"success":false,"error":{"code":"BAD_REQUEST","status":400,"message":"You have insufficient credits. Please top up your account to continue."}}"#;
-        let (reason, wait) = exhausted_by_body(body).expect("a spent balance");
-        assert_eq!(reason, select::CooldownReason::QuotaExhausted);
+        let refusal = exhausted_by_body(body).expect("a spent balance");
+        assert_eq!(refusal.reason, select::CooldownReason::QuotaExhausted);
+        // No reset was stated, and none is coming on its own: a balance that is gone needs a person,
+        // so the park is the hour rather than the configured minute that would re-probe it.
+        assert_eq!(refusal.wait_ms, Some(SPENT_BALANCE_PARK_MS));
+    }
+
+    #[test]
+    fn a_locked_balance_under_detail_is_read_as_a_spent_account() {
+        // The exact body fal returns once an account's balance is gone. The sentence sits at
+        // `detail` (FastAPI's envelope), not under `error.message`, so the reader used to see no
+        // message at all and the 403 was classified as a failed credential: the wrong reason, a
+        // fifteen-minute park, and a retry that could never succeed while the money was the whole
+        // story.
+        let body = br#"{"detail":"User is locked. Reason: Exhausted balance. Top up your balance at fal.ai/dashboard/billing."}"#;
+        let refusal = exhausted_by_body(body).expect("a spent account");
+        assert_eq!(refusal.reason, select::CooldownReason::QuotaExhausted);
+        assert_eq!(refusal.scope, None, "the whole account is locked");
+        assert_eq!(refusal.wait_ms, Some(SPENT_BALANCE_PARK_MS));
+    }
+
+    #[test]
+    fn a_plan_that_excludes_the_model_cools_only_that_model() {
+        // Captured from a free account that had spent its monthly allowance for the Pro models. The
+        // same credential still serves the Lite models, so parking it whole would remove capacity
+        // the plan does allow, and a minute of park would walk it back into the same 429 on the
+        // next request.
+        let body = br#"{"error":{"message":"You've used this month's 1M tokens on Pro models, which is what the free plan includes. Lite and other models still work on your plan. Upgrade for unlimited Pro model use.","type":"rate_limit_error"}}"#;
+        let refusal = exhausted_by_body(body).expect("a plan limit");
+        assert_eq!(refusal.reason, select::CooldownReason::QuotaExhausted);
         assert_eq!(
-            wait, None,
-            "no reset was stated, so the default guess applies"
+            refusal.scope,
+            Some(mr_core::model::CooldownScope::Model),
+            "the plan limits this model, not the credential"
         );
+        assert_eq!(refusal.wait_ms, Some(SPENT_BALANCE_PARK_MS));
+    }
+
+    #[test]
+    fn a_plan_word_without_a_limit_word_is_not_a_plan_limit() {
+        // The pair carries the meaning: a message that only mentions a plan says nothing about the
+        // model, and one that only says "not included" says nothing about the plan.
+        for body in [
+            br#"{"error":{"message":"Your plan has been upgraded to Pro"}}"# as &[u8],
+            br#"{"error":{"message":"the model is not included in this deployment"}}"#,
+        ] {
+            assert_eq!(
+                exhausted_by_body(body),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_sent_as_a_bare_error_string_is_still_read() {
+        // A few gateways answer `{"error":"…"}` with no object around the message.
+        let refusal = exhausted_by_body(br#"{"error":"insufficient credit: top up the account"}"#)
+            .expect("a spent balance");
+        assert_eq!(refusal.reason, select::CooldownReason::QuotaExhausted);
+        assert_eq!(refusal.wait_ms, Some(SPENT_BALANCE_PARK_MS));
     }
 
     #[test]

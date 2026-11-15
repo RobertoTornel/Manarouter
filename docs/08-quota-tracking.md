@@ -277,6 +277,32 @@ Two facts are fixed rather than configurable, because they describe the credenti
 `AuthFailed` is always recorded against the bare account (the credential is broken for every model),
 and a malformed request records nothing at all.
 
+A third fact comes from the refusal *body* rather than from the status code, and it can narrow the
+scope the provider configured:
+
+- a body that names the plan's limit for the requested model ("your plan does not include…",
+  "upgrade to use…") is recorded against **that model on that account**, whatever `cooldown_scope`
+  says, because the credential keeps serving everything else the plan covers;
+- a body that names money ("insufficient credit", "exhausted balance", "user is locked", "top up")
+  is recorded against the account even when it arrives as a `400`, because providers report a spent
+  balance under whatever status their framework defaults to, and a `400` on its own means "malformed
+  request" — which is not cooled down at all.
+
+The sentence is read from `error.message`, `error.detail`, a top-level `detail`, a top-level `message`,
+or an `error` that is a bare string. Reading only OpenAI's shape is not a detail: an upstream answered
+`403 {"detail":"User is locked. Reason: Exhausted balance. …"}` and, with that sentence invisible, the
+403 was classified as a broken credential — the wrong reason, a fifteen-minute park, and a retry that
+could never succeed. A 401 or 403 whose body says nothing about money or a plan is still `AuthFailed`,
+and still waits for a person to fix the credential.
+
+A refusal that names money is also parked for **an hour** when the body states no reset, rather than
+for `default_cooldown_secs`. A minute is the right guess for a throttle, because the window turns over
+on its own; a balance does not, and re-probing it every minute spends a request to learn the same fact
+sixty times an hour. The hour is long enough that a locked account stops being dialled and short
+enough that a top-up is noticed the same afternoon. A stated reset — a `retry-after` header, a
+`resets_in_seconds` field, or a recovery instant in words — still outranks it and is used as stated,
+without the repetition growth that turns three guesses into eight minutes.
+
 The default is `account`, so an existing configuration behaves exactly as before. Changing the scope
 does not migrate live entries — they keep the shape they were recorded under and expire on their own
 within one cooldown window. `model` also multiplies the live entries by the number of refused models;

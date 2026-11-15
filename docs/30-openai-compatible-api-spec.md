@@ -680,14 +680,30 @@ batches and evals both go back through `dispatch_internal` for exactly this reas
 
 ### 3.3 Failure classification
 
-The relay's behaviour on failure is a table, not a heuristic. `classify_status` maps the HTTP status
-to a class, and `exhausted_by_body` (`server.rs:4746`) refines a `429` or a money-shaped `400` by
-reading the body for a reset time or a spent-balance phrase. The money phrases are the reason a
-provider that says "you do not have enough credits" fails over silently instead of surfacing a `400`:
-`mentions_a_spent_account` (`server.rs:4811`) recognises them, and the account is cooled with a long
-wait. An agent adding a provider whose "out of money" wording is new MUST add the phrase there and add
-a test in the same shape as `money_wording_from_other_providers_still_cools_the_account`; a phrase that
-does not match is a request that fails while a funded sibling account sits idle.
+The relay's behaviour on failure is a table, not a heuristic. `classify_status` (`server.rs:5161`)
+maps the HTTP status to a class, and `exhausted_by_body` (`server.rs:4794`) refines it from the body,
+returning a `BodyRefusal` (`server.rs:4756`) of reason, wait and an optional scope.
+
+The sentence itself is read by `refusal_text` (`server.rs:4778`) from `error.message`, `error.detail`,
+a top-level `detail`, a top-level `message`, or an `error` that is a bare string, because providers
+use all five envelopes; reading only OpenAI's shape once classified a
+`403 {"detail":"User is locked. Reason: Exhausted balance. …"}` as a broken credential. Two body
+statements narrow the classification further:
+
+- `names_a_plan_limit` (`server.rs:4931`) — a plan word **and** a limit word — means the plan does
+  not cover this model, so the refusal is `QuotaExhausted` scoped with
+  `CooldownScope::Model` (`server.rs:4848`): the account keeps serving the models its plan does cover,
+  and the combo moves to the next step at once.
+- `mentions_a_spent_account` (`server.rs:4876`) means the account cannot pay. That is the reason a
+  provider that says "you do not have enough credits" fails over silently instead of surfacing a
+  `400`, and the refusal is parked for `SPENT_BALANCE_PARK_MS` (`server.rs:4769`, one hour) when the
+  body states no reset, because re-probing a balance every minute only learns it is still gone.
+
+An agent adding a provider whose "out of money" or "your plan does not include this model" wording is
+new MUST add the phrase to `names_a_spent_balance` (`server.rs:4896`) or `names_a_plan_limit` and add a
+test in the shape of `money_wording_from_other_providers_still_cools_the_account` or
+`a_plan_that_excludes_the_model_cools_only_that_model`; a phrase that does not match is a request that
+fails while a funded sibling account sits idle.
 
 A cooldown is a prediction about the near future, not a fact about now. When every step is cooling
 down and nothing was actually tried, the step that recovers soonest is tried anyway
