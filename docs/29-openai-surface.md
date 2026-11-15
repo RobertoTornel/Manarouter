@@ -7,13 +7,18 @@ Vector Stores, Containers, Fine-tuning and Evals. It answers nothing older. `/v1
 each has a successor in the current spec, and carrying a retired shape forward would mean testing
 every provider against an API that no new client should be written against.
 
+The contract an agent implements against — exact paths, capability gating, error strings, limits and
+change recipes — is
+[`docs/30-openai-compatible-api-spec.md`](30-openai-compatible-api-spec.md). This document argues why
+the surface is shaped as it is; that one states what must remain true.
+
 One process serves one port, so which shape an endpoint answers in cannot be left to whichever
 upstream happens to be configured. Every route is classified before it is written, and the class is
 the same in the code, in the route table, and here:
 
 | Class | Who answers | Routes |
 |---|---|---|
-| **Proxied** | A provider, after auth and translation | chat, responses, embeddings, audio speech/transcription/translation, images generations/edits/variations, moderations, videos, realtime client secrets and calls, fine-tuning, containers |
+| **Proxied** | A provider, after auth and translation | chat, responses, embeddings, audio speech/transcription/translation, images generations/edits/variations, moderations, videos, realtime (the websocket upgrade and the two client-secret and call POSTs), fine-tuning, containers |
 | **Served here** | The relay, from its own state | `/v1/models` and `/v1/models/{model}`, files, uploads, batches, stored responses, vector stores and search, evals |
 | **Refused** | Nobody — a deliberate error | containers, when no provider declares them |
 
@@ -196,8 +201,11 @@ more than $15, taking the richest among those that qualify. Known means declared
 anything else is unknown and disqualifies the account rather than being guessed at. A `402` — or a
 `400` whose body says the credit ran out — moves the creation to the next funded account silently,
 and cools the one that refused. The rest of the family is not gated: `GET`, `events`, `checkpoints`,
-`pause`, `resume` and `cancel` name a job that already exists and must reach the account holding it.
-A created job cannot be moved, because no other account can continue it.
+`pause`, `resume` and `cancel` name a job that already exists, so they are forwarded as ordinary
+capability-addressed requests. The relay does not record which account created a job, so no later
+request is pinned to it: under a `RoundRobin` policy the next read can reach a sibling account of the
+same provider, and that provider then answers `404`, which the relay forwards verbatim. A created job
+cannot be moved, because no other account can continue it, and it is never resubmitted elsewhere.
 
 `training_file` and `validation_file` are the one place the relay must intervene. A client uploads its
 JSONL to the relay's file store, so the id it holds — `file_…` — is the relay's; the provider needs an

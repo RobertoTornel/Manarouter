@@ -387,11 +387,15 @@ pub enum Capability {
     /// One capability covers all three routes because a provider either accepts video jobs or it
     /// does not; polling and downloading a job it accepted are not separately optional.
     Video = 15,
-    /// The Realtime API's WebRTC entry points: `POST /v1/realtime/client_secrets` and
+    /// The Realtime API: the `GET /v1/realtime` websocket upgrade, which names its route in
+    /// `?model=`, and the two WebRTC handshake POSTs, `POST /v1/realtime/client_secrets` and
     /// `POST /v1/realtime/calls`.
     ///
-    /// The websocket upgrade itself is not a route this gateway proxies; these two POSTs are the
-    /// HTTP handshake a client makes before it speaks the realtime protocol.
+    /// The upgrade is proxied — `crates/manarouter-relay/src/realtime.rs` selects a provider that
+    /// declares this capability and pumps frames between the client and it. It is not a
+    /// [`RouteKind`] because it carries no JSON body and cannot be re-dispatched the way an HTTP
+    /// request can, so it has a selection path of its own. The two POSTs are [`RouteKind`]s and go
+    /// through the ordinary capability-addressed path.
     Realtime = 16,
     /// `/v1/vector_stores` and its files and search sub-resources.
     ///

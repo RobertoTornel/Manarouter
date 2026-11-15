@@ -1,5 +1,10 @@
 # API reference
 
+If you only need to call the API, [`docs/31-endpoints-in-use.md`](31-endpoints-in-use.md) lists the
+endpoints this project actually uses, with a runnable request for each family. This document is the
+full reference; the agent-facing contract is
+[`docs/30-openai-compatible-api-spec.md`](30-openai-compatible-api-spec.md).
+
 Two surfaces on two ports:
 
 | Surface | Port | Purpose | Auth |

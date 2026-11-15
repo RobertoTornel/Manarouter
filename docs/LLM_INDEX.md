@@ -58,12 +58,13 @@ measured baseline of an existing Javascript router on the development machine �
 |---|---|
 | Understand the whole system | `docs/01-architecture.md` |
 | Help somebody **use** Manarouter | `docs/user/INDEX.md` — the operator and agent series; the panel serves it |
+| Call the API, or find the endpoint for a job | `docs/31-endpoints-in-use.md` — every endpoint this project actually uses, its auth, and a runnable call; no internals |
 | Change something on the request path | `docs/01-architecture.md`, `docs/16-latency-engineering.md` |
 | Add a provider | `docs/providers/README.md`, `catalog/providers.toml`, `crates/mr-core/src/model.rs` |
 | Add a dialect or translator | `crates/mr-dialects/src/lib.rs`, `docs/24-provider-dialects.md`, `docs/18-api-reference.md` |
 | Connect Cursor, or answer "can we route to Cursor?" | `docs/providers/cursor.md` — Cursor is a client of the relay, not a provider; the protocol record is `docs/research/cursor-cli-inference.md` |
 | Work on the batch lane (`/v1/files`, `/v1/batches`) | `crates/manarouter-relay/src/batch.rs` (the whole lane, in one module), `docs/18-api-reference.md` §"The batch lane" for the wire contract, `docs/25-gpu-rentals.md` §2, §10, §11 and §12 for why it is shaped that way |
-| Add, change or refuse an OpenAI endpoint | `docs/29-openai-surface.md` first — it says whether the route is proxied, served here, or refused, and why; then `docs/18-api-reference.md` for the wire shape, `crates/manarouter-relay/src/server.rs` (`router`, `route_kind_for`, `default_path`) and the module that owns it |
+| Add, change or refuse an OpenAI endpoint | `docs/29-openai-surface.md` first — it says whether the route is proxied, served here, or refused, and why; then `docs/30-openai-compatible-api-spec.md` for the agent-facing contract (paths and lines, gates, invariants, change recipes) and `docs/18-api-reference.md` for the wire shape; the code is `crates/manarouter-relay/src/server.rs` (`router`, `route_kind_for`, `default_path`) and the module that owns the route |
 | Work on stored responses (`/v1/responses/{id}`) | `crates/manarouter-relay/src/responses.rs` |
 | Work on uploads (`/v1/uploads`) | `crates/manarouter-relay/src/uploads.rs` |
 | Work on vector stores or retrieval (`/v1/vector_stores`, `POST /v1/search`) | `crates/manarouter-relay/src/vector_stores.rs` |
@@ -77,7 +78,7 @@ measured baseline of an existing Javascript router on the development machine �
 | Add an OAuth platform | `docs/14-oauth-adding-a-platform.md`, `docs/omniroute-reference.md` |
 | Touch credentials or secrets | `docs/21-security.md` — read before writing any code |
 | Change the configuration schema | `docs/03-configuration.md` §1 first — unknown-key preservation is mandatory |
-| Change the snapshot format | `docs/04-routing-snapshot.md` — a format change requires a version bump; the current version is **22**, which is the highest capability tag plus one (`crates/mr-core/src/lib.rs`) |
+| Change the snapshot format | `docs/04-routing-snapshot.md` — a format change requires a version bump; the current version is **23**, which is the highest capability tag plus one (`crates/mr-core/src/lib.rs`) |
 | Change model naming, reasoning levels, or `/v1/models` | `docs/18-api-reference.md` §"Model addressing", `docs/04-routing-snapshot.md` §5-§7, `crates/mr-core/src/snapshot.rs` (`compile`, `explain_miss`) |
 | Work on the panel | `docs/15-web-panel.md`, `docs/01-architecture.md` §5 |
 | Migrate from OmniRoute | `docs/17-migrating-from-omniroute.md` |
@@ -469,6 +470,8 @@ trigger.
     { "path": "docs/23-implementation-status.md", "purpose": "What actually runs today, with the command that checks each claim", "read_when": "before claiming a feature is implemented" },
     { "path": "docs/24-provider-dialects.md", "purpose": "The eleven wire dialects: what each upstream speaks, which client routes reach it, and what the relay translates", "read_when": "adding a dialect or tracing a translation" },
     { "path": "docs/29-openai-surface.md", "purpose": "The OpenAI-compatible surface as a whole: which routes are proxied, served here or refused, the capability gate that decides it, and what each family does", "read_when": "adding, changing or debugging a route, or explaining why one is refused" },
+    { "path": "docs/30-openai-compatible-api-spec.md", "purpose": "The agent-facing specification: exact paths and source lines, the capability gate and its error strings, routes that are served here or refused, invariants, deviations, limits, and change recipes", "read_when": "implementing, reviewing or debugging any /v1 route; read §0 for the authority order first" },
+    { "path": "docs/31-endpoints-in-use.md", "purpose": "The HTTP contract this project uses: method, path, request and response shape, auth, error and retry rules, and a runnable call for each family, with no serving-stack detail", "read_when": "calling the API or wiring a client, without needing the internals" },
     { "path": "docs/combo-cookbook.md", "purpose": "Copy-pasteable combo configurations for common goals", "read_when": "building a combo" },
     { "path": "docs/credits.md", "purpose": "Attribution for the quota fetchers derived from OmniRoute", "read_when": "checking licensing or provenance" },
     { "path": "docs/providers/README.md", "purpose": "How the provider catalogue works and how to add an entry", "read_when": "adding a provider" },

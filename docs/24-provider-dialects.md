@@ -921,8 +921,12 @@ can win a race an Anthropic participant would have answered exactly — the race
 (highest priority that replies inside the window) decides, and the header tells the client what it
 got.
 
-**A provider's declared capabilities do not narrow the matrix.** They are catalogue metadata for
-the panel; the relay's gate is the dialect pairing above.
+**A provider's declared capabilities gate the route; they are not catalogue metadata.** Before a
+request is forwarded, the relay refuses it with `404 unsupported_endpoint` when no step's provider
+declares the capability the route needs. A provider is rejected when it claims a capability its
+dialect cannot serve (`Provider::validate` and `dialect_capability_mismatches`, both in
+`crates/mr-core/src/model.rs`). The dialect pairing above decides *how* a route is translated; the
+capability declaration decides *whether* it is attempted at all.
 
 ---
 
