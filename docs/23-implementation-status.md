@@ -256,8 +256,9 @@ participant it dispatched.
   accounts carrying each tag listed live), and the combo step editor's account checkboxes. That
   panel work adds no endpoint — people ride `PUT /api/config/raw`, and a `tags`/`accounts` array is
   carried by the existing account and combo writes — and is pinned by
-  `panel/test/account-tags.test.mjs` and `panel/test/combo-step-accounts.test.mjs`, which drive the
-  real views against a stubbed DOM and `fetch` and assert the exact request bodies.
+  `panel/test/account-tags.test.mjs`, `panel/test/settings-people.test.mjs` and
+  `panel/test/combo-step-accounts.test.mjs`, which drive the real views against a stubbed DOM and
+  `fetch` and assert the exact request bodies.
 
 ### 4.1 GPU rentals (issue #4) — implemented and exercised end to end, with two named limits
 

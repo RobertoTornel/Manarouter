@@ -109,7 +109,10 @@ The suite in `panel/test/*.test.mjs` covers the DOM-free helpers and the rendere
 without a browser: API request envelopes, uptime/age formatting, provider presets, probe targets,
 reasoning levels, searchable selects, combo live-state selection, quota display ordering,
 quota-probe candidate validation and provenance, model grouping and paging, markdown escaping,
-OAuth redirects and provider refresh decisions. Run it with:
+OAuth redirects and provider refresh decisions. The account editors are covered the same way:
+account tags, the Settings people card, and a combo step's account selection each mount the real
+view against a stubbed DOM and `fetch`, so the tests assert the request body rather than the
+intent. Run it with:
 
 ```bash
 node --test panel/test/*.test.mjs
@@ -120,7 +123,7 @@ mock API in Playwright, without touching the configured conductor. Its setup is 
 
 ### Current verification
 
-At the time of writing, `node --test panel/test/*.test.mjs` runs 350 tests with no failures, and
+At the time of writing, `node --test panel/test/*.test.mjs` runs 403 tests with no failures, and
 the Rust workspace passes `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`
 and `cargo test --workspace`.
 

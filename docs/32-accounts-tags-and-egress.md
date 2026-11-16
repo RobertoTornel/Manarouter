@@ -203,9 +203,9 @@ serves, directly.
 - `mr account list <provider>` — the `TAGS` column.
 - The panel — **Providers** has a `Tags` column per account, **Settings → People** lists each
   person with the accounts carrying their tag, and a combo's step editor shows how many of the
-  provider's accounts the step may use. `node --test panel/test/account-tags.test.mjs` and
-  `panel/test/combo-step-accounts.test.mjs` pin that those editors send exactly the `tags` and
-  `accounts` arrays described above.
+  provider's accounts the step may use. `node --test panel/test/account-tags.test.mjs`,
+  `panel/test/settings-people.test.mjs` and `panel/test/combo-step-accounts.test.mjs` pin that
+  those editors send exactly the `tags`, `people` and `accounts` arrays described above.
 - `mr person list` — each person's tag, label, proxy, and how many accounts are tagged for them.
 - `mr combo show <combo>` — the `ACCOUNTS` column per step.
 - The relay log — `the proxy tunnel could not be established; retrying directly`, and the
