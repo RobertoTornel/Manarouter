@@ -73,6 +73,30 @@ pub enum AccountCmd {
         #[arg(long, conflicts_with = "usd")]
         clear: bool,
     },
+    /// Add a tag to an account.
+    ///
+    /// A tag is a short free-text note. Two spellings are special: a tag that names a person
+    /// configured with `mr person add` sends this account through that person's proxy, and a combo
+    /// step can select accounts by tag with `--accounts tag:<name>`.
+    Tag {
+        /// Provider id.
+        provider: String,
+        /// Account id or label.
+        account: String,
+        /// Tags to add; repeat for more than one.
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+    /// Remove a tag from an account.
+    Untag {
+        /// Provider id.
+        provider: String,
+        /// Account id or label.
+        account: String,
+        /// Tags to remove; repeat for more than one.
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -104,6 +128,9 @@ pub struct AddArgs {
     /// than $15.
     #[arg(long, value_name = "USD")]
     pub credit_usd: Option<f64>,
+    /// Tag the account, for example the person it belongs to; repeat for more than one.
+    #[arg(long = "tag", value_name = "TAG")]
+    pub tags: Vec<String>,
 }
 
 /// Run an account subcommand.
@@ -129,6 +156,16 @@ pub async fn run(cmd: AccountCmd, ctx: &Ctx) -> Result<(), CliError> {
             usd,
             clear,
         } => set_credit(ctx, &provider, &account, usd, clear),
+        AccountCmd::Tag {
+            provider,
+            account,
+            tags,
+        } => edit_tags(ctx, &provider, &account, &tags, true),
+        AccountCmd::Untag {
+            provider,
+            account,
+            tags,
+        } => edit_tags(ctx, &provider, &account, &tags, false),
     }
 }
 
@@ -349,6 +386,15 @@ fn add_with(ctx: &Ctx, args: AddArgs, stdin: impl Read) -> Result<(), CliError> 
         account.weight = weight;
     }
     account.identity = args.identity.clone();
+    for tag in &args.tags {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Err(CliError::validation("a tag cannot be empty"));
+        }
+        if !account.has_tag(tag) {
+            account.tags.push(tag.to_owned());
+        }
+    }
     if let Some(usd) = args.credit_usd {
         check_credit_usd(usd)?;
         account.credit_usd = Some(usd);
@@ -402,6 +448,7 @@ fn list(ctx: &Ctx, provider_id: &str) -> Result<(), CliError> {
         "ENABLED",
         "CREDENTIAL",
         "IDENTITY",
+        "TAGS",
     ]);
     for a in &p.accounts {
         let cred = if a.secret_ref.is_some() {
@@ -418,6 +465,7 @@ fn list(ctx: &Ctx, provider_id: &str) -> Result<(), CliError> {
             if a.enabled { "yes" } else { "no" }.to_owned(),
             cred.to_owned(),
             a.identity.clone().unwrap_or_default(),
+            a.tags.join(","),
         ]);
     }
     t.print();
@@ -606,6 +654,80 @@ fn set_credit(
     )
 }
 
+/// Add or remove tags on one account.
+///
+/// Tags are compared case-insensitively and stored as the operator typed them, so `Alice` and
+/// `alice` are one tag and the panel shows the spelling that was entered first. Adding a tag that
+/// is already present is a no-op rather than an error: the command is idempotent, which is what
+/// makes it safe in a script.
+fn edit_tags(
+    ctx: &Ctx,
+    provider_id: &str,
+    account_key: &str,
+    tags: &[String],
+    add: bool,
+) -> Result<(), CliError> {
+    let mut cfg = ctx.load()?;
+    let p = cfg
+        .providers
+        .iter_mut()
+        .find(|p| p.id.as_str() == provider_id)
+        .ok_or_else(|| CliError::not_found(format!("no provider with id `{provider_id}`")))?;
+    let a = find_account_mut(p, account_key)?;
+    let label = a.label.clone().unwrap_or_else(|| a.id.as_str().to_owned());
+    let mut changed = Vec::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Err(CliError::validation("a tag cannot be empty"));
+        }
+        if add {
+            if !a.has_tag(tag) {
+                a.tags.push(tag.to_owned());
+                changed.push(tag.to_owned());
+            }
+        } else if let Some(index) = a.tags.iter().position(|t| t.eq_ignore_ascii_case(tag)) {
+            a.tags.remove(index);
+            changed.push(tag.to_owned());
+        }
+    }
+    let remaining = a.tags.clone();
+    let out = ctx.save(&cfg)?;
+    let human = if changed.is_empty() {
+        vec![format!(
+            "account `{label}` on `{provider_id}` already has {}",
+            if add {
+                "those tags"
+            } else {
+                "none of those tags"
+            }
+        )]
+    } else {
+        vec![
+            format!(
+                "account `{label}` on `{provider_id}` {} {}",
+                if add { "tagged" } else { "untagged" },
+                changed.join(", ")
+            ),
+            if remaining.is_empty() {
+                "the account now has no tags".to_owned()
+            } else {
+                format!("tags: {}", remaining.join(", "))
+            },
+        ]
+    };
+    ctx.finish(
+        &out,
+        human,
+        serde_json::json!({
+            "provider": provider_id,
+            "account": label,
+            "tags": remaining,
+            "changed": changed,
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,6 +743,7 @@ mod tests {
             weight: None,
             identity: None,
             credit_usd: None,
+            tags: Vec::new(),
         }
     }
 
@@ -708,5 +831,64 @@ mod tests {
         // The only secret that could ever appear here would be the raw value; assert the shape
         // of the reference instead of trusting ourselves.
         assert!(!json.contains("sk-"), "{json}");
+    }
+
+    /// A provider with one account, so the tag commands have something to edit.
+    fn seed_account() {
+        let mut cfg = mr_core::config::Config::default();
+        let mut p = mr_core::model::Provider::new(
+            "alpha",
+            mr_core::dialect::Dialect::OpenAi,
+            "http://127.0.0.1:9/v1",
+        );
+        let mut a = mr_core::model::Account::new("mine");
+        a.id = mr_core::ids::AccountId::from_raw("a1");
+        p.accounts = vec![a];
+        cfg.providers.push(p);
+        cfg.save_default().unwrap();
+    }
+
+    #[test]
+    fn a_tag_can_be_added_and_removed() {
+        crate::output::testutil::with_config_dir("account-tags", |_| {
+            seed_account();
+            let ctx = Ctx { json: false };
+            edit_tags(&ctx, "alpha", "a1", &["alice".into()], true).unwrap();
+            let cfg = mr_core::config::Config::load_default().unwrap();
+            assert_eq!(cfg.providers[0].accounts[0].tags, ["alice"]);
+
+            // Adding the same tag again is a no-op, not a duplicate.
+            edit_tags(&ctx, "alpha", "a1", &["ALICE".into()], true).unwrap();
+            let cfg = mr_core::config::Config::load_default().unwrap();
+            assert_eq!(cfg.providers[0].accounts[0].tags, ["alice"]);
+
+            edit_tags(&ctx, "alpha", "a1", &["alice".into()], false).unwrap();
+            let cfg = mr_core::config::Config::load_default().unwrap();
+            assert!(cfg.providers[0].accounts[0].tags.is_empty());
+        });
+    }
+
+    #[test]
+    fn an_empty_tag_is_refused() {
+        crate::output::testutil::with_config_dir("account-tags-empty", |_| {
+            seed_account();
+            let ctx = Ctx { json: false };
+            let err = edit_tags(&ctx, "alpha", "a1", &["  ".into()], true).unwrap_err();
+            assert_eq!(err.exit, crate::output::Exit::Validation);
+            let cfg = mr_core::config::Config::load_default().unwrap();
+            assert!(cfg.providers[0].accounts[0].tags.is_empty());
+        });
+    }
+
+    #[test]
+    fn tagging_an_unknown_account_names_the_provider() {
+        crate::output::testutil::with_config_dir("account-tags-missing", |_| {
+            seed_account();
+            let ctx = Ctx { json: false };
+            let err = edit_tags(&ctx, "alpha", "nope", &["alice".into()], true).unwrap_err();
+            assert_eq!(err.exit, crate::output::Exit::NotFound);
+            let err = edit_tags(&ctx, "nope", "a1", &["alice".into()], true).unwrap_err();
+            assert_eq!(err.exit, crate::output::Exit::NotFound);
+        });
     }
 }

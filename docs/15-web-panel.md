@@ -43,6 +43,13 @@ The **Models** view distinguishes discovered from hand-entered metadata explicit
 must never overwrite what a human typed. If the two ever disagreed and the panel did not say which
 was which, the operator would have no way to know why their edit vanished.
 
+Three things are **not** in the panel yet, and the CLI is the supported way to set them: an account's
+`tags`, the `people` list that turns a tag into an egress route, and a combo step's `accounts`
+selection. The Settings view does edit the proxy list itself, so a person can be pointed at a proxy
+that already exists; declaring the person, tagging the account and limiting a step are
+`mr person`, `mr account tag` and `mr combo step accounts`. See
+[accounts, tags and egress](32-accounts-tags-and-egress.md).
+
 ### The capability editor
 
 The provider form carries a fieldset of twenty-two checkboxes, one per client surface the provider is
@@ -339,5 +346,6 @@ working directory, its parents, and the executable's directory, so there is no b
 - [Security](21-security.md) — the threat model, sessions, and the origin check.
 - [Configuration](03-configuration.md) — what the panel is actually editing.
 - [Combos](06-combos.md) — the view an operator uses most.
+- [Accounts, tags and egress](32-accounts-tags-and-egress.md) — the three things the panel does not edit yet.
 - [Latency benchmarks](19-latency-benchmarks.md) — why the panel is not on the request path.
 - [Troubleshooting](20-troubleshooting.md) — what to check when the panel will not load.

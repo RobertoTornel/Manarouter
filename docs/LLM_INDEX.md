@@ -74,6 +74,7 @@ measured baseline of an existing Javascript router on the development machine �
 | Change combo behaviour | `docs/06-combos.md`, `docs/07-hedged-race.md`, `crates/mr-core/src/model.rs` |
 | Work on the hedged race | `docs/07-hedged-race.md` — read all of it; the semantics are counterintuitive |
 | Change account/key selection | `docs/05-key-selection.md`, `crates/mr-core/src/dialect.rs` (`KeyStrategy`) |
+| Limit a combo step to some accounts, or route an account through a proxy | `docs/32-accounts-tags-and-egress.md` — read §1 and §4 before touching `StepPlan::accounts`, `AccountPlan::proxy` or the fallback split |
 | Work on quota | `docs/08-quota-tracking.md`, `docs/09-reset-aware-priority.md`, `crates/mr-core/src/quota/` (`openai_compat.rs` reader, `probe.rs` candidate-endpoint walk) |
 | Add an OAuth platform | `docs/14-oauth-adding-a-platform.md`, `docs/omniroute-reference.md` |
 | Touch credentials or secrets | `docs/21-security.md` — read before writing any code |
@@ -446,9 +447,10 @@ trigger.
     { "path": "docs/01-architecture.md", "purpose": "Why there are two processes, what the compiled snapshot is, and the full request path", "read_when": "changing anything structural" },
     { "path": "docs/02-quickstart.md", "purpose": "A working configuration in five minutes", "read_when": "installing or writing a test harness" },
     { "path": "docs/03-configuration.md", "purpose": "The complete config.json schema, plus why unknown keys are preserved", "read_when": "changing any config field" },
-    { "path": "docs/04-routing-snapshot.md", "purpose": "The compiled binary table: layout (format version 8), level-aware compilation, index precedence, versioning, hot swap", "read_when": "changing the snapshot format or the relay's lookup" },
+    { "path": "docs/04-routing-snapshot.md", "purpose": "The compiled binary table: layout (snapshot version 24), level-aware compilation, index precedence, versioning, hot swap", "read_when": "changing the snapshot format or the relay's lookup" },
     { "path": "docs/05-key-selection.md", "purpose": "priority, round-robin, random and least-used, and how dead accounts are skipped", "read_when": "touching account selection" },
     { "path": "docs/06-combos.md", "purpose": "The combo reference and worked examples", "read_when": "changing combo semantics" },
+    { "path": "docs/32-accounts-tags-and-egress.md", "purpose": "Per-step account selection, account tags, people, per-account proxies and the two-stage fallback to a direct connection", "read_when": "touching account selection, tags, egress or proxy failure handling" },
     { "path": "docs/07-hedged-race.md", "purpose": "The eligibility gate, the four on-failure modes, midstream policy, session affinity", "read_when": "touching the race — read it all" },
     { "path": "docs/08-quota-tracking.md", "purpose": "How consumption is observed, recorded and surfaced, and the cooldown_scope that decides how far a refusal spreads", "read_when": "touching accounting or cooldowns" },
     { "path": "docs/09-reset-aware-priority.md", "purpose": "How cooldowns demote rather than remove a step, and how resets restore it", "read_when": "touching reset-aware behaviour" },

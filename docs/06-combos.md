@@ -160,21 +160,27 @@ Compilation does this, in order:
 3. **Steps naming a missing provider are dropped.** A step is kept only if its provider slug resolves
    to a compiled provider. Steps pointing at a *disabled* provider are dropped silently, because the
    operator disabled that provider on purpose.
-4. **The two remaining cases are different failures.** If at least one step survives, the combo
+4. **A step's account selection is resolved.** `accounts` is a list of selectors — an account id, or
+   a tag (bare or `tag:<name>`) — and compilation turns it into the step's `StepPlan::accounts`, in
+   the provider's authored order. An empty list means every account, which is the default. A
+   selection that matches only disabled accounts compiles to an empty set: the step can serve nobody,
+   and is never widened back to all. See
+   [accounts, tags and egress](32-accounts-tags-and-egress.md) §1.
+5. **The two remaining cases are different failures.** If at least one step survives, the combo
    compiles and the dropped steps are only reported by `Config::validate()` as warnings. If no step
    survives *and* the reason was unknown providers, compile fails the whole snapshot with
    `Error::Snapshot` naming the combo — that combination is an operator typo, and failing loudly at
    compile time is much better than failing that one combo at request time. If no step survives
    because everything was disabled, the combo is silently omitted, because that is an intentional
    state, not a mistake.
-5. **Indices are remapped.** Hedge `participants` and the `stable-fallback` step are written as
+6. **Indices are remapped.** Hedge `participants` and the `stable-fallback` step are written as
    indices into the authored step list. Compilation rewrites them onto the surviving list, so a
    dropped step cannot leave the race pointing at the wrong model. A stable step that no longer
    resolves has its mode replaced rather than left dangling.
-6. **A race of one is downgraded.** If fewer than two participants resolve, the hedge is not a race —
+7. **A race of one is downgraded.** If fewer than two participants resolve, the hedge is not a race —
    it is a normal request with bookkeeping — so the compiler turns it off instead of paying for the
    machinery.
-7. **A per-plan signature is computed.** `ComboPlan::signature` is an FNV-1a digest of the plan's
+8. **A per-plan signature is computed.** `ComboPlan::signature` is an FNV-1a digest of the plan's
    routing-relevant fields, used as the cheap "did anything I care about change" check. It is
    deliberately computed from the compiled plan, not from the authored `Combo::signature`, so changes
    the authored signature does not cover still move it.
@@ -389,6 +395,7 @@ costs a table rebuild and a pointer swap — which is exactly why cosmetic field
 - [The hedged race](07-hedged-race.md) — `hedge`, the eligibility window, and the winner-failure modes.
 - [Combo cookbook](combo-cookbook.md) — copy-pasteable recipes for the goals above.
 - [Key selection](05-key-selection.md) — how the account behind a step is chosen.
+- [Accounts, tags and egress](32-accounts-tags-and-egress.md) — limiting a step to some accounts, and per-account proxies.
 - [Quickstart](02-quickstart.md) — creating a first combo and pointing a client at it.
 - [Architecture](01-architecture.md) — why compilation lives in the control plane.
 - [Overview](00-overview.md) — the feature status table this document refers to.

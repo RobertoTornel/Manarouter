@@ -251,6 +251,36 @@ advertised. Until that is fixed, keep the name obscure rather than relying on `h
 
 ---
 
+## 13. One person's accounts only
+
+When several people share one router, a combo step can be limited to the accounts that belong to one
+of them. Tag the accounts once, then select by tag:
+
+```bash
+mr account tag openai main alice
+mr account tag openai backup alice
+mr account tag anthropic work bob
+
+mr combo add alice-coding --step openai/gpt-5.5 --accounts alice
+mr combo step add alice-coding --step anthropic/claude-sonnet-4-5 --accounts alice
+```
+
+The selection is resolved when the combo compiles, so it is a filter on the candidate list, not a
+preference: if Alice's accounts are all parked, the step is unusable and the combo moves on rather
+than quietly spending Bob's account. `mr combo show alice-coding` prints the `ACCOUNTS` column, and
+`mr combo step accounts alice-coding 0 --all` lets every account serve again.
+
+If Alice's accounts should also leave through Alice's machine, declare her once and the tag does
+both jobs:
+
+```bash
+mr person add alice --proxy alice-laptop
+```
+
+See [accounts, tags and egress](32-accounts-tags-and-egress.md).
+
+---
+
 ## Debugging a combo
 
 ```bash
@@ -268,4 +298,5 @@ step order that is not what the operator thought it was, and the numbered list s
 - [Hedged race](07-hedged-race.md) — the full semantics of the race used in recipes 3 and 4.
 - [Reset-aware priority](09-reset-aware-priority.md) — recipe 9 in depth.
 - [Key selection](05-key-selection.md) — which credential pays for a step.
+- [Accounts, tags and egress](32-accounts-tags-and-egress.md) — recipe 13 in depth, and per-account proxies.
 - [Quota tracking](08-quota-tracking.md) — what a cooldown does to a combo.

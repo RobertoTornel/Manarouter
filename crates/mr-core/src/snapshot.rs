@@ -371,6 +371,14 @@ pub struct StepPlan {
     pub pricing: Option<PricingPlan>,
     /// Declared or discovered context window. Provider-level max_context overrides this value.
     pub context_length: Option<u32>,
+    /// Which of the provider's accounts this step may use, resolved from the authored selectors.
+    ///
+    /// `None` means every account, which is what a step that names no selection means and what
+    /// every direct `provider/model` resolution gets. `Some` carries account ids in the provider's
+    /// own order, so the relay filters candidates by identity and never parses a tag at request
+    /// time. `Some(vec![])` is a real state: the selectors matched only accounts that are disabled,
+    /// and the step is unusable rather than silently widened back to all of them.
+    pub accounts: Option<Vec<AccountId>>,
 }
 
 impl StepPlan {
@@ -757,7 +765,10 @@ impl RoutingSnapshot {
             accounts.sort_by_key(|a| a.priority);
             let accounts = accounts
                 .into_iter()
-                .map(|a| account_plan(provider.id.as_str(), a))
+                .map(|a| {
+                    let person = config.person_for_account(a).map(|p| p.proxy.as_str());
+                    account_plan(provider.id.as_str(), a, person)
+                })
                 .collect();
 
             let mut plan = ProviderPlan {
@@ -1708,7 +1719,7 @@ fn temp_sibling(path: &Path) -> PathBuf {
 /// with no OAuth reference falls back to the conventional [`account_secret_id`] vault path, and an
 /// OAuth account keeps only its metadata reference. The relay opens the vault after resolving its
 /// metadata record; this module only handles ids.
-fn account_plan(provider_id: &str, account: &Account) -> AccountPlan {
+fn account_plan(provider_id: &str, account: &Account, person_proxy: Option<&str>) -> AccountPlan {
     let secret_ref = match &account.secret_ref {
         Some(explicit) => Some(explicit.clone()),
         None if account.oauth_ref.is_none() => {
@@ -1727,7 +1738,14 @@ fn account_plan(provider_id: &str, account: &Account) -> AccountPlan {
         max_concurrent: account.max_concurrent,
         models_allow: account.models_allow.clone(),
         models_deny: account.models_deny.clone(),
-        proxy: account.proxy.as_deref().map(str::to_owned),
+        // The account's own choice wins; otherwise the person it is tagged for decides, which is
+        // what makes tagging an account enough to send it through that person's machine. A proxy
+        // id that is missing or disabled resolves to a direct connection at request time, so a
+        // person whose machine is off costs their accounts their egress, not their requests.
+        proxy: account
+            .proxy
+            .clone()
+            .or_else(|| person_proxy.map(str::to_owned)),
         placeholders: account
             .placeholders
             .iter()
@@ -1827,12 +1845,14 @@ impl ComboExpander<'_> {
                 // A step may pin its own tier; otherwise the routing default applies.
                 // `plan_step` clamps a level the model does not offer to the model's highest one,
                 // so an over-asked level degrades instead of failing.
-                out.push(plan_step(
+                let mut planned = plan_step(
                     provider,
                     plan,
                     entry,
                     step.level.unwrap_or(self.default_level),
-                ));
+                );
+                planned.accounts = self.resolve_accounts(step, plan);
+                out.push(planned);
                 Ok(true)
             }
             None => {
@@ -1842,6 +1862,43 @@ impl ComboExpander<'_> {
                 Ok(false)
             }
         }
+    }
+
+    /// Resolve a step's authored account selectors against the provider's compiled accounts.
+    ///
+    /// `None` means the step names no selection and every account may serve it. Otherwise the
+    /// result is the ids of the accounts the selectors name, in the provider's own order — which is
+    /// priority order, so the relay's existing ranking still decides among them.
+    ///
+    /// The selectors are matched against the *authored* accounts rather than the compiled ones
+    /// because a tag lives on the account and the compiled plan carries only what the request path
+    /// needs. A selector that names only disabled accounts therefore resolves to an empty list: the
+    /// operator asked for those accounts and they are not available, which is a step that cannot
+    /// serve rather than a step that quietly serves from everyone.
+    fn resolve_accounts(&self, step: &ComboStep, plan: &ProviderPlan) -> Option<Vec<AccountId>> {
+        if step.accounts.is_empty() {
+            return None;
+        }
+        let authored = self.config.provider(step.provider.as_str());
+        let mut selected = Vec::new();
+        for account in &plan.accounts {
+            let source = authored.and_then(|provider| {
+                provider
+                    .accounts
+                    .iter()
+                    .find(|candidate| candidate.id == account.id)
+            });
+            let named = step.accounts.iter().any(|selector| match source {
+                Some(source) => crate::model::account_selector_matches(selector, source),
+                // A compiled account with no authored counterpart cannot happen, but matching on
+                // the id alone keeps the resolution total rather than silently selecting nothing.
+                None => account.id.as_str() == selector.trim(),
+            });
+            if named {
+                selected.push(account.id.clone());
+            }
+        }
+        Some(selected)
     }
 
     fn add_combo_target(
@@ -1926,6 +1983,9 @@ fn plan_step(
         reasoning_json: reasoning_fragments(provider.dialect, model, levels),
         input_modalities: modalities,
         pricing: model.pricing.clone(),
+        // A direct `provider/model` resolution has no authored step and therefore no selection;
+        // `add_authored` fills this in for a combo step.
+        accounts: None,
         context_length: model.context_length.or_else(|| {
             provider
                 .max_context
@@ -2533,6 +2593,18 @@ fn encode_step(encoder: &mut Encoder, step: &StepPlan) {
     encoder.put_u32(step.input_modalities);
     encode_pricing(encoder, step.pricing.as_ref());
     encoder.put_u32(step.context_length.unwrap_or(0));
+    // A presence byte rather than a count, because "no selection" and "a selection that matched
+    // nothing" are different answers: the first means every account, the second means none.
+    match &step.accounts {
+        None => encoder.put_bool(false),
+        Some(accounts) => {
+            encoder.put_bool(true);
+            encoder.put_u32(accounts.len() as u32);
+            for account in accounts {
+                encoder.put_str(account.as_str());
+            }
+        }
+    }
 }
 
 /// Encode an optional price table.
@@ -2632,6 +2704,25 @@ fn decode_step(
         0 => None,
         value => Some(value),
     };
+    let accounts = if reader.bool()? {
+        let count = reader.u32()? as usize;
+        let mut accounts = Vec::with_capacity(count.min(1024));
+        for _ in 0..count {
+            let id = AccountId::from(reader.string(strings)?);
+            // A selection naming an account the provider does not have would be a step that can
+            // never serve, and the frame is the last place that can be caught cheaply.
+            if !provider.accounts.iter().any(|account| account.id == id) {
+                return Err(Error::Snapshot(format!(
+                    "step for provider {} selects unknown account {id}",
+                    provider.id
+                )));
+            }
+            accounts.push(id);
+        }
+        Some(accounts)
+    } else {
+        None
+    };
     Ok(StepPlan {
         provider_index,
         provider_id: provider.id.clone(),
@@ -2650,6 +2741,7 @@ fn decode_step(
         input_modalities,
         pricing,
         context_length,
+        accounts,
     })
 }
 
@@ -5592,5 +5684,156 @@ mod tests {
         assert!(remaining
             .iter()
             .all(|alias| alias.get("from").and_then(|v| v.as_str()) != Some("generated-one")));
+    }
+
+    // -----------------------------------------------------------------------
+    // per-step account selection and per-person egress
+    // -----------------------------------------------------------------------
+
+    /// A provider with three accounts, two of them tagged for people.
+    fn selected_config() -> Config {
+        let mut config = Config::default();
+        let mut p = provider("alpha");
+        p.models = vec![model("m")];
+        let mut mine = account("a1", "mine", 0);
+        mine.tags.push("alice".into());
+        let mut theirs = account("a2", "theirs", 0);
+        theirs.tags.push("bob".into());
+        let mut spare = account("a3", "spare", 0);
+        spare.enabled = false;
+        p.accounts = vec![mine, theirs, spare];
+        config.providers.push(p);
+        config
+    }
+
+    fn proxy(id: &str) -> crate::config::ProxyConfig {
+        crate::config::ProxyConfig {
+            id: id.into(),
+            label: None,
+            url: "socks5h://100.64.0.7:1080".into(),
+            username: None,
+            secret_ref: None,
+            enabled: true,
+            priority: 0,
+            extra: Default::default(),
+        }
+    }
+
+    /// The default is every account, and it must stay that way: a combo written before this
+    /// feature existed has to behave exactly as it did.
+    #[test]
+    fn a_step_without_a_selection_plans_every_account() {
+        let mut config = selected_config();
+        config
+            .combos
+            .push(combo("chain", "chain", &[("alpha", "m")]));
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+        let step = &snapshot.combos()[0].steps[0];
+        assert_eq!(step.accounts, None);
+    }
+
+    #[test]
+    fn a_step_selection_resolves_to_the_named_accounts() {
+        let mut config = selected_config();
+        let mut c = combo("chain", "chain", &[("alpha", "m")]);
+        c.steps[0].accounts = vec!["alice".into()];
+        config.combos.push(c);
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+        let step = &snapshot.combos()[0].steps[0];
+        assert_eq!(
+            step.accounts.as_ref().unwrap(),
+            &vec![AccountId::from_raw("a1")]
+        );
+
+        // An id and a tag select the same account, and the order is the provider's, not the
+        // selector's.
+        let mut config = selected_config();
+        let mut c = combo("chain", "chain", &[("alpha", "m")]);
+        c.steps[0].accounts = vec!["bob".into(), "a1".into()];
+        config.combos.push(c);
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+        assert_eq!(
+            snapshot.combos()[0].steps[0].accounts.as_ref().unwrap(),
+            &vec![AccountId::from_raw("a1"), AccountId::from_raw("a2")]
+        );
+    }
+
+    /// A selection that matches only a disabled account is an empty set, not "all": widening it
+    /// back would send traffic through an account the operator deliberately excluded.
+    #[test]
+    fn a_selection_of_only_disabled_accounts_stays_empty() {
+        let mut config = selected_config();
+        let mut c = combo("chain", "chain", &[("alpha", "m")]);
+        c.steps[0].accounts = vec!["a3".into()];
+        config.combos.push(c);
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+        assert_eq!(
+            snapshot.combos()[0].steps[0].accounts.as_ref().unwrap(),
+            &Vec::<AccountId>::new()
+        );
+    }
+
+    /// The selection survives the snapshot, and a snapshot naming an account the provider does not
+    /// have is refused rather than silently ignored.
+    #[test]
+    fn the_account_selection_round_trips_and_is_checked() {
+        let mut config = selected_config();
+        let mut c = combo("chain", "chain", &[("alpha", "m")]);
+        c.steps[0].accounts = vec!["alice".into()];
+        config.combos.push(c);
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+        let decoded = RoutingSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+        assert_eq!(decoded, snapshot);
+        assert_eq!(
+            decoded.combos()[0].steps[0].accounts.as_ref().unwrap(),
+            &vec![AccountId::from_raw("a1")]
+        );
+
+        // Corrupt the account id in the payload: the decoder must refuse it, because a step that
+        // selects an account the provider does not have could never run.
+        let mut bytes = snapshot.encode().unwrap();
+        let needle = b"a1";
+        let at = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("the account id is in the payload");
+        bytes[at] = b'z';
+        bytes[at + 1] = b'z';
+        let error = RoutingSnapshot::decode(&bytes).unwrap_err().to_string();
+        assert!(
+            error.contains("selects unknown account") || error.contains("checksum"),
+            "{error}"
+        );
+    }
+
+    /// Tagging an account for a person is enough: the compiled plan carries that person's proxy
+    /// with no per-account configuration.
+    #[test]
+    fn a_person_tag_puts_their_proxy_in_the_plan() {
+        let mut config = selected_config();
+        config.proxies.push(proxy("laptop"));
+        config
+            .people
+            .push(crate::config::PersonConfig::new("alice", "laptop"));
+        config
+            .combos
+            .push(combo("chain", "chain", &[("alpha", "m")]));
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+        let accounts = &snapshot.providers()[0].accounts;
+        assert_eq!(accounts[0].proxy.as_deref(), Some("laptop"));
+        assert_eq!(accounts[1].proxy, None, "bob has no person configured");
+        // The account's own choice still wins over the person's.
+        let mut config = selected_config();
+        config.proxies.push(proxy("laptop"));
+        config.proxies.push(proxy("office"));
+        config
+            .people
+            .push(crate::config::PersonConfig::new("alice", "laptop"));
+        config.providers[0].accounts[0].proxy = Some("office".into());
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+        assert_eq!(
+            snapshot.providers()[0].accounts[0].proxy.as_deref(),
+            Some("office")
+        );
     }
 }

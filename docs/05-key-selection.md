@@ -31,6 +31,13 @@ Two facts about that list matter for everything below:
   never evaluates that flag. This is why `AccountState::Disabled` in a live table can only come from a
   change made after the snapshot was compiled — and why that change triggers a recompile instead.
 
+A combo step may also narrow the pool before any strategy runs: `StepPlan::accounts` is `None` for
+"every account of this provider" and `Some(list)` for the accounts the operator selected by id or by
+tag. The filter is applied to the candidate list first, so everything below — the strategy, the
+cooldown checks, the failover — operates on the smaller set, and a healthy account the step excluded
+is never used to rescue it. That is a separate concern from the strategy and is documented in
+[accounts, tags and egress](32-accounts-tags-and-egress.md) §1.
+
 ### The declared balance, and the one route ranked by it
 
 `AccountPlan` also carries `credit_cents`, compiled from an account's optional `credit_usd`. It is the
@@ -452,6 +459,7 @@ Observe it in two places:
 - [Configuration](03-configuration.md) — `key_strategy` in the authored file, and §11 on per-account health
 - [Routing snapshot](04-routing-snapshot.md) — the `AccountPlan` the relay selects from
 - [Combos](06-combos.md) — `reset-aware-priority` as a combo strategy
+- [Accounts, tags and egress](32-accounts-tags-and-egress.md) — narrowing the pool per step, and where an account's traffic leaves from
 - [The hedged race](07-hedged-race.md) — what happens when the chosen step dies
 - [Security](21-security.md) — how a credential is attached once an account is chosen
 - [LLM_INDEX](LLM_INDEX.md) — the `KeyStrategy` and `AccountState` vocabularies

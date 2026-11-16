@@ -165,6 +165,13 @@ What Manarouter does about it:
 It is the operator's account and the operator's decision. The job of this software is to make the
 tradeoff legible, not to make it for them.
 
+A per-account proxy does not change any of that. It exists so that an account belonging to one person
+can leave through that person's own machine — a Tailscale peer, a home connection — rather than
+through the router's host, and so that a provider sees the address the account normally uses. It is
+not an anonymity layer: the credential is still the account's, the fingerprint is still the
+first-party one, and the provider still sees the same account. See
+[accounts, tags and egress](32-accounts-tags-and-egress.md) §3.
+
 ---
 
 ## 6. Public OAuth client identifiers in this repository

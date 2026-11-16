@@ -196,6 +196,7 @@ mod tests {
             input_modalities: 1,
             pricing: None,
             context_length: None,
+            accounts: None,
         }
     }
 

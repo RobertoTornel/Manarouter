@@ -84,6 +84,13 @@ pub struct AddArgs {
     /// Hedging eligibility window in milliseconds (with --hedge).
     #[arg(long, value_name = "MS")]
     pub window_ms: Option<u64>,
+    /// Which accounts the steps may use: an account id, or a tag (bare or `tag:<name>`).
+    ///
+    /// Applies to every step of the new combo, so it is only useful when the steps share a
+    /// provider. Omit it to let every account serve, which is the default. Use
+    /// `mr combo step accounts` to set one step's selection afterwards.
+    #[arg(long = "accounts", value_name = "SELECTOR", value_delimiter = ',')]
+    pub accounts: Vec<String>,
 }
 
 impl AddArgs {
@@ -106,6 +113,22 @@ pub enum StepCmd {
         /// Insert position instead of appending (0-based).
         #[arg(long, value_name = "INDEX")]
         at: Option<usize>,
+        /// Which accounts this step may use: an account id, or a tag (bare or `tag:<name>`).
+        #[arg(long = "accounts", value_name = "SELECTOR", value_delimiter = ',')]
+        accounts: Vec<String>,
+    },
+    /// Choose which accounts one step may use (replaces the current selection).
+    Accounts {
+        /// Combo name or id.
+        name: String,
+        /// Step index, as printed by `combo show`.
+        index: usize,
+        /// Account ids or tags. Omit with --all to let every account serve again.
+        #[arg(long = "accounts", value_name = "SELECTOR", value_delimiter = ',')]
+        accounts: Vec<String>,
+        /// Clear the selection, so every account of the step's provider may serve.
+        #[arg(long, conflicts_with = "accounts")]
+        all: bool,
     },
     /// Delete one step by index.
     Remove {
@@ -266,6 +289,11 @@ fn add(ctx: &Ctx, args: AddArgs) -> Result<(), CliError> {
     let first = specs.remove(0);
     let mut combo = Combo::new(&name, first);
     combo.steps.extend(specs); // flag order, preserved exactly
+    if !args.accounts.is_empty() {
+        for step in &mut combo.steps {
+            step.accounts = args.accounts.clone();
+        }
+    }
 
     if let Some(strategy) = &args.strategy {
         combo.strategy = parse_choice(
@@ -390,7 +418,7 @@ fn show(ctx: &Ctx, name: &str) -> Result<(), CliError> {
     ]);
     t.print();
 
-    let mut s = Table::new(["#", "PROVIDER", "MODEL", "WEIGHT", "ON", "NOTE"]);
+    let mut s = Table::new(["#", "PROVIDER", "MODEL", "WEIGHT", "ON", "ACCOUNTS", "NOTE"]);
     for (i, step) in c.steps.iter().enumerate() {
         s.row(vec![
             i.to_string(),
@@ -398,6 +426,13 @@ fn show(ctx: &Ctx, name: &str) -> Result<(), CliError> {
             step.model.clone(),
             step.weight.to_string(),
             if step.enabled { "yes" } else { "no" }.to_owned(),
+            // "all" is the default and the common case; spelling it out is what makes a
+            // restricted step visible at a glance.
+            if step.accounts.is_empty() {
+                "all".to_owned()
+            } else {
+                step.accounts.join(",")
+            },
             step.note.clone().unwrap_or_default(),
         ]);
     }
@@ -493,16 +528,34 @@ fn set_enabled(ctx: &Ctx, name: &str, enabled: bool) -> Result<(), CliError> {
 
 fn step_cmd(ctx: &Ctx, cmd: StepCmd) -> Result<(), CliError> {
     match cmd {
-        StepCmd::Add { name, step, at } => step_add(ctx, &name, &step, at),
+        StepCmd::Add {
+            name,
+            step,
+            at,
+            accounts,
+        } => step_add(ctx, &name, &step, at, &accounts),
+        StepCmd::Accounts {
+            name,
+            index,
+            accounts,
+            all,
+        } => step_accounts(ctx, &name, index, &accounts, all),
         StepCmd::Remove { name, index } => step_remove(ctx, &name, index),
         StepCmd::Move { name, from, to } => step_move(ctx, &name, from, to),
     }
 }
 
-fn step_add(ctx: &Ctx, name: &str, spec: &str, at: Option<usize>) -> Result<(), CliError> {
+fn step_add(
+    ctx: &Ctx,
+    name: &str,
+    spec: &str,
+    at: Option<usize>,
+    accounts: &[String],
+) -> Result<(), CliError> {
     let mut cfg = ctx.load()?;
     // Validate the new step (provider must exist) before touching the combo.
-    let step = build_step(&cfg, spec)?;
+    let mut step = build_step(&cfg, spec)?;
+    step.accounts = accounts.to_vec();
     let idx = combo_position(&cfg, name)?;
     let combo = &mut cfg.combos[idx];
     let len = combo.steps.len();
@@ -532,6 +585,105 @@ fn step_add(ctx: &Ctx, name: &str, spec: &str, at: Option<usize>) -> Result<(), 
             "name": combo_name,
             "index": insert_at,
             "step": step,
+        }),
+    )
+}
+
+/// Replace one step's account selection.
+///
+/// The selectors are checked against the step's own provider here, so a typo is reported against
+/// the flag that caused it rather than as a configuration problem from `save`. `Config::validate`
+/// checks the same thing again — this is the friendlier of the two messages, not a second rule.
+fn step_accounts(
+    ctx: &Ctx,
+    name: &str,
+    index: usize,
+    accounts: &[String],
+    all: bool,
+) -> Result<(), CliError> {
+    if accounts.is_empty() && !all {
+        return Err(CliError::usage(
+            "step accounts needs --accounts <selector>, or --all to let every account serve",
+        ));
+    }
+    let mut cfg = ctx.load()?;
+    let idx = combo_position(&cfg, name)?;
+    let combo = &mut cfg.combos[idx];
+    let len = combo.steps.len();
+    if index >= len {
+        return Err(CliError::usage(format!(
+            "step index {index} is out of range: combo `{}` has {len} step(s), so the valid \
+             indices are 0..{}",
+            combo.name,
+            len.saturating_sub(1)
+        )));
+    }
+    let provider_id = combo.steps[index].provider.clone();
+    let provider = require_provider(&cfg, provider_id.as_str())?;
+    let mut selected = Vec::new();
+    for selector in accounts {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Err(CliError::usage("an account selector cannot be empty"));
+        }
+        if !provider
+            .accounts
+            .iter()
+            .any(|a| mr_core::model::account_selector_matches(selector, a))
+        {
+            let known: Vec<String> = provider
+                .accounts
+                .iter()
+                .map(|a| match a.label.as_deref() {
+                    Some(label) => format!("{label} ({})", a.id),
+                    None => a.id.as_str().to_owned(),
+                })
+                .collect();
+            let mut e = CliError::not_found(format!(
+                "`{selector}` matches no account of provider `{provider_id}`"
+            ));
+            e = if known.is_empty() {
+                e.with_detail(format!("`{provider_id}` has no accounts"))
+            } else {
+                e.with_detail(format!("accounts: {}", known.join(", ")))
+            };
+            return Err(
+                e.with_detail("a selector is an account id, or a tag (bare or `tag:<name>`)")
+            );
+        }
+        if !selected.iter().any(|s: &String| s == selector) {
+            selected.push(selector.to_owned());
+        }
+    }
+    let combo = &mut cfg.combos[idx];
+    combo.steps[index].accounts = selected.clone();
+    let combo_name = combo.name.clone();
+    let step_desc = format!(
+        "{}/{}",
+        combo.steps[index].provider.as_str(),
+        combo.steps[index].model
+    );
+    let out = ctx.save(&cfg)?;
+    let human = if selected.is_empty() {
+        vec![format!(
+            "step {index} of `{combo_name}` ({step_desc}) may use every account again"
+        )]
+    } else {
+        vec![
+            format!(
+                "step {index} of `{combo_name}` ({step_desc}) may use: {}",
+                selected.join(", ")
+            ),
+            "accounts not named here are not tried for this step".to_owned(),
+        ]
+    };
+    ctx.finish(
+        &out,
+        human,
+        serde_json::json!({
+            "name": combo_name,
+            "index": index,
+            "accounts": selected,
         }),
     )
 }
@@ -644,6 +796,7 @@ mod tests {
             hedge: false,
             participants: None,
             window_ms: None,
+            accounts: Vec::new(),
         }
     }
 
@@ -757,6 +910,7 @@ mod tests {
                     name: "Chain".into(),
                     step: "openai/b".into(),
                     at: Some(4),
+                    accounts: Vec::new(),
                 },
             )
             .unwrap_err();
@@ -768,6 +922,7 @@ mod tests {
                     name: "Chain".into(),
                     step: "openai/b".into(),
                     at: Some(1),
+                    accounts: Vec::new(),
                 },
             )
             .unwrap();
@@ -997,5 +1152,140 @@ mod tests {
         assert_eq!(parse_participants("1,1", 3).unwrap_err().exit, Exit::Usage);
         assert_eq!(parse_participants("", 3).unwrap_err().exit, Exit::Usage);
         assert_eq!(parse_participants("x", 3).unwrap_err().exit, Exit::Usage);
+    }
+
+    /// A provider with two accounts, one tagged for a person, so a selector has something to match.
+    fn seed_tagged() {
+        let mut cfg = Config::default();
+        let mut p = mr_core::model::Provider::new(
+            "alpha",
+            mr_core::dialect::Dialect::OpenAi,
+            "http://127.0.0.1:9/v1",
+        );
+        let mut mine = mr_core::model::Account::new("mine");
+        mine.id = mr_core::ids::AccountId::from_raw("a1");
+        mine.tags.push("alice".to_owned());
+        let mut theirs = mr_core::model::Account::new("theirs");
+        theirs.id = mr_core::ids::AccountId::from_raw("a2");
+        theirs.tags.push("bob".to_owned());
+        p.accounts = vec![mine, theirs];
+        cfg.providers.push(p);
+        cfg.save_default().unwrap();
+    }
+
+    #[test]
+    fn a_step_can_be_limited_to_one_account_and_let_go_again() {
+        with_config_dir("combo-accounts", |_| {
+            seed_tagged();
+            let ctx = Ctx { json: false };
+            block_on(run(ComboCmd::Add(add_args("Chain", &["alpha/m"])), &ctx)).unwrap();
+
+            run_step(
+                &ctx,
+                StepCmd::Accounts {
+                    name: "Chain".into(),
+                    index: 0,
+                    accounts: vec!["alice".into()],
+                    all: false,
+                },
+            )
+            .unwrap();
+            let cfg = Config::load_default().unwrap();
+            assert_eq!(cfg.combo("Chain").unwrap().steps[0].accounts, ["alice"]);
+
+            // `--all` is the way back to the default, and it is not the same as an empty selector.
+            run_step(
+                &ctx,
+                StepCmd::Accounts {
+                    name: "Chain".into(),
+                    index: 0,
+                    accounts: Vec::new(),
+                    all: true,
+                },
+            )
+            .unwrap();
+            let cfg = Config::load_default().unwrap();
+            assert!(cfg.combo("Chain").unwrap().steps[0].accounts.is_empty());
+        });
+    }
+
+    #[test]
+    fn a_step_selection_needs_a_selector_or_all() {
+        with_config_dir("combo-accounts", |_| {
+            seed_tagged();
+            let ctx = Ctx { json: false };
+            block_on(run(ComboCmd::Add(add_args("Chain", &["alpha/m"])), &ctx)).unwrap();
+            let err = run_step(
+                &ctx,
+                StepCmd::Accounts {
+                    name: "Chain".into(),
+                    index: 0,
+                    accounts: Vec::new(),
+                    all: false,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err.exit, Exit::Usage, "{err}");
+        });
+    }
+
+    #[test]
+    fn a_step_selection_naming_nothing_is_refused() {
+        with_config_dir("combo-accounts", |_| {
+            seed_tagged();
+            let ctx = Ctx { json: false };
+            block_on(run(ComboCmd::Add(add_args("Chain", &["alpha/m"])), &ctx)).unwrap();
+            let err = run_step(
+                &ctx,
+                StepCmd::Accounts {
+                    name: "Chain".into(),
+                    index: 0,
+                    accounts: vec!["nobody".into()],
+                    all: false,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err.exit, Exit::NotFound, "{err}");
+            // Nothing was written, so the step still serves every account.
+            let cfg = Config::load_default().unwrap();
+            assert!(cfg.combo("Chain").unwrap().steps[0].accounts.is_empty());
+        });
+    }
+
+    #[test]
+    fn a_step_selection_is_range_checked() {
+        with_config_dir("combo-accounts", |_| {
+            seed_tagged();
+            let ctx = Ctx { json: false };
+            block_on(run(ComboCmd::Add(add_args("Chain", &["alpha/m"])), &ctx)).unwrap();
+            let err = run_step(
+                &ctx,
+                StepCmd::Accounts {
+                    name: "Chain".into(),
+                    index: 3,
+                    accounts: vec!["alice".into()],
+                    all: false,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err.exit, Exit::Usage, "{err}");
+        });
+    }
+
+    /// `combo add --accounts` applies to every step, which is the shorthand for a combo whose steps
+    /// share a provider.
+    #[test]
+    fn combo_add_can_limit_every_step_at_once() {
+        with_config_dir("combo-accounts", |_| {
+            seed_tagged();
+            let ctx = Ctx { json: false };
+            let mut args = add_args("Chain", &["alpha/m", "alpha/m"]);
+            args.accounts = vec!["bob".into()];
+            block_on(run(ComboCmd::Add(args), &ctx)).unwrap();
+            let cfg = Config::load_default().unwrap();
+            for step in &cfg.combo("Chain").unwrap().steps {
+                assert_eq!(step.accounts, ["bob"]);
+            }
+        });
     }
 }

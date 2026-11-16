@@ -121,6 +121,12 @@ pub struct Config {
     /// Upstream proxies, in operator-chosen order.
     pub proxies: Vec<ProxyConfig>,
 
+    /// People whose accounts egress through their own machine, by account tag.
+    ///
+    /// Empty is the normal case for a single-operator install: every account then egresses the way
+    /// its provider does. See [`PersonConfig`].
+    pub people: Vec<PersonConfig>,
+
     /// How to choose among the eligible proxies.
     pub proxy_strategy: ProxyStrategy,
 
@@ -510,6 +516,52 @@ impl ProxyConfig {
     }
 }
 
+/// One person whose accounts egress through their own machine.
+///
+/// This is the join between two things the operator already writes down separately: an account
+/// carries [`crate::Account::tags`], and a proxy carries an endpoint. A person says "the accounts
+/// tagged `alice` leave through the proxy `alice-laptop`", and from then on tagging an account is
+/// all it takes to route it through her machine.
+///
+/// The proxy is normally a Tailscale peer's SOCKS5 listener — `socks5h://100.64.0.7:1080`, with
+/// the `h` so the *peer* resolves the provider's hostname and the request leaves from her network
+/// rather than from this one. A full `tailscale up --exit-node` is machine-wide and cannot be
+/// per-account, which is exactly why the per-account proxy is the mechanism here.
+///
+/// A person is a convenience, not a second source of truth: an account that names its own
+/// [`crate::Account::proxy`] keeps it, and a person whose proxy is disabled or missing simply
+/// leaves their accounts on the provider's egress.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersonConfig {
+    /// The account tag that identifies this person. Matched case-insensitively.
+    pub tag: String,
+    /// The proxy their accounts egress through, by [`ProxyConfig::id`].
+    pub proxy: String,
+    /// Human label for the panel, when the tag is not the name to show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Fields this binary does not know about, preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl PersonConfig {
+    /// A person with no label beyond their tag.
+    pub fn new(tag: impl Into<String>, proxy: impl Into<String>) -> Self {
+        Self {
+            tag: tag.into(),
+            proxy: proxy.into(),
+            label: None,
+            extra: Map::new(),
+        }
+    }
+
+    /// The name to show a person: the label when there is one, the tag otherwise.
+    pub fn display(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.tag)
+    }
+}
+
 /// How to choose among the eligible proxies.
 ///
 /// The same vocabulary the account [`crate::dialect::KeyStrategy`] uses, on purpose: an operator
@@ -621,6 +673,7 @@ impl Default for Config {
             latency: LatencyConfig::default(),
             routing: RoutingConfig::default(),
             proxies: Vec::new(),
+            people: Vec::new(),
             proxy_strategy: ProxyStrategy::default(),
             no_key_required: false,
             allow_remote_without_key: false,
@@ -1033,6 +1086,14 @@ impl Config {
                 )
             })
             .collect();
+        // Accounts per provider, for checking a step's account selection. Both the ids and the
+        // tags are needed: a selector may name either, and a selector that names neither is a typo
+        // that would otherwise make the step silently unusable at request time.
+        let accounts_by_provider: BTreeMap<&str, Vec<&crate::model::Account>> = self
+            .providers
+            .iter()
+            .map(|p| (p.id.as_str(), p.accounts.iter().collect()))
+            .collect();
         let mut combo_ids = BTreeMap::new();
         let mut combo_names = BTreeMap::new();
         for c in &self.combos {
@@ -1073,6 +1134,15 @@ impl Config {
                 let Some(provider) = providers_by_id.get(step.provider.as_str()) else {
                     continue; // an unknown provider is already reported above
                 };
+                let accounts = accounts_by_provider
+                    .get(step.provider.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                for selector in &step.accounts {
+                    if let Some(problem) = account_selector_problem(selector, accounts) {
+                        problems.push(format!("combo {}: step {} {problem}", c.id, index + 1));
+                    }
+                }
                 if let Some(level) = step.level {
                     if let Some(reason) = provider.unsendable_level_reason(level) {
                         problems.push(format!(
@@ -1172,6 +1242,7 @@ impl Config {
         problems.extend(self.validate_routing());
         problems.extend(self.validate_quota_probe());
         problems.extend(self.validate_proxies());
+        problems.extend(self.validate_people());
         problems.extend(self.validate_keyless());
 
         problems
@@ -1261,6 +1332,37 @@ impl Config {
         problems
     }
 
+    /// Validate the people list and every reference into it.
+    ///
+    /// A person is a join between a tag and a proxy, so both halves are checked: an empty or
+    /// duplicated tag would make "whose accounts are these" ambiguous, and a proxy id that names
+    /// nothing would leave the person's accounts egressing directly while the operator believes
+    /// they leave through her machine. A *disabled* proxy is not a problem — that is a person whose
+    /// machine is off, and the documented behaviour is to fall back to a direct connection.
+    fn validate_people(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let mut seen: BTreeMap<String, ()> = BTreeMap::new();
+        for person in &self.people {
+            let tag = person.tag.trim();
+            if tag.is_empty() {
+                problems.push("person with an empty tag".to_string());
+                continue;
+            }
+            if seen.insert(tag.to_ascii_lowercase(), ()).is_some() {
+                problems.push(format!("duplicate person tag {tag:?}"));
+            }
+            if person.proxy.trim().is_empty() {
+                problems.push(format!("person {tag:?} names no proxy"));
+            } else if self.proxy(&person.proxy).is_none() {
+                problems.push(format!(
+                    "person {tag:?} egresses through unknown proxy {:?}",
+                    person.proxy
+                ));
+            }
+        }
+        problems
+    }
+
     /// Refuse an unauthenticated relay that anyone on the network could reach.
     ///
     /// The startup path performs the same check against the address it is about to bind; doing it
@@ -1332,6 +1434,29 @@ impl Config {
         self.proxies.iter().find(|p| p.id == id)
     }
 
+    /// The person whose tag is `tag`, if any.
+    ///
+    /// Case-insensitive for the same reason [`crate::Account::has_tag`] is: the tag is typed by a
+    /// person, and a case difference is not a different person.
+    pub fn person_for_tag(&self, tag: &str) -> Option<&PersonConfig> {
+        let wanted = tag.trim();
+        if wanted.is_empty() {
+            return None;
+        }
+        self.people
+            .iter()
+            .find(|p| p.tag.trim().eq_ignore_ascii_case(wanted))
+    }
+
+    /// The person an account belongs to, by the first of its tags that names one.
+    ///
+    /// First rather than last so the order the operator wrote the tags in is the order that
+    /// decides, which is the only order they can see. An account tagged for two people egresses
+    /// through the first one's machine; the second tag still selects it for a combo step.
+    pub fn person_for_account(&self, account: &crate::model::Account) -> Option<&PersonConfig> {
+        account.tags.iter().find_map(|tag| self.person_for_tag(tag))
+    }
+
     /// Every enabled proxy, for selection.
     pub fn enabled_proxies(&self) -> Vec<&ProxyConfig> {
         self.proxies.iter().filter(|p| p.enabled).collect()
@@ -1341,7 +1466,9 @@ impl Config {
     ///
     /// The account's choice wins over the provider's, which is the whole reason both exist: several
     /// accounts on one provider where only one needs to egress elsewhere is the case an operator
-    /// actually hits. A reference to a proxy that is missing or disabled resolves to `None`, which
+    /// actually hits. Between the two sits the person the account is tagged for, so tagging an
+    /// account is enough to send it through that person's machine without repeating the proxy id on
+    /// every account. A reference to a proxy that is missing or disabled resolves to `None`, which
     /// means a direct connection — the request still goes out, because silently failing every
     /// request over a typo'd proxy id would be worse than egressing directly.
     pub fn effective_proxy(
@@ -1351,6 +1478,11 @@ impl Config {
     ) -> Option<&ProxyConfig> {
         let wanted = account
             .and_then(|a| a.proxy.as_deref())
+            .or_else(|| {
+                account
+                    .and_then(|a| self.person_for_account(a))
+                    .map(|person| person.proxy.as_str())
+            })
             .or(provider.proxy.as_deref())?;
         self.proxy(wanted).filter(|p| p.enabled)
     }
@@ -1447,6 +1579,9 @@ impl Config {
                 a.enabled.hash(&mut hasher);
                 a.models_allow.hash(&mut hasher);
                 a.models_deny.hash(&mut hasher);
+                // A tag decides which machine the account egresses from, so it is routing-relevant
+                // even though it reads like a note.
+                a.tags.hash(&mut hasher);
                 a.proxy.hash(&mut hasher);
             }
             for m in &p.models {
@@ -1482,6 +1617,13 @@ impl Config {
         // order as a tiebreak input for strategies that use declaration order, and include disabled
         // entries too: re-enabling one must invalidate the plan.
         self.proxy_strategy.hash(&mut hasher);
+        // A person joins a tag to a proxy, so both halves change where traffic leaves from.
+        for (person_index, person) in self.people.iter().enumerate() {
+            person_index.hash(&mut hasher);
+            person.tag.hash(&mut hasher);
+            person.proxy.hash(&mut hasher);
+            person.label.hash(&mut hasher);
+        }
         for (proxy_index, proxy) in self.proxies.iter().enumerate() {
             proxy_index.hash(&mut hasher);
             proxy.id.hash(&mut hasher);
@@ -1514,6 +1656,35 @@ impl Config {
         self.routing.defaults.file.hash(&mut hasher);
         hasher.finish()
     }
+}
+
+/// Why `selector` cannot select any account of `accounts`, if it cannot.
+///
+/// The selector vocabulary itself lives in [`crate::model::account_selector_matches`]; this only
+/// reports the two ways it can fail to name anything — an empty selector, and one that matches no
+/// account of the provider the step names. A selector that matches only *disabled* accounts is not
+/// reported: that is a deliberate state (the person is away, the key is parked), and the step
+/// becomes unusable rather than silently widening back to every account.
+fn account_selector_problem(selector: &str, accounts: &[&crate::model::Account]) -> Option<String> {
+    let trimmed = selector.trim();
+    if trimmed.is_empty() {
+        return Some("has an empty account selector".to_string());
+    }
+    if accounts
+        .iter()
+        .any(|account| crate::model::account_selector_matches(trimmed, account))
+    {
+        return None;
+    }
+    let known: Vec<&str> = accounts.iter().map(|a| a.id.as_str()).collect();
+    Some(format!(
+        "selects {trimmed:?}, which matches no account of this provider (accounts: {})",
+        if known.is_empty() {
+            "none".to_string()
+        } else {
+            known.join(", ")
+        }
+    ))
 }
 
 /// Walk combo targets and return the chain that closes a routing loop, if one exists.
@@ -3264,5 +3435,241 @@ mod tests {
         let cfg = Config::load(&p).unwrap();
         assert!(cfg.aliases.is_empty());
         assert!(migration_backup_path(&p).exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // people, tags and per-step account selection
+    // -----------------------------------------------------------------------
+
+    /// A provider with two accounts, one of them tagged for a person.
+    fn tagged_provider() -> Provider {
+        let mut p = provider("alpha");
+        let mut mine = account("mine");
+        mine.id = AccountId::from_raw("a1");
+        mine.tags.push("alice".into());
+        let mut theirs = account("theirs");
+        theirs.id = AccountId::from_raw("a2");
+        theirs.tags.push("bob".into());
+        p.accounts.push(mine);
+        p.accounts.push(theirs);
+        p
+    }
+
+    fn person(tag: &str, proxy: &str) -> PersonConfig {
+        PersonConfig::new(tag, proxy)
+    }
+
+    fn proxy_config(id: &str) -> ProxyConfig {
+        ProxyConfig {
+            id: id.into(),
+            label: None,
+            url: "socks5h://100.64.0.7:1080".into(),
+            username: None,
+            secret_ref: None,
+            enabled: true,
+            priority: 0,
+            extra: Map::new(),
+        }
+    }
+
+    #[test]
+    fn a_person_is_found_by_tag_whatever_the_case() {
+        let mut config = Config::default();
+        config.people.push(person("Alice", "laptop"));
+        assert_eq!(
+            config.person_for_tag("alice").map(|p| p.proxy.as_str()),
+            Some("laptop")
+        );
+        assert_eq!(
+            config.person_for_tag("  ALICE  ").map(|p| p.proxy.as_str()),
+            Some("laptop")
+        );
+        assert!(config.person_for_tag("bob").is_none());
+        assert!(config.person_for_tag("").is_none());
+    }
+
+    /// The tag is the whole configuration: naming a person on an account is what routes it through
+    /// that person's machine, with no second step.
+    #[test]
+    fn a_tag_that_names_a_person_supplies_the_egress() {
+        let mut config = Config::default();
+        config.proxies.push(proxy_config("laptop"));
+        config.people.push(person("alice", "laptop"));
+        let p = tagged_provider();
+        let mine = &p.accounts[0];
+        assert_eq!(
+            config.person_for_account(mine).map(|p| p.proxy.as_str()),
+            Some("laptop")
+        );
+        assert_eq!(
+            config
+                .effective_proxy(&p, Some(mine))
+                .map(|x| x.id.as_str()),
+            Some("laptop")
+        );
+    }
+
+    /// An account that names its own proxy keeps it: the person is a default, not an override.
+    #[test]
+    fn an_accounts_own_proxy_wins_over_its_person() {
+        let mut config = Config::default();
+        config.proxies.push(proxy_config("laptop"));
+        config.proxies.push(proxy_config("office"));
+        config.proxies.push(proxy_config("provider-wide"));
+        config.people.push(person("alice", "laptop"));
+        let mut p = tagged_provider();
+        p.proxy = Some("provider-wide".into());
+        p.accounts[0].proxy = Some("office".into());
+        assert_eq!(
+            config
+                .effective_proxy(&p, Some(&p.accounts[0]))
+                .map(|x| x.id.as_str()),
+            Some("office")
+        );
+        // The untagged account still falls through to the provider's own egress.
+        assert_eq!(
+            config
+                .effective_proxy(&p, Some(&p.accounts[1]))
+                .map(|x| x.id.as_str()),
+            Some("provider-wide")
+        );
+    }
+
+    /// The first tag that names a person wins, so an account tagged for two people is not ambiguous
+    /// at request time.
+    #[test]
+    fn the_first_tag_naming_a_person_decides_the_egress() {
+        let mut config = Config::default();
+        config.people.push(person("alice", "laptop"));
+        config.people.push(person("bob", "desktop"));
+        let mut p = provider("alpha");
+        let mut a = account("shared");
+        a.tags = vec!["bob".into(), "alice".into()];
+        p.accounts.push(a);
+        assert_eq!(
+            config
+                .person_for_account(&p.accounts[0])
+                .map(|p| p.proxy.as_str()),
+            Some("desktop")
+        );
+    }
+
+    #[test]
+    fn a_person_needs_a_tag_and_a_known_proxy() {
+        let mut config = Config::default();
+        config.proxies.push(proxy_config("laptop"));
+        config.people.push(person("", "laptop"));
+        config.people.push(person("alice", ""));
+        config.people.push(person("bob", "nowhere"));
+        config.people.push(person("ALICE", "laptop"));
+        let problems = config.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("person with an empty tag")),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("person \"alice\" names no proxy")),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("person \"bob\" egresses through unknown proxy \"nowhere\"")),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("duplicate person tag \"ALICE\"")),
+            "{problems:?}"
+        );
+    }
+
+    /// A disabled proxy is a deliberate pause, not a broken configuration: the accounts fall back
+    /// to a direct connection, which is the same thing the request path does.
+    #[test]
+    fn a_disabled_proxy_is_not_a_configuration_problem() {
+        let mut config = Config::default();
+        let mut paused = proxy_config("laptop");
+        paused.enabled = false;
+        config.proxies.push(paused);
+        config.people.push(person("alice", "laptop"));
+        assert!(config.validate().is_empty(), "{:?}", config.validate());
+    }
+
+    #[test]
+    fn a_selector_matches_an_id_or_a_tag() {
+        let mut a = account("mine");
+        a.id = AccountId::from_raw("a1");
+        a.tags.push("alice".into());
+        assert!(crate::model::account_selector_matches("a1", &a));
+        assert!(crate::model::account_selector_matches("alice", &a));
+        assert!(crate::model::account_selector_matches("tag:alice", &a));
+        assert!(crate::model::account_selector_matches("TAG:Alice", &a));
+        assert!(crate::model::account_selector_matches("  alice  ", &a));
+        assert!(!crate::model::account_selector_matches("bob", &a));
+        assert!(!crate::model::account_selector_matches("", &a));
+        assert!(!crate::model::account_selector_matches("tag:", &a));
+        // A multi-byte selector must not panic on the `tag:` prefix check.
+        assert!(!crate::model::account_selector_matches("tä", &a));
+    }
+
+    #[test]
+    fn a_step_selector_that_matches_nothing_is_a_configuration_problem() {
+        let mut config = Config::default();
+        config.providers.push(tagged_provider());
+        let mut c = combo("chain", "alpha");
+        c.steps[0].accounts = vec!["alice".into()];
+        config.combos.push(c);
+        assert!(config.validate().is_empty(), "{:?}", config.validate());
+
+        config.combos[0].steps[0].accounts = vec!["nobody".into()];
+        let problems = config.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("selects \"nobody\", which matches no account")),
+            "{problems:?}"
+        );
+
+        config.combos[0].steps[0].accounts = vec!["  ".into()];
+        let problems = config.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("has an empty account selector")),
+            "{problems:?}"
+        );
+    }
+
+    /// The selection is part of the routing digest, so editing it makes the relay reload.
+    #[test]
+    fn the_account_selection_changes_the_routing_digest() {
+        let mut config = Config::default();
+        config.providers.push(tagged_provider());
+        let mut c = combo("chain", "alpha");
+        config.combos.push(c.clone());
+        let before = config.routing_digest();
+        c.steps[0].accounts = vec!["alice".into()];
+        config.combos[0] = c;
+        assert_ne!(before, config.routing_digest());
+    }
+
+    /// Tags and people are part of the digest too: retagging an account changes where its traffic
+    /// leaves, which the relay must notice.
+    #[test]
+    fn tags_and_people_change_the_routing_digest() {
+        let mut config = Config::default();
+        config.providers.push(tagged_provider());
+        let before = config.routing_digest();
+        config.providers[0].accounts[0].tags.push("carol".into());
+        let retagged = config.routing_digest();
+        assert_ne!(before, retagged);
+        config.people.push(person("carol", "laptop"));
+        assert_ne!(retagged, config.routing_digest());
     }
 }

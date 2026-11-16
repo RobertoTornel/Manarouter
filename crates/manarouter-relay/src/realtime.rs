@@ -417,7 +417,7 @@ fn select_step<'a>(
     }
 
     let first_healthy = capable.iter().position(|(step, provider)| {
-        select::step_has_usable_account(provider, health, now_ms, &step.model)
+        select::step_has_usable_account(provider, health, now_ms, step)
     });
     let (step, provider) = capable[first_healthy.unwrap_or(0)];
     Selection::Found { step, provider }

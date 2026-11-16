@@ -1254,17 +1254,7 @@ async fn forward_with_bytes(
                     );
                 }
             };
-            let proxy = match resolve_proxy(&app, &table.snapshot, provider, account) {
-                Ok(choice) => choice,
-                Err(message) => {
-                    return error_response(
-                        StatusCode::BAD_GATEWAY,
-                        Dialect::OpenAi,
-                        "proxy_error",
-                        &message,
-                    );
-                }
-            };
+            let proxy = resolve_proxy(&app, &table.snapshot, provider, account);
             // Shaped before the request is built, because a shaper may itself dial the provider
             // (staging a file) and the body it returns is what this attempt sends.
             let shaped = shape(
@@ -1906,28 +1896,34 @@ struct ProxyChoice {
 /// per attempt rather than cached, for the same reason the provider credential is: the vault is
 /// the authority on what the current password is, and a cached copy would keep dialling with a
 /// password the operator has already rotated.
+/// The proxy this attempt should dial, or `None` for a direct connection.
+///
+/// A proxy that cannot be used at all — a missing vault secret, an unreadable credential, an
+/// endpoint the relay cannot dial — is a configuration problem, and the answer is a **direct
+/// connection with a warning**, not a failed request. The operator's intent is that traffic leaves
+/// through the proxy; their stronger intent is that the request is served. A typo in a secret
+/// reference must not take a provider offline, and a person's laptop being asleep must not stop
+/// their accounts from working.
+///
+/// This is the *configuration* half of the fallback. The transport half lives in
+/// [`crate::upstream`]: a tunnel that cannot be established is retried once directly, while a
+/// request that may already have been sent is not.
 fn resolve_proxy(
     app: &AppState,
     snapshot: &mr_core::snapshot::RoutingSnapshot,
     provider: &mr_core::snapshot::ProviderPlan,
     account: &mr_core::snapshot::AccountPlan,
-) -> Result<Option<ProxyChoice>, String> {
+) -> Option<ProxyChoice> {
     let wanted = account.proxy.as_deref().or(provider.proxy.as_deref());
     let plan = match wanted {
-        Some(id) => match snapshot.proxy(id) {
-            Some(plan) => plan,
-            // Disabled: a direct connection, as `Config::effective_proxy` documents.
-            None => return Ok(None),
-        },
+        // Disabled: a direct connection, as `Config::effective_proxy` documents.
+        Some(id) => snapshot.proxy(id)?,
         None => {
             let pool = snapshot.proxies();
             if pool.is_empty() {
-                return Ok(None);
+                return None;
             }
-            match proxy::choose(pool, snapshot.proxy_strategy(), app.relay.proxy_selection()) {
-                Some(plan) => plan,
-                None => return Ok(None),
-            }
+            proxy::choose(pool, snapshot.proxy_strategy(), app.relay.proxy_selection())?
         }
     };
 
@@ -1935,28 +1931,41 @@ fn resolve_proxy(
         Some(secret_ref) => match app.vault.get(secret_ref) {
             Ok(Some(password)) => Some(password),
             Ok(None) => {
-                return Err(format!(
-                    "the proxy `{}` names the vault secret `{}`, which does not exist",
-                    plan.id, secret_ref
-                ));
+                tracing::warn!(
+                    proxy = %plan.id,
+                    secret_ref,
+                    "the proxy names a vault secret that does not exist; connecting directly"
+                );
+                return None;
             }
             Err(e) => {
-                return Err(format!(
-                    "the credential for the proxy `{}` could not be read: {e}",
-                    plan.id
-                ));
+                tracing::warn!(
+                    proxy = %plan.id,
+                    error = %e,
+                    "the proxy credential could not be read; connecting directly"
+                );
+                return None;
             }
         },
         None => None,
     };
 
-    let endpoint = ProxyEndpoint::from_plan(plan, password.as_deref())
-        .map_err(|e| format!("the proxy `{}` is not usable: {e}", plan.id))?;
+    let endpoint = match ProxyEndpoint::from_plan(plan, password.as_deref()) {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            tracing::warn!(
+                proxy = %plan.id,
+                error = %e,
+                "the proxy is not usable; connecting directly"
+            );
+            return None;
+        }
+    };
     let lease = app.relay.proxy_selection().lease(&plan.id);
-    Ok(Some(ProxyChoice {
+    Some(ProxyChoice {
         endpoint,
         _lease: lease,
-    }))
+    })
 }
 
 /// The request path, with the modality-fallback budget and the snapshot generation it may use.
@@ -2183,12 +2192,7 @@ async fn dispatch_routed(
                             .providers()
                             .get(step.provider_index as usize)
                             .is_some_and(|provider| {
-                                select::step_has_usable_account(
-                                    provider,
-                                    &health,
-                                    now_ms,
-                                    &step.model,
-                                )
+                                select::step_has_usable_account(provider, &health, now_ms, step)
                             })
                     },
                     std::time::Instant::now(),
@@ -3159,6 +3163,14 @@ async fn attempt_step(
             &step.model,
         )
     };
+    // A step that names an account selection may be served by those accounts only. The filter is
+    // applied to the selected list rather than inside the selectors so ordering, cooldown and
+    // model checks keep their single implementation, and so a narrowed step still fails over
+    // among the accounts it was given.
+    let candidates: Vec<&mr_core::snapshot::AccountPlan> = candidates
+        .into_iter()
+        .filter(|account| select::step_allows_account(step, account))
+        .collect();
     if candidates.is_empty() {
         if is_sticky_step {
             if let Some(combo) = combo {
@@ -3481,22 +3493,10 @@ async fn attempt_step(
     // that is the whole reason the override exists.
     //
     // A proxy that cannot be used at all — a missing vault secret, an unusable URL — is a
-    // configuration problem, and the request fails rather than quietly going out directly. The
-    // failure is deliberately *not* a routing fallback: trying the next step would send the
-    // request somewhere the operator did not intend.
-    let proxy = match resolve_proxy(app, &table.snapshot, provider, account) {
-        Ok(choice) => choice,
-        Err(message) => {
-            return Attempt::Fatal {
-                response: error_response(
-                    StatusCode::BAD_GATEWAY,
-                    client_dialect,
-                    "proxy_error",
-                    &message,
-                ),
-            };
-        }
-    };
+    // configuration problem, and the attempt goes out directly with a warning rather than failing.
+    // The operator's intent is that traffic leaves through the proxy; their stronger intent is that
+    // the request is served, and a typo in a secret reference must not take a provider offline.
+    let proxy = resolve_proxy(app, &table.snapshot, provider, account);
     let proxy_endpoint = proxy.as_ref().map(|choice| choice.endpoint.clone());
     // Does this attempt's provider already hold a reservation made on its behalf?
     //
@@ -6108,9 +6108,7 @@ fn step_has_a_live_account(
         .snapshot
         .providers()
         .get(step.provider_index as usize)
-        .is_some_and(|provider| {
-            select::step_has_usable_account(provider, &health, now_ms, &step.model)
-        })
+        .is_some_and(|provider| select::step_has_usable_account(provider, &health, now_ms, step))
 }
 
 fn build_response(
@@ -6736,6 +6734,7 @@ mod tests {
             input_modalities: 1,
             pricing: None,
             context_length: None,
+            accounts: None,
         }
     }
 
@@ -9562,6 +9561,219 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         (state, text_seen, vision_seen)
     }
 
+    /// A fake upstream that records the credential each request carried, so a test can tell which
+    /// account served it.
+    async fn auth_recording_upstream() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(move |headers: HeaderMap| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let credential = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                sink.lock().unwrap().push(credential);
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// A relay with one provider, two accounts and a combo whose single step may use `selection`.
+    ///
+    /// The accounts are ordered so that the *first* one is the one a selection would exclude: if the
+    /// filter were ignored, the recorded credential would be `sk-first`.
+    async fn selection_state(
+        selection: Vec<String>,
+    ) -> (AppState, Arc<std::sync::Mutex<Vec<String>>>) {
+        let (url, seen) = auth_recording_upstream().await;
+
+        let mut provider = mr_core::model::Provider::new("alpha", Dialect::OpenAi, &url);
+        let mut first = mr_core::model::Account::new("first");
+        first.id = mr_core::ids::AccountId::from_raw("a1");
+        first.priority = 0;
+        first.secret_ref = Some("first-credential".to_owned());
+        let mut second = mr_core::model::Account::new("second");
+        second.id = mr_core::ids::AccountId::from_raw("a2");
+        second.priority = 1;
+        second.secret_ref = Some("second-credential".to_owned());
+        provider.accounts = vec![first, second];
+        let mut entry = dm();
+        entry.id = "shared-model".to_owned();
+        entry.input_modalities = vec![InputModality::Text];
+        provider.models = vec![entry];
+
+        let mut combo = mr_core::model::Combo::new(
+            "chain",
+            mr_core::model::ComboStep::new("alpha", "shared-model"),
+        );
+        combo.steps[0].accounts = selection;
+
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            combos: vec![combo],
+            ..Default::default()
+        };
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("first-credential", "sk-first").unwrap();
+        opened.put("second-credential", "sk-second").unwrap();
+        let vault = Arc::new(opened);
+
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+        (state, seen)
+    }
+
+    fn selection_body() -> String {
+        serde_json::json!({
+            "model": "chain",
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        .to_string()
+    }
+
+    /// Without a selection the first account serves, which is what makes the next test meaningful.
+    #[tokio::test]
+    async fn a_step_without_a_selection_uses_the_first_account() {
+        let (state, seen) = selection_state(Vec::new()).await;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(selection_body()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.lock().unwrap().as_slice(), ["Bearer sk-first"]);
+    }
+
+    /// A step that names one account must not try the other, even though the other is first in
+    /// priority order and healthy.
+    #[tokio::test]
+    async fn a_step_selection_keeps_the_other_accounts_out_of_the_request() {
+        let (state, seen) = selection_state(vec!["a2".to_owned()]).await;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(selection_body()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["Bearer sk-second"],
+            "the excluded account was tried anyway"
+        );
+    }
+
+    /// A tag selects the same way an id does, which is the point of tagging: a combo step can say
+    /// "my accounts" without naming each one.
+    #[tokio::test]
+    async fn a_step_selection_by_tag_picks_the_tagged_account() {
+        let (url, seen) = auth_recording_upstream().await;
+        let mut provider = mr_core::model::Provider::new("alpha", Dialect::OpenAi, &url);
+        let mut first = mr_core::model::Account::new("first");
+        first.id = mr_core::ids::AccountId::from_raw("a1");
+        first.priority = 0;
+        first.secret_ref = Some("first-credential".to_owned());
+        let mut second = mr_core::model::Account::new("second");
+        second.id = mr_core::ids::AccountId::from_raw("a2");
+        second.priority = 1;
+        second.secret_ref = Some("second-credential".to_owned());
+        second.tags.push("alice".to_owned());
+        provider.accounts = vec![first, second];
+        let mut entry = dm();
+        entry.id = "shared-model".to_owned();
+        entry.input_modalities = vec![InputModality::Text];
+        provider.models = vec![entry];
+
+        let mut combo = mr_core::model::Combo::new(
+            "chain",
+            mr_core::model::ComboStep::new("alpha", "shared-model"),
+        );
+        combo.steps[0].accounts = vec!["tag:alice".to_owned()];
+
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            combos: vec![combo],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("first-credential", "sk-first").unwrap();
+        opened.put("second-credential", "sk-second").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(selection_body()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.lock().unwrap().as_slice(), ["Bearer sk-second"]);
+    }
+
     /// A chat body that carries an image, which the text-only route cannot serve.
     fn image_body(model: &str) -> String {
         serde_json::json!({
@@ -9951,6 +10163,41 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         (state, upstream_seen)
     }
 
+    /// A proxy that accepts the connection, says the tunnel is open, and then drops it. The request
+    /// is written into a socket that is already gone, which is the shape of a proxy that dies
+    /// mid-flight.
+    async fn fake_connect_proxy_that_breaks() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let sink = Arc::clone(&sink);
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while socket.read(&mut byte).await.unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                        if head.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&head).to_string();
+                    let target = text.split_whitespace().nth(1).unwrap_or("").to_string();
+                    sink.lock().unwrap().push(target);
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await;
+                    // Drop the socket without forwarding anything.
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
     #[tokio::test]
     async fn a_provider_that_names_a_proxy_egresses_through_it() {
         let (proxy_url, proxy_seen) = fake_connect_proxy(false).await;
@@ -9989,9 +10236,47 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         );
     }
 
+    /// A proxy that refuses the tunnel is a proxy that is not working, and the account still has to
+    /// serve: the request goes direct. Nothing was written to the provider through the tunnel, so
+    /// this is not a double spend.
     #[tokio::test]
-    async fn a_proxy_that_refuses_the_tunnel_fails_the_request_without_going_direct() {
+    async fn a_proxy_that_refuses_the_tunnel_falls_back_to_a_direct_connection() {
         let (proxy_url, proxy_seen) = fake_connect_proxy(true).await;
+        let (state, upstream_seen) = proxy_state(&proxy_url, Some("edge"), true).await;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(
+                serde_json::json!({
+                    "model": "p/m",
+                    "messages": [{"role": "user", "content": "hello"}],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            proxy_seen.lock().unwrap().len(),
+            1,
+            "the proxy was not tried at all"
+        );
+        assert_eq!(
+            upstream_seen.lock().unwrap().len(),
+            1,
+            "the request did not fall back to a direct connection"
+        );
+    }
+
+    /// A tunnel that *opened* and then broke is the one case that must not be retried directly: the
+    /// request may already be at the provider, and sending it again would bill it twice.
+    #[tokio::test]
+    async fn a_tunnel_that_breaks_after_opening_is_not_retried_directly() {
+        let (proxy_url, proxy_seen) = fake_connect_proxy_that_breaks().await;
         let (state, upstream_seen) = proxy_state(&proxy_url, Some("edge"), true).await;
         let response = dispatch(
             state,
@@ -10013,7 +10298,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(
             upstream_seen.lock().unwrap().len(),
             0,
-            "the request reached the upstream directly, which is the leak the proxy exists to stop"
+            "a request that may already have reached the provider was sent again"
         );
         assert_eq!(proxy_seen.lock().unwrap().len(), 1);
     }

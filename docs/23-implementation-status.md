@@ -242,6 +242,17 @@ participant it dispatched.
   a target that also lacks the modality, or names no known model, fails with HTTP 501
   `modality_fallback_unavailable` rather than looping. Covered by five tests in
   `crates/manarouter-relay/src/server.rs`.
+* **A combo step can be limited to some accounts, and an account can be sent through a proxy.** A
+  step's `accounts` selectors (an id, or a tag bare or as `tag:<name>`) are resolved at compile time
+  into `StepPlan::accounts` and filtered on the request path before any account is tried, so failover
+  stays inside the selection and an excluded healthy account never rescues the step. An account's
+  egress is its own `proxy`, else the proxy of the first tag naming a person, else the provider's,
+  else the pool's strategy, else direct. A proxy that is missing, disabled or unreadable is a direct
+  connection with a warning; a tunnel that never opened is retried directly; a tunnel that opened and
+  then broke is not, because the request may already be at the provider. Covered by tests in
+  `mr-core` (`config`, `snapshot`), `manarouter-relay` (`select`, `server`, `upstream`) and `mr-cli`
+  (`combo`, `account`, `person`). The panel editors for tags, people and step selection are **not
+  built**; the CLI and the configuration file are the supported way to set them.
 
 ### 4.1 GPU rentals (issue #4) — implemented and exercised end to end, with two named limits
 

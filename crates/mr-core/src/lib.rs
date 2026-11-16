@@ -141,7 +141,7 @@ pub const SNAPSHOT_MAGIC: [u8; 8] = *b"MROUTES1";
 /// capability appended later without a version bump would otherwise pass the header and fail only
 /// when the decoder reached its tag. The test `the_snapshot_version_stays_ahead_of_every_capability_tag`
 /// enforces the invariant.
-pub const SNAPSHOT_VERSION: u32 = 23;
+pub const SNAPSHOT_VERSION: u32 = 24;
 
 /// Current on-disk database schema version.
 ///

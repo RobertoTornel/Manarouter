@@ -89,6 +89,9 @@ state and restart" is only safe when neither of those matters to you.
   "aliases":   [ /* §6 */ ],
   "client_keys": [ /* §7 */ ],
 
+  "proxies": [ /* §4, "Egress" */ ],
+  "people":  [ /* §4, "Egress" */ ],
+
   "quota": {
     "enabled": true,
     "live_signals_win": true,
@@ -189,7 +192,7 @@ panel edits the same section, so the file is not the only way in.
   "cooldown_scope": "account",         // account | model | provider — what a refusal parks
   "enabled": true,
 
-  "accounts": [ /* one per credential */ ],
+  "accounts": [ /* one per credential; see "Egress" below for `tags` and `proxy` */ ],
 
   "models": [ /* discovered from /models, or entered by hand */ ],
   "models_synced_at": null,
@@ -318,6 +321,54 @@ with a `manual` one updates the discovered fields and leaves the authored ones a
 `hidden` removes a model from the panel's pickers without deleting it, which matters because a
 provider's `/models` frequently lists more than the operator wants to see.
 
+### Egress: `tags`, `proxy`, `proxies` and `people`
+
+An account carries two optional fields that decide where its traffic leaves from, and a top-level
+`people` array that ties the two together:
+
+```jsonc
+{
+  "accounts": [
+    {
+      "id": "0193f2c1-...",
+      "label": "main",
+      "tags": ["alice", "work"],       // free-text notes; case-insensitive; not a security boundary
+      "proxy": null,                   // this account's own egress, overriding its person's
+      "secret_ref": "provider/openai/account/0193f2c1-...",
+      "priority": 0,
+      "enabled": true
+    }
+  ],
+
+  "proxies": [
+    {
+      "id": "alice-laptop",
+      "label": "Alice's laptop",
+      "url": "socks5h://100.64.0.7:1080",   // http | https | socks4 | socks5 | socks5h
+      "username": null,
+      "secret_ref": null,                    // vault entry holding the password, if any
+      "enabled": true,
+      "priority": 0
+    }
+  ],
+
+  "people": [
+    { "tag": "alice", "proxy": "alice-laptop", "label": "Alice" }
+  ]
+}
+```
+
+`effective_proxy` resolves one proxy per account: the account's own `proxy`, else the proxy of the
+first tag that names a person, else the provider's `proxy`, else the pool's `proxy_strategy`, else a
+direct connection. Tagging an account `alice` therefore both selects it for a combo step and sends it
+through Alice's machine. `socks5h` is the spelling to prefer for a Tailscale peer, because the peer
+then resolves the provider's hostname rather than the router.
+
+A proxy that is missing, disabled, or whose secret cannot be read is a **direct connection** with a
+warning, never a failed request; a tunnel that never opened is retried directly, and one that opened
+and then broke is not. The full reasoning, the Tailscale setup and the CLI commands are in
+[accounts, tags and egress](32-accounts-tags-and-egress.md).
+
 ---
 
 ## 5. A combo
@@ -331,7 +382,8 @@ A combo is a **named model**: clients call it exactly like a model name.
   "label": "Brains (best of three)",
   "steps": [
     { "provider": "codex",        "model": "cx/gpt-6-astra", "enabled": true, "weight": 1 },
-    { "provider": "command-code", "model": "cmd/gpt-5.5",    "enabled": true }
+    { "provider": "command-code", "model": "cmd/gpt-5.5",    "enabled": true,
+      "accounts": ["alice", "tag:work"] }   // [] or absent: every account of that provider
   ],
   "strategy": "priority",              // priority | round-robin | reset-aware-priority
   "hedge": {
@@ -364,6 +416,13 @@ worst possible moment.
 
 `combo.signature()` is a `u64` digest of the routing-relevant fields. The conductor uses it to skip
 recompiling a snapshot when nothing that affects routing changed.
+
+A step's `accounts` is a list of selectors — an account id, or a tag (bare or `tag:<name>`) — and it
+is resolved at compile time into the step's `StepPlan::accounts`. Omitting it means every account of
+the step's provider may serve, which is what every combo did before the field existed. A selector
+that matches no account is a validation problem, and a selection that matches only disabled accounts
+compiles to a step that can serve nobody rather than widening back to all. See
+[accounts, tags and egress](32-accounts-tags-and-egress.md) §1.
 
 The full semantics — including the eligibility gate and the four `on_winner_fail` modes — are in
 `docs/07-hedged-race.md`. Note that `on_winner_fail` is internally tagged: the mode name goes in
@@ -548,5 +607,6 @@ a secret that window is the difference between a defence and a gesture.
 - `docs/05-key-selection.md` — `key_strategy` in detail
 - `docs/08-quota-tracking.md` — cooldowns, backoff and `cooldown_scope`
 - `docs/06-combos.md` — combos, strategies and worked examples
+- `docs/32-accounts-tags-and-egress.md` — account selection, tags, people and proxy fallback
 - `docs/21-security.md` — the vault, the panel and the threat model
 - `docs/22-sync-design.md` — why unknown keys are preserved

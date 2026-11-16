@@ -133,6 +133,19 @@ overhead against providers whose own TTFB is hundreds of milliseconds. If you su
 
 ---
 
+## A request egresses from the wrong place
+
+| Cause | How to confirm |
+|---|---|
+| The account's own `proxy` overrides its person | `mr account list <provider>` shows the tags; the account's `proxy` field wins over the person's. Clear it to fall back to the person. |
+| The tag does not name a person | `mr person list`. A tag is only an egress route if a person declares it; otherwise it is just a note. |
+| The person's proxy is disabled or missing | `mr person list` shows the proxy id; a disabled or unknown proxy is a **direct connection** with a warning in the relay log, by design. |
+| The proxy is up but refuses the tunnel | The relay logs `the proxy tunnel could not be established; retrying directly` and serves the request directly. A proxy that answers `CONNECT` with a refusal is treated as unusable, not as a reason to fail. |
+| The request went through the proxy but the provider sees the router's address | The proxy is a SOCKS5 listener on the peer, not an exit node. `socks5h://` makes the *peer* resolve the hostname; plain `socks5` resolves it locally. |
+| A step used an account you excluded | `mr combo show <name>` — the `ACCOUNTS` column. A selection is resolved at compile time, so a change needs the snapshot recompiled (any `mr` write does it). |
+
+---
+
 ## The panel is unreachable
 
 | Cause | Fix |
@@ -274,6 +287,7 @@ is at fault.
 - [API reference](18-api-reference.md) — what each response is supposed to look like.
 - [Quota tracking](08-quota-tracking.md) — the account states in full.
 - [Key selection](05-key-selection.md) — why an account was skipped.
+- [Accounts, tags and egress](32-accounts-tags-and-egress.md) — why an account was or was not used, and where its traffic left from.
 - [Web panel](15-web-panel.md) — what each indicator means.
 - [Latency benchmarks](19-latency-benchmarks.md) — measuring rather than guessing.
 - [Migration](17-migrating-from-omniroute.md) — what a migration deliberately leaves behind.

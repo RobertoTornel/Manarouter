@@ -94,7 +94,7 @@ magic[8] | version u32 | digest u64 | payload_len u32 | checksum u64 | payload[.
 | Field | Offset | Type | Protects against |
 |---|---|---|---|
 | `magic` | 0 | 8 bytes | Being handed an unrelated file. The constant is `SNAPSHOT_MAGIC = *b"MROUTES1"` in `mr-core/src/lib.rs`. A mismatch is reported as *"this is not a compiled routing snapshot"*, before any structure is built. |
-| `version` | 8 | `u32` LE | Loading a layout this binary cannot interpret. `SNAPSHOT_VERSION = 10`. A mismatch is refused, not guessed at. |
+| `version` | 8 | `u32` LE | Loading a layout this binary cannot interpret. `SNAPSHOT_VERSION = 24`. A mismatch is refused, not guessed at. |
 | `digest` | 12 | `u64` LE | Being unable to tell "the file changed" from "the bytes changed" without comparing whole snapshots. Copied from `Config::routing_digest()`. |
 | `payload_len` | 20 | `u32` LE | A truncated or padded file. Checked against the actual byte count in both directions: fewer bytes is a precise "truncated" error, more bytes is a "trailing bytes" error. |
 | `checksum` | 24 | `u64` LE | A single flipped byte anywhere meaningful. |
@@ -171,6 +171,16 @@ function that applies them, and its doc comment claims the set "is computed at c
 stored in the snapshot"; the code does not do that, and cannot, because the list is per-request. What
 the snapshot stores is the allow/deny lists themselves, and the relay evaluates them when it selects
 an account. [Key selection](05-key-selection.md) §5 works through what that means in practice.
+
+Two more things are resolved here rather than per request. A step's authored `accounts` selectors
+become `StepPlan::accounts: Option<Vec<AccountId>>` — `None` for "every account of this provider",
+`Some(list)` for the accounts the operator selected by id or tag, in the provider's authored order.
+The relay filters its candidate list with it before any account is tried, so failover stays inside
+the selection. And each account's egress becomes `AccountPlan::proxy: Option<String>`, the proxy id
+resolved from the account's own `proxy`, else the proxy of the first tag naming a person, else the
+provider's — so the relay never repeats that lookup. A proxy id that is missing or disabled at
+request time is a direct connection, not an error. Both are in
+[accounts, tags and egress](32-accounts-tags-and-egress.md).
 
 Hedge handling has one subtlety worth naming: `hedge.enabled` in the plan is
 `combo.hedge.enabled && participants.len() >= 2`. A "race" of one participant is not a race, so the
@@ -413,7 +423,7 @@ yet, not a routing decision — a `Default` snapshot resolves everything to `Not
 
 ## 10. Version and compatibility
 
-`SNAPSHOT_MAGIC` is `*b"MROUTES1"` and `SNAPSHOT_VERSION` is `10`, both in
+`SNAPSHOT_MAGIC` is `*b"MROUTES1"` and `SNAPSHOT_VERSION` is `24`, both in
 `crates/mr-core/src/lib.rs`.
 
 The version history is worth recording, because it has moved repeatedly. Version 3 added the
@@ -432,8 +442,12 @@ read. Version 9 added each account's named placeholder values, so a base URL lik
 `…/accounts/{account_id}` reaches the upstream filled in rather than literally. Version 10 adds each
 provider's **hidden model ids**: the models the operator hid are absent from `steps` (as they always
 were) and now also recorded, because "no such model" and "that model is hidden" are different
-problems with different fixes — a typo versus a checkbox. A version-2 through version-9 snapshot is
-therefore refused rather than read as though it carried fields it does not.
+problems with different fixes — a typo versus a checkbox. Versions 11 through 23 added further fields
+in the same way. Version 24 adds each step's optional **account selection** (`StepPlan::accounts`),
+the list of accounts a step may use, and each account's resolved **egress** (`AccountPlan::proxy`), so
+the relay filters candidates and picks a proxy without re-reading the authored combo. A snapshot
+written under any other version is therefore refused rather than read as though it carried fields it
+does not; the constant in `lib.rs` is the authority, and the history above is not exhaustive.
 
 The rule is absolute: **a change to the compiled layout requires a `SNAPSHOT_VERSION` bump.** The
 version is not a semver hint; the decoder has no compatibility paths, and a table written under a
@@ -640,6 +654,7 @@ none.
 - [Configuration](03-configuration.md) — the authored form the compiler reads
 - [API reference](18-api-reference.md) — model addressing, reasoning levels and `/v1/models`
 - [Key selection](05-key-selection.md) — what the relay does with an `AccountPlan`
+- [Accounts, tags and egress](32-accounts-tags-and-egress.md) — `StepPlan::accounts` and `AccountPlan::proxy`
 - [Combos](06-combos.md) — what `ComboPlan` means to an operator
 - [The hedged race](07-hedged-race.md) — the remapped participants and the eligibility gate
 - [Latency engineering](16-latency-engineering.md) — why the lookup is the only work on the path

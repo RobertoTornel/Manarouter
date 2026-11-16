@@ -21,6 +21,7 @@ mod key;
 mod migrate;
 mod models;
 mod output;
+mod person;
 mod provider;
 mod serve;
 mod vault;
@@ -78,6 +79,9 @@ enum Command {
     /// Named model routes: add, list, show, remove, and edit their steps.
     #[command(subcommand)]
     Combo(combo::ComboCmd),
+    /// The people whose machines accounts egress through (a tag plus a proxy).
+    #[command(subcommand)]
+    Person(person::PersonCmd),
     /// List, add and remove alternative model spellings.
     #[command(subcommand)]
     Alias(alias::AliasCmd),
@@ -260,6 +264,7 @@ async fn dispatch(command: Command, ctx: &Ctx) -> Result<(), CliError> {
         Command::Provider(c) => provider::run(c, ctx).await,
         Command::Account(c) => account::run(c, ctx).await,
         Command::Combo(c) => combo::run(c, ctx).await,
+        Command::Person(c) => person::run(c, ctx).await,
         Command::Alias(c) => alias::run(c, ctx).await,
         Command::Key(c) => key::run(c, ctx).await,
         Command::Models(c) => models::run(c, ctx).await,

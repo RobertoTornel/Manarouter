@@ -53,9 +53,10 @@ pub struct UpstreamRequest {
     pub headers: HeaderMap,
     /// A pre-resolved proxy endpoint, when selection and the vault lookup chose one.
     ///
-    /// `None` means a direct connection. `Some` never means "try direct if the proxy fails": proxy
-    /// failure is returned to the caller, because falling back would leak a request the operator
-    /// explicitly configured to egress through an intermediary.
+    /// `None` means a direct connection. `Some` means the request is written through that proxy;
+    /// the only fallback is a tunnel that never opened, which [`Upstream::send`] retries directly
+    /// because nothing was sent. A tunnel that opened and then failed is returned to the caller,
+    /// because retrying it would send a request the provider may already have.
     pub proxy: Option<crate::proxy::ProxyEndpoint>,
     /// The request body. Empty for a `GET`.
     pub body: Bytes,
@@ -328,9 +329,18 @@ pub enum UpstreamError {
     ///
     /// A distinct variant because it is not the provider that failed: the request never left the
     /// machine, and the operator needs to be told that the *egress* is broken rather than that the
-    /// provider is down. It is also the variant that must never be retried as a direct connection.
+    /// provider is down. It is also the variant that must never be retried as a direct connection:
+    /// the tunnel may have carried the request before it broke, and a retry would send it twice.
     #[error("proxy egress failed: {0}")]
     Proxy(String),
+    /// The tunnel itself could not be established, so nothing was sent.
+    ///
+    /// The one proxy failure that *is* safe to retry directly, and the reason it is a separate
+    /// variant: the connector failed before a single byte of the request was written, so a direct
+    /// retry cannot double-send a `POST`. [`Upstream::send`] takes that retry itself, which is why
+    /// this variant does not normally reach a caller.
+    #[error("proxy tunnel could not be established: {0}")]
+    ProxyConnect(String),
 }
 
 /// The result type for this module.
@@ -599,14 +609,43 @@ impl Upstream {
         let started = Instant::now();
 
         // A proxied request uses the client of its proxy, and that client's pool holds only
-        // connections that went through that proxy. There is no path by which a proxied request is
-        // served on a direct connection, and no path by which a failed tunnel falls back to one.
+        // connections that went through that proxy.
+        //
+        // The one exception is a tunnel that never opened. Nothing was written, so retrying
+        // directly cannot double-send the request, and the operator's stronger intent — that the
+        // request is served — wins over their intent that it egress through the proxy. A tunnel
+        // that opened and then broke is *not* retried: the request may already be at the provider,
+        // and a second copy would be a second charge.
         let resp = match &request.proxy {
             Some(endpoint) => {
                 let client = self.inner.proxy_client(endpoint)?;
-                send_with(&client, req, &request, started).await?
+                // A handle copy, not a body copy: `Bytes` is reference-counted, and the headers are
+                // small. Kept only for the tunnel-never-opened retry below.
+                let direct_req = req.clone();
+                match send_with(&client, req, &request, started, true).await {
+                    Ok(resp) => resp,
+                    Err(UpstreamError::ProxyConnect(reason)) => {
+                        tracing::warn!(
+                            proxy_host = %endpoint.host,
+                            proxy_port = endpoint.port,
+                            error = %reason,
+                            "the proxy tunnel could not be established; retrying directly"
+                        );
+                        // A fresh clock, so the direct attempt is classified on its own timing
+                        // rather than inheriting the failed tunnel's elapsed time.
+                        send_with(
+                            &self.inner.client,
+                            direct_req,
+                            &request,
+                            Instant::now(),
+                            false,
+                        )
+                        .await?
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-            None => send_with(&self.inner.client, req, &request, started).await?,
+            None => send_with(&self.inner.client, req, &request, started, false).await?,
         };
 
         let status = resp.status();
@@ -720,6 +759,7 @@ async fn send_with<C>(
     req: http::Request<http_body_util::Full<Bytes>>,
     request: &UpstreamRequest,
     started: Instant,
+    proxied: bool,
 ) -> Result<hyper::Response<hyper::body::Incoming>>
 where
     C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
@@ -744,7 +784,7 @@ where
         Err(_) => return Err(UpstreamError::TotalTimeout(deadline)),
     };
     let headers_at = started.elapsed();
-    resp.map_err(|e| classify(&e, request, headers_at))
+    resp.map_err(|e| classify(&e, request, headers_at, proxied))
 }
 
 /// Map a transport error onto the variant that tells the caller what to do about it.
@@ -758,12 +798,20 @@ fn classify(
     error: &hyper_util::client::legacy::Error,
     request: &UpstreamRequest,
     headers_at: Duration,
+    proxied: bool,
 ) -> UpstreamError {
-    if request.proxy.is_some() {
+    if proxied {
         // The request was on its way through a proxy and never reached the provider. Reporting this
         // as a plain connect failure would point the operator at the provider when the proxy is
-        // what broke — and it is the one failure that must never be retried as a direct
-        // connection, because that would defeat the egress policy the proxy was configured for.
+        // what broke.
+        //
+        // A connector failure is the one case where nothing was written, so it is reported as
+        // `ProxyConnect` and the caller may retry it directly. Everything else — a tunnel that
+        // opened and then stalled or broke — stays `Proxy`, which is never retried: the request may
+        // already be at the provider.
+        if error.is_connect() {
+            return UpstreamError::ProxyConnect(error.to_string());
+        }
         if headers_at >= request.connect_timeout {
             return UpstreamError::Proxy(format!(
                 "the tunnel did not complete within {:?}",
@@ -1175,6 +1223,60 @@ mod tests {
             video: Some("video/model".into()),
             ..RoutingDefaults::default()
         }
+    }
+
+    /// A tunnel that never opened must not cost the request.
+    ///
+    /// The proxy here is a SOCKS5 endpoint with nothing listening on it, which is what a Tailscale
+    /// peer that is asleep or off the tailnet looks like. Nothing was written, so the request is
+    /// retried directly and the caller sees the provider's answer rather than a proxy error.
+    #[tokio::test]
+    async fn a_tunnel_that_never_opened_is_retried_directly() {
+        // A real provider stand-in: it answers, so a successful retry is observable.
+        let provider = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let provider_addr = provider.local_addr().expect("addr");
+        let served = tokio::spawn(async move {
+            let (mut socket, _) = provider.accept().await.expect("accept");
+            use tokio::io::AsyncWriteExt as _;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await;
+            let _ = socket.shutdown().await;
+        });
+
+        // A port that was bound and released: nothing is listening, so the tunnel cannot open.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let dead_port = dead.local_addr().expect("addr").port();
+        drop(dead);
+
+        let upstream = Upstream::new(Duration::from_secs(5), 8).expect("client");
+        let response = upstream
+            .send(UpstreamRequest {
+                method: Method::POST,
+                url: format!("http://{provider_addr}/v1/chat/completions"),
+                headers: HeaderMap::new(),
+                proxy: Some(crate::proxy::ProxyEndpoint {
+                    scheme: crate::proxy::ProxyScheme::Socks5h,
+                    host: "127.0.0.1".into(),
+                    port: dead_port,
+                    auth: None,
+                }),
+                body: Bytes::from_static(b"{}"),
+                http2: Http2Preference::Auto,
+                connect_timeout: Duration::from_secs(1),
+                ttfb_timeout: Duration::from_secs(2),
+                total_timeout: Some(Duration::from_secs(5)),
+            })
+            .await
+            .expect("a dead tunnel must fall back to a direct connection");
+        assert_eq!(response.status, StatusCode::OK);
+        served
+            .await
+            .expect("the provider stand-in must have answered");
     }
 
     /// A provider that accepts the connection and then says nothing must fail like any other

@@ -297,11 +297,25 @@ pub struct Account {
     /// Per-account quota windows, when they differ from the provider's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quota: Vec<QuotaWindow>,
+    /// Free-form tags naming who the account belongs to, or what it is for.
+    ///
+    /// A tag is a small note, not a security boundary. It exists for two jobs that are the same
+    /// job seen from two ends: a combo step can select the accounts it may use by tag
+    /// (`accounts: ["tag:alice"]`), and a tag that names a configured [`crate::config::PersonConfig`]
+    /// decides which machine the account's traffic leaves from — that person's Tailscale exit node,
+    /// expressed as a proxy. Matching is case-insensitive and surrounding whitespace is ignored, so
+    /// `Alice` and `alice` are one tag.
+    ///
+    /// The first tag that names a person wins, in the order the tags are written. An account with
+    /// no tags is nobody's in particular and egresses the way its provider does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// Which configured proxy this account's traffic goes through, by [`ProxyConfig::id`].
     ///
-    /// `None` falls back to the provider's [`Provider::proxy`], which falls back to a direct
-    /// connection. The account level exists because one account can be the one that is rate-limited
-    /// or region-locked, and moving *just it* behind a proxy must not move the whole provider.
+    /// `None` falls back to the person named by [`Self::tags`], then to the provider's
+    /// [`Provider::proxy`], then to a direct connection. The account level exists because one
+    /// account can be the one that is rate-limited or region-locked, and moving *just it* behind a
+    /// proxy must not move the whole provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
     /// Values for the named placeholders in the provider's base URL.
@@ -354,6 +368,7 @@ impl Account {
             models_allow: Vec::new(),
             models_deny: Vec::new(),
             quota: Vec::new(),
+            tags: Vec::new(),
             proxy: None,
             placeholders: BTreeMap::new(),
             credit_usd: None,
@@ -381,6 +396,19 @@ impl Account {
             .any(|m| m == model || m == "*" || glob_match(m, model))
     }
 
+    /// Whether this account carries `tag`, ignoring case and surrounding whitespace.
+    ///
+    /// The comparison is deliberately forgiving: a tag is typed by a person into a CLI flag or a
+    /// panel field, and `Alice ` failing to match `alice` would be a bug report, not a feature.
+    pub fn has_tag(&self, tag: &str) -> bool {
+        let wanted = tag.trim();
+        !wanted.is_empty()
+            && self
+                .tags
+                .iter()
+                .any(|own| own.trim().eq_ignore_ascii_case(wanted))
+    }
+
     /// The live scheduling state implied by configuration alone, before any traffic is seen.
     pub fn configured_state(&self) -> AccountState {
         if self.enabled {
@@ -388,6 +416,24 @@ impl Account {
         } else {
             AccountState::Disabled
         }
+    }
+}
+
+/// Whether `selector` names `account`.
+///
+/// A selector is an account id, or a tag with an optional `tag:` prefix — `alice` and `tag:alice`
+/// are the same selector. The id is checked first, so an account whose id happens to equal a tag
+/// stays addressable; the tag comparison ignores case and surrounding whitespace, the same rule
+/// [`Account::has_tag`] applies. This is the one definition of a selector: configuration
+/// validation, snapshot compilation and the CLI all read it from here.
+pub fn account_selector_matches(selector: &str, account: &Account) -> bool {
+    let trimmed = selector.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    match trimmed.get(..4) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("tag:") => account.has_tag(&trimmed[4..]),
+        _ => account.id.as_str() == trimmed || account.has_tag(trimmed),
     }
 }
 
@@ -1296,6 +1342,20 @@ pub struct ComboStep {
     /// a loop here would be an unbounded request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub combo: Option<String>,
+    /// Which of the provider's accounts may serve this step. Empty means every account.
+    ///
+    /// Each entry is either an account id, or `tag:<name>` for every account carrying that tag —
+    /// which is how a step is written as "my accounts, and team member 1's, but not team member
+    /// 2's". A bare word is read as a tag too, so `alice` and `tag:alice` mean the same thing; the
+    /// prefix exists for the case where a tag happens to look like an id.
+    ///
+    /// The selection is resolved when the snapshot is compiled, so the relay compares account ids
+    /// and never parses a selector at request time. An entry that matches no account of this
+    /// provider is a configuration problem, reported by [`crate::Config::validate`]; a selector
+    /// that matches only *disabled* accounts resolves to an empty set, which makes the step
+    /// unusable rather than silently widening it back to every account.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<String>,
     /// Whether the operator has this step enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -1325,6 +1385,7 @@ impl ComboStep {
             provider: ProviderId::from(provider.into()),
             model: model.into(),
             combo: None,
+            accounts: Vec::new(),
             enabled: true,
             weight: 0,
             level: None,
@@ -1338,6 +1399,7 @@ impl ComboStep {
             provider: ProviderId::from(String::new()),
             model: String::new(),
             combo: Some(combo.into()),
+            accounts: Vec::new(),
             enabled: true,
             weight: 0,
             level: None,
@@ -1604,6 +1666,12 @@ impl Combo {
             }
             if let Some(target) = &s.combo {
                 h ^= fnv1a64(target.as_bytes());
+            }
+            // Which accounts a step may use changes which upstream credential is called, so a
+            // signature that ignored the selection would leave the relay running the previous plan
+            // after the operator narrowed a step.
+            for selector in &s.accounts {
+                h ^= fnv1a64(selector.as_bytes());
             }
         }
         for p in &self.hedge.participants {

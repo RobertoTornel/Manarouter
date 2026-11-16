@@ -1233,6 +1233,7 @@ async fn import_one(
             models_allow: Vec::new(),
             models_deny: Vec::new(),
             quota: Vec::new(),
+            tags: Vec::new(),
             proxy: None,
             placeholders: Default::default(),
             credit_usd: None,

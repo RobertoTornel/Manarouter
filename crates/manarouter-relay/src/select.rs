@@ -394,16 +394,36 @@ pub fn step_available(
         .any(|a| account_available_for(provider.id.as_str(), a.id.as_str(), model, health, now_ms))
 }
 
+/// Whether `step` may use `account`.
+///
+/// A step that names no selection may use every account, which is the default and what every direct
+/// `provider/model` resolution carries. A step that names one may use only those accounts, and a
+/// selection that resolved to nothing may use none — the operator asked for accounts that are not
+/// available, and widening back to everyone would send the request from an account they excluded.
+pub fn step_allows_account(step: &StepPlan, account: &AccountPlan) -> bool {
+    match &step.accounts {
+        None => true,
+        Some(selected) => selected.iter().any(|id| id == &account.id),
+    }
+}
+
 /// Whether a step has at least one usable account that allows the requested model.
 pub fn step_has_usable_account(
     provider: &ProviderPlan,
     health: &HashMap<String, Cooldown>,
     now_ms: u64,
-    model: &str,
+    step: &StepPlan,
 ) -> bool {
     provider.accounts.iter().any(|a| {
-        account_allows_model(a, model)
-            && account_available_for(provider.id.as_str(), a.id.as_str(), model, health, now_ms)
+        step_allows_account(step, a)
+            && account_allows_model(a, &step.model)
+            && account_available_for(
+                provider.id.as_str(),
+                a.id.as_str(),
+                &step.model,
+                health,
+                now_ms,
+            )
     })
 }
 
@@ -916,6 +936,7 @@ mod tests {
             input_modalities: 1,
             pricing: None,
             context_length: None,
+            accounts: None,
         }
     }
 
@@ -1902,5 +1923,58 @@ mod tests {
             parked(9_000, CooldownReason::QuotaExhausted),
         );
         assert_eq!(order_steps(&c, &[p], &h, 0, 0), vec![1, 0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // per-step account selection
+    // -----------------------------------------------------------------------
+
+    /// The default is every account, so a step written before selection existed is unchanged.
+    #[test]
+    fn a_step_without_a_selection_allows_every_account() {
+        let step = step(0, "m");
+        assert!(step_allows_account(&step, &account("a1")));
+        assert!(step_allows_account(&step, &account("a2")));
+    }
+
+    #[test]
+    fn a_step_selection_allows_only_the_named_accounts() {
+        let mut step = step(0, "m");
+        step.accounts = Some(vec![mr_core::ids::AccountId::from_raw("a2")]);
+        assert!(!step_allows_account(&step, &account("a1")));
+        assert!(step_allows_account(&step, &account("a2")));
+    }
+
+    /// An empty selection is a step that can run nowhere. It must not be read as "no restriction",
+    /// which would send traffic through accounts the operator excluded.
+    #[test]
+    fn an_empty_selection_allows_nothing() {
+        let mut step = step(0, "m");
+        step.accounts = Some(Vec::new());
+        assert!(!step_allows_account(&step, &account("a1")));
+        assert!(!step_allows_account(&step, &account("a2")));
+    }
+
+    /// The selection is applied before cooldowns are consulted, so a step whose only account is
+    /// parked reports itself unusable rather than falling through to an account it may not use.
+    #[test]
+    fn a_selected_account_that_is_parked_makes_the_step_unusable() {
+        let p = provider("p0", vec![account("a1"), account("a2")]);
+        let mut step = step(0, "m");
+        step.accounts = Some(vec![mr_core::ids::AccountId::from_raw("a1")]);
+        let mut health = HashMap::new();
+        health.insert(
+            cooldown_key(
+                CooldownScope::Account,
+                "p0",
+                "a1",
+                "m",
+                CooldownReason::AuthFailed,
+            ),
+            parked(9_000, CooldownReason::AuthFailed),
+        );
+        assert!(!step_has_usable_account(&p, &health, 0, &step));
+        // The unselected account is healthy, and that must not rescue the step.
+        assert!(account_available_for("p0", "a2", "m", &health, 0));
     }
 }
