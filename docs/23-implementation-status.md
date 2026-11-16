@@ -251,8 +251,13 @@ participant it dispatched.
   connection with a warning; a tunnel that never opened is retried directly; a tunnel that opened and
   then broke is not, because the request may already be at the provider. Covered by tests in
   `mr-core` (`config`, `snapshot`), `manarouter-relay` (`select`, `server`, `upstream`) and `mr-cli`
-  (`combo`, `account`, `person`). The panel editors for tags, people and step selection are **not
-  built**; the CLI and the configuration file are the supported way to set them.
+  (`combo`, `account`, `person`). All three are editable in the panel as well: the account table's
+  `Tags` column and add form, the Settings view's People card (tag, label, egress proxy, with the
+  accounts carrying each tag listed live), and the combo step editor's account checkboxes. That
+  panel work adds no endpoint — people ride `PUT /api/config/raw`, and a `tags`/`accounts` array is
+  carried by the existing account and combo writes — and is pinned by
+  `panel/test/account-tags.test.mjs` and `panel/test/combo-step-accounts.test.mjs`, which drive the
+  real views against a stubbed DOM and `fetch` and assert the exact request bodies.
 
 ### 4.1 GPU rentals (issue #4) — implemented and exercised end to end, with two named limits
 

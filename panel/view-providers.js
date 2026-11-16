@@ -16,6 +16,7 @@ import {
 } from './dom.js';
 import {
   deriveProviderHealth, accountState, formatAge, formatCompact, providerLevels, declaredLevels,
+  parseTagList, tagListText,
 } from './format.js';
 import {
   placeholderNamesIn, NAME_PATTERN as PLACEHOLDER_NAME, VALUE_PATTERN as PLACEHOLDER_VALUE,
@@ -1381,6 +1382,7 @@ export async function renderProviders(mount, ctx) {
         accTb.append(h('tr', {},
           h('td', { class: 'mono' }, a.id ?? ''),
           h('td', {}, a.label ?? a.identity ?? ''),
+          buildInlineAccountTags(p, a),
           h('td', {}, chip(s.label, s.cls, `state: ${s.key}`), quotaChip),
           buildInlineAccountNumber(p, a, 'priority', 'priority'),
           buildInlineAccountNumber(p, a, 'weight', 'weight'),
@@ -1391,6 +1393,7 @@ export async function renderProviders(mount, ctx) {
         h('table', { class: 'tbl' },
           h('thead', {}, h('tr', {},
             h('th', { scope: 'col' }, 'ID'), h('th', { scope: 'col' }, 'Label'),
+            h('th', { scope: 'col', title: 'Free-text notes. A tag that names a person in Settings sends this account through that person\u2019s proxy.' }, 'Tags'),
             h('th', { scope: 'col' }, 'State'), h('th', { scope: 'col' }, 'Pri'),
             h('th', { scope: 'col' }, 'Weight'),
             h('th', { scope: 'col', title: 'Known credit in US dollars; a fine-tuning job is only started on an account with more than $15' }, 'Credit'),
@@ -2199,6 +2202,73 @@ export async function renderProviders(mount, ctx) {
     return cell;
   }
 
+  /// The account's tags: a small free-text note, edited in place.
+  ///
+  /// A tag is not decoration. A tag that names a person in Settings → People is what sends this
+  /// account out through that person's machine, and a combo step can name a tag instead of an
+  /// account id — so this cell is the only place either of those facts is expressed. Chips keep
+  /// several tags readable while the table is being scanned; the editor is one comma-separated
+  /// field, the same shape `mr account tag` takes.
+  function buildInlineAccountTags(p, account) {
+    const slot = `account:${p.id}:${account.id}:tags`;
+    const tags = Array.isArray(account.tags) ? account.tags.map(String) : [];
+    const cell = h('td', { class: 'tags-cell' });
+    const edit = h('button', {
+      class: 'icon-btn', type: 'button',
+      'aria-label': `Edit tags for account ${account.id ?? ''}`,
+      title: 'Tags for this account',
+    }, icon('pencil'));
+    edit.addEventListener('click', () => renderEditor(inlineDrafts.get(slot) ?? tags.join(', ')));
+
+    function renderView() {
+      cell.replaceChildren(h('div', { class: 'tags-view' },
+        ...(tags.length
+          ? tags.map((tag) => chip(tag, 'chip-neutral', `tag: ${tag}`))
+          : [h('span', { class: 'hint' }, 'no tags')]),
+        edit));
+    }
+
+    function renderEditor(initial) {
+      const input = h('input', {
+        class: 'input mono', type: 'text', value: initial, placeholder: 'alice, work',
+        'aria-label': `Tags for account ${account.id ?? ''}`, style: 'min-width:150px',
+      });
+      const save = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, 'Save');
+      const cancel = h('button', { class: 'btn btn-sm', type: 'button' }, 'Cancel');
+      cell.replaceChildren(h('div', { class: 'tags-edit' }, input, save, cancel));
+      input.addEventListener('input', () => inlineDrafts.set(slot, input.value));
+      const restore = () => { inlineDrafts.delete(slot); renderView(); };
+      const persist = async () => {
+        const next = parseTagList(input.value);
+        save.disabled = true;
+        save.textContent = 'Saving…';
+        try {
+          await api.put(`/api/providers/${encodeURIComponent(p.id)}/accounts/${encodeURIComponent(account.id)}`,
+            { ...account, tags: next });
+          inlineDrafts.delete(slot);
+          ctx.toast.success(next.length ? 'Tags saved.' : 'Tags cleared.');
+          await reload(true);
+        } catch (err) {
+          save.disabled = false;
+          save.textContent = 'Save';
+          ctx.toast.error('Could not save the account tags', err);
+        }
+      };
+      save.addEventListener('click', persist);
+      cancel.addEventListener('click', restore);
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); persist(); }
+        if (e.key === 'Escape') { e.preventDefault(); restore(); }
+      });
+      input.focus();
+      input.select();
+    }
+
+    if (inlineDrafts.has(slot)) renderEditor(inlineDrafts.get(slot));
+    else renderView();
+    return cell;
+  }
+
   function buildInlineModelNumber(p, model, key, label) {
     const slot = `model:${p.id}:${model.id}:${key}`;
     return buildInlineNumericCell(model[key], label, slot, async (value) => {
@@ -2721,6 +2791,7 @@ export async function renderProviders(mount, ctx) {
     }
     const label = h('input', { class: 'input', type: 'text', 'data-field': 'label' });
     const identity = h('input', { class: 'input mono', type: 'text', 'data-field': 'identity', placeholder: 'e.g. work@account' });
+    const tags = h('input', { class: 'input mono', type: 'text', 'data-field': 'tags', placeholder: 'alice, work' });
     const secret = h('input', { class: 'input mono', type: 'password', 'data-field': 'secret', autocomplete: 'new-password', ...(describedBy ? { 'aria-describedby': describedBy } : {}) });
     const revealSecret = h('button', {
       class: 'btn btn-sm', type: 'button',
@@ -2768,6 +2839,7 @@ export async function renderProviders(mount, ctx) {
       h('div', { class: 'grid-fields' },
         field('Label', label),
         field('Identity (optional)', identity),
+        field('Tags (optional)', tags, { hint: 'Free-text notes, comma separated. A tag that names a person in Settings sends this account through that person\u2019s machine.' }),
         secretBox),
       keylessRow,
       add);
@@ -2792,7 +2864,12 @@ export async function renderProviders(mount, ctx) {
         // Field names are the Account struct's (mr-core/src/model.rs); the secret is sent once
         // and stored server-side as a secret_ref. Validation errors land next to their fields.
         await api.post(`/api/providers/${encodeURIComponent(p.id)}/accounts`,
-          { label: label.value || null, identity: identity.value || null, secret: keyless.checked ? null : key });
+          {
+            label: label.value || null,
+            identity: identity.value || null,
+            tags: parseTagList(tags.value),
+            secret: keyless.checked ? null : key,
+          });
         // Clear the plaintext from the DOM immediately — it must not linger on screen.
         secret.value = '';
         ctx.toast.success('Account added.');

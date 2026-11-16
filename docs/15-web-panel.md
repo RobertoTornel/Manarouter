@@ -32,23 +32,27 @@ The two processes share state through files, not through IPC: the conductor writ
 | **Overview** | Control-plane uptime, relay reachability, snapshot digest and age, configuration counts, and whether a panel password is set | Nothing |
 | **Providers** | Every provider, its dialect, base URL, auth, key strategy, cooldown scope, account count, and health, with that provider's accounts and models inline under its own row | Add, edit, enable/disable, remove; add, enable/disable and remove accounts; pin providers and sort by name, date added, number of keys or manual order, dragging rows to reorder |
 | **Models** | Discovered and hand-entered models per provider, model-first so the same id from several providers sits together, with provider/source/search/hidden filters and paging | Hide/show, delete, and **test** a model (one small live request; the answer or the upstream error is shown as a toast). Paging offers 50, 100, 250 or 500 rows. **Resync all models** and **Delete all models** loop over the per-provider endpoints; deletion still asks for an explicit confirmation. The test runs on the relay's loopback probe (`POST /control/probe`), so it goes through the ordinary dispatch path — routing table, dialect translation, account selection, cooldowns and fallbacks — and works for every dialect, not only the OpenAI shape. The route refuses non-loopback callers because it skips the client-key check |
-| **Combos** | Every combo with its steps **in priority order**, each model step's optional pinned reasoning level, and a **Live health** panel | Create, edit, reorder steps, enable/disable, remove, pin a model step's reasoning level, and **check** the steps: one tiny completion per enabled model step through the relay probe, in priority order, so the panel shows which step answers right now and which one failed and why. A step may instead route to another combo; it has no provider, model or level of its own, is shown as a nested combo, and is checked in that combo rather than probed here. Provider, model and combo pickers are searchable. A cycle between nested combos is refused with the chain that closes it |
+| **Combos** | Every combo with its steps **in priority order**, each model step's optional pinned reasoning level, and a **Live health** panel | Create, edit, reorder steps, enable/disable, remove, pin a model step's reasoning level, and **check** the steps: one tiny completion per enabled model step through the relay probe, in priority order, so the panel shows which step answers right now and which one failed and why. A step may instead route to another combo; it has no provider, model or level of its own, is shown as a nested combo, and is checked in that combo rather than probed here. Provider, model and combo pickers are searchable; a step can be limited to some of its provider's accounts, by account id or by a person's tag, where nothing ticked means every account. A cycle between nested combos is refused with the chain that closes it |
 | **Keys** | Client keys by label and prefix | Create (plaintext shown once), edit the policy, rotate the secret in place (new plaintext shown once, old secret invalidated after commit), enable/disable, delete |
 | **Aliases** | Alias to target mappings | Add, remove |
 | **Quota** | Allowances first, grouped by provider: each provider block has a heading, a strip of its accounts' window chips, and one card per account, laid out so several accounts share a wide page and a phone gets one full-width card, with one row per window the provider actually reported — then the recent request ledger underneath. Provider blocks and the account cards inside them can be dragged; that changes only this page. A provider that quantifies a single window gets a single row, never padding for the families it did not mention; an account with nothing quantified (never fetched, or no reported fraction) is left off the page rather than shown as an empty shell. An account whose refresh *failed* keeps its last-good card and the error when an earlier fetch left a quantified window to show; a failure with no window (including before the first snapshot) stays off the page too. A provider with no dedicated reader is asked through its candidate list, and such a card's footer names the candidate that answered | Refresh an account's windows from the provider (key *and* OAuth accounts: the conductor mints the same short-lived token the relay would); reorder provider blocks and accounts for display |
-| **Settings** | Listen ports, client-key access, upstream proxies, the relay connection pool (including a low-resource profile), quota display, quota probing (the candidate endpoints a generic provider is asked for an allowance), pricing data, the panel password, and the raw configuration | Edit; **ports apply on next restart** |
+| **Settings** | Listen ports, client-key access, upstream proxies, the `people` mapping from a tag to one of those proxies, the relay connection pool (including a low-resource profile), quota display, quota probing (the candidate endpoints a generic provider is asked for an allowance), pricing data, the panel password, and the raw configuration | Edit, including a person's tag, label and egress proxy; **ports apply on next restart** |
 | **Documentation** | The top-level files in `docs/`, rendered from markdown | Nothing |
 
 The **Models** view distinguishes discovered from hand-entered metadata explicitly, because a sync
 must never overwrite what a human typed. If the two ever disagreed and the panel did not say which
 was which, the operator would have no way to know why their edit vanished.
 
-Three things are **not** in the panel yet, and the CLI is the supported way to set them: an account's
-`tags`, the `people` list that turns a tag into an egress route, and a combo step's `accounts`
-selection. The Settings view does edit the proxy list itself, so a person can be pointed at a proxy
-that already exists; declaring the person, tagging the account and limiting a step are
-`mr person`, `mr account tag` and `mr combo step accounts`. See
-[accounts, tags and egress](32-accounts-tags-and-egress.md).
+All three parts of [accounts, tags and egress](32-accounts-tags-and-egress.md) are editable here.
+**Settings → People** declares a person — a tag, a label and the upstream proxy their accounts
+egress through — and shows, live, which accounts currently carry that tag. **Providers** gives every
+account a `Tags` column with a pencil that edits the comma-separated note in place, and the add-account
+form takes the same list. A **combo step** has an *Accounts this step may use* list: one checkbox per
+account of that step's provider, with nothing ticked meaning every account, including any added
+later. The one ordering that matters is that a person can only name a proxy that already exists, so
+save the proxy before the person; with no proxies at all the people card says so instead of offering
+a list it knows will not validate. The CLI stays equivalent (`mr person`, `mr account tag`,
+`mr combo step accounts`) for scripted setups.
 
 ### The capability editor
 
@@ -346,6 +350,6 @@ working directory, its parents, and the executable's directory, so there is no b
 - [Security](21-security.md) — the threat model, sessions, and the origin check.
 - [Configuration](03-configuration.md) — what the panel is actually editing.
 - [Combos](06-combos.md) — the view an operator uses most.
-- [Accounts, tags and egress](32-accounts-tags-and-egress.md) — the three things the panel does not edit yet.
+- [Accounts, tags and egress](32-accounts-tags-and-egress.md) — tags, people and per-step account selection.
 - [Latency benchmarks](19-latency-benchmarks.md) — why the panel is not on the request path.
 - [Troubleshooting](20-troubleshooting.md) — what to check when the panel will not load.

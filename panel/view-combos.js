@@ -20,6 +20,7 @@ import {
   extractList, stepLabel, moveStep, remapParticipants, remapIndex,
   parseWinnerFail, buildWinnerFail, toggleParticipant,
   stepModel, stepProvider, modelLevels, providerLevels, probeTarget,
+  stepAccountSelection, describeAccountSelection, selectorNames,
 } from './format.js';
 import { comboActivityIndex, comboRoutePreview } from './combo-live.js';
 import { createSearchSelect } from './search-select.js';
@@ -1090,6 +1091,9 @@ export async function renderCombos(mount, ctx, selectedId) {
             delete step.provider;
             delete step.model;
             delete step.level;
+            // A nested combo supplies its own steps' account choices; a selector here would name no
+            // provider's account pool and is never read.
+            delete step.accounts;
           }
           return step;
         }),
@@ -1203,6 +1207,18 @@ export async function renderCombos(mount, ctx, selectedId) {
         const pos = h('span', { class: 'step-pos' }, String(i + 1));
         const ref = h('span', { class: 'step-ref mono' }, stepLabel(step));
 
+        // A restricted step says so where it is scanned. The picker is two clicks away, and an
+        // operator reading priorities should not have to open every row to learn that one of them
+        // covers two accounts out of four. Nothing ticked is the default and shows no chip at all.
+        const selectionPool = stepProvider(step, providers)?.accounts;
+        const pool = Array.isArray(selectionPool) ? selectionPool : [];
+        const selection = stepAccountSelection(step.accounts, pool);
+        const accountsChip = selection.all ? null : chip(
+          `${selection.selected.length} of ${pool.length} accounts`,
+          selection.missing.length ? 'chip-red' : 'chip-neutral',
+          `${describeAccountSelection(step.accounts, pool)}; edit the step to change it`,
+        );
+
         const race = h('input', {
           type: 'checkbox', 'aria-label': `Step ${i + 1} races (hedged participant)`,
         });
@@ -1278,6 +1294,7 @@ export async function renderCombos(mount, ctx, selectedId) {
           pos,
           h('span', { class: 'icon-btn', 'aria-hidden': 'true', title: 'Drag to reorder' }, icon('grip')),
           ref,
+          accountsChip,
           levelSelect,
           h('label', { class: 'step-flag' }, race, 'race'),
           h('label', { class: 'step-flag' }, on, 'on'),
@@ -1316,7 +1333,7 @@ export async function renderCombos(mount, ctx, selectedId) {
         placeholder: 'provider…',
         value: step.provider ?? '',
         emptyText: 'no provider matches',
-        onChoose: () => fillModels(),
+        onChoose: () => { fillModels(); pruneChosen(); },
       });
       const modelSel = createSearchSelect({
         ariaLabel: `Model for step ${i + 1}`,
@@ -1332,6 +1349,80 @@ export async function renderCombos(mount, ctx, selectedId) {
       });
       const noteIn = h('input', { class: 'input', type: 'text', value: step.note ?? '', placeholder: 'note (optional)', 'aria-label': `Note for step ${i + 1}` });
       const done = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, 'Done');
+
+      // Which accounts this step may use. An empty selection means *every* account — that is the
+      // default and the reason the picker opens with nothing ticked, so the panel has to say
+      // "every account" out loud rather than leave an empty box to be read as "none".
+      //
+      // Selectors are kept verbatim. A step written as `alice` follows whoever carries that tag,
+      // so rewriting it to an account id here would freeze a choice the operator expressed in terms
+      // of a person; ticking a new account by hand stores its id, which is the right precision for
+      // a one-off.
+      let chosen = Array.isArray(step.accounts)
+        ? step.accounts.map((sel) => String(sel ?? '').trim()).filter(Boolean)
+        : [];
+      const accountsBox = h('div', { class: 'step-accounts' });
+
+      function providerAccounts() {
+        const provider = localProviders().find((entry) => entry.id === provSel.value());
+        return Array.isArray(provider?.accounts) ? provider.accounts : [];
+      }
+
+      function drawAccounts() {
+        const pool = providerAccounts();
+        const selection = stepAccountSelection(chosen, pool);
+        const rows = pool.map((account) => {
+          const box = h('input', {
+            type: 'checkbox',
+            'aria-label': `Use account ${account.label || account.identity || account.id} in step ${i + 1}`,
+          });
+          box.checked = chosen.some((sel) => selectorNames(sel, account));
+          box.addEventListener('change', () => {
+            if (box.checked) {
+              if (!chosen.some((sel) => selectorNames(sel, account))) chosen = [...chosen, String(account.id ?? '')];
+            } else {
+              chosen = chosen.filter((sel) => !selectorNames(sel, account));
+            }
+            drawAccounts();
+          });
+          const tags = Array.isArray(account.tags) ? account.tags.filter(Boolean) : [];
+          return h('label', { class: 'checkbox-row' },
+            box,
+            h('span', {}, account.label || account.identity || account.id),
+            h('span', { class: 'hint mono' }, account.id ?? ''),
+            ...(tags.length ? [chip(tags.join(', '), 'chip-neutral', `tags: ${tags.join(', ')}`)] : []));
+        });
+        const clear = h('button', { class: 'btn btn-sm', type: 'button' }, 'Use every account');
+        clear.disabled = chosen.length === 0;
+        clear.addEventListener('click', () => { chosen = []; drawAccounts(); });
+
+        accountsBox.replaceChildren(
+          h('div', { class: 'step-accounts-head' },
+            h('strong', {}, 'Accounts this step may use'),
+            chip(selection.all ? 'every account' : `${selection.selected.length} of ${pool.length}`, 'chip-neutral'),
+            clear),
+          ...(pool.length
+            ? rows
+            : [h('p', { class: 'hint' }, 'This provider has no accounts yet, so the step has nothing to choose between.')]),
+          h('p', { class: 'hint' }, selection.all
+            ? 'Nothing ticked means every account, including any added later.'
+            : 'Only the ticked accounts may serve this step; an account added later is not included.'),
+          ...(selection.missing.length
+            ? [h('p', { class: 'form-errors' },
+              `No account of this provider matches ${selection.missing.map((name) => JSON.stringify(name)).join(', ')}.`)]
+            : []),
+        );
+        accountsBox.hidden = kindSel.value === 'combo';
+      }
+
+      // An explicit change of provider is an explicit statement of which pool applies: selectors
+      // that name something in the new provider survive, the rest do not. Done only on a pick, so
+      // opening the editor never silently discards a selector that is merely stale.
+      function pruneChosen() {
+        const pool = providerAccounts();
+        chosen = chosen.filter((sel) => pool.some((account) => selectorNames(sel, account)));
+        drawAccounts();
+      }
 
       function localProviders(next) {
         return next !== undefined ? next : (ctx.state.providers ?? providers ?? []);
@@ -1349,6 +1440,9 @@ export async function renderCombos(mount, ctx, selectedId) {
         provSel.el.hidden = toCombo;
         modelSel.el.hidden = toCombo;
         comboPick.el.hidden = !toCombo;
+        // A nested combo supplies its own steps' account choices; a selector here would have no
+        // provider to resolve against, so the picker does not apply to a combo target.
+        accountsBox.hidden = toCombo;
       }
       function fillProviderChoices(next) {
         provSel.setOptions(localProviders(next).map((p) => ({
@@ -1367,12 +1461,14 @@ export async function renderCombos(mount, ctx, selectedId) {
         .filter((c) => c.id !== draft.id && c.name !== draft.name)
         .map((c) => ({ value: c.name || c.id, label: c.name || c.id, hint: c.name && c.name !== c.id ? c.id : undefined })));
       fillModels();
+      drawAccounts();
       applyKind();
 
       ctx.loadProviders().then((next) => {
         providers = next ?? providers;
         fillProviderChoices(next);
         fillModels();
+        drawAccounts();
       }).catch(() => {});
 
       done.addEventListener('click', () => {
@@ -1392,13 +1488,19 @@ export async function renderCombos(mount, ctx, selectedId) {
           if (!model) { ctx.toast.warning('enter a model id for the step'); return; }
           const next = { ...step, provider, model, note };
           delete next.combo;
+          // Present only when the step is restricted: an empty array would be a second spelling of
+          // "every account" in the config file, and the saved document should have one.
+          if (chosen.length) next.accounts = [...chosen];
+          else delete next.accounts;
           draft.steps[i] = next;
         }
         renderSteps(); renderStableSelect();
         markDirty();
       });
-      li.replaceChildren(h('div', { class: 'step-edit' },
-        h('span', { class: 'step-pos' }, String(i + 1)), kindSel, provSel.el, modelSel.el, comboPick.el, noteIn, done));
+      li.replaceChildren(h('div', { class: 'step-edit-wrap' },
+        h('div', { class: 'step-edit' },
+          h('span', { class: 'step-pos' }, String(i + 1)), kindSel, provSel.el, modelSel.el, comboPick.el, noteIn, done),
+        accountsBox));
       (kindSel.value === 'combo' ? comboPick : modelSel).input.focus();
     }
 

@@ -13,19 +13,22 @@ export async function renderSettings(mount, ctx) {
   const latencyCard = h('div', { class: 'card' }, h('h2', {}, 'Relay connection pool'));
   const accessCard = h('div', { class: 'card' }, h('h2', {}, 'Client-key access'));
   const proxiesCard = h('div', { class: 'card wide' }, h('h2', {}, 'Upstream proxies'));
+  const peopleCard = h('div', { class: 'card wide' }, h('h2', {}, 'People and their machines'));
   const quotaDisplayCard = h('div', { class: 'card' }, h('h2', {}, 'Quota display'));
   const quotaProbeCard = h('div', { class: 'card wide' }, h('h2', {}, 'Quota probing'));
   const pricingCard = h('div', { class: 'card' }, h('h2', {}, 'Pricing data'));
   const passwordCard = h('div', { class: 'card' }, h('h2', {}, 'Panel password'));
   const rawCard = h('div', { class: 'card wide' }, h('h2', {}, 'Raw configuration'));
   // Eight full-width cards made Settings a long single column with no reading rhythm. A two-up
-  // grid keeps the wide forms (ports, proxies, raw JSON) full width and pairs the short ones.
-  // Quota probing joins them wide: a candidate list is a row of paths, each with its own label and
-  // reorder buttons, and pairing it with a narrow card would squeeze the paths into a column.
+  // grid keeps the wide forms (ports, proxies, people, raw JSON) full width and pairs the short
+  // ones. Quota probing joins them wide: a candidate list is a row of paths, each with its own
+  // label and reorder buttons, and pairing it with a narrow card would squeeze the paths into a
+  // column.
   mount.replaceChildren(h('div', { class: 'settings-grid' },
-    portsCard, latencyCard, accessCard, proxiesCard, quotaDisplayCard, quotaProbeCard, pricingCard, passwordCard, rawCard));
+    portsCard, latencyCard, accessCard, proxiesCard, peopleCard, quotaDisplayCard, quotaProbeCard,
+    pricingCard, passwordCard, rawCard));
 
-  await Promise.all([renderPorts(), renderPassword(), renderLatency(), renderAccess(), renderProxies(), renderQuotaDisplay(), renderQuotaProbe(), renderPricing()]);
+  await Promise.all([renderPorts(), renderPassword(), renderLatency(), renderAccess(), renderProxies(), renderPeople(), renderQuotaDisplay(), renderQuotaProbe(), renderPricing()]);
   renderRaw(); // sequential on purpose: the textarea is heavy and it can stream in last
 
   // ------------------------------------------------------------------ ports
@@ -437,6 +440,169 @@ export async function renderSettings(mount, ctx) {
       h('h2', {}, 'Upstream proxies'),
       h('p', { class: 'hint' }, 'These endpoints route upstream provider traffic. URLs can reveal internal hostnames; passwords must not be embedded in the URL. No proxy URLs or credentials are written to browser logs.'),
       field('Selection strategy', strategy, { help: 'Priority chooses the lowest number first; least-used, random and round-robin distribute among eligible enabled proxies.' }),
+      list,
+      h('div', { class: 'dialog-actions' }, add, save), status,
+    );
+  }
+
+  // ------------------------------------------------------------------ people
+
+  /// People, and the machine each one's traffic should leave from.
+  ///
+  /// A person is a tag plus a proxy. An account tagged `alice` egresses through alice's Tailscale
+  /// exit node without a second per-account proxy reference that could drift away from the tag —
+  /// the tag *is* the assignment. The entries live in the configuration file rather than behind
+  /// their own endpoint, so this card reads and writes the whole document exactly as the proxy list
+  /// above does: one validated commit, one digest bump, no half-saved people.
+  async function renderPeople() {
+    let config;
+    try {
+      config = await readConfig();
+    } catch (err) {
+      peopleCard.replaceChildren(h('h2', {}, 'People and their machines'), errorBlock(err));
+      return;
+    }
+
+    const proxies = Array.isArray(config.proxies) ? config.proxies : [];
+    const providerList = Array.isArray(config.providers) ? config.providers : [];
+    const people = Array.isArray(config.people) ? config.people.map((person) => ({ ...person })) : [];
+    const list = h('div', { class: 'stack' });
+    const status = h('div');
+    const controlsByPerson = new Map();
+
+    function syncControls() {
+      for (const [person, controls] of controlsByPerson) {
+        person.tag = controls.tag.value.trim();
+        person.label = controls.label.value.trim() || null;
+        person.proxy = controls.proxy.value;
+      }
+    }
+
+    // The join is the point of this card. A person with no tagged accounts routes nothing at all,
+    // and nothing else in the panel would say so: the accounts themselves look perfectly ordinary.
+    function accountsTagged(tag) {
+      const needle = String(tag ?? '').trim().toLowerCase();
+      if (!needle) return [];
+      const found = [];
+      for (const provider of providerList) {
+        for (const account of Array.isArray(provider.accounts) ? provider.accounts : []) {
+          const tags = Array.isArray(account.tags) ? account.tags : [];
+          if (tags.some((t) => String(t ?? '').trim().toLowerCase() === needle)) {
+            found.push(`${account.label || account.identity || account.id} (${provider.id})`);
+          }
+        }
+      }
+      return found;
+    }
+
+    function drawJoin(slot, tag) {
+      const found = accountsTagged(tag);
+      slot.replaceChildren(found.length
+        ? h('span', {}, 'Tagged accounts: ', h('span', { class: 'mono' }, found.join(', ')))
+        : h('span', { class: 'hint' }, 'No account carries this tag yet. Add it to an account under Providers.'));
+    }
+
+    function drawPeople() {
+      controlsByPerson.clear();
+      list.replaceChildren();
+      if (!people.length) {
+        list.append(h('p', { class: 'hint' },
+          'No people yet. A person is a tag plus a proxy; tagging an account with that tag sends it through their machine.'));
+      }
+      for (const [index, person] of people.entries()) {
+        const tag = h('input', {
+          class: 'input mono', type: 'text', value: person.tag ?? '',
+          'aria-label': `Person ${index + 1} tag`, placeholder: 'alice',
+        });
+        const label = h('input', {
+          class: 'input', type: 'text', value: person.label ?? '',
+          'aria-label': `Person ${index + 1} label`, placeholder: 'optional display name',
+        });
+        const proxy = h('select', { class: 'input', 'aria-label': `Person ${index + 1} proxy` },
+          ...(person.proxy ? [] : [h('option', { value: '' }, 'choose a proxy…')]),
+          ...proxies.map((option) => h('option', { value: option.id, selected: person.proxy === option.id },
+            option.enabled === false ? `${option.id} (disabled)` : option.id)),
+          // A proxy this person already names but the list no longer has must stay visible: a
+          // select whose value matches no option shows the first one, and saving would then
+          // silently repoint the person at a different machine.
+          ...(person.proxy && !proxies.some((option) => option.id === person.proxy)
+            ? [h('option', { value: person.proxy, selected: true }, `${person.proxy} (unknown)`)]
+            : []));
+        const join = h('p', { class: 'hint settings-person-join' });
+        drawJoin(join, person.tag);
+        tag.addEventListener('input', () => drawJoin(join, tag.value));
+
+        const remove = h('button', { class: 'btn btn-sm', type: 'button' }, 'Remove person');
+        remove.addEventListener('click', () => {
+          syncControls();
+          people.splice(index, 1);
+          drawPeople();
+        });
+        const row = h('div', { class: 'card settings-proxy' },
+          h('div', { class: 'grid-2' },
+            field('Tag', tag, { hint: 'The word accounts carry. Accounts tagged alice egress through alice\u2019s proxy.' }),
+            field('Label', label, { hint: 'Optional. Shown instead of the tag where the panel has room.' })),
+          field('Proxy', proxy, { hint: 'A Tailscale exit node is usually a SOCKS5 endpoint on a tailnet address, for example socks5h://100.64.0.7:1080. Add it above first.' }),
+          join,
+          remove);
+        list.append(row);
+        controlsByPerson.set(person, { tag, label, proxy });
+      }
+    }
+    drawPeople();
+
+    const add = h('button', { class: 'btn', type: 'button' }, 'Add person');
+    add.addEventListener('click', () => {
+      syncControls();
+      people.push({ tag: '', label: null, proxy: proxies.length === 1 ? proxies[0].id : '' });
+      drawPeople();
+    });
+    const save = h('button', { class: 'btn btn-primary', type: 'button' }, 'Save people');
+    save.addEventListener('click', async () => {
+      const latest = await readConfig().catch((err) => {
+        status.replaceChildren(errorBlock(err));
+        return null;
+      });
+      if (!latest) return;
+      syncControls();
+      const nextPeople = people.map((person) => ({
+        tag: person.tag,
+        label: person.label,
+        proxy: person.proxy,
+      }));
+      const blank = nextPeople.find((person) => !person.tag || !person.proxy);
+      if (blank) {
+        status.replaceChildren(h('div', { class: 'form-errors', role: 'alert' },
+          'Each person needs a tag and a proxy. Add the proxy above first if the list is still empty.'));
+        return;
+      }
+      // The server refuses duplicates too, but with a message about a tag rather than a row; the
+      // card can say which row.
+      const seen = new Map();
+      const duplicate = nextPeople.find((person) => {
+        const key = person.tag.toLowerCase();
+        if (seen.has(key)) return true;
+        seen.set(key, person);
+        return false;
+      });
+      if (duplicate) {
+        status.replaceChildren(h('div', { class: 'form-errors', role: 'alert' },
+          `Two people share the tag ${JSON.stringify(duplicate.tag)}. Tags identify a person, so each one has to be unique.`));
+        return;
+      }
+      latest.people = nextPeople;
+      try {
+        await api.putRaw('/api/config/raw', JSON.stringify(latest, null, 2));
+        await renderValidation(status);
+        ctx.toast.success('People saved.');
+      } catch (err) {
+        status.replaceChildren(errorBlock(err));
+      }
+    });
+    peopleCard.replaceChildren(
+      h('h2', {}, 'People and their machines'),
+      h('p', { class: 'hint' },
+        'A person here is a tag plus a proxy, so tagging an account with that tag sends its traffic through that machine — no per-account proxy to keep in step. An account\u2019s own proxy still wins, and a proxy that cannot be reached falls back to a direct connection.'),
       list,
       h('div', { class: 'dialog-actions' }, add, save), status,
     );

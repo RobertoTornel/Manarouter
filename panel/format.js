@@ -436,6 +436,77 @@ export function listToLines(list) {
   return (list ?? []).join('\n');
 }
 
+// ---------- account tags and step account selection ----------
+
+/**
+ * The tag field → the list the configuration stores.
+ *
+ * Tags are a small free-text note, so the field accepts the natural separators (comma or newline)
+ * and nothing is rejected for shape. Case-insensitive duplicates collapse: `Alice, alice` is one
+ * tag because that is how the server compares them, and keeping both would make a step selector
+ * look ambiguous when it is not.
+ */
+export function parseTagList(text) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of String(text ?? '').split(/[,\n]/)) {
+    const tag = raw.trim();
+    if (!tag) continue;
+    const key = tag.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(tag);
+  }
+  return out;
+}
+
+export function tagListText(list) {
+  return (Array.isArray(list) ? list : []).join(', ');
+}
+
+/**
+ * Does one step selector name this account? Mirrors `mr_core::model::account_selector_matches`:
+ * a `tag:` prefix is optional, the id is checked first, and the comparison is case-insensitive.
+ */
+export function selectorNames(selector, account) {
+  if (!account) return false;
+  const trimmed = String(selector ?? '').trim();
+  if (!trimmed) return false;
+  const bare = trimmed.slice(0, 4).toLowerCase() === 'tag:' ? trimmed.slice(4).trim() : trimmed;
+  if (!bare) return false;
+  const needle = bare.toLowerCase();
+  if (String(account.id ?? '').toLowerCase() === needle) return true;
+  return (Array.isArray(account.tags) ? account.tags : [])
+    .some((tag) => String(tag ?? '').trim().toLowerCase() === needle);
+}
+
+/**
+ * The accounts a step's selectors name, and the selectors that name nothing.
+ *
+ * An empty selection is not "no accounts": it is the default, *every* account of the provider.
+ * `missing` is what the panel must warn about, because the server rejects the whole combo when a
+ * selector matches nothing and the operator needs to see which one.
+ */
+export function stepAccountSelection(selectors, accounts) {
+  const list = (Array.isArray(selectors) ? selectors : []).map((s) => String(s ?? '').trim()).filter(Boolean);
+  const pool = Array.isArray(accounts) ? accounts : [];
+  if (!list.length) return { selected: pool.slice(), missing: [], all: true };
+  const selected = pool.filter((account) => list.some((selector) => selectorNames(selector, account)));
+  const missing = list.filter((selector) => !pool.some((account) => selectorNames(selector, account)));
+  return { selected, missing, all: false };
+}
+
+/** "every account" or "alice, work" — a step's selection in a few words. */
+export function describeAccountSelection(selectors, accounts, { max = 3 } = {}) {
+  const { selected, missing, all } = stepAccountSelection(selectors, accounts);
+  if (all) return 'every account';
+  const names = selected.map((a) => a.label || a.identity || a.id);
+  const shown = names.slice(0, max).join(', ');
+  const more = names.length > max ? ` +${names.length - max}` : '';
+  const gaps = missing.length ? ` (unknown: ${missing.join(', ')})` : '';
+  return (names.length ? `${shown}${more}` : 'no account') + gaps;
+}
+
 /** One QuotaWindow (config-declared) → "50 req · 200 k tok / 1 h". */
 export function formatWindowLimits(qw) {
   if (!qw || typeof qw !== 'object') return '—';

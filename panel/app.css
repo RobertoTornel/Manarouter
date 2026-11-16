@@ -1210,6 +1210,24 @@ ol.steps { list-style: none; margin: 0; padding: 0; }
 .step-edit { flex: 1 1 auto; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .step-edit .input { width: auto; flex: 1 1 120px; }
 
+/* The step editor is two rows when an operator restricts a step to some of a provider's accounts,
+   so it becomes a column of rows and the inner row keeps .step-edit's own layout. */
+.step-edit-wrap { flex: 1 1 auto; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.step-accounts {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+}
+/* `display: flex` would otherwise beat the hidden attribute a combo target sets. */
+.step-accounts[hidden] { display: none; }
+.step-accounts-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+.step-accounts-head strong { font-size: 12px; font-weight: 600; }
+.step-accounts .checkbox-row { flex-wrap: wrap; align-items: center; gap: 6px; margin: 3px 0; font-size: 12px; }
+.step-accounts .checkbox-row input[type="checkbox"] { margin-top: 0; }
+.step-accounts .checkbox-row .hint { margin: 0; flex: 0 1 auto; overflow-wrap: anywhere; }
+
 /* A step picker: an input plus a list the page draws. The list floats over the rows below, so
    the row must not clip it (overflow stays visible) and the wrapper owns the stacking order. */
 .add-step-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 8px; }

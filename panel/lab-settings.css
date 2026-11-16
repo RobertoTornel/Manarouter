@@ -66,6 +66,9 @@
 
 .settings-proxy { margin: 10px 0; padding: 12px 14px; }
 .settings-proxy > .grid-2 { margin-bottom: 8px; }
+/* The tag→account join under a person: a hint line, but it carries the one fact the card exists to
+   show, so it keeps its own row and never wraps into the proxy field above it. */
+.settings-person-join { margin: 6px 0 10px; }
 
 /* ---------- probe paths ---------- */
 

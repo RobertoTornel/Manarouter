@@ -454,6 +454,26 @@ body.provider-dragging .providers-view .provider-table tr.row-draggable { cursor
 }
 .providers-view .provider-detail-row:hover > td { background: var(--bg0); }
 
+/* ---------------------------------------------------------------- account tags */
+
+/* Tags are short words an operator scans, so they sit as chips in one wrapping row. The cell is
+   capped in width: a long note must not push the state and actions columns off the visible pane,
+   which scrolls as a whole anyway. */
+.providers-view .tags-cell { max-width: 240px; }
+.providers-view .tags-view {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.providers-view .tags-view .hint { margin: 0; }
+.providers-view .tags-edit {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
 /* ---------------------------------------------------------------- empty states */
 
 .providers-view .provider-empty {
