@@ -30,7 +30,7 @@ UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrom
 curl -sS -X POST https://www.kaggle.com/mcp \
   -H "User-Agent: $UA" -H "Authorization: Bearer $KGAT" \
   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"manarouter","version":"0.2.3"}}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"manarouter","version":"0.2.4"}}}'
 
 curl -sS -X POST https://www.kaggle.com/mcp \
   -H "User-Agent: $UA" -H "Authorization: Bearer $KGAT" \
