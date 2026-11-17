@@ -215,3 +215,42 @@ test('a sent block ignores further submits until the flow ends', async () => {
     api.post = original;
   }
 });
+
+test('the paste-only flow asks for the code, not for a URL', async () => {
+  // Anthropic's login redirects to a page on Anthropic's own origin, so there is no address bar to
+  // copy from. The same block is reused, but every word around the input has to match what the
+  // person is looking at — telling them to paste a URL they will never have is the bug this pins.
+  const calls = [];
+  const original = api.post;
+  api.post = async (path, body) => {
+    calls.push({ path, body });
+    return {};
+  };
+  try {
+    const ui = buildRedirectPaste({ id: 'claude-max' }, makeCtx(), { id: 'sess-5' });
+    ui.show(null, { codeOnly: true });
+
+    const all = walk(ui.block);
+    const label = all.find((n) => n.tagName === 'LABEL');
+    assert.match(textOf(label), /paste the code/i);
+    assert.doesNotMatch(textOf(label), /redirected/i);
+    assert.equal(ui.input.placeholder, 'code#state');
+    assert.equal(ui.submit.textContent, 'Use this code');
+    assert.match(textOf(ui.block), /code#state/);
+
+    ui.input.value = 'abc123#state-456';
+    await ui.send();
+    assert.deepEqual(calls, [{
+      path: '/api/oauth/sessions/sess-5/redirect',
+      body: { provider_id: 'claude-max', url: 'abc123#state-456' },
+    }], 'code#state is sent verbatim as the url field');
+
+    // Switching back for a browser flow restores the URL wording on the same block.
+    ui.show('http://127.0.0.1:1455/auth/callback');
+    assert.match(textOf(walk(ui.block).find((n) => n.tagName === 'LABEL')), /paste the URL/i);
+    assert.equal(ui.submit.textContent, 'Use this URL');
+    assert.equal(ui.input.placeholder, 'http://127.0.0.1:1455/auth/callback?code=…&state=…');
+  } finally {
+    api.post = original;
+  }
+});

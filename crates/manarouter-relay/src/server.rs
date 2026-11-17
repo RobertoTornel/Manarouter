@@ -5295,6 +5295,9 @@ fn dialect_version(dialect: Dialect) -> Option<&'static str> {
         // (`/agent.v1.AgentService/Run`). Nothing is ever appended to it, so there is no version
         // segment to add — and adding one would produce a path the server does not serve.
         Dialect::Cursor => None,
+        // Claude Code's base is `https://api.anthropic.com/v1`, the same API prefix the plain
+        // Anthropic dialect uses, and its endpoints are the same `/v1/messages` pair.
+        Dialect::ClaudeCli => Some("v1"),
     }
 }
 
@@ -5454,6 +5457,13 @@ fn default_path(dialect: Dialect, route: RouteKind) -> &'static str {
             RouteKind::CountTokens => "/v1/messages/count_tokens",
             _ => "/v1/messages",
         },
+        // Claude Code posts to the same two endpoints on the same host as the plain Anthropic
+        // dialect. What differs is the body's identity block and the credential's headers, not
+        // the address.
+        Dialect::ClaudeCli => match route {
+            RouteKind::CountTokens => "/v1/messages/count_tokens",
+            _ => "/v1/messages",
+        },
         Dialect::Google => "/v1beta/models:generateContent",
         Dialect::GoogleAiStudio => "/v1beta/models:generateContent",
         Dialect::Antigravity => "/v1internal:generateContent",
@@ -5598,6 +5608,36 @@ fn upstream_headers(
     // would never send is exactly what this dialect exists to avoid.
     if step.dialect == Dialect::Zcode {
         zcode_attribution_headers(&mut map, client_session_hint(client_headers));
+    }
+
+    // Claude Code's subscription surface. `apply_auth` has already produced `Authorization:
+    // Bearer` from `AuthKind::OAuth`; what the Messages API additionally validates is the CLI
+    // fingerprint — the beta flag that accepts an `sk-ant-oat*` token at all, the version the CLI is
+    // built against, the client marker, and the CLI's own `User-Agent`. `x-api-key` is never sent:
+    // a subscription token on that header is refused, and the `claude-code` template configures
+    // OAuth auth so a key-shaped credential cannot end up there by accident. The body side of the
+    // fingerprint — the identity sentence in `system` — is `mr_dialects::claudecli`'s business.
+    if step.dialect == Dialect::ClaudeCli {
+        map.entry("anthropic-version")
+            .or_insert(HeaderValue::from_static(
+                mr_core::published::claude::ANTHROPIC_VERSION,
+            ));
+        map.entry("anthropic-beta")
+            .or_insert(HeaderValue::from_static(
+                mr_core::published::claude::ANTHROPIC_BETA,
+            ));
+        map.entry(mr_core::published::claude::APP_HEADER)
+            .or_insert(HeaderValue::from_static(mr_core::published::claude::APP));
+        if !map.contains_key("user-agent") {
+            match HeaderValue::from_str(&mr_dialects::claudecli::user_agent()) {
+                Ok(value) => {
+                    map.insert("user-agent", value);
+                }
+                Err(_) => {
+                    tracing::warn!("the Claude Code user agent is not a valid header");
+                }
+            }
+        }
     }
 
     // Cloud Code refuses clients below a rolling minimum build ("This version of Antigravity is
@@ -8450,6 +8490,84 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             &[],
         );
         assert_eq!(out.get("user-agent").unwrap().to_str().unwrap(), RECORDED);
+    }
+
+    #[test]
+    fn claude_code_carries_the_subscription_headers_and_never_an_api_key() {
+        // A Claude subscription token is only accepted with the CLI's own fingerprint, and it is a
+        // bearer credential: sending `x-api-key` alongside (or instead) is what makes the upstream
+        // answer 401 for a perfectly valid token.
+        let mut p = provider_plan();
+        p.headers
+            .insert("anthropic-version".to_owned(), "2023-06-01".to_owned());
+        p.headers.insert(
+            "user-agent".to_owned(),
+            mr_dialects::claudecli::user_agent(),
+        );
+        let head = scan_request_head(br#"{"model":"claude-sonnet-4-5"}"#);
+        let out = upstream_headers(
+            &p,
+            &step(Dialect::ClaudeCli, "https://api.anthropic.com"),
+            Some("sk-ant-oat01-token"),
+            &HeaderMap::new(),
+            &head,
+            false,
+            None,
+            &[],
+        );
+        assert_eq!(
+            out.get("authorization").unwrap(),
+            "Bearer sk-ant-oat01-token"
+        );
+        assert!(
+            out.get("x-api-key").is_none(),
+            "a subscription is not a key"
+        );
+        assert_eq!(out.get("anthropic-version").unwrap(), "2023-06-01");
+        assert_eq!(
+            out.get("anthropic-beta").unwrap(),
+            mr_core::published::claude::ANTHROPIC_BETA
+        );
+        assert_eq!(out.get("x-app").unwrap(), "cli");
+        assert_eq!(
+            out.get("user-agent").unwrap().to_str().unwrap(),
+            mr_dialects::claudecli::user_agent()
+        );
+
+        // A provider that recorded none of them still gets every one: the relay supplies what the
+        // translator's identity sentence makes mandatory, so an operator template cannot lose it.
+        let bare = provider_plan();
+        let out = upstream_headers(
+            &bare,
+            &step(Dialect::ClaudeCli, "https://api.anthropic.com"),
+            Some("sk-ant-oat01-token"),
+            &HeaderMap::new(),
+            &head,
+            false,
+            None,
+            &[],
+        );
+        assert_eq!(
+            out.get("anthropic-version").unwrap(),
+            mr_core::published::claude::ANTHROPIC_VERSION
+        );
+        assert_eq!(out.get("x-app").unwrap(), "cli");
+        assert!(out.get("user-agent").is_some());
+
+        // Another dialect never gains them, so adding the surface did not change anyone else.
+        let out = upstream_headers(
+            &bare,
+            &step(Dialect::Anthropic, "https://api.anthropic.com"),
+            Some("sk-ant-api03-key"),
+            &HeaderMap::new(),
+            &head,
+            false,
+            None,
+            &[],
+        );
+        assert!(out.get("anthropic-beta").is_none());
+        assert!(out.get("x-app").is_none());
+        assert_eq!(out.get("authorization").unwrap(), "Bearer sk-ant-api03-key");
     }
 
     #[test]

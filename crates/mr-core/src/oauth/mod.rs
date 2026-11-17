@@ -41,6 +41,7 @@
 //! own account mutation; this module only reads and writes credential material.
 
 pub mod antigravity;
+pub mod claude;
 pub mod codex;
 pub mod copilot;
 pub mod cursor;
@@ -535,6 +536,21 @@ pub trait OAuthPlatform: Send + Sync {
     /// Read this as "what happens when the operator just clicks Connect".
     fn begins_with_loopback(&self) -> bool;
 
+    /// The fixed redirect target a **paste** login comes back through, when the platform has one.
+    ///
+    /// `Some` means this platform's redirect URI points at the provider's own origin rather than at
+    /// a listener here, so the browser cannot hand the code back to this router: the provider's
+    /// page shows `code#state` and the human copies it into the panel. The value is the URI the
+    /// authorization request must carry, verbatim, and is also the URI the token exchange must
+    /// repeat — it is *not* derived from a bound port, because nothing is bound.
+    ///
+    /// A platform that returns `Some` here is started with
+    /// [`OAuthSessions::start_paste`](session::OAuthSessions::start_paste) and never advertises the
+    /// device flow.
+    fn paste_redirect_uri(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Whether this platform can *also* be logged in with a device code.
     ///
     /// Codex answers `true` while still defaulting to the loopback redirect, because the two flows
@@ -547,10 +563,13 @@ pub trait OAuthPlatform: Send + Sync {
     /// the device code (Copilot) returns `false` for [`begins_with_loopback`](Self::begins_with_loopback)
     /// and `true` here.
     fn supports_device_flow(&self) -> bool {
-        // `begins_with_screen_login` is excluded explicitly: the device flow and the
-        // provider-page flow are both "not loopback", so the deduction alone would advertise a
-        // code prompt for a platform whose login can only be finished on its own page.
-        !self.begins_with_loopback() && !self.begins_with_screen_login()
+        // `begins_with_screen_login` and `paste_redirect_uri` are excluded explicitly: all three
+        // are "not loopback", so the deduction alone would advertise a code prompt for a platform
+        // whose login can only be finished on its own page — or, worse, for one that is finished by
+        // pasting a redirect the device flow would never produce.
+        !self.begins_with_loopback()
+            && !self.begins_with_screen_login()
+            && self.paste_redirect_uri().is_none()
     }
 
     /// Where a browser-based login may send the user back. Device platforms return an inert
@@ -576,6 +595,25 @@ pub trait OAuthPlatform: Send + Sync {
 
     /// Redeem the authorization code the loopback listener received for a token set.
     async fn exchange_code(&self, code: &str, pkce: Option<&Pkce>, port: u16) -> Result<TokenSet>;
+
+    /// Redeem an authorization code while also handing the exchange the `state` it was issued for.
+    ///
+    /// Anthropic's token endpoint requires `state` in the request body as well as the code, and
+    /// treats a mismatch as an invalid grant. Every other platform's endpoint derives what it needs
+    /// from the code and the PKCE verifier alone, so the default forwards to
+    /// [`exchange_code`](Self::exchange_code) and existing implementations need no change.
+    ///
+    /// The `state` passed here is the one this router generated for the attempt and compared the
+    /// result against; it is never a value taken from the pasted text.
+    async fn exchange_code_with_state(
+        &self,
+        code: &str,
+        _state: &str,
+        pkce: Option<&Pkce>,
+        port: u16,
+    ) -> Result<TokenSet> {
+        self.exchange_code(code, pkce, port).await
+    }
 
     /// Exchange a refresh token for a fresh token set.
     ///
@@ -716,11 +754,13 @@ pub trait OAuthPlatform: Send + Sync {
 // The registry. Each platform type carries its own `pub const ID` (see the trait docs); the
 // statics below exist so `platforms()` can hand out `&'static dyn OAuthPlatform`.
 use antigravity::Antigravity;
+use claude::Claude;
 use codex::Codex;
 use copilot::Copilot;
 use cursor::Cursor;
 use zcode::Zcode;
 
+static CLAUDE: Claude = Claude;
 static CODEX: Codex = Codex;
 static COPILOT: Copilot = Copilot;
 static ANTIGRAVITY: Antigravity = Antigravity::ide();
@@ -728,8 +768,8 @@ static CURSOR: Cursor = Cursor;
 static ZCODE: Zcode = Zcode;
 
 /// Registration order for implemented platforms, matching `catalog/providers.toml`.
-static PLATFORMS: [&'static dyn OAuthPlatform; 5] =
-    [&CODEX, &COPILOT, &ANTIGRAVITY, &CURSOR, &ZCODE];
+static PLATFORMS: [&'static dyn OAuthPlatform; 6] =
+    [&CODEX, &COPILOT, &ANTIGRAVITY, &CURSOR, &ZCODE, &CLAUDE];
 
 /// Every registered platform. Required to resolve every `AuthKind::OAuth` catalogue id — see
 /// the tests at the bottom of this file, which check both directions.

@@ -19,6 +19,8 @@
 //! * [`anthropic`] — Anthropic Messages, both directions against the pivot.
 //! * [`responses`] — the OpenAI Responses API, both directions against the pivot.
 //! * [`google`] — Gemini `generateContent`.
+//! * [`claudecli`] — the identity block Claude Code's own surface validates, prepended to a
+//!   Messages body.
 //! * [`commandcode`] — the Command Code CLI `alpha/generate` envelope and its private event stream.
 //! * [`sse`] — framing helpers for `text/event-stream`, used by everything that streams.
 //!
@@ -31,6 +33,7 @@ use bytes::Bytes;
 use mr_core::{Dialect, RouteKind};
 
 pub mod anthropic;
+pub mod claudecli;
 pub mod commandcode;
 pub mod cursor;
 pub mod google;
@@ -210,6 +213,18 @@ pub fn translate_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Option<T
         (Dialect::Anthropic, Dialect::Zcode) => Ok(None),
         (Dialect::OpenAi, Dialect::Zcode) => anthropic::from_openai_request(ctx, body).map(Some),
 
+        // Claude Code's surface is Anthropic Messages with one *body* requirement the API shape
+        // does not have: the `system` field must open with the CLI's identity sentence when the
+        // credential is a subscription token. So the Anthropic pairing is a rewrite rather than
+        // `Ok(None)`, and the OpenAI pairing is the Messages translation followed by the same
+        // rewrite. `claudecli` explains which measurement this rests on.
+        (Dialect::Anthropic, Dialect::ClaudeCli) => {
+            claudecli::from_anthropic_request(ctx, body).map(Some)
+        }
+        (Dialect::OpenAi, Dialect::ClaudeCli) => {
+            claudecli::from_openai_request(ctx, body).map(Some)
+        }
+
         (Dialect::OpenAi, Dialect::Anthropic) => {
             anthropic::from_openai_request(ctx, body).map(Some)
         }
@@ -293,6 +308,9 @@ pub fn translate_response_body(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<By
         // and an OpenAI client's goes through the same converter `(OpenAi, Anthropic)` uses.
         (Dialect::Anthropic, Dialect::Zcode) => Ok(Bytes::copy_from_slice(body)),
         (Dialect::OpenAi, Dialect::Zcode) => anthropic::to_openai_response(ctx, body),
+        // The reply is Anthropic Messages JSON either way; the identity block is request-side only.
+        (Dialect::Anthropic, Dialect::ClaudeCli) => Ok(Bytes::copy_from_slice(body)),
+        (Dialect::OpenAi, Dialect::ClaudeCli) => anthropic::to_openai_response(ctx, body),
         // `google::to_pivot_response` unwraps the Cloud Code `{response: {...}, traceId}`
         // envelope when the upstream is Antigravity, so every Gemini pairing answers here.
         (Dialect::OpenAi, Dialect::Google)
@@ -348,6 +366,8 @@ pub fn translate_sse_data(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<Stri
         // `ping`/keep-alives. `(OpenAi, Zcode)` is the same conversion as `(OpenAi, Anthropic)`.
         (Dialect::Anthropic, Dialect::Zcode) => Ok(vec![data.to_owned()]),
         (Dialect::OpenAi, Dialect::Zcode) => anthropic::sse_to_openai(ctx, data),
+        (Dialect::Anthropic, Dialect::ClaudeCli) => Ok(vec![data.to_owned()]),
+        (Dialect::OpenAi, Dialect::ClaudeCli) => anthropic::sse_to_openai(ctx, data),
         (Dialect::OpenAi, Dialect::CommandCodeGo)
         | (Dialect::Anthropic, Dialect::CommandCodeGo) => commandcode::sse_to_pivot(ctx, data),
         // Cloud Code's stream frames carry the same `{"response": ...}` wrapper, unwrapped per

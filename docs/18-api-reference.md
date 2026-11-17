@@ -760,13 +760,15 @@ later request. **No other endpoint returns a credential value** — not `/api/co
 | `GET` | `/api/quota` | Cached provider quota state for every account, plus its declared windows; `POST /api/quota/refresh` refreshes it. It does not read the request ledger — that is `/api/usage` below. See [Quota tracking](08-quota-tracking.md). |
 | `GET` | `/api/usage` | The per-request usage ledger, with the token count reported by the provider or estimated by the router — see below. |
 | `GET` | `/api/oauth` | The OAuth platforms this build supports. |
-| `POST` | `/api/oauth/{platform}/authorize` | Starts an interactive login. |
+| `POST` | `/api/oauth/{platform}/authorize` | Starts an interactive login — a loopback listener, a page login, or (for Claude Code) a paste-only session. |
 | `POST` | `/api/oauth/{platform}/device-code` | Starts a device-code login. |
-| `POST` | `/api/oauth/sessions/{id}/poll` | Polls a device-code session. |
-| `POST` | `/api/oauth/sessions/{id}/complete` | Completes an interactive login; blocks until the browser reaches the loopback redirect. |
+| `POST` | `/api/oauth/{platform}/screen` | Starts a page login the conductor observes by polling (Cursor). |
+| `POST` | `/api/oauth/{platform}/paste` | Starts a login that binds nothing and finishes when the person pastes the code the provider's page shows (Claude Code). The platform must declare `paste_redirect_uri()`; any other platform answers `400`. |
+| `POST` | `/api/oauth/sessions/{id}/poll` | Polls a device-code session, or a page-login session. |
+| `POST` | `/api/oauth/sessions/{id}/complete` | Completes an interactive login; blocks until the browser reaches the loopback redirect, or until the pasted code arrives. |
 | `POST` | `/api/oauth/sessions/{id}/redirect` | Hands a pasted redirect URL (or its `code`/`state` query, or `code#state`) to a login that is already waiting. Answers `202`; the exchange still happens in the waiting `complete` call. |
 
-The five OAuth `POST`s are how a credential enters the vault without ever passing through
+The seven OAuth `POST`s are how a credential enters the vault without ever passing through
 `config.json`; they are documented in [OAuth overview](10-oauth-overview.md).
 
 ### `GET /api/usage` — the token count, by the provider or by the router

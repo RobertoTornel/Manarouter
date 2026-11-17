@@ -139,6 +139,7 @@ pub(crate) fn guarded_router(state: AppState) -> Router<AppState> {
         .route("/api/oauth/{platform}/authorize", post(oauth_authorize))
         .route("/api/oauth/{platform}/device-code", post(oauth_device_code))
         .route("/api/oauth/{platform}/screen", post(oauth_screen_start))
+        .route("/api/oauth/{platform}/paste", post(oauth_paste_start))
         .route("/api/oauth/sessions/{id}/poll", post(oauth_poll))
         .route("/api/oauth/sessions/{id}/complete", post(oauth_complete))
         .route(
@@ -1566,10 +1567,18 @@ async fn oauth_platforms() -> Json<Value> {
                 // own page finishes the login and this router polls to learn of it.
                 flows.push("screen");
             }
+            if p.paste_redirect_uri().is_some() {
+                // The redirect leaves this machine and cannot come back, so the human copies the
+                // code the provider's page shows. Listed *after* loopback and device because a
+                // platform that offers either of those has a shape the panel can automate.
+                flows.push("paste");
+            }
             let flow = if p.begins_with_screen_login() {
                 "screen"
             } else if p.begins_with_loopback() {
                 "browser"
+            } else if p.paste_redirect_uri().is_some() {
+                "paste"
             } else {
                 "device"
             };
@@ -1659,6 +1668,37 @@ async fn oauth_screen_start(
         .await
         .map_err(ApiError::bad_gateway)?;
     Ok(Json(json!({"session_id": id, "login_url": login_url})))
+}
+
+/// Start a login whose redirect lands on the provider's own page.
+///
+/// The URL is returned but nothing is bound and nothing is awaited here: the human opens it
+/// wherever their browser is (this machine, a phone, another host), reads the code the provider
+/// displays, and the panel submits it to `/sessions/{id}/redirect` before calling `/complete`,
+/// which is where the blocking exchange happens. That split is what makes the flow usable on a
+/// headless server without a tunnel, which is the whole reason it exists.
+async fn oauth_paste_start(
+    State(state): State<AppState>,
+    Path(platform): Path<String>,
+    JsonBody(body): JsonBody,
+) -> ApiResult<Json<Value>> {
+    let body = object_body(body, "OAuth paste start")?;
+    let provider_id = body
+        .get("provider_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad("missing_provider", "provider_id is required"))?
+        .to_owned();
+    validate_oauth_provider(&state, &provider_id, &platform).await?;
+    let platform = oauth_platform(&platform)
+        .ok_or_else(|| ApiError::not_found("unknown or unavailable OAuth platform"))?;
+    let (id, authorization_url) = state
+        .oauth_sessions
+        .start_paste(platform, provider_id)
+        .await
+        .map_err(ApiError::bad_gateway)?;
+    Ok(Json(
+        json!({"session_id": id, "authorization_url": authorization_url}),
+    ))
 }
 
 /// Answer a session-binding failure with the status the panel behaves correctly on: a session that
@@ -3477,6 +3517,51 @@ mod tests {
             "a provider naming a registered platform must be accepted"
         );
         assert_eq!(state.current_config().await.providers.len(), 1);
+    }
+
+    /// The drawer decides which login to show from this list alone. A flow that is offered but
+    /// cannot start, or a default that is not in `flows`, strands the operator with no way to sign
+    /// in — so the contract is asserted here rather than discovered in the UI.
+    #[tokio::test]
+    async fn every_platform_declares_a_default_flow_it_can_actually_finish() {
+        let Json(body) = oauth_platforms().await;
+        let platforms = body["platforms"].as_array().expect("a platforms array");
+        assert!(!platforms.is_empty());
+
+        for platform in platforms {
+            let id = platform["id"].as_str().expect("an id");
+            let flow = platform["flow"].as_str().expect("a default flow");
+            let flows: Vec<&str> = platform["flows"]
+                .as_array()
+                .expect("a flows array")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            assert!(!flows.is_empty(), "{id} offers no way to log in");
+            assert!(
+                flows.contains(&flow),
+                "{id} defaults to {flow}, which is not one of {flows:?}"
+            );
+        }
+
+        let find = |id: &str| {
+            platforms
+                .iter()
+                .find(|p| p["id"] == id)
+                .unwrap_or_else(|| panic!("{id} must be registered"))
+        };
+        // Claude has no loopback and no device grant: the code comes back from Anthropic's own
+        // page, so `paste` is the only flow it can offer and the only one it may default to.
+        let claude = find("claude");
+        assert_eq!(claude["flow"], "paste");
+        assert_eq!(claude["flows"], serde_json::json!(["paste"]));
+        // Codex is the counter-example that proves the list is per-platform rather than a constant.
+        let codex = find("openai-codex");
+        assert_eq!(codex["flow"], "browser");
+        assert!(codex["flows"]
+            .as_array()
+            .expect("a flows array")
+            .contains(&serde_json::json!("device")));
     }
 
     #[test]

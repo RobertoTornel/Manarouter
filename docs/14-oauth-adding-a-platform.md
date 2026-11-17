@@ -84,12 +84,17 @@ pub trait OAuthPlatform: Send + Sync {
     fn label(&self) -> &'static str;
     fn description(&self) -> &'static str;
 
-    /// The platform's **default** flow: `true` binds a loopback listener and opens the browser,
-    /// `false` means the device-code flow.
+    /// The platform's **default** flow: `true` binds a loopback listener and opens the browser.
+    /// `false` means the login does not start with a local listener — a device code, a page login
+    /// the conductor polls, or a paste-only flow, whichever the declarations below select.
     fn begins_with_loopback(&self) -> bool;
     /// Whether the platform can *also* be logged in with a device code. Defaults to
     /// `!begins_with_loopback()`; Codex overrides it to `true` while still defaulting to loopback.
     fn supports_device_flow(&self) -> bool { !self.begins_with_loopback() }
+    /// A redirect URI on the provider's own origin: the browser lands there, the page shows a code,
+    /// and the person pastes it back. `Some` selects the paste-only flow, which binds nothing and
+    /// overrides both shapes above. Default: `None`.
+    fn paste_redirect_uri(&self) -> Option<&'static str> { None }
 
     /// The host/port/path a browser is sent back to; device platforms return an inert value.
     /// The host and path strings are sent to the provider verbatim and must not be normalised.
@@ -107,6 +112,13 @@ pub trait OAuthPlatform: Send + Sync {
     /// Redeem the authorization code the loopback listener received, with this platform's
     /// encoding (often not the same as `refresh`'s).
     async fn exchange_code(&self, code: &str, pkce: Option<&Pkce>, port: u16) -> Result<TokenSet>;
+    /// Redeem a code that must be presented together with the `state` it was issued for (Claude's
+    /// JSON exchange). Default: delegates to `exchange_code` and ignores the state.
+    async fn exchange_code_with_state(
+        &self, code: &str, state: &str, pkce: Option<&Pkce>, port: u16,
+    ) -> Result<TokenSet> {
+        self.exchange_code(code, pkce, port).await
+    }
 
     /// Exchange a refresh token for a fresh token set. Single-use refresh tokens mean the caller
     /// (`refresh::Refresher`) owns serialisation and persistence; implementations must not persist.
@@ -141,11 +153,12 @@ pub trait OAuthPlatform: Send + Sync {
 }
 ```
 
-Five items have defaults so that a device-flow platform does not have to write a loopback listener
-and a loopback-only platform does not have to write a device pair: `supports_device_flow`,
-`refresh_with_context`, `complete_login`/`complete_login_with`, `device_start` and `device_poll`.
-Everything else is required: a platform that cannot say how to build an authorize URL or how to turn
-a credential into headers is not a platform.
+Seven items have defaults so that a device-flow platform does not have to write a loopback listener,
+a loopback-only platform does not have to write a device pair, and an ordinary loopback platform does
+not have to write a paste session: `supports_device_flow`, `paste_redirect_uri`,
+`exchange_code_with_state`, `refresh_with_context`, `complete_login`/`complete_login_with`,
+`device_start` and `device_poll`. Everything else is required: a platform that cannot say how to build
+an authorize URL or how to turn a credential into headers is not a platform.
 
 `apply_credential` is deliberately the last thing the shared machinery calls before a request is
 built. It is also the item most worth testing, because its failure mode is a `400` from an upstream
@@ -523,7 +536,7 @@ In order. Skipping a step produces a failure at the next one, which is why the o
 | The `redirect_uri` differs by a host alias or port | `redirect_uri_mismatch` at authorize; the user sees a provider error | `localhost` and `127.0.0.1` are the same interface but not the same string; the provider compares strings |
 | A single-use refresh token is treated as reusable | the second use is classified as token theft; the grant is revoked and only a re-login recovers it | nothing marks the token as consumed, and a retry after a lost response looks harmless |
 | `offline_access` (or `access_type=offline`) is omitted | login succeeds, no refresh token is returned, the account dies within the hour | the token response is "valid"; the missing field is not an error |
-| A response field is assumed because another platform has it | a deserialiser fails on every response, or a default is silently used | the three platforms' token responses look similar and are not |
+| A response field is assumed because another platform has it | a deserialiser fails on every response, or a default is silently used | the six platforms' token responses look similar and are not |
 | The header fingerprint is over-complete | the upstream refuses, or attributes the caller to a fallback integrator with fewer models | adding a header feels like diligence, and the vendors do not document the reject list |
 | The refresh uses the exchange's encoding | refresh fails, the account goes to `auth-failed`, and the operator re-logs in and never learns why | one URL with two encodings is unusual and the difference is invisible in a diff |
 

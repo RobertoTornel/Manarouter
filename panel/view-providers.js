@@ -40,16 +40,23 @@ function httpUrl(value) {
 
 // --------------------------------------------------------------------------- OAuth redirect paste
 //
-// The manual fallback for the browser flow. The loopback capture can fail without telling anyone:
-// the browser may be on another host, the port may be busy, or the tab may be closed after
-// approval. The address bar still holds `?code=…&state=…`, so this block hands that URL to the
-// waiting session. It is revealed the moment the tab opens rather than after a timeout — someone
-// who already knows the capture failed should not sit through the ten-minute wait.
+// Two flows end with the person holding text the router needs, and they share this block.
 //
-// `session.id` is a shared box the caller fills in once /authorize answers. The blocking /complete
-// call stays in flight; this block only delivers the pasted URL and reports whether the server
-// accepted it. It deliberately never calls /complete a second time: two completions would race for
-// one callback.
+// * Browser fallback. The loopback capture can fail without telling anyone: the browser may be on
+//   another host, the port may be busy, or the tab may be closed after approval. The address bar
+//   still holds `?code=…&state=…`, so this block hands that URL to the waiting session.
+// * Paste-only platforms (a fixed `paste_redirect_uri`, e.g. Anthropic's Claude login). The page
+//   never redirects anywhere this machine can answer; it *displays* a one-time `code#state` and
+//   the human copies it. There is no URL to fall back from, so the same box is shown immediately
+//   with `codeOnly` wording.
+//
+// It is revealed the moment the tab opens rather than after a timeout — someone who already knows
+// the capture failed should not sit through the wait.
+//
+// `session.id` is a shared box the caller fills in once /authorize (or /paste) answers. The
+// blocking /complete call stays in flight; this block only delivers the pasted text and reports
+// whether the server accepted it. It deliberately never calls /complete a second time: two
+// completions would race for one callback.
 export function buildRedirectPaste(p, ctx, session) {
   const input = h('input', {
     class: 'input mono',
@@ -65,32 +72,60 @@ export function buildRedirectPaste(p, ctx, session) {
   const remote = !['localhost', '127.0.0.1', '[::1]', '::1'].includes(pageHost);
   const submit = h('button', { class: 'btn', type: 'button' }, 'Use this URL');
   const status = h('div', { class: 'muted' });
-  const notice = h('p', { class: 'hint' },
-    remote
-      ? 'You are using the panel from another device, so the sign-in page will end on a URL this '
-        + 'computer cannot open — that is expected. The address bar still holds the one-time code: '
-        + 'copy the whole URL and paste it below.'
-      : 'If the browser did not come back on its own, the address bar still holds the one-time code.');
+  const notice = h('p', { class: 'hint' });
+  // The words are mode-dependent but the input, the wire call and the in-flight guard are not:
+  // a second block would be a second place for the paste contract to drift.
+  const prompt = field('Paste the URL you were redirected to', input, {
+    hint: 'The address-bar URL works, and so does just the code. It is sent exactly as pasted.',
+  });
+  // field() emits the <label> as its first child when no help affordance is asked for; holding it
+  // is what lets the paste-only flow say "code" without rebuilding the field.
+  const promptLabel = prompt.children[0];
+  // Replacing the children, not assigning `.textContent`: both a real DOM and the element stub the
+  // panel tests install end up with the text node the assertions walk.
+  const relabel = (el, text) => {
+    el.textContent = text;
+    el.replaceChildren(document.createTextNode(text));
+  };
   const block = h('div', { hidden: true },
-    field('Paste the URL you were redirected to', input, {
-      hint: 'The address-bar URL works, and so does just the code. It is sent exactly as pasted.',
-    }),
+    prompt,
     notice,
     h('div', { class: 'toolbar', style: 'padding:0;border:0;background:none;' }, submit),
     status);
 
-  function show(redirectUri) {
+  /// `codeOnly` is the `paste` flow: there is no address bar to copy from, only the code the
+  /// provider's page displays.
+  function show(redirectUri, { codeOnly = false } = {}) {
     input.value = '';
     submit.disabled = false;
     status.replaceChildren();
-    if (redirectUri) input.placeholder = `${redirectUri}?code=…&state=…`;
+    relabel(submit, codeOnly ? 'Use this code' : 'Use this URL');
+    relabel(promptLabel, codeOnly
+      ? 'Paste the code the provider showed you'
+      : 'Paste the URL you were redirected to');
+    relabel(notice, codeOnly
+      ? 'The sign-in page shows a one-time code instead of sending the browser back. Copy the '
+        + 'whole value it displays — it looks like code#state — and paste it below.'
+      : remote
+        ? 'You are using the panel from another device, so the sign-in page will end on a URL this '
+          + 'computer cannot open — that is expected. The address bar still holds the one-time code: '
+          + 'copy the whole URL and paste it below.'
+        : 'If the browser did not come back on its own, the address bar still holds the one-time code.');
+    input.placeholder = codeOnly
+      ? 'code#state'
+      : redirectUri
+        ? `${redirectUri}?code=…&state=…`
+        : 'http://127.0.0.1:1455/auth/callback?code=…&state=…';
     block.hidden = false;
     // One action, not two: a browser that fails to reach the loopback leaves the whole URL on the
-    // clipboard, and pasting it is the entire manual step.
+    // clipboard, and pasting it is the entire manual step. The paste-only flow has the code on the
+    // clipboard the same way.
     if (typeof input.focus === 'function') input.focus();
     input.addEventListener('paste', () => {
       setTimeout(() => {
-        if (input.value.includes('code=') && !submit.disabled) submit.click();
+        const pasted = input.value;
+        const usable = codeOnly ? pasted.includes('#') : pasted.includes('code=');
+        if (usable && !submit.disabled) submit.click();
       }, 0);
     }, { once: true });
   }
@@ -152,7 +187,7 @@ export function buildRedirectPaste(p, ctx, session) {
 // `open-ai`, `parse` wants `openai`. A value here that the backend rejects turns "Add provider"
 // into a save-time error, which is how the pre-rename `command-code` spelling was caught. The Rust
 // test `the_panel_offers_only_dialects_this_binary_deserialises` pins this list.
-const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm', 'cursor', 'zcode'];
+const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm', 'cursor', 'zcode', 'claude-cli'];
 // Must list exactly the capability spellings the backend *deserialises* (mr-core `dialect.rs`,
 // serde kebab-case) and in the enum's order: `panel/test/capabilities.test.mjs` pins the ids to
 // the Rust variants. A checkbox spelling the server refuses turns "Create provider" into a
@@ -339,6 +374,7 @@ const PROVIDER_PRESETS = {
     { name: 'Antigravity', dialect: 'antigravity', baseUrl: 'https://cloudcode-pa.googleapis.com', auth: 'oauth', platform: 'antigravity', capabilities: ['chat', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'Google Antigravity / Cloud Code — OAuth sign-in from the panel.' },
     { name: 'Cursor', dialect: 'cursor', baseUrl: 'https://api2.cursor.sh', auth: 'oauth', platform: 'cursor', capabilities: ['chat'], hint: 'Cursor — OAuth sign-in from the panel. The sign-in finishes in Cursor’s own tab and the panel learns of it by polling, so nothing is ever pasted back here.' },
     { name: 'Z Code', dialect: 'zcode', baseUrl: 'https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1', auth: 'oauth', platform: 'zcode', capabilities: ['messages', 'tool-calling', 'reasoning'], hint: 'Z.ai coding plan — sign in with the ZCode desktop app’s own login flow; the link opens at zcode.z.ai and the panel waits for the browser.' },
+    { name: 'Claude Code', dialect: 'claude-cli', baseUrl: 'https://api.anthropic.com/v1', auth: 'oauth', platform: 'claude', capabilities: ['messages', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'Claude Code with a Claude subscription (Pro/Max) — sign-in happens on claude.ai and Anthropic shows a one-time code; the panel asks you to paste it. Do not add an API key: the subscription token is the credential, and an sk-ant-api… key is refused on this surface.' },
     { name: 'Command Code', dialect: 'command-code-go', baseUrl: 'https://api.commandcode.ai', auth: 'bearer', capabilities: ['chat', 'models', 'tool-calling', 'reasoning'], hint: 'Command Code — bearer auth.' },
     { name: 'Modal vLLM', dialect: 'modal-vllm', baseUrl: '', auth: 'modal', hint: 'Enter your Modal app’s HTTPS public URL (for example https://your-app--serve.modal.run). Add the Modal Token ID.Token Secret as the account secret after saving; the panel sends it as Modal-Key and Modal-Secret headers.' },
     { name: 'OpenCode Zen', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/v1', auth: 'bearer', capabilities: ['chat', 'responses', 'models', 'tool-calling', 'reasoning'], hint: 'OpenCode Console, pay-as-you-go. Needs a funded key: the free models are refused outside the OpenCode client, so they cannot be routed from here.' },
@@ -355,6 +391,7 @@ const DIALECT_BASE_URLS = {
   'command-code-go': 'https://api.commandcode.ai',
   copilot: 'https://api.githubcopilot.com',
   cursor: 'https://api2.cursor.sh',
+  'claude-cli': 'https://api.anthropic.com/v1',
 };
 // The dialects that have no API-key path: their request builders expect the header an OAuth
 // login produces, and the Cursor transport refuses a turn before opening a socket when no such
@@ -404,9 +441,12 @@ export function buildOAuthAccountForm(p, ctx, onConnected, isDrawerOpen = () => 
     } catch { details = null; }
     if (!details) return;
     const flows = Array.isArray(details.flows) && details.flows.length ? details.flows : [details.flow];
-    // If this platform only supports device code, relabel the primary button.
+    // Relabel the primary button when no browser is involved, so it says what the click will ask
+    // for instead of promising a sign-in window that never appears.
     if (!flows.includes('browser') && flows.includes('device')) {
       connect.textContent = 'Connect with a device code';
+    } else if (!flows.includes('browser') && !flows.includes('screen') && flows.includes('paste')) {
+      connect.textContent = 'Connect and paste the code';
     }
   })();
 
@@ -429,16 +469,20 @@ export function buildOAuthAccountForm(p, ctx, onConnected, isDrawerOpen = () => 
       flows = Array.isArray(details.flows) && details.flows.length ? details.flows : [details.flow];
       if (flows.includes('screen')) return runScreen(platformId);
       if (flows.includes('browser')) return runBrowser(platformId);
+      if (flows.includes('paste')) return runPaste(platformId);
       if (flows.includes('device')) return runDevice(platformId);
       throw new Error('No OAuth flow available for this platform.');
     }
-    // Discovery hasn't answered yet: try browser, then device code, then the provider-page
-    // flow. Each refuses immediately when it does not apply, so the cost of guessing is two
-    // rejected requests rather than a wrong tab left open.
+    // Discovery hasn't answered yet: try browser, then device code, then the pasted-code flow,
+    // then the provider-page flow. Each refuses immediately when it does not apply, so the cost of
+    // guessing is a few rejected requests rather than a wrong tab left open.
     try { return await runBrowser(platformId); }
     catch {
       try { return await runDevice(platformId); }
-      catch { return await runScreen(platformId); }
+      catch {
+        try { return await runPaste(platformId); }
+        catch { return await runScreen(platformId); }
+      }
     }
   }
 
@@ -476,6 +520,38 @@ export function buildOAuthAccountForm(p, ctx, onConnected, isDrawerOpen = () => 
     } finally {
       // Success, failure or a flow abandoned by closing the drawer: no stale paste form is left
       // behind, and a later attempt starts from a clean block.
+      session.id = null;
+      redirectPaste.hide();
+    }
+  }
+
+  /// Open the provider's page and wait for the human to paste the code the page displays.
+  ///
+  /// This is the `paste` flow: the platform's redirect is a page on the *provider's* origin (for
+  /// Claude, console.anthropic.com), so nothing can ever reach this machine. `/paste` therefore
+  /// binds no port; it opens a session in the same shape as `/authorize`, and `/complete` blocks on
+  /// it exactly as it does for a loopback callback — the code arrives through `/redirect` instead
+  /// of a query string.
+  async function runPaste(platformId) {
+    const start = await api.post(`/api/oauth/${encodeURIComponent(platformId)}/paste`, { provider_id: p.id });
+    session.id = start.session_id;
+    const authorizeUrl = httpUrl(start.authorization_url);
+    if (!authorizeUrl) {
+      session.id = null;
+      throw new Error('The provider did not return a sign-in URL. Try again.');
+    }
+    window.open(authorizeUrl, '_blank', 'noopener,noreferrer');
+    // The code lives on that page, so the box is the instruction — shown before the first await
+    // so it is on screen while /complete is still pending.
+    redirectPaste.show(null, { codeOnly: true });
+    progress.replaceChildren(
+      h('span', {}, 'Waiting for you to paste the code… '),
+      h('a', { href: authorizeUrl, target: '_blank', rel: 'noopener noreferrer' }, 'Reopen the page'),
+    );
+    try {
+      const done = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/complete`, { provider_id: p.id });
+      await reportConnected(done);
+    } finally {
       session.id = null;
       redirectPaste.hide();
     }
@@ -563,7 +639,7 @@ export function buildOAuthAccountForm(p, ctx, onConnected, isDrawerOpen = () => 
     }
   }
 
-  /// The single success path for all three flows.
+  /// The single success path for every flow.
   ///
   /// It lives in one place because the copies drift: the browser flow reported the account label
   /// while the device flow did not, so the same success read differently depending on how the

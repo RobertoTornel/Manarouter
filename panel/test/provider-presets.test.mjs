@@ -203,6 +203,7 @@ test('a preset that names a catalog provider agrees with the catalog', () => {
     ['Copilot', 'github-copilot'],
     ['Antigravity', 'antigravity'],
     ['Z Code', 'zcode'],
+    ['Claude Code', 'claude-code'],
   ]);
   const byId = new Map();
   for (const block of toml.split('[[providers]]').slice(1)) {

@@ -184,6 +184,65 @@ pub mod openai {
     pub const DEVICE_VERIFY: &str = "https://auth.openai.com/codex/device";
 }
 
+/// The Anthropic endpoints used by the Claude Code login and by Claude inference.
+///
+/// Claude's login is the odd one among these platforms in a way that decides where every value
+/// lives: the redirect target is a page on **Anthropic's** origin
+/// ([`CODE_CALLBACK`]), not a listener here. Nothing can be bound, so the flow is finished by the
+/// human copying `code#state` off that page. The endpoint is still a fixed, published URI and the
+/// token exchange must repeat it verbatim.
+pub mod claude {
+    /// The authorization endpoint, on the consumer (`claude.ai`) origin.
+    pub const AUTHORIZE: &str = "https://claude.ai/oauth/authorize";
+    /// The token endpoint: code exchange and refresh, both **JSON** bodies.
+    ///
+    /// Not `console.anthropic.com`: CLIProxyAPI's PR #1660 moved the exchange here because the
+    /// console host answers a Cloudflare challenge to non-browser clients, which turns every login
+    /// into an unreadable HTML failure.
+    pub const TOKEN: &str = "https://api.anthropic.com/v1/oauth/token";
+    /// The fixed redirect the authorization request carries.
+    ///
+    /// This page belongs to Anthropic, so the browser leaves this machine: it renders `code#state`
+    /// for the human to copy instead of redirecting to something local. It is also the exact value
+    /// the token exchange must present — see [`super::CLAUDE_CODE_CLIENT_ID`] for the client it is
+    /// registered to.
+    pub const CODE_CALLBACK: &str = "https://console.anthropic.com/oauth/code/callback";
+    /// The API origin. The Messages path and its `/v1` version are the dialect's business; this is
+    /// the host the catalogue template's `base_url` starts from.
+    pub const API: &str = "https://api.anthropic.com";
+    /// Where the account behind a token set is described.
+    ///
+    /// Used as the fallback for [`AccountIdentity`](crate::oauth::AccountIdentity) when the token
+    /// response carried no `account` object — which happens on refresh, where Anthropic returns
+    /// only the tokens.
+    pub const PROFILE: &str = "https://api.anthropic.com/api/oauth/profile";
+    /// The scopes the Claude Code client asks for: an API key it may create, the profile it may
+    /// read, and inference.
+    pub const SCOPES: &str = "org:create_api_key user:profile user:inference";
+    /// The beta flag the OAuth surfaces require. Same value as
+    /// [`crate::quota::claude::OAUTH_BETA`]; named here as well because the login sends it, not
+    /// just the usage read.
+    pub const OAUTH_BETA: &str = "oauth-2025-04-20";
+
+    /// The `anthropic-version` every Messages request must carry.
+    pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+    /// The `anthropic-beta` bundle a Claude Code inference request carries.
+    ///
+    /// Two values joined by a comma: `claude-code-20250219` unlocks the subscription-only
+    /// behaviour the CLI's own requests rely on, `oauth-2025-04-20` is what accepts an
+    /// `sk-ant-oat*` bearer at all. UNCERTAIN: the CLI has shipped additional betas (context
+    /// management, interleaved thinking) in some releases; adding one that a server no longer
+    /// knows is a hard refusal, so the list stays at the two that are load-bearing.
+    pub const ANTHROPIC_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
+
+    /// The header that marks a request as coming from the CLI rather than from a browser or SDK.
+    pub const APP_HEADER: &str = "x-app";
+
+    /// The value [`APP_HEADER`] carries.
+    pub const APP: &str = "cli";
+}
+
 /// The GitHub endpoints used by the Copilot flow.
 pub mod github {
     /// Where the device flow starts.

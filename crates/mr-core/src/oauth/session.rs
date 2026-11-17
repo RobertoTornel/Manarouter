@@ -87,6 +87,16 @@ enum PendingKind {
         tokens: TokenSet,
         identity: Option<super::AccountIdentity>,
     },
+    /// A login whose only return path is the operator copying `code#state` off the provider's page.
+    ///
+    /// No listener is bound — the provider sends the browser to a callback on *its* origin, which
+    /// this router could never receive — so the wait is on [`ManualSlot`] alone. The exchange is
+    /// otherwise the same one [`PendingKind::Browser`] performs, down to the PKCE verifier and the
+    /// cached [`PendingKind::BrowserComplete`] result.
+    Paste {
+        state: String,
+        pkce: Option<Pkce>,
+    },
     BrowserInProgress,
     Device {
         authorization: DeviceAuthorization,
@@ -186,6 +196,66 @@ impl OAuthSessions {
                 state,
                 pkce_bound: platform.requires_pkce(),
                 port: redirect_port,
+                callback: Mutex::new(None),
+                notify: tokio::sync::Notify::new(),
+                expires,
+            }),
+        );
+        Ok((id, url))
+    }
+
+    /// Begin a login the human completes by pasting `code#state` back here.
+    ///
+    /// The provider's redirect target is a page on its own origin — Claude's is
+    /// `https://console.anthropic.com/oauth/code/callback` — so no port can be bound and nothing
+    /// can be received automatically. What makes the flow work is that such a page *displays* the
+    /// code and state for the human to copy; [`submit_redirect`](Self::submit_redirect) parks the
+    /// pasted value in the same [`ManualSlot`] a browser flow would use, and
+    /// [`finish_browser`](Self::finish_browser) waits on that slot instead of a listener.
+    ///
+    /// `authorization_url` is built with port `0`, which is honest: the platform ignores the port
+    /// and substitutes its own fixed redirect URI. A platform that does not declare
+    /// [`paste_redirect_uri`](OAuthPlatform::paste_redirect_uri) is refused rather than started
+    /// with a URL that would end somewhere this router cannot see.
+    pub async fn start_paste(
+        &self,
+        platform: &'static dyn OAuthPlatform,
+        provider_id: String,
+    ) -> Result<(String, String), String> {
+        if platform.paste_redirect_uri().is_none() {
+            return Err("platform cannot be finished by pasting a code".into());
+        }
+        self.ensure_capacity().await?;
+        self.discard_superseded(&provider_id, platform.id()).await;
+        let state = super::flow::new_state();
+        // A pasted code has no listener tying it to this attempt, so PKCE is what binds it. Every
+        // paste platform declares it; asking here means a future one cannot silently lose it.
+        let pkce = platform.requires_pkce().then(Pkce::generate);
+        let url = platform
+            .authorization_url(&state, pkce.as_ref(), 0)
+            .map_err(safe_error)?;
+        let expires = tokio::time::Instant::now() + SESSION_TTL;
+        let id = self
+            .insert(Pending {
+                platform,
+                kind: PendingKind::Paste {
+                    state: state.clone(),
+                    pkce,
+                },
+                expires,
+                provider_id: provider_id.clone(),
+                last_polled: None,
+                interval: Duration::from_secs(5),
+                busy: false,
+            })
+            .await?;
+        self.manual.lock().await.insert(
+            id.clone(),
+            Arc::new(ManualSlot {
+                provider_id,
+                state,
+                pkce_bound: platform.requires_pkce(),
+                port: 0,
                 callback: Mutex::new(None),
                 notify: tokio::sync::Notify::new(),
                 expires,
@@ -498,43 +568,73 @@ impl OAuthSessions {
             return Ok((tokens, identity));
         }
         let old_kind = std::mem::replace(&mut pending.kind, PendingKind::BrowserInProgress);
-        let PendingKind::Browser {
-            state,
-            pkce,
-            listener,
-        } = old_kind
-        else {
-            return Err("OAuth session is not a browser flow".into());
-        };
-        let slot = self.manual.lock().await.get(id).cloned();
-        let callback: Callback = match slot {
-            Some(slot) => {
-                // `notified()` is armed *before* the select so a paste that lands during setup is
-                // not lost: `Notify` holds the permit until somebody waits on it.
-                let notified = slot.notify.notified();
-                tokio::select! {
-                    result = listener.await_callback(&state, pending.platform.label(), SESSION_TTL) => {
-                        match result {
-                            Ok(callback) => callback,
-                            Err(error) => return Err(safe_error(error)),
+        // Both returning flows end in the same exchange: the browser flow arrives at `callback` by
+        // listener or paste, the paste-only flow by paste alone. Only the wait differs, so only the
+        // wait is branched on.
+        let (state, pkce, callback) = match old_kind {
+            PendingKind::Browser {
+                state,
+                pkce,
+                listener,
+            } => {
+                let slot = self.manual.lock().await.get(id).cloned();
+                let callback: Callback = match slot {
+                    Some(slot) => {
+                        // `notified()` is armed *before* the select so a paste that lands during
+                        // setup is not lost: `Notify` holds the permit until somebody waits on it.
+                        let notified = slot.notify.notified();
+                        tokio::select! {
+                            result = listener.await_callback(&state, pending.platform.label(), SESSION_TTL) => {
+                                match result {
+                                    Ok(callback) => callback,
+                                    Err(error) => return Err(safe_error(error)),
+                                }
+                            }
+                            _ = notified => {
+                                let pasted = slot.callback.lock().await.take();
+                                pasted.ok_or_else(|| {
+                                    "the pasted redirect could not be read".to_string()
+                                })?
+                            }
                         }
                     }
-                    _ = notified => {
-                        let pasted = slot.callback.lock().await.take();
-                        pasted.ok_or_else(|| "the pasted redirect could not be read".to_string())?
-                    }
-                }
+                    // No slot means it was already cleaned up; still try the automatic path rather
+                    // than refusing a sign-in that may well succeed.
+                    None => listener
+                        .await_callback(&state, pending.platform.label(), SESSION_TTL)
+                        .await
+                        .map_err(safe_error)?,
+                };
+                (state, pkce, callback)
             }
-            // No slot means it was already cleaned up; still try the automatic path rather than
-            // refusing a sign-in that may well succeed.
-            None => listener
-                .await_callback(&state, pending.platform.label(), SESSION_TTL)
-                .await
-                .map_err(safe_error)?,
+            PendingKind::Paste { state, pkce } => {
+                let slot = self.manual.lock().await.get(id).cloned().ok_or_else(|| {
+                    "this sign-in is no longer waiting for a pasted code (it may have finished or \
+                     expired); start it again"
+                        .to_string()
+                })?;
+                // Armed before the check so a paste that lands in between is remembered.
+                let notified = slot.notify.notified();
+                let parked = slot.callback.lock().await.take();
+                let callback = match parked {
+                    Some(callback) => callback,
+                    None => {
+                        tokio::time::timeout(SESSION_TTL, notified)
+                            .await
+                            .map_err(|_| {
+                                "the sign-in expired before a code was pasted".to_string()
+                            })?;
+                        let pasted = slot.callback.lock().await.take();
+                        pasted.ok_or_else(|| "the pasted code could not be read".to_string())?
+                    }
+                };
+                (state, pkce, callback)
+            }
+            _ => return Err("OAuth session is not waiting for a redirect".into()),
         };
         let tokens = match pending
             .platform
-            .exchange_code(&callback.code, pkce.as_ref(), callback.port)
+            .exchange_code_with_state(&callback.code, &state, pkce.as_ref(), callback.port)
             .await
         {
             Ok(tokens) => tokens,
@@ -959,6 +1059,172 @@ mod tests {
         fn refresh_lead(&self) -> Duration {
             Duration::from_secs(0)
         }
+    }
+
+    /// A platform whose redirect lands on the provider's own page: no port is ever bound, and the
+    /// only way a code reaches this process is the human pasting it.
+    struct FakePaste {
+        exchanged: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl FakePaste {
+        fn new() -> &'static Self {
+            Box::leak(Box::new(Self {
+                exchanged: std::sync::Mutex::new(Vec::new()),
+            }))
+        }
+
+        fn exchanged(&self) -> Vec<(String, String)> {
+            self.exchanged.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl OAuthPlatform for FakePaste {
+        fn id(&self) -> &'static str {
+            "fake-paste"
+        }
+        fn label(&self) -> &'static str {
+            "Fake paste"
+        }
+        fn description(&self) -> &'static str {
+            "Test double whose redirect cannot come back."
+        }
+        fn begins_with_loopback(&self) -> bool {
+            false
+        }
+        fn paste_redirect_uri(&self) -> Option<&'static str> {
+            Some("https://example.test/oauth/code/callback")
+        }
+        fn redirect_ports(&self) -> RedirectPorts {
+            RedirectPorts {
+                host: "",
+                primary: 0,
+                fallback: None,
+                path: "",
+            }
+        }
+        fn requires_pkce(&self) -> bool {
+            true
+        }
+        fn validates_redirect_port(&self) -> bool {
+            false
+        }
+        fn authorization_url(
+            &self,
+            state: &str,
+            pkce: Option<&Pkce>,
+            _port: u16,
+        ) -> crate::oauth::Result<String> {
+            Ok(format!(
+                "https://example.test/authorize?state={state}&challenge={}",
+                pkce.map(|p| p.challenge().to_owned()).unwrap_or_default()
+            ))
+        }
+        async fn exchange_code(
+            &self,
+            _code: &str,
+            _pkce: Option<&Pkce>,
+            _port: u16,
+        ) -> crate::oauth::Result<TokenSet> {
+            panic!("a paste platform exchanges with its state; the code-only method must not run")
+        }
+        async fn exchange_code_with_state(
+            &self,
+            code: &str,
+            state: &str,
+            _pkce: Option<&Pkce>,
+            _port: u16,
+        ) -> crate::oauth::Result<TokenSet> {
+            self.exchanged
+                .lock()
+                .unwrap()
+                .push((code.to_owned(), state.to_owned()));
+            Ok(TokenSet::new("access-from-paste-exchange"))
+        }
+        async fn refresh(&self, _refresh_token: &str) -> crate::oauth::Result<TokenSet> {
+            Ok(TokenSet::new("refreshed"))
+        }
+        async fn account_identity(
+            &self,
+            _tokens: &TokenSet,
+        ) -> crate::oauth::Result<AccountIdentity> {
+            Ok(AccountIdentity {
+                id: "acct-paste".into(),
+                label: "Pasted Account".into(),
+                email: None,
+                plan: None,
+            })
+        }
+        fn apply_credential(
+            &self,
+            _tokens: &TokenSet,
+        ) -> Vec<(http::HeaderName, http::HeaderValue)> {
+            Vec::new()
+        }
+        fn fingerprint_headers(&self) -> &'static [(&'static str, &'static str)] {
+            &[]
+        }
+        fn refresh_lead(&self) -> Duration {
+            Duration::from_secs(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paste_platform_starts_without_binding_a_port_and_finishes_with_its_state() {
+        let platform = FakePaste::new();
+        let sessions = OAuthSessions::new();
+        let (id, url) = sessions
+            .start_paste(platform, "provider-1".into())
+            .await
+            .expect("a paste platform starts");
+        assert!(
+            state_of(&url).len() >= 32,
+            "the URL carries a fresh state: {url}"
+        );
+        assert!(
+            !url.contains("port="),
+            "no port is bound for this flow: {url}"
+        );
+
+        let waiting = {
+            let sessions = sessions.clone();
+            let id = id.clone();
+            tokio::spawn(async move { sessions.finish_browser(&id, "provider-1").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Exactly what the provider's page shows: `code#state`, with no URL around it.
+        let state = state_of(&url);
+        sessions
+            .submit_redirect(&id, "provider-1", &format!("pasted-code#{state}"))
+            .await
+            .expect("a code#state paste is accepted");
+        let (tokens, identity) = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiting flow must finish")
+            .expect("the task must not panic")
+            .expect("the sign-in must succeed");
+        assert_eq!(tokens.access_token, "access-from-paste-exchange");
+        assert_eq!(identity.id, "acct-paste");
+        assert_eq!(
+            platform.exchanged(),
+            vec![("pasted-code".to_owned(), state)],
+            "the exchange must receive the code and the state that binds it to this attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_loopback_platform_cannot_start_a_paste_flow() {
+        let sessions = OAuthSessions::new();
+        let error = sessions
+            .start_paste(FakeBrowser::leaked(), "provider-1".into())
+            .await
+            .expect_err("a platform with a listener has nothing to paste into");
+        assert!(
+            error.contains("cannot be finished by pasting a code"),
+            "{error}"
+        );
     }
 
     /// The `state` the flow generated, read back out of the authorize URL the panel would open.

@@ -216,6 +216,33 @@ seconds = 18000
 reset_only = true
 
 [[providers]]
+id = "claude-code"
+label = "Claude Code (Claude subscription)"
+dialect = "claude-cli"
+# The public Messages API. The trailing `/v1` is the version the base URL carries; the dialect's own
+# path adds another, and exactly one survives the join, so the wire path is /v1/messages.
+base_url = "https://api.anthropic.com/v1"
+auth = { type = "oauth", platform = "claude" }
+oauth_platform = "claude"
+capabilities = ["messages", "models", "tool-calling", "reasoning", "vision"]
+key_strategy = "round-robin"
+note = "OAuth only, with the Claude subscription token (sk-ant-oat01-…) the Claude Code login produces. Two things about this surface are not the public Messages API: the credential goes in Authorization: Bearer and never x-api-key, and the request body must start its system array with the CLI's identity sentence (mr-dialects::claudecli prepends it). anthropic-beta carries claude-code-20250219 (the subscription surface) and oauth-2025-04-20 (the credential shape) together; dropping either is a refusal. The login redirects to a page on Anthropic's own origin, so there is no local port to bind: the panel shows the URL, the human pastes the code#state the page displays, and the exchange is JSON with the state repeated. Tokens refresh 4 hours before expiry and the refresh token rotates. UNCERTAIN: 4 hours is not documented by Anthropic; the usage read at /api/oauth/usage carries the plan's real windows if one needs to be checked."
+docs_url = "https://docs.anthropic.com/en/docs/claude-code/overview"
+oauth_authorize_url = "https://claude.ai/oauth/authorize"
+oauth_token_url = "https://api.anthropic.com/v1/oauth/token"
+oauth_client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+oauth_scopes = "org:create_api_key user:profile user:inference"
+oauth_redirect_uri = "https://console.anthropic.com/oauth/code/callback"
+oauth_pkce = "S256"
+user_agent_template = "claude-cli/<version> (external, cli)"
+
+[providers.headers]
+"anthropic-version" = "2023-06-01"
+"anthropic-beta" = "claude-code-20250219,oauth-2025-04-20"
+"x-app" = "cli"
+"user-agent" = "claude-cli/2.1.280 (external, cli)"
+
+[[providers]]
 id = "gemini"
 label = "Google Gemini (AI Studio)"
 dialect = "google-ai-studio"

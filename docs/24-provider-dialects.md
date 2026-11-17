@@ -1,6 +1,6 @@
 # 24 — Provider dialects
 
-A **dialect** is the shape of HTTP API an upstream speaks. This document says what each of the eleven
+A **dialect** is the shape of HTTP API an upstream speaks. This document says what each of the twelve
 is on the wire, which client routes can reach it, what the relay rewrites on the way in and on the
 way back, and where the edges are. It is one level above the per-provider guides in
 [providers/](providers/README.md): those describe a *vendor*, this describes a *protocol*.
@@ -14,7 +14,7 @@ grouped by dialect because translation is only required when the client's dialec
 upstream's, and two providers that share a dialect share every code path
 (`crates/mr-core/src/dialect.rs:10-13`).
 
-The set is closed and small — eleven members (`dialect.rs:17-45`, and `Dialect::ALL` at
+The set is closed and small — twelve members (`dialect.rs:17-45`, and `Dialect::ALL` at
 `dialect.rs:137-145`):
 
 | `Dialect` | Canonical id (`Dialect::as_str`, `dialect.rs:94-104`) | Serde id (what a `config.json` or `catalog/providers.toml` entry carries) | Templates in `catalog/providers.toml` |
@@ -30,6 +30,7 @@ The set is closed and small — eleven members (`dialect.rs:17-45`, and `Dialect
 | `ModalVllm` | `modal-vllm` | `modal-vllm` | 0 |
 | `Cursor` | `cursor` | `cursor` | 1 |
 | `Zcode` | `zcode` | `zcode` | 1 |
+| `ClaudeCli` | `claude-cli` | `claude-cli` | 1 |
 
 Two spellings exist for a reason, and they differ for one member. `as_str` is the permissive,
 human-facing id; `serde`'s `kebab-case` rename is the strict wire form, and the two differ exactly
@@ -43,8 +44,10 @@ migrated OmniRoute data: `openai`, `openai-compatible`, `oa` and `compatible` al
 `claude` and `messages` mean `Anthropic`; `gemini`, `google-ai-studio`, `googleaistudio`,
 `ai-studio` and `aistudio` mean `GoogleAiStudio`, while `google` and `generativelanguage` mean the
 `Google` envelope shape; `chatgpt` means `Codex`;
-`agy` and `cloudcode` mean `Antigravity`. `CommandCodeGo` is the deliberate exception: it accepts
-exactly `command-code-go` and `cmdgo`. The pre-rename spellings (`commandcode`, `command-code`,
+`agy` and `cloudcode` mean `Antigravity`; `claude-cli`, `claudecli`, `claude-code` and `claudecode`
+mean `ClaudeCli`, while bare `claude` keeps meaning `Anthropic` — the alias names the CLI *surface*,
+not the vendor. `CommandCodeGo` is the deliberate exception: it accepts exactly `command-code-go` and
+`cmdgo`. The pre-rename spellings (`commandcode`, `command-code`,
 `cmd`) are **not** aliases, because accepting them would defeat the rename and hide stale
 configuration — a file that still contains one fails loudly (`dialect.rs:36-44`, `dialect.rs:92-96`).
 
@@ -103,7 +106,7 @@ upstream response straight back.
 
 ---
 
-## The eleven dialects at a glance
+## The twelve dialects at a glance
 
 | Dialect | Upstream path | Body passthrough possible | Always answers as SSE | Upstream shape |
 |---|---|---|---|---|
@@ -118,6 +121,7 @@ upstream response straight back.
 | `modal-vllm` | `/v1/chat/completions` | yes, from an OpenAI client | no | OpenAI Chat Completions on a Modal-hosted vLLM, behind Modal proxy headers |
 | `cursor` | `/agent.v1.AgentService/Run` | no | yes, only | Cursor's bidirectional Connect stream of protobuf frames |
 | `zcode` | `/v1/messages` | yes, from an Anthropic client | no | Anthropic Messages on the ZCode app's plan surface, behind its attribution headers |
+| `claude-cli` | `/v1/messages` | shape yes, bytes no — the `system` field is rewritten | no | Anthropic Messages presented as the Claude Code CLI sends it |
 
 The path column is the path a request ends up at: the **dialect default** for the client's route,
 unless the provider's `route_overrides` names one or a translator supplies one. The two Gemini
@@ -310,6 +314,59 @@ provider's base URL is expected to already end in `/v1`" (`anthropic.rs:43-50`).
 
 **Read next.** [Anthropic-compatible providers](providers/anthropic-compatible.md) for the native
 `/v1/messages` argument and the block-versus-message difference.
+
+---
+
+## `claude-cli` — Anthropic Messages with the CLI's identity
+
+**On the wire.** `POST https://api.anthropic.com/v1/messages`, and `/v1/messages/count_tokens` for
+the counting route: the public Messages API, presented the way the Claude Code CLI presents it. The
+JSON shape is Anthropic's; two things *around* it are not.
+
+**The body must open with the CLI's identity.** When the credential is a Claude **subscription** token
+(`sk-ant-oat01-…`), the API validates that the request came from the CLI: the `system` field must begin
+with `You are Claude Code, Anthropic's official CLI for Claude.` as its **first** entry, separate from
+the caller's text. The measurement is recorded in
+[anthropics/claude-code#40515](https://github.com/anthropics/claude-code/issues/40515): a separate
+first block, or a `system` string equal to the sentence, is accepted (200); the sentence concatenated
+into the caller's block, or no `system` at all, is a 400 `invalid_request_error`. `claude-haiku-4-5`
+is exempt; the larger models are not. `mr_dialects::claudecli::with_identity` applies the rule to
+every request and is idempotent, so a Claude Code client pointed at this relay does not gain a second
+copy. No header can put a block in the body, which is why this is a dialect rather than an auth mode
+on `anthropic`.
+
+**The credential and fingerprint are headers.** `Authorization: Bearer` — never `x-api-key` — plus
+`anthropic-version: 2023-06-01`, `anthropic-beta: claude-code-20250219,oauth-2025-04-20`, `x-app: cli`
+and `user-agent: claude-cli/<version> (external, cli)`. `claude-code-20250219` selects the subscription
+behaviour and `oauth-2025-04-20` is what accepts an `sk-ant-oat*` bearer at all; dropping either is a
+refusal. The relay adds the block when `step.dialect == Dialect::ClaudeCli`, taking the user agent from
+`mr_dialects::claudecli::user_agent()` so the wire string and the pinned release
+(`quota::claude::CLAUDE_CODE_VERSION`) cannot drift; the catalogue template repeats the same four
+headers so a direct request and a relayed one look alike.
+
+**Who can reach it.** Both client dialects. An Anthropic client's body is rewritten in place
+(`claudecli::from_anthropic_request` → `with_identity`) rather than forwarded, which makes this the one
+Anthropic-shaped pairing that cannot be `Ok(None)`; an OpenAI client goes through
+`anthropic::from_openai_request` and then the same rewrite. The response half is ordinary Anthropic
+Messages, so `(Anthropic, ClaudeCli)` answers byte for byte and the SSE path for an OpenAI client is
+`anthropic::sse_to_openai`.
+
+**The path.** `default_path` answers `/v1/messages` for every route except `CountTokens`. The
+catalogue's `base_url` ends in `/v1`, and `build_url` keeps the base's version segment while dropping
+the dialect path's (§*How the upstream path is chosen*), so exactly one `/v1` survives.
+
+**Quirks.**
+
+- `metadata.user_id` is not required, and a byte-exact Stainless client fingerprint is not either: the
+  surface checks the identity sentence and the beta flag, not the scaffolding around them. This is
+  widely repeated and rarely measured.
+- The token is a subscription credential, not a per-token balance: it is billed against the plan's
+  windows and refused by any surface that wants an API key.
+- `model` carries the API's own names (`claude-*`), not the CLI's aliases; the relay sends what the
+  model list supplied.
+
+**Read next.** [Claude Code OAuth](33-oauth-claude-code.md) for the login that obtains this credential,
+and the [`claude-code` row](providers/catalog.md) of the catalogue.
 
 ---
 
@@ -881,6 +938,7 @@ The route list is the one in the [API reference](18-api-reference.md); `RouteKin
 | `copilot` | **Passthrough** — Copilot is OpenAI-shaped | **Translated** — direct Anthropic→OpenAI pair |
 | `antigravity` | **Translated** — pivot → Gemini + Cloud Code envelope | **Translated** — pivot → Gemini + envelope (two hops) |
 | `command-code-go` | **Translated** — Chat Completions body → CLI envelope | **Translated** — envelope built from the Anthropic body directly |
+| `claude-cli` | **Translated** — OpenAI→Messages, then the identity rewrite | **Rewritten** — Anthropic shape, `system` gains the identity block |
 | anything else | **Refused** — `400`, both dialects named | **Refused** — `400`, both dialects named |
 
 "Two hops" means the Anthropic body is first normalised into the Chat Completions pivot and then

@@ -119,6 +119,36 @@ pub enum Dialect {
     /// OpenAI client. It is not in [`Dialect::is_passthrough_to`]: that predicate means "the same
     /// dialect twice", and a request to this one still needs a different set of headers.
     Zcode = 10,
+    /// Anthropic Messages as **Claude Code itself** sends them: `api.anthropic.com/v1/messages`
+    /// with a Claude subscription OAuth token, where the surface validates that the request comes
+    /// from its own CLI.
+    ///
+    /// The body is Anthropic's, with one requirement [`Dialect::Anthropic`] has no reason to know:
+    /// when the credential is an `sk-ant-oat-…` subscription token rather than an API key, the
+    /// `system` field must begin with the CLI's own identity —
+    ///
+    /// > `You are Claude Code, Anthropic's official CLI for Claude.`
+    ///
+    /// — as the **first element** of the `system` array. Not concatenated into the caller's own
+    /// text, not absent, and not merely present somewhere: a separate first array entry is answered
+    /// `200`, while a request whose `system` omits it is answered
+    /// `400 {"type":"error","error":{"type":"invalid_request_error","message":"Error"}}`.
+    /// `claude-haiku-4-5` is exempt; the Opus and Sonnet models are not. `mr-dialects::claudecli`
+    /// performs that rewrite, and it is a body rewrite rather than a header one, which is exactly
+    /// why this is a dialect and not an auth method on [`Dialect::Anthropic`].
+    ///
+    /// The rest of the fingerprint is headers: `Authorization: Bearer` instead of `x-api-key`,
+    /// `anthropic-beta: claude-code-20250219,oauth-2025-04-20`, `anthropic-version: 2023-06-01`,
+    /// `user-agent: claude-cli/<version> (external, cli)` and `x-app: cli`. The relay applies them
+    /// from [`crate::published`] and the provider row; a subscription token sent without them is
+    /// refused before the model ever runs.
+    ///
+    /// The login that mints the token is a paste flow, not a loopback one: Claude Code's registered
+    /// redirect is `https://console.anthropic.com/oauth/code/callback`, a page nobody's browser can
+    /// reach on *this* host, so `mr-core::oauth::claude` exchanges the `code#state` the operator
+    /// copies out of it. That is also why this is not in [`Dialect::is_passthrough_to`]: a request
+    /// needs a different body and a different set of headers.
+    ClaudeCli = 11,
 }
 
 impl Dialect {
@@ -143,6 +173,7 @@ impl Dialect {
             8 => Self::ModalVllm,
             9 => Self::Cursor,
             10 => Self::Zcode,
+            11 => Self::ClaudeCli,
             _ => return None,
         })
     }
@@ -169,6 +200,7 @@ impl Dialect {
             Self::ModalVllm => "modal-vllm",
             Self::Cursor => "cursor",
             Self::Zcode => "zcode",
+            Self::ClaudeCli => "claude-cli",
         }
     }
 
@@ -182,6 +214,12 @@ impl Dialect {
     /// held to. `gemini` is the alias OmniRoute data carries, so migrated data picks up the
     /// stricter — and correct — control instead of keeping a fragment the surface rejects.
     ///
+    /// The three `claude*` spellings are separated by *which credential they authenticate*:
+    /// `claude` and `messages` name the Messages API with an API key and keep
+    /// [`Dialect::Anthropic`]; `claude-cli`, `claudecli`, `claude-code` and `claudecode` name the
+    /// CLI surface, which a subscription token authenticates only when the request also looks
+    /// like the CLI.
+    ///
     /// [`Dialect::CommandCodeGo`] is the deliberate exception: it accepts exactly
     /// `command-code-go` and the short alias `cmdgo`, and nothing else. The pre-rename spellings
     /// are not aliases — accepting them here would defeat the rename and hide stale config, so a
@@ -193,6 +231,11 @@ impl Dialect {
                 Self::OpenAi
             }
             "anthropic" | "anthropic-compatible" | "claude" | "messages" => Self::Anthropic,
+            // `claude` above is the *API* shape and stays [`Dialect::Anthropic`]; these name the
+            // CLI's own surface, whose body carries the CLI identity block and whose credential is
+            // a subscription token. Accepting `claude` here too would silently move every existing
+            // configuration onto a surface an API key cannot authenticate.
+            "claude-cli" | "claudecli" | "claude-code" | "claudecode" => Self::ClaudeCli,
             "google" | "generativelanguage" => Self::Google,
             "gemini" | "google-ai-studio" | "googleaistudio" | "ai-studio" | "aistudio" => {
                 Self::GoogleAiStudio
@@ -236,7 +279,7 @@ impl Dialect {
     }
 
     /// Every dialect, in snapshot order. Useful for exhaustive tests.
-    pub const ALL: [Dialect; 11] = [
+    pub const ALL: [Dialect; 12] = [
         Self::OpenAi,
         Self::Anthropic,
         Self::Google,
@@ -248,6 +291,7 @@ impl Dialect {
         Self::ModalVllm,
         Self::Cursor,
         Self::Zcode,
+        Self::ClaudeCli,
     ];
 
     /// The reasoning levels this dialect can put on the wire as *themselves*, ascending.
@@ -279,7 +323,8 @@ impl Dialect {
             | Self::Google
             | Self::Antigravity
             | Self::GoogleAiStudio
-            | Self::Zcode => &ReasoningLevel::ALL,
+            | Self::Zcode
+            | Self::ClaudeCli => &ReasoningLevel::ALL,
             // The agent wire format has no reasoning-effort field and no thinking budget: the model
             // is chosen by id and the server decides how much to think. Offering `none` alone is
             // the honest answer — every other tier would be a promise this dialect cannot keep, and
@@ -1503,8 +1548,10 @@ mod tests {
             assert_eq!(Dialect::parse(d.as_str()), Some(d), "{d:?}");
         }
         // Unknown values must be rejected rather than silently mapping onto a dialect, because a
-        // misread snapshot byte would otherwise route traffic to an unrelated provider.
-        assert_eq!(Dialect::from_u8(11), None);
+        // misread snapshot byte would otherwise route traffic to an unrelated provider. The value
+        // after the last dialect is the one a new variant would take, so this line moves with the
+        // enum: `ClaudeCli` is 11, and 12 is still unassigned.
+        assert_eq!(Dialect::from_u8(12), None);
         assert_eq!(Dialect::from_u8(255), None);
     }
 
@@ -1804,6 +1851,7 @@ mod tests {
             (Dialect::ModalVllm, "modal-vllm"),
             (Dialect::Cursor, "cursor"),
             (Dialect::Zcode, "zcode"),
+            (Dialect::ClaudeCli, "claude-cli"),
         ];
         assert_eq!(expected.len(), Dialect::ALL.len());
         for (dialect, id) in expected {
@@ -1830,6 +1878,26 @@ mod tests {
             Some(Dialect::Google),
             "the host name names the protocol shape"
         );
+    }
+
+    /// A subscription token authenticates a request only when the body carries the CLI identity
+    /// block, so the alias must not fall through to the API-key shape it resembles.
+    #[test]
+    fn the_claude_aliases_select_the_cli_surface_and_keep_the_api_one_apart() {
+        assert_eq!(Dialect::parse("claude"), Some(Dialect::Anthropic));
+        assert_eq!(Dialect::parse("messages"), Some(Dialect::Anthropic));
+        assert_eq!(Dialect::parse("claude-cli"), Some(Dialect::ClaudeCli));
+        assert_eq!(Dialect::parse("Claude-Code"), Some(Dialect::ClaudeCli));
+        assert_eq!(Dialect::parse("claudecode"), Some(Dialect::ClaudeCli));
+        assert_eq!(Dialect::parse("claudecli"), Some(Dialect::ClaudeCli));
+        assert_eq!(
+            Dialect::parse("claude code"),
+            None,
+            "aliases are exact, not fuzzy"
+        );
+        // The serde spelling the panel and config files use, which `as_str` also returns.
+        let value = serde_json::to_value(Dialect::ClaudeCli).expect("serialize");
+        assert_eq!(value, serde_json::json!("claude-cli"));
     }
 
     #[test]

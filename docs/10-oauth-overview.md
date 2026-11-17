@@ -15,7 +15,7 @@ of adding a fourth platform is `docs/14-oauth-adding-a-platform.md`.
 
 ## Current implementation scope
 
-The management API and panel currently offer interactive OAuth connection for **OpenAI Codex** (browser loopback/PKCE, with an OpenAI device-code fallback), **GitHub Copilot** (device code) and **Google Antigravity** (loopback authorization code; the reverse-engineered T2 IDE client metadata is unverified, and paid-tier onboarding needs an explicit project). Those are exactly the three registered platforms — `openai-codex`, `github-copilot` and `antigravity` in `crates/mr-core/src/oauth/mod.rs`. Token sets are stored in the encrypted vault; non-secret credential metadata is in the conductor's SQLite store. The relay opens the same configured SQLite store and vault, resolves the metadata reference to its vault key, and uses the platform refresher before inference. Cline, xAI OAuth, and import-only or cookie/session credentials are not exposed as working login flows. No live login was exercised as part of implementation; run the automated tests before relying on the behavior.
+The management API and panel currently offer interactive OAuth connection for six platforms — `openai-codex`, `github-copilot`, `antigravity`, `cursor`, `zcode` and `claude` in `crates/mr-core/src/oauth/mod.rs`. **OpenAI Codex** is browser loopback/PKCE with an OpenAI device-code fallback; **GitHub Copilot** is device code; **Google Antigravity** is loopback authorization code (the reverse-engineered T2 IDE client metadata is unverified, and paid-tier onboarding needs an explicit project); **Cursor** is a page login the panel observes by polling; **Z Code** creates a login link at `zcode.z.ai` and polls until the browser finishes; **Claude Code** is a pasted-code flow because its only registered redirect is on Anthropic's own origin. Token sets are stored in the encrypted vault; non-secret credential metadata is in the conductor's SQLite store. The relay opens the same configured SQLite store and vault, resolves the metadata reference to its vault key, and uses the platform refresher before inference. Cline, xAI OAuth, and import-only or cookie/session credentials are not exposed as working login flows. No live login was exercised as part of implementation; run the automated tests before relying on the behavior.
 
 These OAuth operations live in the **conductor control plane**; they do not add endpoints to the inference relay. The relay only consumes the resulting account credential while serving inference.
 
@@ -52,7 +52,7 @@ legible rather than to make it for them.
 
 ---
 
-## 2. The three flow shapes, and which platform uses which
+## 2. The flow shapes, and which platform uses which
 
 | Platform | Flow | Redirect | Why this flow |
 |---|---|---|---|
@@ -61,6 +61,8 @@ legible rather than to make it for them.
 | gemini-cli (T1) | authorization code, no PKCE on the loopback path | loopback `127.0.0.1:{ephemeral}/oauth2callback` | Google's installed-app client; the client secret substitutes for PKCE |
 | Copilot | **device flow** | none | the client has no browser and cannot receive a loopback callback |
 | Cursor | **page login** (browser-completion) | none | the provider owns the sign-in page, and its own CLI learns of completion by polling |
+| Z Code | **login link + poll** | none | the browser finishes on `zcode.z.ai`; the router polls the flow it created |
+| Claude Code | **pasted code** (authorization code + PKCE `S256`) | fixed `https://console.anthropic.com/oauth/code/callback`, bound nowhere | the only redirect the client is registered for is a page on Anthropic's origin, which cannot reach this machine |
 
 ### Authorization code with PKCE on a loopback redirect
 
@@ -86,8 +88,10 @@ just the query string, or `code#state`) and the waiting sign-in completes. Three
 fallback as safe as the redirect it stands in for:
 
 * **The `state` is still compared.** A pasted URL is attacker-influenced input exactly like a socket
-  callback, so a code from somebody else's flow is refused. A bare code, which carries no state, is
-  refused with an explanation rather than exchanged.
+  callback, so a code carrying somebody else's `state` is refused. A bare code has no state to
+  compare, and is accepted only for a platform that enforces PKCE — there the code is already bound
+  to this attempt's verifier, and a foreign code simply fails at exchange. A platform without PKCE
+  refuses it with an explanation rather than exchanging it.
 * **There is only one completion path.** The paste does not exchange anything itself: it hands the
   code to the wait that is already in progress, so the pasted and automatic routes cannot drift
   apart.
@@ -99,6 +103,9 @@ Because a waiting `complete` call takes its session *out* of the session registr
 must not hold the map lock), pasted redirects live in a separate slot keyed by session id, and the
 wait races the loopback listener against that slot. A paste that arrives before the wait starts is
 still parked and found, and `Notify` keeps it from being lost in the gap.
+
+Claude Code is the same slot machinery from the other direction: it has no loopback listener at all,
+so the pasted code is the *only* completion path rather than a fallback (see *The pasted code*).
 
 ### The device flow
 
@@ -147,6 +154,34 @@ boolean is needed:
 fifth each attempt and stops growing at ten seconds — an abandoned tab costs a poll every ten
 seconds rather than one every second, and the session itself expires well before the page does.
 
+### The pasted code, where the redirect belongs to the provider
+
+Claude Code is the fourth shape, and it exists because neither of the previous three is available.
+The client is registered for exactly one redirect, `https://console.anthropic.com/oauth/code/callback`,
+which is a page on Anthropic's origin: the browser lands there and Anthropic's page prints
+`code#state`. Nothing can be bound on this machine and no page of the provider's *polls* our session,
+so there is no loopback to wait on and no page login to observe.
+
+What remains is to ask the human to carry the value across, and the code treats that as a **first-class
+flow**, not an error path. `paste_redirect_uri()` names the fixed redirect the platform is registered
+with; a platform that returns `Some` from it starts a session with `start_paste`, which binds **no
+listener** (port `0` is recorded only because the shared session type has a field for it) and parks one
+manual callback slot. `POST /api/oauth/sessions/{id}/redirect` accepts the whole redirect URL, its query
+string, a bare code, or `code#state`, parses the `state` out and hands the code to the session. The
+session's `POST /api/oauth/sessions/{id}/complete` then blocks on that slot and finishes the exchange
+exactly as a loopback flow would.
+
+Three consequences are deliberate:
+
+* `supports_device_flow()` excludes a paste platform even when it does not begin with loopback — the
+  default is `!begins_with_loopback() && !begins_with_screen_login() && paste_redirect_uri().is_none()`
+  — or the panel would offer a code prompt the provider's device endpoint does not exist for;
+* the panel starts the flow by opening the authorize URL and showing the code box **immediately**,
+  labelled `Use this code` with `code#state` as its placeholder, because the box *is* the instruction
+  rather than a fallback for a failed redirect;
+* the one-paste rule is enforced by `submit_redirect`: the slot is taken on the first successful paste,
+  so a person who pastes twice does not start a second exchange with a code that is already spent.
+
 ---
 
 ## 3. What a platform must provide: the `OAuthPlatform` trait
@@ -157,9 +192,9 @@ The design rule is that adding a platform is **implementing a trait**, not editi
 that has nothing to do with it.
 
 > **Status.** The `OAuthPlatform` trait is implemented in `crates/mr-core/src/oauth/mod.rs`, with the
-> platform implementations in `codex.rs`, `copilot.rs` and `antigravity.rs` beside it and the static
-> registry in `PLATFORMS`/`platforms()`. The table below names the implemented methods; it is not a
-> design sketch.
+> platform implementations in `codex.rs`, `copilot.rs`, `antigravity.rs`, `cursor.rs`, `zcode.rs` and
+> `claude.rs` beside it and the static registry in `PLATFORMS`/`platforms()`. The table below names the
+> implemented methods; it is not a design sketch.
 
 Every item below is something a platform knows and the shared machinery does not:
 
@@ -167,8 +202,9 @@ Every item below is something a platform knows and the shared machinery does not
 |---|---|
 | `id()`, `label()`, `description()` | the stable platform id, matching `oauth_platform` in `catalog/providers.toml` and the `platform` field of `AuthKind::OAuth` in `crates/mr-core/src/dialect.rs`, plus the panel's label and one-line description |
 | `begins_with_loopback() -> bool` | the **default** flow: `true` for a loopback redirect, `false` for device code |
-| `supports_device_flow() -> bool` | whether the platform can *also* be logged in with a device code; defaults to `!begins_with_loopback() && !begins_with_screen_login()` — both of those are non-loopback flows that a device prompt cannot serve — and Codex overrides it to `true` |
+| `supports_device_flow() -> bool` | whether the platform can *also* be logged in with a device code; defaults to `!begins_with_loopback() && !begins_with_screen_login() && paste_redirect_uri().is_none()` — each of those is a flow a device prompt cannot serve — and Codex overrides it to `true` |
 | `begins_with_screen_login() -> bool` | whether the login finishes on a provider page the router only observes; defaults to `false` |
+| `paste_redirect_uri() -> Option<&'static str>` | the fixed redirect a pasted-code platform is registered with, when the redirect lands somewhere this machine cannot receive it; defaults to `None`. `Some` is what makes `GET /api/oauth` report `"flows": ["paste"]` and what lets `start_paste` refuse a platform that has a real redirect |
 | `screen_login_start() -> Result<ScreenLogin>` / `screen_login_poll(&ScreenLogin) -> Result<DevicePoll>` | the page-login pair: open the page, then ask once whether that page has reported completion. The default implementations refuse with a message naming the flow the platform does use |
 | `redirect_ports() -> RedirectPorts` | host, primary/fallback port and path — the string must match what the provider registered |
 | `requires_pkce() -> bool` / `validates_redirect_port() -> bool` | whether the flow binds a PKCE `S256` challenge, and whether the bound port must be one of the registered ports |
@@ -259,17 +295,19 @@ A refresh window is how far *before* expiry the credential is refreshed.
 | Copilot | `refresh_in` from the mint response, ~1500 s; the language server sets `expires_at = now + refresh_in + 60` and VS Code refreshes at `expires_at - 300` | primary/T2 |
 | Antigravity | 60 seconds | T2 — the reverse-engineered IDE client refreshes within 60 s of expiry |
 | Cursor | 5 minutes (`Cursor::refresh_lead`, 300 s) | the observed token lifetime is an hour and the CLI refreshes minutes early; the window leaves room for one retry cycle |
-| Claude Code | **4 hours** | **UNCERTAIN** — not in the research dossier; see below |
+| Claude Code | **4 hours** (`Claude::refresh_lead`, 14 400 s) | **UNCERTAIN** provenance — the number is implemented, not confirmed; see below |
 
 > **UNCERTAIN.** The 4-hour Claude Code figure is stated in this project's brief but does not appear
 > in `.research/oauth.md`, which is the verified source for the rest of this document. It is
-> **not** confirmed from Anthropic's client in this session. The consequence of being wrong is
-> bounded and worth naming: if the real window is much shorter, the router's scheduled refresh fires
-> too rarely and the 401 repair path (§7) does the work instead — slower, but correct. If it is much
-> longer than the token lifetime, the router refreshes after expiry and every refresh is a wasted
-> round trip, which on a single-use token is worse than it sounds because each wasted refresh still
-> consumes a rotation. Treat the number as a tunable default to be verified against
-> [`anthropics/claude-code`](https://github.com/anthropics/claude-code) before it is relied on.
+> **not** confirmed from Anthropic's client in this session — `Claude::refresh_lead()` returns it, so
+> the build behaves as described here, but the value itself is a tunable default rather than an
+> observation. The consequence of being wrong is bounded and worth naming: if the real window is much
+> shorter, the router's scheduled refresh fires too rarely and the 401 repair path (§7) does the work
+> instead — slower, but correct. If it is much longer than the token lifetime, the router refreshes
+> after expiry and every refresh is a wasted round trip, which on a single-use token is worse than it
+> sounds because each wasted refresh still consumes a rotation. Verify it against
+> [`anthropics/claude-code`](https://github.com/anthropics/claude-code) before relying on it, and
+> change `REFRESH_LEAD_SECS` in `crates/mr-core/src/oauth/claude.rs` if the client disagrees.
 
 ### Why a large lead matters when the refresh token is single-use
 
@@ -382,7 +420,7 @@ its address as the OAuth `redirect_uri`.
 | Codex | `127.0.0.1` | **1455**, fallback **1457** | `/auth/callback` | both ports are registered with the provider |
 | Antigravity (T2) | `localhost` | **51121** (fixed) | `/oauth-callback` | registered for the Antigravity IDE |
 | gemini-cli (T1) | `127.0.0.1` | ephemeral (OS-assigned) | `/oauth2callback` | the installed-app client secret, not a registered port, is the protection |
-| Claude Code | `127.0.0.1` | loopback | — | **UNCERTAIN**; not covered by the research dossier |
+| Claude Code | — (nothing is bound) | — | — | the redirect is a fixed page on Anthropic's origin; the person pastes `code#state` (see *The pasted code*) |
 
 ### Why the port is fixed
 

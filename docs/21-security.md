@@ -155,7 +155,7 @@ What Manarouter does about it:
   it;
 - it sends **exactly** the header fingerprint the first-party client sends, and no extras. An
   over-complete fingerprint is as detectable as a missing one. The catalogue records the required
-  header names and a test asserts they are present for each of the three platforms;
+  header names and a test asserts they are present for each of the six registered platforms;
 - it does not rotate accounts to evade rate limits; per-account cooldowns exist to *respect* a
   provider's signal, not to defeat it;
 - it does not spend rate-limit reset credits or reset grants. One reference implementation does; that

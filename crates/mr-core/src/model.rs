@@ -1072,7 +1072,10 @@ impl Provider {
             // on the wire (image input, token output), while every other non-Messages family —
             // embeddings, audio, images, moderation, video, realtime and the management surfaces
             // appended in this build — has no equivalent on the Messages API at all.
-            Dialect::Anthropic | Dialect::Zcode => {
+            //
+            // Claude Code's surface is the same Messages endpoint: the identity sentence and the
+            // subscription headers change how a request is accepted, not which families exist.
+            Dialect::Anthropic | Dialect::Zcode | Dialect::ClaudeCli => {
                 for c in Capability::ALL {
                     if wants(c) && !is_text_capability(c) {
                         out.push(format!(
@@ -2351,6 +2354,7 @@ mod tests {
             (Dialect::OpenAi, Vec::new()),
             (Dialect::Anthropic, with_new(&text_and_audio_free)),
             (Dialect::Zcode, with_new(&text_and_audio_free)),
+            (Dialect::ClaudeCli, with_new(&text_and_audio_free)),
             (Dialect::Codex, with_new(&text_and_audio_free)),
             (Dialect::CommandCodeGo, with_new(&[Capability::Embeddings])),
             (
