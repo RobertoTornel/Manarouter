@@ -5128,6 +5128,14 @@ fn exhausted_by_body(body: &[u8]) -> Option<BodyRefusal> {
     let announced = seconds
         .map(|s| s.min(86_400).saturating_mul(1000))
         .or(spoken);
+    // Google/Vertex-style resource exhaustion (status RESOURCE_EXHAUSTED) usually recovers in
+    // seconds to a couple of minutes, not on a billing cycle. A stated reset still wins; without
+    // one, cool briefly so a combo can retry the step soon instead of holding it for the sixty
+    // second spent-account default.
+    let google_short_wait = status_lower
+        .contains("resource_exhausted")
+        .then_some(10_000);
+
     // A plan that does not include the model is a refusal about *that model*, not about the
     // credential: the same account can still serve everything else its plan covers. It is read
     // before the money phrases because "Upgrade for unlimited Pro model use" is a plan statement
@@ -5148,8 +5156,9 @@ fn exhausted_by_body(body: &[u8]) -> Option<BodyRefusal> {
     if !exhausted && spoken.is_none() && !spent_account {
         return None;
     }
-    let wait_ms =
-        announced.or_else(|| names_a_spent_balance(message).then_some(SPENT_BALANCE_PARK_MS));
+    let wait_ms = announced
+        .or(google_short_wait)
+        .or_else(|| names_a_spent_balance(message).then_some(SPENT_BALANCE_PARK_MS));
     Some(BodyRefusal {
         reason: select::CooldownReason::QuotaExhausted,
         wait_ms,
@@ -9530,15 +9539,17 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         let body = br#"{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}"#;
         let refusal = exhausted_by_body(body).expect("resource exhausted is a refusal");
         assert_eq!(refusal.reason, select::CooldownReason::QuotaExhausted);
-        assert!(
-            refusal.wait_ms.is_none(),
-            "no recovery instant named; the configured default applies"
+        assert_eq!(
+            refusal.wait_ms,
+            Some(10_000),
+            "google-style exhaustion cools briefly so a combo can retry soon"
         );
         // The canonical spelling is read the same way.
         let canonical =
             br#"{"status":"RESOURCE_EXHAUSTED","message":"Resource has been exhausted."}"#;
         let refusal = exhausted_by_body(canonical).expect("canonical spelling");
         assert_eq!(refusal.reason, select::CooldownReason::QuotaExhausted);
+        assert_eq!(refusal.wait_ms, Some(10_000));
     }
 
     #[test]
