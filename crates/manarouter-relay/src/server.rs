@@ -5090,10 +5090,18 @@ fn exhausted_by_body(body: &[u8]) -> Option<BodyRefusal> {
         .or_else(|| error.get("code"))
         .and_then(|kind| kind.as_str())
         .unwrap_or_default();
+    // Some providers spell the quota refusal in a `status` field rather than `code`/`type`
+    // (Google's RESOURCE_EXHAUSTED), so both are normalized and compared.
+    let status_kind = value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let kind_lower = kind.to_ascii_lowercase();
+    let status_lower = status_kind.to_ascii_lowercase();
     let exhausted = matches!(
-        kind,
-        "usage_limit_reached" | "rate_limit_reached" | "insufficient_quota"
-    );
+        kind_lower.as_str(),
+        "usage_limit_reached" | "rate_limit_reached" | "insufficient_quota" | "resource_exhausted"
+    ) || status_lower.contains("resource_exhausted");
     let seconds = error
         .get("resets_in_seconds")
         .and_then(serde_json::Value::as_u64)
@@ -5160,13 +5168,15 @@ fn exhausted_by_body(body: &[u8]) -> Option<BodyRefusal> {
 fn mentions_a_spent_account(message: &str) -> bool {
     // A quota that comes back on its own is still about the account, but it is not about a balance,
     // so it is parked by the configured default rather than by the hour.
-    const WINDOWS: [&str; 6] = [
+    const WINDOWS: [&str; 8] = [
         "quota exceeded",
         "quota exhausted",
         "exceeded your quota",
         "exceeded your current quota",
         "spend limit",
         "credit limit",
+        "resource has been exhausted",
+        "check quota",
     ];
     let lower = message.to_ascii_lowercase();
     names_a_spent_balance(message) || WINDOWS.iter().any(|phrase| lower.contains(phrase))
@@ -9507,6 +9517,28 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(exhausted_by_body(b"not json at all"), None);
         assert_eq!(exhausted_by_body(b""), None);
         assert_eq!(exhausted_by_body(br#"{"error":{}}"#), None);
+    }
+
+    #[test]
+    #[test]
+    fn a_google_style_resource_exhausted_429_is_a_quota_refusal() {
+        // Captured live: Google/Vertex answers 429 with a `status` field, a numeric `code`, and a
+        // message that only says "check quota". It used to be read as a plain throttle (kind was
+        // empty because `code` was a number), which the relay handled by cooling briefly and
+        // failing over — but the user-visible reason stayed the upstream's 429 even when a sibling
+        // step could serve. Recognizing it lets the combo exhaust it fast and report it as quota.
+        let body = br#"{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}"#;
+        let refusal = exhausted_by_body(body).expect("resource exhausted is a refusal");
+        assert_eq!(refusal.reason, select::CooldownReason::QuotaExhausted);
+        assert!(
+            refusal.wait_ms.is_none(),
+            "no recovery instant named; the configured default applies"
+        );
+        // The canonical spelling is read the same way.
+        let canonical =
+            br#"{"status":"RESOURCE_EXHAUSTED","message":"Resource has been exhausted."}"#;
+        let refusal = exhausted_by_body(canonical).expect("canonical spelling");
+        assert_eq!(refusal.reason, select::CooldownReason::QuotaExhausted);
     }
 
     #[test]
