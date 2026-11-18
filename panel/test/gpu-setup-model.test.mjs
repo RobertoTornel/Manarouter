@@ -313,6 +313,7 @@ test('emptyDraft fills every documented key and starts on Modal with no plan cla
     tokenSecret: '',
     apiTokenId: '',
     apiTokenSecret: '',
+    extraAccounts: '',
     accountMode: 'new',
     hfTokenNeeded: false,
     hfTokenId: '',
@@ -412,8 +413,8 @@ test('stepList field inventory is stable per step', () => {
     // ones for a reuse. Exactly one is visible, keyed by `accountMode`, so the duplicate is the
     // inventory being honest rather than two fields.
     account: [
-      'accountMode', 'accountId', 'accountId', 'workspace', 'plan', 'tokenId', 'tokenSecret',
-      'apiTokenId', 'apiTokenSecret', 'planMarker', 'accountCredentialNote',
+      'accountMode', 'accountId', 'accountId', 'extraAccounts', 'workspace', 'plan', 'tokenId',
+      'tokenSecret', 'apiTokenId', 'apiTokenSecret', 'planMarker', 'accountCredentialNote',
     ],
     model: [
       'repo', 'revision', 'hfTokenId', 'hfTokenNew', 'hfTokenNewLabel',

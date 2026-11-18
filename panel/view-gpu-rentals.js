@@ -1254,6 +1254,18 @@ async function renderInventory(mount, ctx) {
       } else {
         credential.push(h('span', { class: 'hint' }, 'no credential fingerprint reported'));
       }
+      const editBtn = h('button', {
+        class: 'btn btn-sm btn-ghost', type: 'button',
+        'aria-label': `Edit rental account ${account.id}`,
+        title: 'Edit account',
+      }, 'Edit');
+      editBtn.addEventListener('click', () => { void editAccountDialog(view, ctx, account); });
+      const deleteBtn = h('button', {
+        class: 'btn btn-sm btn-ghost btn-quiet-danger', type: 'button',
+        'aria-label': `Delete rental account ${account.id}`,
+        title: 'Delete account',
+      }, 'Delete');
+      deleteBtn.addEventListener('click', () => { void deleteAccountFlow(view, ctx, account); });
       const cells = [
         h('td', {},
           h('div', {}, account.label),
@@ -1264,6 +1276,7 @@ async function renderInventory(mount, ctx) {
         h('td', {}, ...credential),
         h('td', { class: 'num' },
           account.maxContainers === null ? '—' : String(account.maxContainers)),
+        h('td', { class: 'actions' }, editBtn, deleteBtn),
       ];
       if (perAccount) {
         cells.push(
@@ -1280,6 +1293,7 @@ async function renderInventory(mount, ctx) {
       { label: 'Workspace' },
       { label: 'Credential' },
       { label: 'Container ceiling', num: true },
+      { label: '' },
       ...(perAccount ? [
         { label: 'GPU requests', num: true },
         { label: 'GPU time', num: true },
@@ -3918,7 +3932,20 @@ async function openAccountDialog(view, ctx) {
       paint();
       try {
         const payload = { accountMode: 'new', accountId: values.id.trim(), accountLabel: values.label.trim(), platform: 'modal', plan: values.plan, workspace: values.workspace.trim(), tokenId: values.tokenId.trim(), tokenSecret: values.tokenSecret, apiTokenId: values.apiTokenId.trim(), apiTokenSecret: values.apiTokenSecret.trim() };
-        const wire = callModel(wizard, 'accountApplyPayload', null, payload);
+        const wire = {
+          action: 'create-account',
+          account: {
+            id: payload.accountId,
+            label: payload.accountLabel,
+            platform: payload.platform,
+            plan: payload.plan,
+            workspace: payload.workspace,
+            token_id: payload.tokenId,
+            token_secret: payload.tokenSecret,
+            api_token_id: payload.apiTokenId || undefined,
+            api_token_secret: payload.apiTokenSecret || undefined,
+          },
+        };
         const response = objectOf(await api.post('/api/gpu/apply', wire)) ?? {};
         state.result = {
           id: asString(pick(response, 'account_id')) || payload.accountId,
@@ -3946,6 +3973,198 @@ async function openAccountDialog(view, ctx) {
     paint();
   });
   await done;
+}
+
+/// Edit a rental account's non-secret fields and optionally rotate either credential pair.
+async function editAccountDialog(view, ctx, existing) {
+  const mod = await import('./gpu-setup-model.js').catch(() => null);
+  const wizard = freshWizard();
+  wizard.mod = mod ?? {};
+  wizard.view = view;
+  const values = {
+    id: existing?.id ?? '',
+    label: existing?.label ?? '',
+    platform: 'modal',
+    plan: existing?.plan ?? 'unknown',
+    workspace: existing?.workspace ?? '',
+    tokenId: '',
+    tokenSecret: '',
+    apiTokenId: '',
+    apiTokenSecret: '',
+  };
+  const root = dialogRoot();
+  const state = { busy: false, error: null, result: null };
+
+  const done = contentDialog(root, 'Edit Modal account', (body, close) => {
+    const fields = h('div', { class: 'form-fields' });
+    const actions = h('div', { class: 'dialog-actions' });
+
+    function textInput(name, { placeholder = '', type = 'text', readonly = false } = {}) {
+      const input = h('input', {
+        class: 'input', type, name, placeholder, autocomplete: 'off', spellcheck: 'false',
+        readonly, disabled: readonly,
+        oninput: (e) => { values[name] = e.target.value; },
+      });
+      input.dataset.field = name;
+      input.setAttribute('data-field', name);
+      return input;
+    }
+
+    function paint() {
+      body.replaceChildren();
+      if (state.result) {
+        body.append(
+          h('h3', {}, 'Saved'),
+          kv([
+            ['Account', state.result.id],
+            ['Plan', state.result.plan],
+            ['Workspace', state.result.workspace || '—'],
+            ['Proxy credential', state.result.fingerprint || 'unchanged'],
+            ['API credential', state.result.apiFingerprint || 'unchanged'],
+          ]),
+          h('p', { class: 'hint' },
+            'Fields left blank keep their current vault values. The secret is never rendered back.'),
+          formActions(button('Done', () => close(true), { className: 'btn btn-primary' })),
+        );
+        return;
+      }
+      fields.replaceChildren(
+        field('Account id', textInput('id', { readonly: true })),
+        field('Label', textInput('label'), { hint: 'Shown on the list.' }),
+        field('Platform', h('input', { class: 'input', value: 'modal', readonly: true, disabled: true })),
+        field('Modal workspace', textInput('workspace'), { hint: 'Not a secret: the first half of every endpoint URL this workspace publishes.' }),
+        field('Plan', (() => {
+          const ids = Array.isArray(mod?.PLAN_IDS) ? mod.PLAN_IDS : ['unknown'];
+          const select = h('select', { class: 'input', onchange: (e) => { values.plan = e.target.value; } },
+            ...ids.map((id) => h('option', { value: id, selected: id === values.plan }, PLAN_LABELS[id] ?? id)));
+          select.dataset.field = 'plan';
+          select.setAttribute('data-field', 'plan');
+          return select;
+        })(), { hint: 'Unknown is a real answer and is never rendered as free or as paid.' }),
+        field('Modal proxy token id (blank = keep)', textInput('tokenId', { placeholder: 'wk-…', type: 'password' }), {
+          hint: 'Only to rotate. Leave blank to keep the stored pair.',
+        }),
+        field('Modal proxy token secret', textInput('tokenSecret', { placeholder: 'ws-…', type: 'password' }), {
+          hint: 'Provide both halves to rotate, or leave both blank.',
+        }),
+        field('Modal API key (blank = keep)', textInput('apiTokenId', { placeholder: 'ak-…', type: 'password' }), {
+          hint: 'Optional, separate pair. Leave blank to keep.',
+        }),
+        field('Modal API secret', textInput('apiTokenSecret', { placeholder: 'as-…', type: 'password' }), {
+          hint: 'Provide both halves to rotate, or leave both blank.',
+        }),
+      );
+      body.append(
+        h('p', { class: 'hint' },
+          'Editing an account changes what every rental naming it bills through. If you rotate a credential, existing rentals use the new value immediately.'),
+        fields,
+      );
+      if (state.error) body.append(applyFieldErrors(body, state.error));
+      body.append(formActions(
+        ghostButton('Cancel', () => close(false)),
+        button(state.busy ? 'Saving…' : 'Save account', submit, {
+          className: 'btn btn-primary',
+          disabled: state.busy,
+        }),
+      ));
+    }
+    async function submit() {
+      if (state.busy) return;
+      const missing = [];
+      const proxyPair = values.tokenId.trim() || values.tokenSecret.trim();
+      const apiPair = values.apiTokenId.trim() || values.apiTokenSecret.trim();
+      if (proxyPair && (!values.tokenId.trim() || !values.tokenSecret.trim())) {
+        missing.push({ field: 'tokenId', message: 'Provide both proxy-token halves to rotate, or neither.' });
+      }
+      if (apiPair && (!values.apiTokenId.trim() || !values.apiTokenSecret.trim())) {
+        missing.push({ field: 'apiTokenId', message: 'Provide both API halves to rotate, or neither.' });
+      }
+      if (proxyPair && !/^wk-/.test(values.tokenId.trim())) {
+        missing.push({ field: 'tokenId', message: 'Proxy token ids start with wk-.' });
+      }
+      if (proxyPair && !/^ws-/.test(values.tokenSecret.trim())) {
+        missing.push({ field: 'tokenSecret', message: 'Proxy token secrets start with ws-.' });
+      }
+      if (apiPair && !/^ak-/.test(values.apiTokenId.trim())) {
+        missing.push({ field: 'apiTokenId', message: 'Modal API keys start with ak-.' });
+      }
+      if (apiPair && !/^as-/.test(values.apiTokenSecret.trim())) {
+        missing.push({ field: 'apiTokenSecret', message: 'Modal API secrets start with as-.' });
+      }
+      state.error = null;
+      if (missing.length) {
+        state.error = { message: 'The account is not complete.', details: missing };
+        paint();
+        return;
+      }
+      state.busy = true;
+      paint();
+      try {
+        const payload = {
+          action: 'update-account',
+          account: {
+            id: values.id,
+            label: values.label.trim(),
+            plan: values.plan,
+            workspace: values.workspace.trim(),
+          },
+        };
+        if (proxyPair) {
+          payload.account.token_id = values.tokenId.trim();
+          payload.account.token_secret = values.tokenSecret.trim();
+        }
+        if (apiPair) {
+          payload.account.api_token_id = values.apiTokenId.trim();
+          payload.account.api_token_secret = values.apiTokenSecret.trim();
+        }
+        const response = objectOf(await api.post('/api/gpu/apply', payload)) ?? {};
+        state.result = {
+          id: asString(pick(response, 'account_id')) || payload.account.id,
+          plan: payload.account.plan,
+          workspace: payload.account.workspace,
+          fingerprint: asString(pick(objectOf(response.vault) ?? {}, 'fingerprint')),
+          apiFingerprint: asString(pick(objectOf(response.api_vault) ?? {}, 'fingerprint')),
+        };
+        values.tokenId = '';
+        values.tokenSecret = '';
+        values.apiTokenId = '';
+        values.apiTokenSecret = '';
+        if (ctx && typeof ctx.toast?.success === 'function') ctx.toast.success('Modal account updated.');
+        await view?.refresh?.(true);
+      } catch (err) {
+        state.error = err;
+      } finally {
+        state.busy = false;
+        paint();
+      }
+    }
+
+    paint();
+  });
+  await done;
+}
+
+/// Delete a rental account after confirmation, refusing when deployments still bill through it.
+async function deleteAccountFlow(view, ctx, account) {
+  const ok = await (ctx.confirm ? ctx.confirm({
+    title: `Delete rental account “${account.label || account.id}”?`,
+    message: 'The vault entry and credential are removed. Deployments still billing through this '
+      + 'account are refused until they are deleted first.',
+    confirmLabel: 'Delete account',
+  }) : Promise.resolve(true));
+  if (!ok) return;
+  const mod = await import('./gpu-setup-model.js').catch(() => null);
+  const wizard = freshWizard();
+  wizard.mod = mod ?? {};
+  wizard.view = view;
+  try {
+    const payload = { action: 'delete-account', account: { id: account.id } };
+    await api.post('/api/gpu/apply', payload);
+    if (ctx && typeof ctx.toast?.success === 'function') ctx.toast.success('Rental account deleted.');
+    await view?.refresh?.(true);
+  } catch (err) {
+    if (ctx && typeof ctx.toast?.error === 'function') ctx.toast.error('Could not delete the account', err);
+  }
 }
 
 // -- Add a HuggingFace token ----------------------------------------------------------------

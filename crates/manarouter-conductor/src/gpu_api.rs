@@ -1529,6 +1529,8 @@ async fn post_apply(
     let map = object_body(body, "apply")?;
     match string_field(&map, "action").as_deref() {
         Some("create-account") => create_account(&state, &map).await.map(Json),
+        Some("update-account") => update_account(&state, &map).await.map(Json),
+        Some("delete-account") => delete_account(&state, &map).await.map(Json),
         Some("create-hf-token") => create_hf_token(&state, &map).await.map(Json),
         Some("create-deployment") => create_deployment(&state, &map).await.map(Json),
         Some(other) => Err(ApiError::bad(
@@ -1794,6 +1796,280 @@ async fn create_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
     }))
 }
 
+/// Update a rental account's non-secret fields and optionally rotate either credential pair.
+///
+/// Every field is optional; absent fields keep their current value. A credential pair is replaced
+/// only when both halves are supplied (or the combined string), so editing an account never forces
+/// re-entering a secret.
+async fn update_account(state: &AppState, map: &Map<String, Value>) -> ApiResult<Value> {
+    let account_value = map.get("account").cloned().unwrap_or(Value::Null);
+    let account_map = object_body(account_value, "account")?;
+    let id = match string_field(&account_map, "id") {
+        Some(id) => id,
+        None => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "the account needs an `id` naming the rental account to update",
+            ))
+        }
+    };
+
+    let guard = state.mutation_lock.lock().await;
+    let current = state.current_config().await;
+    let Some(mut account) = rental_accounts(&current)
+        .iter()
+        .find(|account| account.id == id)
+        .cloned()
+    else {
+        return Err(ApiError::not_found(format!(
+            "there is no rental account with id `{id}`"
+        )));
+    };
+
+    if let Some(label) = string_field(&account_map, "label") {
+        account.label = label;
+    }
+    if let Some(plan) = string_field(&account_map, "plan") {
+        match RentalPlan::parse(&plan) {
+            Some(plan) => account.plan = plan,
+            None => {
+                return Err(ApiError::bad(
+                    "invalid_body",
+                    "`plan` must be one of `free`, `paid`, or `unknown`",
+                ))
+            }
+        }
+    }
+    if let Some(workspace) = string_field(&account_map, "workspace") {
+        if let Some(problem) = workspace_problem(&workspace) {
+            return Err(ApiError::bad("invalid_body", problem));
+        }
+        account.workspace = Some(workspace);
+    }
+    if let Some(count) = account_map.get("max_concurrent_containers") {
+        if count.is_null() {
+            account.max_concurrent_containers = None;
+        } else if let Some(value) = count.as_u64() {
+            account.max_concurrent_containers = Some(value.min(u64::from(u32::MAX)) as u32);
+        } else {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "`max_concurrent_containers` must be a non-negative integer or null",
+            ));
+        }
+    }
+    if let Some(note) = string_field(&account_map, "note") {
+        account.note = Some(note);
+    }
+    if let Some(limits) = map
+        .get("plan_limits")
+        .or_else(|| account_map.get("plan_limits"))
+    {
+        validate_plan_limits(limits)?;
+        account
+            .extra
+            .insert("plan_limits".to_owned(), limits.clone());
+    }
+
+    let mut tx = crate::state::VaultTx::default();
+
+    // Rotate the proxy-token pair when both halves (or the combined string) are supplied.
+    let proxy_token = string_field(&account_map, "token");
+    let proxy_token_id = string_field(&account_map, "token_id");
+    let proxy_token_secret = string_field(&account_map, "token_secret");
+    let proxy_combined = match (proxy_token, proxy_token_id, proxy_token_secret) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "send either `token` or `token_id` with `token_secret`, not both",
+            ))
+        }
+        (Some(token), None, None) => Some(token),
+        (None, Some(token_id), Some(token_secret)) => Some(format!("{token_id}.{token_secret}")),
+        (None, None, None) => None,
+        _ => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "a Modal proxy credential needs both `token_id` and `token_secret`, or neither",
+            ))
+        }
+    };
+    if let Some(combined) = &proxy_combined {
+        if let Some(problem) = modal_credential_problem(combined) {
+            return Err(ApiError::bad("invalid_credential", problem));
+        }
+        let credential_id = rental_credential_id(&id);
+        if let Err(e) = state.tx_put(&mut tx, &credential_id, combined).await {
+            state.tx_rollback(tx).await;
+            return Err(ApiError::internal(format!(
+                "the credential could not be written to the vault: {e}"
+            )));
+        }
+        account.secret_ref = Some(credential_id);
+    }
+
+    // Same for the Modal API pair.
+    let api_token = string_field(&account_map, "api_token");
+    let api_token_id = string_field(&account_map, "api_token_id");
+    let api_token_secret = string_field(&account_map, "api_token_secret");
+    let api_combined = match (api_token, api_token_id, api_token_secret) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "send either `api_token` or `api_token_id` with `api_token_secret`, not both",
+            ))
+        }
+        (Some(token), None, None) => Some(token),
+        (None, Some(token_id), Some(token_secret)) => Some(format!("{token_id}.{token_secret}")),
+        (None, None, None) => None,
+        _ => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "a Modal API credential needs both `api_token_id` and `api_token_secret`, or \
+                 neither",
+            ))
+        }
+    };
+    if let Some(combined) = &api_combined {
+        if let Some(problem) = modal_api_credential_problem(combined) {
+            return Err(ApiError::bad("invalid_credential", problem));
+        }
+        let api_credential_id = rental_api_credential_id(&id);
+        if let Err(e) = state.tx_put(&mut tx, &api_credential_id, combined).await {
+            state.tx_rollback(tx).await;
+            return Err(ApiError::internal(format!(
+                "the API credential could not be written to the vault: {e}"
+            )));
+        }
+        account.api_secret_ref = Some(api_credential_id);
+    }
+
+    let next = with_account(&current, &account);
+    if let Err(error) = state.commit_locked(next).await {
+        state.tx_rollback(tx).await;
+        return Err(error.into());
+    }
+    drop(guard);
+
+    let proxy_fingerprint = {
+        let vault = state.vault.lock().await;
+        account
+            .secret_ref
+            .as_deref()
+            .and_then(|id| vault.fingerprint_of(id))
+            .map(str::to_owned)
+    };
+    let api_fingerprint = {
+        let vault = state.vault.lock().await;
+        account
+            .api_secret_ref
+            .as_deref()
+            .and_then(|id| vault.fingerprint_of(id))
+            .map(str::to_owned)
+    };
+
+    Ok(json!({
+        "action": "update-account",
+        "account": {
+            "id": account.id,
+            "label": account.label,
+            "platform": account.platform.as_str(),
+            "plan": account.plan.as_str(),
+            "workspace": account.workspace,
+            "has_credential": account.has_credential(),
+            "has_api_credential": account.api_secret_ref.is_some(),
+        },
+        "vault": {
+            "credential_id": account.secret_ref,
+            "fingerprint": proxy_fingerprint,
+        },
+        "api_vault": account.api_secret_ref.as_ref().map(|id| json!({
+            "credential_id": id,
+            "fingerprint": api_fingerprint,
+        })).unwrap_or(Value::Null),
+        "restart_pending": state.restart.is_pending(),
+        "applies_on": "immediately",
+    }))
+}
+
+/// Delete a rental account and its vault entries, refusing when deployments still bill through it.
+async fn delete_account(state: &AppState, map: &Map<String, Value>) -> ApiResult<Value> {
+    let account_value = map.get("account").cloned().unwrap_or(Value::Null);
+    let account_map = object_body(account_value, "account")?;
+    let id = match string_field(&account_map, "id") {
+        Some(id) => id,
+        None => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "the account needs an `id` naming the rental account to delete",
+            ))
+        }
+    };
+
+    let guard = state.mutation_lock.lock().await;
+    let current = state.current_config().await;
+    let Some(account) = rental_accounts(&current)
+        .iter()
+        .find(|account| account.id == id)
+        .cloned()
+    else {
+        return Err(ApiError::not_found(format!(
+            "there is no rental account with id `{id}`"
+        )));
+    };
+
+    let referencing: Vec<String> = current
+        .providers
+        .iter()
+        .filter_map(|provider| {
+            let deployment = parse_deployment(provider.id.as_ref(), &provider.extra).ok()?;
+            deployment
+                .is_some_and(|d| d.account == id)
+                .then(|| provider.id.as_str().to_owned())
+        })
+        .collect();
+    if !referencing.is_empty() {
+        return Err(ApiError::bad(
+            "account_in_use",
+            format!(
+                "the account `{id}` is still billed through {} deployment(s): {}; delete those \
+                 deployments first",
+                referencing.len(),
+                referencing.join(", ")
+            ),
+        ));
+    }
+
+    let mut next = current.clone();
+    next.rental_accounts.retain(|existing| existing.id != id);
+    if let Err(error) = state.commit_locked(next).await {
+        return Err(error.into());
+    }
+    drop(guard);
+
+    // Best-effort vault cleanup after the config commit: orphaned entries are harmless (they are
+    // never referenced again) but leaving them would leak old credentials on disk.
+    {
+        let mut vault = state.vault.lock().await;
+        if let Some(ref_id) = &account.secret_ref {
+            vault.delete(ref_id);
+        }
+        if let Some(api_ref) = &account.api_secret_ref {
+            vault.delete(api_ref);
+        }
+        if let Some(hf_ref) = &account.hf_secret_ref {
+            vault.delete(hf_ref);
+        }
+    }
+
+    Ok(json!({
+        "action": "delete-account",
+        "deleted": id,
+        "restart_pending": state.restart.is_pending(),
+        "applies_on": "immediately",
+    }))
+}
+
 /// Create a Hugging Face token, or replace the value of one that already exists.
 ///
 /// The token is its own entity because it authenticates a repository fetch, not a rental: the same
@@ -1994,15 +2270,9 @@ fn parse_batch_shape(value: &Value, mode: RentalMode) -> ApiResult<BatchShape> {
 }
 
 async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiResult<Value> {
-    let account_id = match string_field(map, "account_id") {
-        Some(id) => id,
-        None => {
-            return Err(ApiError::bad(
-                "invalid_body",
-                "the deployment needs an `account_id` naming a configured rental account",
-            ))
-        }
-    };
+    // Either a single `account_id` or an `accounts` list of several. The list takes precedence;
+    // neither is an error naming what is missing.
+    let account_id = string_field(map, "account_id").unwrap_or_default();
     let deployment_map = object_body(
         map.get("deployment").cloned().unwrap_or(Value::Null),
         "deployment",
@@ -2207,26 +2477,60 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
 
     let guard = state.mutation_lock.lock().await;
     let current = state.current_config().await;
-    let Some(account) = rental_accounts(&current)
-        .iter()
-        .find(|account| account.id == account_id)
-    else {
-        return Err(ApiError::not_found(format!(
-            "there is no rental account with id `{account_id}`"
-        )));
+
+    // A deployment may bill through one account or several: the provider gets one credential per
+    // chosen account, and the relay fails over across them exactly as it does for a provider with
+    // several accounts.
+    let account_ids: Vec<String> = match map
+        .get("accounts")
+        .or_else(|| deployment_map.get("accounts"))
+    {
+        Some(Value::Array(items)) if !items.is_empty() => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        _ => {
+            if account_id.is_empty() {
+                return Err(ApiError::bad(
+                    "invalid_body",
+                    "the deployment needs an `account_id` naming a configured rental account, or \
+                     an `accounts` list of several",
+                ));
+            }
+            vec![account_id.clone()]
+        }
     };
-    // `RentalPlatform` has one implementation today, so an account on another platform is refused
-    // by name rather than silently given a Modal image.
-    if account.platform != RentalPlatform::Modal {
+    if account_ids.is_empty() {
         return Err(ApiError::bad(
-            "unsupported_platform",
-            format!(
-                "account `{account_id}` is on platform `{}`, and this build can only generate a \
-                 deployment for `modal`",
-                account.platform.as_str()
-            ),
+            "invalid_body",
+            "`accounts` must name at least one configured rental account",
         ));
     }
+    let mut accounts: Vec<&RentalAccount> = Vec::with_capacity(account_ids.len());
+    for id in &account_ids {
+        match rental_accounts(&current).iter().find(|a| a.id == *id) {
+            Some(account) => {
+                if account.platform != RentalPlatform::Modal {
+                    return Err(ApiError::bad(
+                        "unsupported_platform",
+                        format!(
+                            "account `{id}` is on platform `{}`, and this build can only generate \
+                             a deployment for `modal`",
+                            account.platform.as_str()
+                        ),
+                    ));
+                }
+                accounts.push(account);
+            }
+            None => {
+                return Err(ApiError::not_found(format!(
+                    "there is no rental account with id `{id}`"
+                )));
+            }
+        }
+    }
+    let account = accounts[0];
 
     // Several deployments may share one account, and one model-on-a-GPU may be recorded under
     // several accounts: each pairing gets its own provider id (`provider_id_for` above), so two
@@ -2292,20 +2596,25 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
     // only points at it. The vault id is derived from the account id, so every deployment on this
     // account reads the same entry: a rotation on the account reaches all of them, and no copy can
     // go stale. Another account cannot point here, because its id derives a different vault id.
-    let credential_id = account
-        .secret_ref
-        .clone()
-        .unwrap_or_else(|| rental_credential_id(&account.id));
+    let mut credential_ids: Vec<String> = Vec::with_capacity(accounts.len());
     {
         let vault = state.vault.lock().await;
-        if !vault.contains(&credential_id) {
-            return Err(ApiError::bad(
-                "missing_credential",
-                format!(
-                    "rental account `{account_id}` has no credential at `{credential_id}` in the \
-                     vault; add the Modal token to the account before deploying"
-                ),
-            ));
+        for account in &accounts {
+            let credential_id = account
+                .secret_ref
+                .clone()
+                .unwrap_or_else(|| rental_credential_id(&account.id));
+            if !vault.contains(&credential_id) {
+                return Err(ApiError::bad(
+                    "missing_credential",
+                    format!(
+                        "rental account `{}` has no credential at `{credential_id}` in the vault; \
+                         add the Modal token to the account before deploying",
+                        account.id
+                    ),
+                ));
+            }
+            credential_ids.push(credential_id);
         }
     }
 
@@ -2417,13 +2726,14 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
     };
     provider.models.push(model);
 
-    // The provider's sole account references the rental account's vault entry. Several
-    // deployments may reference the same entry: the credential belongs to the account, not to one
-    // rental.
-    let mut account_row = mr_core::Account::new(account.label.clone());
-    account_row.secret_ref = Some(credential_id.clone());
-    account_row.max_concurrent = 1;
-    provider.accounts.push(account_row);
+    // Each chosen rental account becomes one account of the derived provider, referencing its own
+    // vault entry. The relay fails over across them like any multi-account provider.
+    for (rental, credential_id) in accounts.iter().zip(credential_ids.iter()) {
+        let mut account_row = mr_core::Account::new(rental.label.clone());
+        account_row.secret_ref = Some(credential_id.clone());
+        account_row.max_concurrent = 1;
+        provider.accounts.push(account_row);
+    }
 
     let extra = deployment
         .to_extra_value()
@@ -2446,9 +2756,19 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
     if let Some(_reason) = restart_reason {
         state.restart.request();
     }
-    let fingerprint = {
+    let accounts_payload: Vec<Value> = {
         let vault = state.vault.lock().await;
-        vault.fingerprint_of(&credential_id).map(str::to_owned)
+        accounts
+            .iter()
+            .zip(credential_ids.iter())
+            .map(|(rental, credential_id)| {
+                json!({
+                    "id": rental.id,
+                    "secret_id": credential_id,
+                    "fingerprint": vault.fingerprint_of(credential_id).map(str::to_owned),
+                })
+            })
+            .collect()
     };
 
     Ok(json!({
@@ -2462,11 +2782,12 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
             "repo": deployment.repo,
             "hf_token": deployment.hf_token,
         },
+        "accounts": accounts_payload,
         "vault": {
-            // The account's own entry, referenced — not copied. A second deployment on the same
-            // account references this same entry.
-            "secret_id": credential_id,
-            "fingerprint": fingerprint,
+            // The first account's own entry, referenced — not copied. A second deployment on the
+            // same account references this same entry.
+            "secret_id": credential_ids[0],
+            "fingerprint": accounts_payload[0].get("fingerprint").cloned(),
         },
         "restart_pending": state.restart.is_pending(),
         "applies_on": if restart_reason.is_some() { "restart" } else { "immediately" },
@@ -4073,6 +4394,112 @@ mod tests {
         );
         assert!(!body.to_string().contains(first_credential));
         assert!(!body.to_string().contains(second_credential));
+    }
+
+    #[tokio::test]
+    async fn a_deployment_can_bill_through_several_accounts_and_accounts_edit_or_delete() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = state_in(dir.path());
+        for (id, credential) in [
+            ("mana-modal", "wk-one-id.ws-one-secret"),
+            ("second-rental", "wk-two-id.ws-two-secret"),
+        ] {
+            create_modal_account(&state, id, "mana", credential).await;
+        }
+
+        // A deployment naming both accounts creates one provider with two accounts, each pointing at
+        // its own vault entry.
+        let created = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "accounts": ["mana-modal", "second-rental"],
+                "deployment": {
+                    "repo": "Qwen/Qwen3-8B",
+                    "gpu": "H100",
+                    "gpu_count": 1,
+                    "max_model_len": 32768,
+                },
+            }),
+        )
+        .await
+        .expect("create a multi-account deployment");
+        let accounts = created["accounts"].as_array().expect("accounts list");
+        assert_eq!(accounts.len(), 2);
+        let provider_id = created["provider_id"].as_str().expect("provider id");
+        let config = state.current_config().await;
+        let provider = config
+            .providers
+            .iter()
+            .find(|p| p.id.as_ref() == provider_id)
+            .expect("provider exists");
+        assert_eq!(provider.accounts.len(), 2);
+        assert_ne!(
+            provider.accounts[0].secret_ref,
+            provider.accounts[1].secret_ref
+        );
+
+        // Editing the account updates its non-secret fields without touching either vault entry.
+        let updated = apply_body(
+            &state,
+            json!({
+                "action": "update-account",
+                "account": {
+                    "id": "mana-modal",
+                    "label": "Mana edited",
+                    "plan": "free",
+                    "note": "edited",
+                },
+            }),
+        )
+        .await
+        .expect("update the account");
+        assert_eq!(updated["account"]["label"], "Mana edited");
+        assert_eq!(updated["account"]["plan"], "free");
+        {
+            let vault = state.vault.lock().await;
+            assert_eq!(
+                vault.get("rental:mana-modal").unwrap().as_deref(),
+                Some("wk-one-id.ws-one-secret")
+            );
+        }
+
+        // Deleting an account still in use is refused and names the provider.
+        let refused = apply_body(
+            &state,
+            json!({
+                "action": "delete-account",
+                "account": {"id": "mana-modal"},
+            }),
+        )
+        .await
+        .expect_err("delete in use must fail");
+        let message = refused.to_string();
+        assert!(message.contains("still billed"), "{message}");
+
+        // Deleting an unused account removes it and its vault entry.
+        create_modal_account(&state, "ephemeral", "mana", "wk-x-id.ws-x-secret").await;
+        apply_body(
+            &state,
+            json!({
+                "action": "delete-account",
+                "account": {"id": "ephemeral"},
+            }),
+        )
+        .await
+        .expect("delete the account");
+        let config = state.current_config().await;
+        assert!(
+            !config.rental_accounts.iter().any(|a| a.id == "ephemeral"),
+            "the account is gone"
+        );
+        {
+            let vault = state.vault.lock().await;
+            assert!(
+                vault.get("rental:ephemeral").unwrap().is_none(),
+                "the vault entry is gone"
+            );
+        }
     }
 
     #[tokio::test]

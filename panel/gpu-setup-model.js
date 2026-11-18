@@ -360,6 +360,9 @@ export function emptyDraft(platformId) {
     // rentals, and the account's credential is written once.
     accountMode: 'new',
     accountId: '',
+    // Additional rental accounts the deployment should also bill through (comma-separated ids),
+    // for failover across several accounts. Empty means only `accountId`.
+    extraAccounts: '',
     // Shown on the list instead of the id when the operator gives one. Empty falls back to the id,
     // which is what a flow that never asked for a label has always recorded.
     accountLabel: '',
@@ -1873,6 +1876,7 @@ export function stepList(draft, catalog = null) {
           value: fieldValue(d, 'accountId'),
           hint: 'A recorded account. Its credential stays where it is; this rental only names it.',
         }),
+        textField({ name: 'extraAccounts', label: 'Also bill through (optional)', kind: 'text', required: false, visible: d.accountMode === 'existing', value: fieldValue(d, 'extraAccounts'), placeholder: 'account-id-2, account-id-3', hint: 'Comma-separated rental account ids. The deployment fails over across all of them like a multi-account provider.' }),
         textField({ name: 'workspace', label: 'Modal workspace', required: true, visible: d.accountMode !== 'existing', value: fieldValue(d, 'workspace'), placeholder: 'mana', hint: 'The workspace this account\'s apps deploy into, for example `mana`. Not a secret: it is the half of the endpoint URL Manarouter can know without deploying.' }),
         selectField({ name: 'plan', label: 'Plan', optionsSource: 'plans', required: true, visible: d.accountMode !== 'existing', value: planLabel, hint: 'Unknown is a real answer and is never rendered as free or as paid.' }),
         textField({ name: 'tokenId', label: 'Modal proxy token id', kind: 'password', required: true, visible: d.accountMode !== 'existing', value: fieldValue(d, 'tokenId'), placeholder: 'wk-…', hint: 'Half of the Modal proxy token pair: the `wk-…` id the relay sends as `Modal-Key`. Stored in the vault; never rendered back.' }),
@@ -2962,9 +2966,16 @@ export function applyPayload(draft, sizing) {
   // The token is named by id beside the account id, not inside the account: the same token may be
   // named by deployments on several accounts, and this one may need none.
   const hfToken = d.hfTokenId || null;
+  const accountIds = [
+    String(d.accountId || '').trim(),
+    ...String(d.extraAccounts || '').split(',').map((s) => s.trim()),
+  ].filter((value, index, all) => value && all.indexOf(value) === index);
+  const accountField = accountIds.length === 1
+    ? { account_id: accountIds[0] }
+    : { accounts: accountIds };
   return hfToken
-    ? { action: 'create-deployment', account_id: d.accountId, hf_token: hfToken, deployment }
-    : { action: 'create-deployment', account_id: d.accountId, deployment };
+    ? { action: 'create-deployment', ...accountField, hf_token: hfToken, deployment }
+    : { action: 'create-deployment', ...accountField, deployment };
 }
 
 // ---------------------------------------------------------------------------
