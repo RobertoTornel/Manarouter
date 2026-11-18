@@ -3810,7 +3810,7 @@ async function openAccountDialog(view, ctx) {
   const wizard = freshWizard();
   wizard.mod = mod ?? {};
   wizard.view = view;
-  const values = { id: '', label: '', platform: 'modal', plan: 'unknown', workspace: '', tokenId: '', tokenSecret: '' };
+  const values = { id: '', label: '', platform: 'modal', plan: 'unknown', workspace: '', tokenId: '', tokenSecret: '', apiTokenId: '', apiTokenSecret: '' };
   const root = dialogRoot();
   const state = { busy: false, error: null, result: null };
 
@@ -3841,6 +3841,7 @@ async function openAccountDialog(view, ctx) {
             ['Workspace', state.result.workspace],
             ['Vault entry', state.result.vaultId || 'written'],
             ['Fingerprint', state.result.fingerprint || 'not returned'],
+            ...(state.result.apiVaultId ? [['API credential', state.result.apiVaultId], ['API fingerprint', state.result.apiFingerprint || 'not returned']] : []),
           ]),
           h('p', { class: 'hint' },
             'The credential is in the vault. It is never rendered back, and no response carries it. Deployments now name this account by id.'),
@@ -3871,6 +3872,12 @@ async function openAccountDialog(view, ctx) {
         field('Modal proxy token secret', textInput('tokenSecret', { placeholder: 'ws-…', type: 'password' }), {
           hint: 'The `ws-…` half, sent as `Modal-Secret`. Both halves are written as one entry.',
         }),
+        field('Modal API key', textInput('apiTokenId', { placeholder: 'ak-…', type: 'password' }), {
+          hint: 'Optional. The `ak-…` half of the Modal *API* token pair (the CLI/API credential), a different pair from the proxy tokens above. Written to its own vault entry.',
+        }),
+        field('Modal API secret', textInput('apiTokenSecret', { placeholder: 'as-…', type: 'password' }), {
+          hint: 'Optional. The `as-…` half. Provide both halves or neither.',
+        }),
       );
       body.append(
         h('p', { class: 'hint' },
@@ -3896,6 +3903,11 @@ async function openAccountDialog(view, ctx) {
       if (!values.workspace.trim()) missing.push({ field: 'workspace', message: 'The Modal workspace is required: without it no endpoint URL can be derived.' });
       if (!values.tokenId.trim()) missing.push({ field: 'tokenId', message: 'The proxy token id is required.' });
       if (!values.tokenSecret.trim()) missing.push({ field: 'tokenSecret', message: 'The proxy token secret is required.' });
+      if (values.apiTokenId.trim() && !/^ak-/.test(values.apiTokenId.trim())) missing.push({ field: 'apiTokenId', message: 'Modal API keys start with ak-.' });
+      if (values.apiTokenSecret.trim() && !/^as-/.test(values.apiTokenSecret.trim())) missing.push({ field: 'apiTokenSecret', message: 'Modal API secrets start with as-.' });
+      if (values.apiTokenId.trim() || values.apiTokenSecret.trim()) {
+        if (!values.apiTokenId.trim() || !values.apiTokenSecret.trim()) missing.push({ field: 'apiTokenId', message: 'Provide both the API key and the API secret, or neither.' });
+      }
       state.error = null;
       if (missing.length) {
         state.error = { message: 'The account is not complete.', details: missing };
@@ -3905,7 +3917,7 @@ async function openAccountDialog(view, ctx) {
       state.busy = true;
       paint();
       try {
-        const payload = { accountMode: 'new', accountId: values.id.trim(), accountLabel: values.label.trim(), platform: 'modal', plan: values.plan, workspace: values.workspace.trim(), tokenId: values.tokenId.trim(), tokenSecret: values.tokenSecret };
+        const payload = { accountMode: 'new', accountId: values.id.trim(), accountLabel: values.label.trim(), platform: 'modal', plan: values.plan, workspace: values.workspace.trim(), tokenId: values.tokenId.trim(), tokenSecret: values.tokenSecret, apiTokenId: values.apiTokenId.trim(), apiTokenSecret: values.apiTokenSecret.trim() };
         const wire = callModel(wizard, 'accountApplyPayload', null, payload);
         const response = objectOf(await api.post('/api/gpu/apply', wire)) ?? {};
         state.result = {
@@ -3914,9 +3926,13 @@ async function openAccountDialog(view, ctx) {
           workspace: payload.workspace,
           vaultId: asString(pick(objectOf(response.vault) ?? {}, 'secret_id', 'id')),
           fingerprint: asString(pick(objectOf(response.vault) ?? {}, 'fingerprint')),
+          apiVaultId: asString(pick(objectOf(response.api_vault) ?? {}, 'credential_id')),
+          apiFingerprint: asString(pick(objectOf(response.api_vault) ?? {}, 'fingerprint')),
         };
         values.tokenId = '';
         values.tokenSecret = '';
+        values.apiTokenId = '';
+        values.apiTokenSecret = '';
         if (ctx && typeof ctx.toast?.success === 'function') ctx.toast.success('Modal account recorded.');
         await view?.refresh?.(true);
       } catch (err) {

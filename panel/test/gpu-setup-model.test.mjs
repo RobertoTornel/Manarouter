@@ -311,6 +311,8 @@ test('emptyDraft fills every documented key and starts on Modal with no plan cla
     plan: 'unknown',
     tokenId: '',
     tokenSecret: '',
+    apiTokenId: '',
+    apiTokenSecret: '',
     accountMode: 'new',
     hfTokenNeeded: false,
     hfTokenId: '',
@@ -411,7 +413,7 @@ test('stepList field inventory is stable per step', () => {
     // inventory being honest rather than two fields.
     account: [
       'accountMode', 'accountId', 'accountId', 'workspace', 'plan', 'tokenId', 'tokenSecret',
-      'planMarker', 'accountCredentialNote',
+      'apiTokenId', 'apiTokenSecret', 'planMarker', 'accountCredentialNote',
     ],
     model: [
       'repo', 'revision', 'hfTokenId', 'hfTokenNew', 'hfTokenNewLabel',
@@ -1597,6 +1599,20 @@ test('the account payload writes the platform credential and no HuggingFace toke
   });
   assert.equal('hf_token' in accountApplyPayload(draft({ hfTokenId: 'hub-main' })).account, false,
     'a token is its own record; the account never carries one');
+  // The optional Modal API token pair is a second vault entry, posted only when both halves exist.
+  assert.equal('api_token_id' in accountApplyPayload(draft()).account, false,
+    'no API pair means no API fields on the wire');
+  assert.deepEqual(accountApplyPayload(draft({ apiTokenId: 'ak-x', apiTokenSecret: 'as-y' })).account, {
+    id: 'mana-modal',
+    label: 'mana-modal',
+    platform: 'modal',
+    plan: 'paid',
+    workspace: 'mana',
+    token_id: 'wk-x',
+    token_secret: 'ws-y',
+    api_token_id: 'ak-x',
+    api_token_secret: 'as-y',
+  });
 });
 
 test('reusing a recorded account posts nothing at all', () => {

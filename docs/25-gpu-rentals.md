@@ -121,9 +121,11 @@ through it.** This is the one place the GPU-rental flow deliberately differs fro
 provider flow, where adding a provider drops you straight into that provider's first-account form.
 
 Creating a rental account asks for the platform and its credentials — for Modal, a **proxy token**
-pair, `Modal-Key` (`wk-…`) and `Modal-Secret` (`ws-…`). The credential is written to the vault as a
-bundle and referenced from `config.json` by id; **the secret itself never appears in `config.json`,
-in a snapshot, in a log, or in this repository.** Entering it goes through the same
+pair, `Modal-Key` (`wk-…`) and `Modal-Secret` (`ws-…`). The form also asks for the optional Modal
+**API token** pair (`ak-…` / `as-…`) — the credential the Modal CLI/API uses, a different pair from
+the proxy tokens — stored as its own vault entry when given. Each credential is written to the vault
+as a bundle and referenced from `config.json` by id; **the secret itself never appears in
+`config.json`, in a snapshot, in a log, or in this repository.** Entering it goes through the same
 `--secret-stdin`-style flow the rest of the project uses, so it does not land in shell history.
 
 An account carries no model. Models are attached to it afterwards, and the relation is not 1:1 in

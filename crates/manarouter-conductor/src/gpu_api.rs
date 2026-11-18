@@ -108,6 +108,15 @@ fn rental_credential_id(account_id: &str) -> String {
     format!("rental:{account_id}")
 }
 
+/// Vault id where an account's Modal API token pair is stored.
+///
+/// Separate from [`rental_credential_id`]: the proxy pair authenticates the relay's inference
+/// requests, the API pair authenticates the Modal CLI/API, and the two are never merged into one
+/// entry.
+fn rental_api_credential_id(account_id: &str) -> String {
+    format!("rental:{account_id}:api")
+}
+
 /// **Legacy.** Vault id where a Hugging Face token was stored when it belonged to an account.
 ///
 /// New tokens live at [`hf_token_vault_id`] and are named by a deployment. This id is still read
@@ -142,6 +151,37 @@ fn modal_credential_problem(value: &str) -> Option<String> {
     }
     if value.chars().any(char::is_whitespace) {
         return Some("the credential contains whitespace".to_owned());
+    }
+    None
+}
+
+/// Whether a string is shaped like a combined Modal **API** credential.
+///
+/// Modal shows two credential kinds with the same two-half shape: proxy auth tokens (`wk-…` /
+/// `ws-…`) for endpoint requests, and API tokens (`ak-…` / `as-…`) for the Modal API and CLI.
+/// This validator is for the second kind; the pair is stored as its own vault entry, never merged
+/// with the proxy pair.
+fn modal_api_credential_problem(value: &str) -> Option<String> {
+    let mut parts = value.split('.');
+    let id = parts.next().unwrap_or_default();
+    let secret = parts.next().unwrap_or_default();
+    if parts.next().is_some() {
+        return Some(
+            "the API credential contains more than one `.`; it is split on the first dot, so a \
+             second one would silently corrupt the secret half"
+                .to_owned(),
+        );
+    }
+    if !id.starts_with("ak-") || !secret.starts_with("as-") {
+        return Some(
+            "the Modal API credential must be `<api token id>.<api token secret>` — `ak-…` and \
+             `as-…`, as Modal's dashboard shows them. The proxy credential (`wk-…` / `ws-…`) \
+             is a different pair and belongs in the account's proxy-token fields"
+                .to_owned(),
+        );
+    }
+    if id.trim().is_empty() || secret.trim().is_empty() || value.chars().any(char::is_whitespace) {
+        return Some("the API credential contains whitespace".to_owned());
     }
     None
 }
@@ -1258,6 +1298,11 @@ pub async fn rentals_body(state: &AppState) -> Value {
                 .as_deref()
                 .and_then(|id| vault.fingerprint_of(id))
                 .map(str::to_owned);
+            let api_fingerprint = account
+                .api_secret_ref
+                .as_deref()
+                .and_then(|id| vault.fingerprint_of(id))
+                .map(str::to_owned);
             let problems: Vec<Value> = account
                 .problems()
                 .into_iter()
@@ -1272,6 +1317,8 @@ pub async fn rentals_body(state: &AppState) -> Value {
                 "plan_is_known": account.plan_is_known(),
                 "has_credential": account.has_credential(),
                 "credential_fingerprint": credential_fingerprint,
+                "has_api_credential": account.api_secret_ref.is_some(),
+                "api_credential_fingerprint": api_fingerprint,
                 "has_hf_token": account.hf_secret_ref.is_some(),
                 "hf_token_fingerprint": hf_fingerprint,
                 "max_concurrent_containers": account.max_concurrent_containers,
@@ -1603,6 +1650,38 @@ async fn create_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
             return Err(ApiError::bad("invalid_credential", problem));
         }
     }
+    // The Modal API token pair is a second, optional credential: the proxy pair above authenticates
+    // inference, the API pair authenticates the Modal CLI/API. Same two-half rule, separate vault
+    // entry.
+    let api_token_id = string_field(&account_map, "api_token_id");
+    let api_token_secret = string_field(&account_map, "api_token_secret");
+    let api_combined = match (
+        string_field(&account_map, "api_token"),
+        api_token_id,
+        api_token_secret,
+    ) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "send either `api_token` or `api_token_id` with `api_token_secret`, not both",
+            ))
+        }
+        (Some(token), None, None) => Some(token),
+        (None, Some(token_id), Some(token_secret)) => Some(format!("{token_id}.{token_secret}")),
+        (None, None, None) => None,
+        _ => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "a Modal API credential needs both `api_token_id` and `api_token_secret`, or \
+                 neither; the pair is the two halves of one credential",
+            ))
+        }
+    };
+    if let Some(combined) = &api_combined {
+        if let Some(problem) = modal_api_credential_problem(combined) {
+            return Err(ApiError::bad("invalid_credential", problem));
+        }
+    }
 
     let guard = state.mutation_lock.lock().await;
     let current = state.current_config().await;
@@ -1650,6 +1729,26 @@ async fn create_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
         }
         account.secret_ref = Some(credential_id.clone());
     }
+    let api_credential_id = rental_api_credential_id(&id);
+    if let Some(combined) = &api_combined {
+        {
+            let vault = state.vault.lock().await;
+            if vault.contains(&api_credential_id) {
+                return Err(ApiError::conflict(format!(
+                    "the vault already holds an API credential at `{api_credential_id}` for a \
+                     different account; refusing to overwrite it. Use a different account id, or \
+                     clear that credential deliberately"
+                )));
+            }
+        }
+        if let Err(e) = state.tx_put(&mut tx, &api_credential_id, combined).await {
+            state.tx_rollback(tx).await;
+            return Err(ApiError::internal(format!(
+                "the API credential could not be written to the vault: {e}"
+            )));
+        }
+        account.api_secret_ref = Some(api_credential_id.clone());
+    }
     let next = with_account(&current, &account);
     if let Err(error) = state.commit_locked(next).await {
         state.tx_rollback(tx).await;
@@ -1661,6 +1760,14 @@ async fn create_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
         let vault = state.vault.lock().await;
         vault.fingerprint_of(&credential_id).map(str::to_owned)
     };
+    let api_fingerprint = {
+        let vault = state.vault.lock().await;
+        account
+            .api_secret_ref
+            .as_deref()
+            .and_then(|id| vault.fingerprint_of(id))
+            .map(str::to_owned)
+    };
     Ok(json!({
         "action": "create-account",
         "account": {
@@ -1670,11 +1777,16 @@ async fn create_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
             "plan": account.plan.as_str(),
             "workspace": account.workspace,
             "has_credential": account.has_credential(),
+            "has_api_credential": account.api_secret_ref.is_some(),
         },
         "vault": {
             "credential_id": credential_id,
             "fingerprint": fingerprint,
         },
+        "api_vault": account.api_secret_ref.as_ref().map(|id| json!({
+            "credential_id": id,
+            "fingerprint": api_fingerprint,
+        })).unwrap_or(Value::Null),
         "restart_pending": state.restart.is_pending(),
         "applies_on": "immediately",
         "note": "the account is a record of what is rented; it takes effect as a provider when a \
@@ -3961,6 +4073,99 @@ mod tests {
         );
         assert!(!body.to_string().contains(first_credential));
         assert!(!body.to_string().contains(second_credential));
+    }
+
+    #[tokio::test]
+    async fn an_account_accepts_an_api_token_pair_beside_the_proxy_pair() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = state_in(dir.path());
+        let created = apply_body(
+            &state,
+            json!({
+                "action": "create-account",
+                "account": {
+                    "id": "mana-modal",
+                    "platform": "modal",
+                    "plan": "paid",
+                    "workspace": "mana",
+                    "token": "wk-proxy-id.ws-proxy-secret",
+                    "api_token_id": "ak-api-id",
+                    "api_token_secret": "as-api-secret",
+                },
+            }),
+        )
+        .await
+        .expect("create the account with both credential pairs");
+        assert_eq!(created["account"]["has_api_credential"], json!(true));
+        let api_vault = created["api_vault"].clone();
+        assert_eq!(api_vault["credential_id"], json!("rental:mana-modal:api"));
+        assert!(api_vault["fingerprint"].is_string());
+
+        // The API pair lives in its own vault entry; the proxy entry is untouched.
+        {
+            let vault = state.vault.lock().await;
+            assert_eq!(
+                vault
+                    .get("rental:mana-modal")
+                    .expect("proxy entry")
+                    .as_deref(),
+                Some("wk-proxy-id.ws-proxy-secret")
+            );
+            assert_eq!(
+                vault
+                    .get("rental:mana-modal:api")
+                    .expect("api entry")
+                    .as_deref(),
+                Some("ak-api-id.as-api-secret")
+            );
+        }
+
+        // A proxy-shaped pair in the API fields is refused, with a message pointing at the split.
+        let refused = apply_body(
+            &state,
+            json!({
+                "action": "create-account",
+                "account": {
+                    "id": "bad-api-account",
+                    "platform": "modal",
+                    "plan": "unknown",
+                    "workspace": "mana",
+                    "token": "wk-proxy-id.ws-proxy-secret",
+                    "api_token_id": "wk-wrong-id",
+                    "api_token_secret": "ws-wrong-secret",
+                },
+            }),
+        )
+        .await
+        .expect_err("a proxy pair is not an API pair");
+        let error = refused.to_string();
+        assert!(
+            error.contains("ak-"),
+            "the refusal names the api prefixes: {error}"
+        );
+
+        // One half alone is also refused: the pair is atomic.
+        let refused = apply_body(
+            &state,
+            json!({
+                "action": "create-account",
+                "account": {
+                    "id": "bad-api-account",
+                    "platform": "modal",
+                    "plan": "unknown",
+                    "workspace": "mana",
+                    "token": "wk-proxy-id.ws-proxy-secret",
+                    "api_token_id": "ak-only-id",
+                },
+            }),
+        )
+        .await
+        .expect_err("one half of the API pair is not enough");
+        let error = refused.to_string();
+        assert!(
+            error.contains("api_token_secret"),
+            "the refusal names the missing half"
+        );
     }
 
     #[tokio::test]

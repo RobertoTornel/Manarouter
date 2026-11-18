@@ -369,6 +369,10 @@ export function emptyDraft(platformId) {
     plan: 'unknown',
     tokenId: '',
     tokenSecret: '',
+    // The Modal API token pair (`ak-…` / `as-…`) is a second, optional credential: the proxy
+    // pair above authenticates inference, the API pair authenticates the Modal CLI/API.
+    apiTokenId: '',
+    apiTokenSecret: '',
     // A Hugging Face token is named, never pasted here: `hfTokenId` is an id from the recorded
     // tokens (`hf_tokens` in `GET /api/gpu/rentals`). `hfTokenNew`/`hfTokenNewLabel` hold a token
     // being added in the same step, so a gated repository does not force a second visit.
@@ -1873,6 +1877,8 @@ export function stepList(draft, catalog = null) {
         selectField({ name: 'plan', label: 'Plan', optionsSource: 'plans', required: true, visible: d.accountMode !== 'existing', value: planLabel, hint: 'Unknown is a real answer and is never rendered as free or as paid.' }),
         textField({ name: 'tokenId', label: 'Modal proxy token id', kind: 'password', required: true, visible: d.accountMode !== 'existing', value: fieldValue(d, 'tokenId'), placeholder: 'wk-…', hint: 'Half of the Modal proxy token pair: the `wk-…` id the relay sends as `Modal-Key`. Stored in the vault; never rendered back.' }),
         textField({ name: 'tokenSecret', label: 'Modal proxy token secret', kind: 'password', required: true, visible: d.accountMode !== 'existing', value: fieldValue(d, 'tokenSecret'), placeholder: 'ws-…', hint: 'The other half: the `ws-…` secret sent as `Modal-Secret`. Both halves are stored as one vault entry, so an account cannot exist half-configured.' }),
+        textField({ name: 'apiTokenId', label: 'Modal API key', kind: 'password', required: false, visible: d.accountMode !== 'existing', value: fieldValue(d, 'apiTokenId'), placeholder: 'ak-…', hint: 'Optional. The `ak-…` half of the Modal API token pair (the CLI/API credential), a different pair from the proxy tokens above. Written to its own vault entry.' }),
+        textField({ name: 'apiTokenSecret', label: 'Modal API secret', kind: 'password', required: false, visible: d.accountMode !== 'existing', value: fieldValue(d, 'apiTokenSecret'), placeholder: 'as-…', hint: 'Optional. The `as-…` half. Provide both halves or neither.' }),
         readout({
           name: 'planMarker', label: 'Plan marker', optionsSource: 'planMarker',
           hint: 'Shown only for a card the catalog marks `free_plan: "unavailable"`.',
@@ -2246,6 +2252,18 @@ export function validateStep(draft, stepId, catalog = null, accounts = null) {
         problems.push(problem('tokenSecret', 'The Modal proxy token secret is required (Modal-Secret).'));
       } else if (/^as-/.test(d.tokenSecret)) {
         problems.push(problem('tokenSecret', 'That is a Modal API token secret (as-…), not a proxy token secret (ws-…).'));
+      }
+      if (d.apiTokenId || d.apiTokenSecret) {
+        if (!d.apiTokenId) {
+          problems.push(problem('apiTokenId', 'Provide the Modal API key (ak-…) as well, or leave both API fields empty.'));
+        } else if (!/^ak-/.test(d.apiTokenId)) {
+          problems.push(problem('apiTokenId', 'Modal API keys start with ak-; proxy tokens start with wk- and belong in the proxy field above.'));
+        }
+        if (!d.apiTokenSecret) {
+          problems.push(problem('apiTokenSecret', 'Provide the Modal API secret (as-…) as well, or leave both API fields empty.'));
+        } else if (!/^as-/.test(d.apiTokenSecret)) {
+          problems.push(problem('apiTokenSecret', 'Modal API secrets start with as-; proxy secrets start with ws- and belong in the proxy field above.'));
+        }
       }
     }
   }
@@ -2860,6 +2878,10 @@ export function accountApplyPayload(draft) {
       token_secret: d.tokenSecret,
     },
   };
+  if (d.apiTokenId && d.apiTokenSecret) {
+    payload.account.api_token_id = d.apiTokenId;
+    payload.account.api_token_secret = d.apiTokenSecret;
+  }
   return payload;
 }
 

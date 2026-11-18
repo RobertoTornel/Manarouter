@@ -377,6 +377,14 @@ pub struct RentalAccount {
     /// Vault entry id holding the platform's one combined credential string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<String>,
+    /// Vault entry id holding the Modal API token pair (`ak-<id>.as-<secret>`), when the account
+    /// also carries one.
+    ///
+    /// This is a *second* credential, separate from the proxy token pair in [`Self::secret_ref`]:
+    /// the proxy pair authenticates the relay's inference requests, while the API token pair is
+    /// what the Modal CLI / API uses. Both may coexist on one account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_secret_ref: Option<String>,
     /// **Legacy.** Vault entry id of a HuggingFace token recorded on the account before tokens
     /// became independent.
     ///
@@ -413,6 +421,7 @@ impl RentalAccount {
             plan: RentalPlan::Unknown,
             workspace: None,
             secret_ref: None,
+            api_secret_ref: None,
             hf_secret_ref: None,
             max_concurrent_containers: None,
             note: None,
