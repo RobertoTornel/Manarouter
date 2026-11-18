@@ -18,22 +18,38 @@ const MAX_ENTRIES: usize = 256;
 /// later would never be used again. A pin is therefore bounded by *total* age, independent of the
 /// window, so it cannot become permanent.
 ///
-/// The bound is deliberately short. Every upstream failure already arms a cooldown on the account,
-/// and `order_steps` demotes a cooling step on its own, so a pin only decides what happens *after*
-/// that cooldown expires. Anything much longer than one cooldown cycle therefore buys no cache
-/// stability that the cooldown was not already giving, and it delays recovery: a step that is well
-/// again is ignored for the rest of the pin's life. Two cooldown defaults is long enough to keep a
-/// burst on the fallback and short enough that a recovered primary is retried promptly.
-const MAX_PIN_AGE: Duration = Duration::from_secs(120);
+/// The bound is deliberately generous relative to a cooldown cycle: sticky is what stops the
+/// ping-pong of two flaky providers trading the pin back and forth, so it must outlast a few
+/// cooldown windows. Thirty minutes is long enough that a recovered primary is retried promptly
+/// (a cooling step is demoted on its own anyway) while a burst stays on the step that answered.
+const MAX_PIN_AGE: Duration = Duration::from_secs(1800);
 
 #[derive(Clone, Debug)]
 struct Pin {
     provider_id: String,
     model: String,
     level: u8,
+    /// Identifies the combo's step list at pin time, so an edited combo cannot inherit a stale
+    /// preference. Derived from `steps` by [`StickySuccess::steps_key`].
+    steps_key: u64,
     expires_at: Instant,
     touched_at: Instant,
     pinned_at: Instant,
+}
+
+/// A cheap, stable identity for a combo's current step list.
+///
+/// Collisions are acceptable: a collision means a pin keeps being consulted for a combo saved
+/// differently, and the configured order is simply what decides — it cannot misroute.
+fn steps_key(steps: &[StepPlan]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for step in steps {
+        step.provider_id.as_str().hash(&mut hasher);
+        step.model.hash(&mut hasher);
+        step.level.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Process-local sticky-success memory. It never performs provider requests or keepalives.
@@ -67,6 +83,13 @@ impl StickySuccess {
                 .unwrap_or_else(|poison| poison.into_inner());
             let pin = pins.get(combo_id.as_str())?;
             if pin.expires_at <= now || now.duration_since(pin.pinned_at) >= MAX_PIN_AGE {
+                pins.remove(combo_id.as_str());
+                return None;
+            }
+            if pin.steps_key != steps_key(steps) {
+                // The combo was edited since the pin was made: the preference describes a step
+                // list that no longer exists, so it is dropped for one request and rebuilt from
+                // the new order.
                 pins.remove(combo_id.as_str());
                 return None;
             }
@@ -105,9 +128,13 @@ impl StickySuccess {
     }
 
     /// Record a successful response and set the expiry to `now + window`.
+    ///
+    /// `steps` is the combo's current step list; it is captured in the pin so an edited combo
+    /// (any reorder, model swap or strategy change) invalidates the preference.
     pub fn record_success(
         &self,
         combo_id: &ComboId,
+        steps: &[StepPlan],
         step: &StepPlan,
         window: Duration,
         now: Instant,
@@ -150,6 +177,7 @@ impl StickySuccess {
                 provider_id: step.provider_id.as_str().to_owned(),
                 model: step.model.clone(),
                 level: step.level,
+                steps_key: steps_key(steps),
                 expires_at: now + window,
                 touched_at: now,
                 pinned_at,
@@ -206,13 +234,19 @@ mod tests {
         let combo = ComboId::from_raw("combo");
         let steps = vec![step("a", "m"), step("b", "m")];
         let start = Instant::now();
-        cache.record_success(&combo, &steps[1], Duration::from_secs(30), start);
+        cache.record_success(&combo, &steps, &steps[1], Duration::from_secs(30), start);
         assert_eq!(
             cache.preferred_index(&combo, &steps, |_| true, start),
             Some(1)
         );
         let second_success = start + Duration::from_secs(20);
-        cache.record_success(&combo, &steps[1], Duration::from_secs(30), second_success);
+        cache.record_success(
+            &combo,
+            &steps,
+            &steps[1],
+            Duration::from_secs(30),
+            second_success,
+        );
         assert_eq!(
             cache.preferred_index(&combo, &steps, |_| true, second_success),
             Some(1)
@@ -233,13 +267,13 @@ mod tests {
         let combo = ComboId::from_raw("combo");
         let steps = vec![step("a", "m"), step("b", "m")];
         let now = Instant::now();
-        cache.record_success(&combo, &steps[0], Duration::from_secs(30), now);
+        cache.record_success(&combo, &steps, &steps[0], Duration::from_secs(30), now);
         assert_eq!(
             cache.preferred_index(&combo, &steps, |s| s.provider_id.as_str() == "b", now),
             None
         );
         // The fallback becomes the pin, and it is honoured while the step ahead of it is down.
-        cache.record_success(&combo, &steps[1], Duration::from_secs(30), now);
+        cache.record_success(&combo, &steps, &steps[1], Duration::from_secs(30), now);
         assert_eq!(
             cache.preferred_index(&combo, &steps, |s| s.provider_id.as_str() == "b", now),
             Some(1)
@@ -255,12 +289,12 @@ mod tests {
         let steps = vec![step("a", "m"), step("b", "m"), step("c", "m")];
         let start = Instant::now();
         // The combo failed over to its last step while the first two were unusable.
-        cache.record_success(&combo, &steps[2], Duration::from_secs(1800), start);
+        cache.record_success(&combo, &steps, &steps[2], Duration::from_secs(1800), start);
         // Steady traffic keeps the sliding window alive, but not the age cap.
         let mut now = start;
         while now.duration_since(start) < MAX_PIN_AGE - Duration::from_secs(10) {
             now += Duration::from_secs(10);
-            cache.record_success(&combo, &steps[2], Duration::from_secs(1800), now);
+            cache.record_success(&combo, &steps, &steps[2], Duration::from_secs(1800), now);
             assert_eq!(
                 cache.preferred_index(&combo, &steps, |_| true, now),
                 Some(2)
@@ -270,7 +304,7 @@ mod tests {
         let after = start + MAX_PIN_AGE;
         assert_eq!(cache.preferred_index(&combo, &steps, |_| true, after), None);
         // A fresh failover starts a fresh cap.
-        cache.record_success(&combo, &steps[2], Duration::from_secs(1800), after);
+        cache.record_success(&combo, &steps, &steps[2], Duration::from_secs(1800), after);
         assert_eq!(
             cache.preferred_index(&combo, &steps, |_| true, after + Duration::from_secs(1)),
             Some(2)
@@ -283,15 +317,24 @@ mod tests {
         let steps = [step("a", "m"), step("b", "m")];
         let now = Instant::now();
         let combo = ComboId::from_raw("combo");
-        cache.record_success(&combo, &steps[1], Duration::from_secs(30), now);
+        cache.record_success(&combo, &steps, &steps[1], Duration::from_secs(30), now);
+        assert_eq!(
+            cache.preferred_index(&combo, &steps, |_| true, now),
+            Some(1),
+            "the pin prefers the provider/model that answered"
+        );
+        // An edited combo (here: a reorder) invalidates the pin: the preference described a step
+        // list that no longer exists, so it is dropped and the configured order decides.
         let reordered = [steps[1].clone(), steps[0].clone()];
         assert_eq!(
             cache.preferred_index(&combo, &reordered, |_| true, now),
-            Some(0)
+            None,
+            "a changed combo must not inherit a stale pin"
         );
         for i in 0..(MAX_ENTRIES + 5) {
             cache.record_success(
                 &ComboId::from_raw(format!("c{i}")),
+                &steps,
                 &steps[0],
                 Duration::from_secs(30),
                 now,

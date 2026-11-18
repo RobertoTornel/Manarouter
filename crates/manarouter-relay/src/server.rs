@@ -4006,12 +4006,24 @@ async fn attempt_step(
             app.health
                 .record_success(step.provider_id.as_str(), account.id.as_str(), &step.model);
             if let Some(combo) = combo.filter(|c| sticky_applies(c)) {
-                app.sticky_success.record_success(
-                    &combo.id,
-                    step,
-                    Duration::from_secs(combo.sticky_success_window_secs as u64),
-                    std::time::Instant::now(),
-                );
+                let position = combo.steps.iter().position(|candidate| {
+                    candidate.provider_id.as_str() == step.provider_id.as_str()
+                        && candidate.model == step.model
+                        && candidate.level == step.level
+                });
+                if position == Some(0) {
+                    // The configured first step served: there is nothing to be sticky about, and a
+                    // leftover fallback pin would make a healthy primary ping-pong with the fallback.
+                    app.sticky_success.clear(&combo.id);
+                } else {
+                    app.sticky_success.record_success(
+                        &combo.id,
+                        &combo.steps,
+                        step,
+                        Duration::from_secs(combo.sticky_success_window_secs as u64),
+                        std::time::Instant::now(),
+                    );
+                }
             }
             tracing::debug!(
                 model = model_name,
