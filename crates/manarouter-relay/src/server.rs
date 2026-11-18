@@ -48,6 +48,7 @@ use mr_core::ids::ProviderId;
 use mr_core::oauth::platform as oauth_platform;
 use mr_core::oauth::refresh::Refresher;
 use mr_core::secret::Vault;
+use mr_core::model::ModelEntry;
 use mr_core::snapshot::{AccountPlan, ProviderPlan, Resolution, StepPlan};
 
 use mr_dialects::{translate_request, TranslateCtx};
@@ -3881,6 +3882,11 @@ async fn attempt_step(
 
     let initial_body = outgoing.clone();
     let mut current_body = outgoing;
+    // A provider can cap how many tokens a completion may emit (agnes: 65536). If the client asked
+    // for more, the upstream refuses the whole request; clamping the request down to the model's
+    // own ceiling is the only honest fix — it lowers a number, never raises one — and it keeps a
+    // combo step from failing on every request with a constant body.
+    current_body = clamp_generation_caps(current_body, &provider.models, &step.model);
     let mut reconciled_once = false;
 
     // The dial is recorded before the request goes out, so a refused request still counts against
@@ -6524,6 +6530,41 @@ fn build_response_with_spend(
     }
 
     response
+}
+
+/// Clamp a generation request's output-token caps to the model's own ceiling.
+///
+/// `max_tokens`, `max_completion_tokens` and `max_output_tokens` are the three spellings clients
+/// use. When a model entry declares `max_output_tokens` and a field exceeds it, the field is
+/// lowered to the ceiling; unknown bodies and bodies without a matching model pass through
+/// untouched. The result is re-encoded (compact), so the bytes are not guaranteed identical even
+/// when nothing changed — callers treat it as a fresh body.
+fn clamp_generation_caps(body: Bytes, models: &[ModelEntry], model_id: &str) -> Bytes {
+    let Some(ceiling) = models
+        .iter()
+        .find(|entry| entry.id == model_id)
+        .and_then(|entry| entry.max_output_tokens)
+        .filter(|ceiling| *ceiling > 0)
+    else {
+        return body;
+    };
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    let mut changed = false;
+    for field in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+        let Some(current) = value.get(field).and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        if current > u64::from(ceiling) {
+            value[field] = serde_json::json!(ceiling);
+            changed = true;
+        }
+    }
+    if !changed {
+        return body;
+    }
+    Bytes::from(serde_json::to_vec(&value).unwrap_or_default())
 }
 
 /// A JSON response.

@@ -110,10 +110,14 @@ impl OAuthPlatform for MistralVibe {
     }
 
     fn redirect_ports(&self) -> RedirectPorts {
+        // The Vibe desktop app's Ory client is registered for two specific loopback ports; the
+        // binary bundles `:4202` and `:8242` near its OIDC callback server. Using an ephemeral
+        // port makes Ory answer `invalid_request` ("redirect_uri does not match any of the
+        // pre-registered redirect urls"), which is exactly the failure observed at login.
         RedirectPorts {
             host: "127.0.0.1",
-            primary: 0,
-            fallback: None,
+            primary: 4202,
+            fallback: Some(8242),
             path: "/",
         }
     }
@@ -123,7 +127,7 @@ impl OAuthPlatform for MistralVibe {
     }
 
     fn validates_redirect_port(&self) -> bool {
-        false
+        true
     }
 
     fn authorization_url(&self, state: &str, pkce: Option<&Pkce>, port: u16) -> Result<String> {
