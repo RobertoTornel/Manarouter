@@ -205,11 +205,13 @@ impl AccountSpendTicket {
             .and_then(|slot| *slot)
             .filter(|usage| !usage.is_empty());
         if let Some(usage) = observed {
+            let cost_cents = usage.cost_cents;
             let usage = usage.usage;
             if let Err(error) = self.store.settle_account_spend(
                 &self.record_id,
                 usage.input_tokens,
                 usage.output_tokens,
+                cost_cents,
             ) {
                 tracing::warn!(
                     provider = self.provider_id,

@@ -130,9 +130,23 @@ impl Health {
     /// down, and fails again is at two consecutive failures, so three strikes really do mean three.
     /// Resetting here would let a permanently throttled account retry forever at full rate.
     pub fn cool_down(&self, account_id: &str, until_ms: u64, reason: CooldownReason) {
+        let now_ms = now_millis().max(0) as u64;
         self.map.rcu(|current| {
+            // A cooldown that has elapsed is information the map no longer needs: it changes no
+            // decision, and keeping it would grow the map without bound. A provider with many
+            // models and accounts parks a model-shaped key per refusal, and those entries never
+            // get cleared by a success on a sibling route — so without pruning, a long-running
+            // relay accumulates thousands of dead entries. Expired entries are dropped once the
+            // map has grown past [`COOLDOWN_MAP_SAFE_SIZE`], which bounds the map while leaving a
+            // small one alone (and with it the failure counts that older tests and the flap
+            // guard rely on carrying across expired parks).
+            let prune = current.len() >= COOLDOWN_MAP_SAFE_SIZE;
             let mut next = HashMap::with_capacity(current.len() + 1);
-            next.extend(current.iter().map(|(k, v)| (k.clone(), *v)));
+            for (key, value) in current.iter() {
+                if !prune || !value.is_over(now_ms) {
+                    next.insert(key.clone(), *value);
+                }
+            }
             let failures = next.get(account_id).map_or(1, |c| c.failures + 1);
             next.insert(
                 account_id.to_owned(),
@@ -246,6 +260,12 @@ impl Health {
             .min()
     }
 }
+
+/// The size past which the cooldown map prunes expired entries on write.
+///
+/// See [`Health::cool_down`]: below this, entries (expired or not) are kept so failure counts
+/// carry across parks; above it, expired entries are dropped to bound memory.
+const COOLDOWN_MAP_SAFE_SIZE: usize = 1_024;
 
 /// The separator between the parts of a scoped cooldown key.
 ///
@@ -1167,6 +1187,28 @@ mod tests {
         );
         assert_eq!(order_steps(&c, &ps, &h, 0, 4_999), vec![1, 0]);
         assert_eq!(order_steps(&c, &ps, &h, 0, 5_000), vec![0, 1]);
+    }
+
+    #[test]
+    fn expired_cooldowns_are_pruned_on_the_next_write() {
+        // A model-scoped park is cleared only by a success on that exact route, so a long-running
+        // relay accumulates expired entries. Below the safe size they are kept (their failure
+        // counts are still useful), and past it they are dropped when something is written, so
+        // the map stays bounded by the number of *live* parks plus the threshold.
+        let h = Health::new();
+        for i in 0..COOLDOWN_MAP_SAFE_SIZE as u64 {
+            h.cool_down(&format!("a{i}"), 1_000, CooldownReason::RateLimited);
+        }
+        // Every seed has expired; the next write crosses the threshold and prunes them.
+        h.cool_down("live", 99_000_000, CooldownReason::RateLimited);
+        let view = h.view();
+        assert_eq!(
+            view.len(),
+            1,
+            "expired entries must be pruned once the map is large"
+        );
+        assert!(view.contains_key("live"));
+        assert!(view.get("live").unwrap().until_ms >= 99_000_000);
     }
 
     #[test]

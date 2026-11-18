@@ -2585,63 +2585,77 @@ async fn dispatch_routed(
     // the cooling accounts in recovery order and stops at the first that answers. Bounded by the
     // number of accounts, like the main loop's account retry.
     if last_failure.is_none() {
-        if let Some(step) = last_resort_step(&app, &table, &steps, &raced, now_ms) {
-            if activity.is_some() {
-                attempted = Some(participant_id(step));
-            }
-            tracing::debug!(
-                provider = %step.provider_id,
-                model = %step.model,
-                "every step is cooling down; trying the one that recovers soonest anyway"
-            );
-            let account_budget = table
-                .snapshot
-                .providers()
-                .get(step.provider_index as usize)
-                .map(|provider| provider.accounts.len().min(8))
-                .unwrap_or(0);
-            let mut tried: Vec<mr_core::ids::AccountId> = Vec::new();
-            let mut last_resort = attempt_step(&attempt_ctx, step, false, true, &tried).await;
-            loop {
-                match &last_resort {
+        // A step whose accounts are all cooling down is normally still dialled once: a cooldown is
+        // a prediction, and the operator may have topped the account up or the window may have
+        // turned over out of band. But a *far* reset is not a prediction to question — it is the
+        // provider's own stated recovery, and dialling that account now would only re-collect the
+        // same refusal. The soonest known reset decides: when it lies beyond
+        // [`LAST_RESORT_MAX_WAIT_MS`], the step is left alone and the request answers at once with
+        // the wait it was told. When nothing is stated, the step is still tried — an unknown
+        // recovery may be imminent.
+        let soonest = app.health.earliest_reset();
+        let dial_last_resort =
+            soonest.is_none_or(|until| until <= now_ms + LAST_RESORT_MAX_WAIT_MS);
+        if dial_last_resort {
+            if let Some(step) = last_resort_step(&app, &table, &steps, &raced, now_ms) {
+                if activity.is_some() {
+                    attempted = Some(participant_id(step));
+                }
+                tracing::debug!(
+                    provider = %step.provider_id,
+                    model = %step.model,
+                    "every step is cooling down; trying the one that recovers soonest anyway"
+                );
+                let account_budget = table
+                    .snapshot
+                    .providers()
+                    .get(step.provider_index as usize)
+                    .map(|provider| provider.accounts.len().min(8))
+                    .unwrap_or(0);
+                let mut tried: Vec<mr_core::ids::AccountId> = Vec::new();
+                let mut last_resort = attempt_step(&attempt_ctx, step, false, true, &tried).await;
+                loop {
+                    match &last_resort {
+                        Attempt::Answer(response) => {
+                            // Moved out below by re-matching; the borrow here ends before the move.
+                            let _ = response;
+                            break;
+                        }
+                        Attempt::Failed {
+                            retry_accounts: true,
+                            account: Some(account),
+                            ..
+                        } if tried.len() + 1 < account_budget => {
+                            tried.push(account.clone());
+                            last_resort =
+                                attempt_step(&attempt_ctx, step, false, true, &tried).await;
+                        }
+                        _ => break,
+                    }
+                }
+                match last_resort {
                     Attempt::Answer(response) => {
-                        // Moved out below by re-matching; the borrow here ends before the move.
-                        let _ = response;
-                        break;
+                        let wrapped = crate::recovery::wrap(
+                            response,
+                            Vec::new(),
+                            crate::recovery::RecoveryConfig {
+                                policy: combo.map(|c| c.midstream_policy).unwrap_or_default(),
+                                mode: mr_core::dialect::WinnerFailMode::PickHighestPassed,
+                                client_dialect,
+                                winner_id: participant_id(step),
+                                announceable: false,
+                                rerun_factory: None,
+                                rerun_max_rounds: 0,
+                            },
+                        );
+                        return served_combo(&app, activity, participant_id(step), now_ms, wrapped);
                     }
                     Attempt::Failed {
-                        retry_accounts: true,
-                        account: Some(account),
+                        response: Some(response),
                         ..
-                    } if tried.len() + 1 < account_budget => {
-                        tried.push(account.clone());
-                        last_resort = attempt_step(&attempt_ctx, step, false, true, &tried).await;
-                    }
-                    _ => break,
+                    } => last_failure = Some(response),
+                    _ => {}
                 }
-            }
-            match last_resort {
-                Attempt::Answer(response) => {
-                    let wrapped = crate::recovery::wrap(
-                        response,
-                        Vec::new(),
-                        crate::recovery::RecoveryConfig {
-                            policy: combo.map(|c| c.midstream_policy).unwrap_or_default(),
-                            mode: mr_core::dialect::WinnerFailMode::PickHighestPassed,
-                            client_dialect,
-                            winner_id: participant_id(step),
-                            announceable: false,
-                            rerun_factory: None,
-                            rerun_max_rounds: 0,
-                        },
-                    );
-                    return served_combo(&app, activity, participant_id(step), now_ms, wrapped);
-                }
-                Attempt::Failed {
-                    response: Some(response),
-                    ..
-                } => last_failure = Some(response),
-                _ => {}
             }
         }
     }
@@ -4630,6 +4644,14 @@ fn sticky_applies(combo: &mr_core::snapshot::ComboPlan) -> bool {
         mr_core::ComboStrategy::Priority | mr_core::ComboStrategy::ResetAwarePriority
     ) && combo.sticky_success_window_secs > 0
 }
+
+/// The farthest known reset a combo will still dial in its last resort.
+///
+/// When every step is cooling and the soonest stated recovery lies beyond this horizon, dialling
+/// the account would only re-collect the same refusal: the provider has said when it recovers,
+/// and the request can answer at once instead of paying a dead round trip. An *unknown* recovery
+/// is still dialled — it may be imminent, and a cooldown is only a guess.
+const LAST_RESORT_MAX_WAIT_MS: u64 = 5 * 60_000;
 
 /// The step to try when every step of a combo is cooling down.
 ///
@@ -11109,6 +11131,108 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             seen.lock().unwrap().len(),
             2,
             "both cooling accounts should have been tried"
+        );
+    }
+
+    /// A last resort whose every known reset lies far ahead answers at once instead of dialling.
+    ///
+    /// The provider has stated when it recovers; re-probing it now re-collects the same refusal and
+    /// costs a round trip for no information. The request must return an immediate `429` with a
+    /// `Retry-After` and dial nothing.
+    #[tokio::test]
+    async fn a_last_resort_with_a_far_stated_reset_answers_at_once() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(
+            move |body: Bytes| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock().unwrap().push(String::from_utf8_lossy(&body).to_string());
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                    )
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}");
+
+        let mut provider = mr_core::model::Provider::new("shared", Dialect::OpenAi, &url);
+        let mut dead = mr_core::model::Account::new("dead");
+        dead.secret_ref = Some("dead-credential".to_owned());
+        provider.accounts = vec![dead];
+        let mut entry = dm();
+        entry.id = "shared-model".to_owned();
+        entry.input_modalities = vec![InputModality::Text];
+        provider.models = vec![entry];
+
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("dead-credential", "dead-key").unwrap();
+        let vault = Arc::new(opened);
+
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        // The account is parked for six days: far beyond the last-resort horizon.
+        let plan = state.relay.table().snapshot.providers()[0].clone();
+        let now_ms = mr_core::ids::now_millis().max(0) as u64;
+        state.health.cool_down(
+            &select::cooldown_key(
+                plan.cooldown_scope,
+                plan.id.as_str(),
+                plan.accounts[0].id.as_str(),
+                "shared-model",
+                select::CooldownReason::QuotaExhausted,
+            ),
+            now_ms + 6 * 86_400_000,
+            select::CooldownReason::QuotaExhausted,
+        );
+
+        let response = chat(state, "shared/shared-model").await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a far stated reset must answer 429 without dialling the parked account"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            0,
+            "no upstream may be dialled for a far stated reset"
+        );
+        assert!(
+            response.headers().get("retry-after").is_some(),
+            "the 429 must carry a Retry-After"
         );
     }
 

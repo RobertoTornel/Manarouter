@@ -553,6 +553,39 @@ fn observed_family(quota: &UsageQuota) -> mr_core::quota::types::WindowFamily {
     WindowFamily::from_seconds(remaining_secs as u64)
 }
 
+/// One declared `QuotaWindow` as a quota-row window: the cap and family, with no consumption
+/// (`fraction_reported: false`) because the relay's local ledger is not exposed through this API.
+fn declared_window_json(window: &mr_core::QuotaWindow) -> Value {
+    let family = mr_core::quota::types::WindowFamily::from_seconds(window.seconds.max(0) as u64);
+    let (total, unit) = if window.limit_usd_cents > 0 {
+        (json!(window.limit_usd_cents), Some("USD"))
+    } else if window.limit_requests > 0 {
+        (json!(window.limit_requests), None)
+    } else if window.limit_tokens > 0 {
+        (json!(window.limit_tokens), None)
+    } else if window.limit_input_tokens > 0 {
+        (json!(window.limit_input_tokens), None)
+    } else if window.limit_output_tokens > 0 {
+        (json!(window.limit_output_tokens), None)
+    } else {
+        (Value::Null, None)
+    };
+    let unlimited = !window.constrains() && !window.reset_only;
+    let display_name = window.name.clone().unwrap_or_else(|| "declared".to_owned());
+    let mut row = json!({
+        "family": family,
+        "display_name": display_name,
+        "total": total,
+        "fraction_reported": false,
+        "unlimited": unlimited,
+        "details": [],
+    });
+    if let Some(unit) = unit {
+        row["unit"] = json!(unit);
+    }
+    row
+}
+
 fn account_row(
     provider: &Provider,
     account: &Account,
@@ -565,11 +598,21 @@ fn account_row(
     // No cached reading and no error means this account has not been fetched yet. The row says so
     // by carrying no windows at all: a fabricated `0/0` window renders as an exhausted account and
     // an operator acts on a number nobody measured.
-    let windows = parsed
+    let mut windows = parsed
         .get("windows")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // An account that was never fetched but *declares* windows still has a limit and a reset the
+    // relay enforces locally (see `reports_quota`). Those windows are shown as declared: a cap
+    // with no measured consumption, not a fabricated `0/0`. A cached fetch for an account with a
+    // real reader wins, because measured beats declared.
+    if windows.is_empty() && error.is_none() && cached.is_none() {
+        let declared = provider.effective_windows(account);
+        if !declared.is_empty() {
+            windows = declared.iter().map(declared_window_json).collect();
+        }
+    }
     let details = parsed.get("details").cloned().unwrap_or_else(|| json!([]));
     let windows = windows
         .into_iter()
@@ -868,6 +911,25 @@ mod tests {
             json!("https://api.openai.com/v1/balance"),
         );
         assert!(reports_quota(&unknown, &broken, &off));
+    }
+
+    #[test]
+    fn a_declared_usd_window_renders_without_fabricating_consumption() {
+        let window = mr_core::QuotaWindow::usd_cents_per(2_592_000, 500);
+        let row = declared_window_json(&window);
+        assert_eq!(row["family"], json!("30d"));
+        assert_eq!(row["total"], json!(500));
+        assert_eq!(row["unit"], json!("USD"));
+        assert_eq!(row["fraction_reported"], json!(false));
+        assert_eq!(row["unlimited"], json!(false));
+        // A reset-only window declares a limit of none: it is not a money cap, and carries no
+        // applicable limit (`unlimited` false, because the reset itself still gates the account;
+        // the relay honours the reset timing).
+        let reset_only = mr_core::QuotaWindow {
+            reset_only: true,
+            ..mr_core::QuotaWindow::default()
+        };
+        assert_eq!(declared_window_json(&reset_only)["unlimited"], json!(false));
     }
 
     /// The label on the one window an undeclared quota produces.

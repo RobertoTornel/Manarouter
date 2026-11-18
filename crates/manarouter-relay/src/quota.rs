@@ -721,6 +721,7 @@ mod tests {
             if let Ok(mut slot) = ticket.usage_slot().lock() {
                 *slot = Some(GenerationUsage {
                     usage,
+                    cost_cents: None,
                     generation_ms: None,
                 });
             }

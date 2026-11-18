@@ -2601,6 +2601,7 @@ fn encode_quota_window(encoder: &mut Encoder, window: &crate::model::QuotaWindow
     encoder.put_u64(window.limit_tokens);
     encoder.put_u64(window.limit_input_tokens);
     encoder.put_u64(window.limit_output_tokens);
+    encoder.put_u64(window.limit_usd_cents);
     encoder.put_bool(window.reset_only);
 }
 
@@ -3397,6 +3398,7 @@ fn decode_quota_window(
         limit_tokens: reader.u64()?,
         limit_input_tokens: reader.u64()?,
         limit_output_tokens: reader.u64()?,
+        limit_usd_cents: reader.u64()?,
         reset_only: reader.bool()?,
     })
 }

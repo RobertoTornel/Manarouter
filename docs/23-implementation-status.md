@@ -73,23 +73,25 @@ node --test panel/test/*.test.mjs
 # Browser workflow (local opt-in): Playwright and the browser binaries are not project dependencies.
 BROWSER=firefox PLAYWRIGHT_MODULE=/path/to/playwright FIREFOX_EXECUTABLE=/path/to/firefox node panel/test/browser.e2e.mjs
 ```
-For the revision described here the Rust and panel lines were re-run and passed: **2 142 workspace
-tests** (0 failed, 1 ignored — the reference-vault refresh test), the
-same suite in `--release` (2 142 passed, 1 ignored), clean strict Clippy
-(`cargo clippy --workspace --all-targets --all-features -- -D warnings`), **405/405 panel Node tests**,
-and `scripts/check-secrets.sh` (325 files, OK). The release binaries `mr`, `manarouter-relay` and
-`manarouter-conductor` 0.2.4 were built from this revision. `tools/mock-upstream`, the installer
-simulation and `tests/smoke_e2e.py` were **not** re-run locally for this revision; they were last green
-at the revision recorded in §1's history, and nothing in this revision touches installation or
-the startup path. The **smoke test, the installer test and the panel Node tests are wired into CI**;
-the browser test remains a local opt-in because Playwright and the browser binaries are not project
-dependencies.
+For the revision described here the Rust and panel lines were re-run and passed: **2 147 workspace
+tests** (0 failed, 4 ignored — the reference-vault refresh test and three doc-tests), clean strict
+Clippy (`cargo clippy --workspace --all-targets --all-features -- -D warnings`), **405/405 panel Node
+tests**, and `scripts/check-secrets.sh` (325 files, OK). The release binaries `mr`,
+`manarouter-relay` and `manarouter-conductor` 0.2.4 were built from this revision. `tools/mock-upstream`,
+the installer simulation and `tests/smoke_e2e.py` were **not** re-run locally for this revision; they
+were last green at the revision recorded in §1's history, and nothing in this revision touches
+installation or the startup path. The **smoke test, the installer test and the panel Node tests are
+wired into CI**; the browser test remains a local opt-in because Playwright and the browser binaries are
+not project dependencies.
 
-The 2 142 count includes the generic per-account quota round: `mr_core::account_quota` (window
-arithmetic with no provider name in it), the `account_spend` ledger (schema v6) and snapshot window
-round-trip (binary `SNAPSHOT_VERSION` 25), the relay's dial recording + token settlement +
-candidate filtering (`crates/manarouter-relay/src/account_spend.rs`), and the conductor's
-declared-window quota rows.
+The count includes the generic per-account quota round: `mr_core::account_quota` (window arithmetic
+with no provider name in it), the `account_spend` ledger (schema v7, with the upstream-reported
+`cost_cents` column) and snapshot window round-trip (binary `SNAPSHOT_VERSION` 26, carrying
+`limit_usd_cents`), the relay's dial recording + token + cost settlement + candidate filtering
+(`crates/manarouter-relay/src/account_spend.rs`), the generic cost parser in the usage tap, the
+conductor's declared-window quota rows, the idempotent re-run of the v7 column migration, the
+cooldown-map pruning, and the last-resort gate that answers at once when every stated reset lies
+more than five minutes ahead instead of dialling a parked step.
 
 
 The OmniRoute migration was verified against a live installation as well, which is a network operation
@@ -506,11 +508,9 @@ accounts came back; those lanes and the shared `lane_vault.rs` helper were remov
 never used it — its credential is the `kaggle` CLI's own login, not a lane secret — so no lane
 credential is stored today. [26-gpu-lanes.md](26-gpu-lanes.md) §9 records the removal.
 
-Test totals on this revision: `cargo test -p manarouter-conductor --lib` → 38 `gpu_api` tests and
-11 Kaggle tests, all passing. `cargo test --workspace --lib` → 1 947 passing; `cargo test
---workspace` → 2 052 passing with 4 ignored (the reference-vault refresh test and three quota
-doctests marked `no_run`). `node --test panel/test/*.test.mjs` → 381 passing and
-`node --test panel-lab/test/*.test.mjs` → 334 passing.
+Test totals on this revision: `cargo test --workspace` → 2 147 passing with 4 ignored (the
+reference-vault refresh test and three quota doctests marked `no_run`), and
+`node --test panel/test/*.test.mjs` → 405 passing.
 
 The gate for the OpenAI surface work was `cargo fmt --all -- --check`, `cargo clippy --workspace
 --all-targets -- -D warnings`, `cargo test --workspace`, and the two Node suites above, all clean on

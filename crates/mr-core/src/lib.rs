@@ -142,10 +142,12 @@ pub const SNAPSHOT_MAGIC: [u8; 8] = *b"MROUTES1";
 /// capability appended later without a version bump would otherwise pass the header and fail only
 /// when the decoder reached its tag. The test `the_snapshot_version_stays_ahead_of_every_capability_tag`
 /// enforces the invariant.
-/// Version 25 adds the declared per-account quota windows that can stop an account. A v24 frame
-/// encodes no such windows, so an account that has declared them would be compiled without them and
-/// never be held back — the frame must be rebuilt from authored config instead of reinterpreted.
-pub const SNAPSHOT_VERSION: u32 = 25;
+/// Version 26 adds the spend dimension to declared quota windows and to
+/// `account_spend` (US cents). A v25 frame encodes no such limits, so an
+/// account that has declared one would be compiled without it and never be
+/// held back — the frame must be rebuilt from authored config instead of
+/// reinterpreted.
+pub const SNAPSHOT_VERSION: u32 = 26;
 
 /// Current on-disk database schema version.
 ///
@@ -159,5 +161,7 @@ pub const SNAPSHOT_VERSION: u32 = 25;
 /// turns into a token estimate when the provider reported no counts of its own. Version 5 adds
 /// `gpu_usage`, the append-only billing record for self-hosted provider GPU seconds. Version 6 adds
 /// `account_spend`, the append-only ledger of what each account was dialled and spent, which
-/// declared per-account quota windows are measured against.
-pub const SCHEMA_VERSION: u32 = 6;
+/// declared per-account quota windows are measured against. Version 7 adds
+/// the upstream-reported spend in US cents to `account_spend`, so a generic
+/// money window can be measured without fabricating a zero.
+pub const SCHEMA_VERSION: u32 = 7;

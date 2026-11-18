@@ -80,6 +80,10 @@ pub struct GenerationUsage {
     /// The counts the upstream reported, folded across every frame that carried any. Empty when the
     /// stream never reported usage — never a row of zeroes.
     pub usage: TokenUsage,
+    /// The spend the upstream reported, in US cents. `None` means no frame
+    /// carried a cost, never a stored zero: an unknown spend must stay unknown
+    /// so a money window under-reports rather than fabricating free usage.
+    pub cost_cents: Option<u64>,
     /// First-to-last OUTPUT token window, in milliseconds. `None` when the stream produced no output
     /// tokens we could see (so tokens per second is honestly unknown), **not** zero.
     ///
@@ -105,7 +109,7 @@ impl GenerationUsage {
     /// A stream that reported no counts and produced no observable output is an empty measurement;
     /// writing it would inflate the request count of a table whose other columns say nothing.
     pub fn is_empty(&self) -> bool {
-        self.usage.is_empty() && self.generation_ms.is_none()
+        self.usage.is_empty() && self.cost_cents.is_none() && self.generation_ms.is_none()
     }
 }
 
@@ -118,6 +122,10 @@ impl GenerationUsage {
 pub struct UsageTap {
     /// The most complete usage report seen so far, folded field by field.
     usage: TokenUsage,
+    /// The latest non-null spend report seen, in US cents. Streaming upstreams
+    /// place spend in the final frame; if several frames carry one, the last
+    /// report wins rather than us adding the same request twice.
+    cost_cents: Option<u64>,
     /// When the first output-bearing frame arrived. `None` until one does.
     first_output_at: Option<Instant>,
     /// When the most recent output-bearing frame arrived.
@@ -196,6 +204,11 @@ impl UsageTap {
         self.usage
     }
 
+    /// The spend accumulated so far, in US cents.
+    pub fn cost_cents(&self) -> Option<u64> {
+        self.cost_cents
+    }
+
     /// Whether any frame has carried output.
     pub fn saw_output(&self) -> bool {
         self.first_output_at.is_some()
@@ -236,6 +249,7 @@ impl UsageTap {
     pub fn generation_usage(&self) -> GenerationUsage {
         GenerationUsage {
             usage: self.usage,
+            cost_cents: self.cost_cents,
             generation_ms: match (self.first_output_at, self.last_output_at) {
                 (Some(first), Some(last)) => {
                     // `duration_since` saturates at zero rather than panicking on a clock that
@@ -257,6 +271,7 @@ impl UsageTap {
     fn into_generation_usage(self) -> GenerationUsage {
         GenerationUsage {
             usage: self.usage,
+            cost_cents: self.cost_cents,
             generation_ms: match (self.first_output_at, self.last_output_at) {
                 (Some(first), Some(last)) => {
                     let millis =
@@ -331,6 +346,9 @@ impl UsageTap {
         if !reported.is_empty() {
             self.usage = self.usage.merged_with(reported);
         }
+        if let Some(cost) = cost_from_frame(value) {
+            self.cost_cents = Some(cost);
+        }
         if frame_reports_done(value) {
             self.saw_done = true;
         }
@@ -372,6 +390,101 @@ fn usage_from_frame(value: &Value) -> TokenUsage {
             TokenUsage::default()
         }
     }
+}
+
+/// Read the upstream-reported spend out of any shape a frame puts it in.
+///
+/// This is deliberately generic: upstreams spell a generation cost as
+/// `total_cost`, `gateway_cost`, `cost`, `cost_usd`, and sometimes as a bare
+/// numeric `usage` field whose value is dollars rather than a token object.
+/// Common wrappers (`response`, `message`, `data`, `usage`, and provider
+/// metadata) are searched without naming any vendor. The value is treated as
+/// dollars and converted to US cents; a string or floating value is accepted,
+/// while `null` and non-numeric values stay unknown.
+fn cost_from_frame(value: &Value) -> Option<u64> {
+    let inner = value.get("response").unwrap_or(value);
+    if let Some(cost) = cost_from_value(inner) {
+        return Some(cost);
+    }
+    for key in [
+        "message",
+        "data",
+        "usage",
+        "usageMetadata",
+        "usage_metadata",
+        "totalUsage",
+    ] {
+        if let Some(nested) = inner.get(key) {
+            if let Some(cost) = cost_from_value(nested) {
+                return Some(cost);
+            }
+        }
+    }
+    for key in ["providerMetadata", "provider_metadata", "metadata"] {
+        if let Some(metadata) = inner.get(key) {
+            if let Some(gateway) = metadata.get("gateway") {
+                if let Some(cost) = cost_from_value(gateway) {
+                    return Some(cost);
+                }
+            }
+            if let Some(cost) = cost_from_value(metadata) {
+                return Some(cost);
+            }
+        }
+    }
+    None
+}
+
+fn cost_from_value(value: &Value) -> Option<u64> {
+    if value.is_number() || value.is_string() {
+        if let Some(cents) = as_dollar_amount(value) {
+            return Some(cents);
+        }
+    } else if let Some(usage) = value.get("usage") {
+        if usage.is_number() || usage.is_string() {
+            if let Some(cents) = as_dollar_amount(usage) {
+                return Some(cents);
+            }
+        }
+    }
+    const COST_KEYS: &[&str] = &[
+        "cost",
+        "total_cost",
+        "totalCost",
+        "gateway_cost",
+        "gatewayCost",
+        "cost_usd",
+        "costUsd",
+        "usd_cost",
+        "amount",
+        "total_amount",
+    ];
+    for key in COST_KEYS {
+        if let Some(found) = value.get(*key) {
+            if let Some(cents) = as_dollar_amount(found) {
+                return Some(cents);
+            }
+        }
+    }
+    None
+}
+
+/// A JSON number/string representing a dollar amount, converted to cents.
+fn as_dollar_amount(value: &Value) -> Option<u64> {
+    let dollars = value.as_f64().or_else(|| {
+        value
+            .as_str()
+            .map(|text| text.trim().trim_start_matches('$').replace(',', ""))
+            .and_then(|text| text.parse::<f64>().ok())
+    })?;
+    if !dollars.is_finite() || dollars < 0.0 {
+        return None;
+    }
+    let cents = (dollars * 100.0).round();
+    if cents >= u64::MAX as f64 {
+        return None;
+    }
+    Some(cents as u64)
 }
 
 /// Whether a frame carries an explicit end-of-stream signal.
@@ -990,6 +1103,26 @@ mod tests {
     }
 
     #[test]
+    fn an_upstream_reported_cost_is_read_without_a_provider_name() {
+        // Gateways spell the same field differently. The tap accepts the spellings at
+        // the top level, under `usage`, and in gateway metadata, converting dollars
+        // to cents while keeping the unknown case as `None`.
+        let mut tap = UsageTap::new();
+        tap.observe_data(r#"{"usage":{"prompt_tokens":10,"completion_tokens":4,"cost":0.42}}"#);
+        assert_eq!(tap.finish().cost_cents, Some(42));
+
+        let mut tap = UsageTap::new();
+        tap.observe_data(
+            r#"{"providerMetadata":{"gateway":{"total_cost":"1.23"}},"usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+        );
+        assert_eq!(tap.finish().cost_cents, Some(123));
+
+        let mut tap = UsageTap::new();
+        tap.observe_data(r#"{"usage":{"prompt_tokens":10}}"#);
+        assert_eq!(tap.finish().cost_cents, None);
+    }
+
+    #[test]
     fn a_field_a_provider_sends_as_a_float_or_a_string_is_still_a_count() {
         // Real gateways emit `1234.0` and occasionally `"1234"`; the reading must survive both or a
         // stream would report nothing where the buffered path reports a number.
@@ -1056,11 +1189,13 @@ mod tests {
                 output_tokens: Some(1),
                 ..Default::default()
             },
+            cost_cents: None,
             generation_ms: None,
         }
         .is_empty());
         assert!(!GenerationUsage {
             usage: TokenUsage::default(),
+            cost_cents: None,
             generation_ms: Some(0),
         }
         .is_empty());
@@ -1077,6 +1212,7 @@ mod tests {
                 cache_read_tokens: Some(6),
                 cache_write_tokens: None,
             },
+            cost_cents: None,
             generation_ms: Some(250),
         };
         let json = serde_json::to_string(&original).unwrap();

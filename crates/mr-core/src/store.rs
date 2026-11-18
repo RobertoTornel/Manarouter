@@ -91,6 +91,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V4,
     MIGRATION_V5,
     MIGRATION_V6,
+    MIGRATION_V7,
 ];
 
 /// Schema v1: four tables, their indexes, and the revision/tombstone columns every row carries
@@ -310,6 +311,13 @@ CREATE TABLE IF NOT EXISTS account_spend (
 );
 
 CREATE INDEX IF NOT EXISTS account_spend_by_account_time ON account_spend(account_id, occurred_at);
+"#;
+
+/// Schema v7 adds the upstream-reported spend to `account_spend`, in US cents. The column is
+/// nullable for the same reason the token columns are: an upstream that reports no cost is an
+/// unknown spend, and a stored zero would under-report a money window.
+const MIGRATION_V7: &str = r#"
+ALTER TABLE account_spend ADD COLUMN cost_cents INTEGER;
 "#;
 
 /// Compile-time guarantee that every migration has a schema version and vice versa.
@@ -974,6 +982,8 @@ pub struct AccountSpendRecord {
     pub prompt_tokens: Option<u64>,
     /// Completion tokens the upstream reported, if it reported any.
     pub completion_tokens: Option<u64>,
+    /// Upstream-reported spend in US cents, if it reported any.
+    pub cost_cents: Option<u64>,
     /// When the request was dialled, in milliseconds since the epoch.
     pub occurred_at: Millis,
     /// When the row was written, in milliseconds since the epoch.
@@ -989,6 +999,7 @@ impl AccountSpendRecord {
             account_id,
             prompt_tokens: None,
             completion_tokens: None,
+            cost_cents: None,
             occurred_at,
             created_at: Millis::now(),
         }
@@ -998,6 +1009,12 @@ impl AccountSpendRecord {
     pub fn with_tokens(mut self, prompt: Option<u64>, completion: Option<u64>) -> Self {
         self.prompt_tokens = prompt;
         self.completion_tokens = completion;
+        self
+    }
+
+    /// Attach the upstream-reported spend in US cents.
+    pub fn with_cost_cents(mut self, cost_cents: Option<u64>) -> Self {
+        self.cost_cents = cost_cents;
         self
     }
 }
@@ -1013,7 +1030,7 @@ impl Store {
         let guard = self.guard()?;
         guard.execute(
             "INSERT INTO account_spend (id, provider_id, account_id, prompt_tokens, \
-             completion_tokens, occurred_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             completion_tokens, cost_cents, occurred_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
              ON CONFLICT(id) DO NOTHING",
             params![
                 record.id,
@@ -1024,6 +1041,9 @@ impl Store {
                     .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                 record
                     .completion_tokens
+                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                record
+                    .cost_cents
                     .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                 record.occurred_at.as_millis(),
                 record.created_at.as_millis(),
@@ -1043,16 +1063,19 @@ impl Store {
         id: &str,
         prompt_tokens: Option<u64>,
         completion_tokens: Option<u64>,
+        cost_cents: Option<u64>,
     ) -> Result<()> {
         let guard = self.guard()?;
         guard.execute(
             "UPDATE account_spend SET \
              prompt_tokens = COALESCE(?1, prompt_tokens), \
-             completion_tokens = COALESCE(?2, completion_tokens) \
-             WHERE id = ?3",
+             completion_tokens = COALESCE(?2, completion_tokens), \
+             cost_cents = COALESCE(?3, cost_cents) \
+             WHERE id = ?4",
             params![
                 prompt_tokens.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                 completion_tokens.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                cost_cents.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                 id,
             ],
         )?;
@@ -1070,17 +1093,19 @@ impl Store {
     ) -> Result<Vec<crate::account_quota::SpendEvent>> {
         let guard = self.guard()?;
         let mut stmt = guard.prepare(
-            "SELECT prompt_tokens, completion_tokens, occurred_at FROM account_spend \
+            "SELECT prompt_tokens, completion_tokens, cost_cents, occurred_at FROM account_spend \
              WHERE account_id = ?1 AND occurred_at >= ?2 ORDER BY occurred_at ASC, id ASC",
         )?;
         let rows = stmt.query_map(params![account_id, since_ms], |row| {
             let prompt: Option<i64> = row.get(0)?;
             let completion: Option<i64> = row.get(1)?;
-            let occurred_at: i64 = row.get(2)?;
+            let cost: Option<i64> = row.get(2)?;
+            let occurred_at: i64 = row.get(3)?;
             Ok(crate::account_quota::SpendEvent {
                 at_ms: u64::try_from(occurred_at).unwrap_or(0),
                 input_tokens: prompt.and_then(|v| u64::try_from(v).ok()),
                 output_tokens: completion.and_then(|v| u64::try_from(v).ok()),
+                cost_cents: cost.and_then(|v| u64::try_from(v).ok()),
             })
         })?;
         let mut out = Vec::new();
@@ -1101,20 +1126,22 @@ impl Store {
     ) -> Result<std::collections::BTreeMap<AccountId, Vec<crate::account_quota::SpendEvent>>> {
         let guard = self.guard()?;
         let mut stmt = guard.prepare(
-            "SELECT account_id, prompt_tokens, completion_tokens, occurred_at FROM account_spend \
+            "SELECT account_id, prompt_tokens, completion_tokens, cost_cents, occurred_at FROM account_spend \
              WHERE provider_id = ?1 AND occurred_at >= ?2 ORDER BY account_id ASC, occurred_at ASC",
         )?;
         let rows = stmt.query_map(params![provider_id, since_ms], |row| {
             let account: String = row.get(0)?;
             let prompt: Option<i64> = row.get(1)?;
             let completion: Option<i64> = row.get(2)?;
-            let occurred_at: i64 = row.get(3)?;
+            let cost: Option<i64> = row.get(3)?;
+            let occurred_at: i64 = row.get(4)?;
             Ok((
                 AccountId::from_raw(account),
                 crate::account_quota::SpendEvent {
                     at_ms: u64::try_from(occurred_at).unwrap_or(0),
                     input_tokens: prompt.and_then(|v| u64::try_from(v).ok()),
                     output_tokens: completion.and_then(|v| u64::try_from(v).ok()),
+                    cost_cents: cost.and_then(|v| u64::try_from(v).ok()),
                 },
             ))
         })?;
@@ -2929,16 +2956,36 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     // See `set_user_version`: zeroing first makes the subsequent bump unconditional on disk.
     set_user_version(&tx, 0)?;
     let mut applied = current;
-    for migration in &MIGRATIONS[(current as usize)..] {
+    for (offset, migration) in MIGRATIONS[(current as usize)..].iter().enumerate() {
         // Each migration and its version bump share one transaction: a crash mid-migration rolls
         // everything back to the last consistent version, so the runner never restarts halfway
         // through a schema change with a version number that says otherwise.
-        tx.execute_batch(migration)?;
+        if (current as usize) + offset == 6 && table_has_column(&tx, "account_spend", "cost_cents")?
+        {
+            // `ALTER TABLE ADD COLUMN` has no idempotent spelling in SQLite. When the
+            // migration has already run but the version bump did not survive, changing a
+            // no-op into an error would brick an otherwise healthy database.
+        } else {
+            tx.execute_batch(migration)?;
+        }
         applied += 1;
         set_user_version(&tx, applied)?;
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Whether `table` already has `column`, used by the one migration whose DDL is not naturally
+/// idempotent (see [`migrate`]).
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column_name in columns {
+        if column_name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Set `PRAGMA user_version` so the value is guaranteed to reach disk with this transaction.
@@ -3306,7 +3353,7 @@ mod tests {
         assert_eq!(before[0].output_tokens, None);
 
         store
-            .settle_account_spend(&record.id, Some(120), Some(30))
+            .settle_account_spend(&record.id, Some(120), Some(30), None)
             .expect("settle");
         let after = store.account_spend_since("acct-a", 0).expect("query");
         assert_eq!(after.len(), 1, "settling updates the same row");
@@ -3320,11 +3367,11 @@ mod tests {
         let record = AccountSpendRecord::new("vercel", account("a"), t(1_000));
         store.record_account_spend(&record).expect("record");
         store
-            .settle_account_spend(&record.id, Some(10), Some(5))
+            .settle_account_spend(&record.id, Some(10), Some(5), None)
             .expect("settle");
         // A second settlement carrying only one count must not erase the other.
         store
-            .settle_account_spend(&record.id, Some(10), None)
+            .settle_account_spend(&record.id, Some(10), None, None)
             .expect("settle again");
         let events = store.account_spend_since("acct-a", 0).expect("query");
         assert_eq!(events.len(), 1);

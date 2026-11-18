@@ -64,6 +64,9 @@ pub struct SpendEvent {
     /// Completion tokens the upstream reported, when it reported any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+    /// Upstream-reported spend in US cents, when it reported any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_cents: Option<u64>,
 }
 
 impl SpendEvent {
@@ -73,6 +76,7 @@ impl SpendEvent {
             at_ms,
             input_tokens: None,
             output_tokens: None,
+            cost_cents: None,
         }
     }
 
@@ -80,6 +84,12 @@ impl SpendEvent {
     pub const fn with_tokens(mut self, input: Option<u64>, output: Option<u64>) -> Self {
         self.input_tokens = input;
         self.output_tokens = output;
+        self
+    }
+
+    /// The same event with the upstream-reported spend attached.
+    pub const fn with_cost_cents(mut self, cost_cents: Option<u64>) -> Self {
+        self.cost_cents = cost_cents;
         self
     }
 
@@ -119,6 +129,10 @@ pub struct WindowSpend {
     pub output_tokens: u64,
     /// The declared output-token limit. Zero means unlimited.
     pub limit_output_tokens: u64,
+    /// Spend counted in the window, in US cents.
+    pub cost_cents: u64,
+    /// The declared spend limit in US cents. Zero means unlimited.
+    pub limit_usd_cents: u64,
     /// Whether the window is full, so the account must not be used until it recovers.
     pub spent: bool,
     /// When the window becomes usable again, when that is knowable. `None` means the window is not
@@ -141,6 +155,7 @@ impl WindowSpend {
             (self.tokens, self.limit_tokens),
             (self.input_tokens, self.limit_input_tokens),
             (self.output_tokens, self.limit_output_tokens),
+            (self.cost_cents, self.limit_usd_cents),
         ]
         .into_iter()
         .filter(|(_, limit)| *limit > 0)
@@ -230,6 +245,8 @@ fn measure_one(window: &QuotaWindow, events: &[SpendEvent], now_ms: u64) -> Wind
         limit_input_tokens: window.limit_input_tokens,
         output_tokens: 0,
         limit_output_tokens: window.limit_output_tokens,
+        cost_cents: 0,
+        limit_usd_cents: window.limit_usd_cents,
         spent: false,
         reset_at_ms: None,
         measured: false,
@@ -266,6 +283,7 @@ fn measure_one(window: &QuotaWindow, events: &[SpendEvent], now_ms: u64) -> Wind
     spend.requests = in_window.len() as u64;
     spend.input_tokens = in_window.iter().filter_map(|e| e.input_tokens).sum();
     spend.output_tokens = in_window.iter().filter_map(|e| e.output_tokens).sum();
+    spend.cost_cents = in_window.iter().filter_map(|e| e.cost_cents).sum();
     spend.tokens = in_window.iter().map(|e| e.tokens()).sum();
 
     // Each limited dimension is checked against the same events; the window is spent on the first
@@ -305,6 +323,15 @@ fn measure_one(window: &QuotaWindow, events: &[SpendEvent], now_ms: u64) -> Wind
             span_ms,
             boundary_end_ms,
             |event| event.output_tokens.unwrap_or(0),
+        ));
+    }
+    if window.limit_usd_cents > 0 && spend.cost_cents >= window.limit_usd_cents {
+        resets.extend(recovery(
+            &in_window,
+            window.limit_usd_cents,
+            span_ms,
+            boundary_end_ms,
+            |event| event.cost_cents.unwrap_or(0),
         ));
     }
 
@@ -536,6 +563,20 @@ mod tests {
             }),
             "weekly"
         );
+    }
+
+    #[test]
+    fn dollar_spend_is_counted_and_limits_the_window() {
+        let window = QuotaWindow::usd_cents_per(3_600, 500);
+        let events = vec![
+            SpendEvent::request(1_000).with_cost_cents(Some(250)),
+            SpendEvent::request(2_000).with_cost_cents(Some(250)),
+        ];
+        let exhausted = exhaustion(&[window], &events, 3_000).expect("full");
+        assert_eq!(exhausted.reset_at_ms, 3_601_000);
+        let spend = measure(&[QuotaWindow::usd_cents_per(3_600, 500)], &events, 3_000);
+        assert_eq!(spend[0].cost_cents, 500);
+        assert_eq!(spend[0].limit_usd_cents, 500);
     }
 
     #[test]

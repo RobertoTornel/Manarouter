@@ -628,7 +628,7 @@ dialect = "open-ai"
 base_url = "https://ai-gateway.vercel.sh/v1"
 auth = { type = "bearer" }
 capabilities = ["chat", "responses", "embeddings", "models", "tool-calling", "reasoning", "vision"]
-note = "One key routes to many upstreams."
+note = "One key routes to many upstreams. Spend caps are the generic money window in `limit_usd_cents` (US cents, 0 = unlimited); Vercel reports spend in each generation's usage frame, so a per-account cap is just an account quota window, e.g. [[providers.accounts.quota]] name = \"monthly-usd-5\" seconds = 2592000 limit_usd_cents = 500. See docs/08-quota-tracking.md."
 
 # ---------------------------------------------------------------------------------------------
 # Additional sourced, key-based providers from the same registries

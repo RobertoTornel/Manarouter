@@ -480,6 +480,15 @@ pub struct QuotaWindow {
     /// Maximum output tokens in the window. Zero means unlimited.
     #[serde(default)]
     pub limit_output_tokens: u64,
+    /// Maximum upstream-reported spend in the window, in US cents. Zero means
+    /// unlimited. This is the generic money dimension: the upstream can report
+    /// it directly, or the relay can settle an estimated/model-priced amount.
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero_u64",
+        alias = "limit_cost_cents"
+    )]
+    pub limit_usd_cents: u64,
     /// Operators frequently know the reset clock of a plan (a 5-hour rolling window, a monthly
     /// calendar) without knowing the limits. Setting this marks the window as
     /// [`WindowKind::ProviderDeclared`] so only the reset timing is used for demotion.
@@ -489,6 +498,10 @@ pub struct QuotaWindow {
 
 fn default_window_kind() -> WindowKind {
     WindowKind::Rolling
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 impl Default for QuotaWindow {
@@ -501,6 +514,7 @@ impl Default for QuotaWindow {
             limit_tokens: 0,
             limit_input_tokens: 0,
             limit_output_tokens: 0,
+            limit_usd_cents: 0,
             reset_only: false,
         }
     }
@@ -516,6 +530,18 @@ impl QuotaWindow {
         }
     }
 
+    /// A spend window in US cents. The caller supplies a provider-agnostic
+    /// cap; the relay settles whatever the upstream reported, or an estimate,
+    /// and the account quota module applies the same window arithmetic used
+    /// for requests and tokens.
+    pub fn usd_cents_per(seconds: i64, limit_usd_cents: u64) -> Self {
+        Self {
+            seconds,
+            limit_usd_cents,
+            ..Self::default()
+        }
+    }
+
     /// Whether this window constrains anything at all.
     ///
     /// A window with no limits and no reset tracking is inert, and the compiler drops it rather
@@ -527,6 +553,7 @@ impl QuotaWindow {
             || self.limit_tokens > 0
             || self.limit_input_tokens > 0
             || self.limit_output_tokens > 0
+            || self.limit_usd_cents > 0
     }
 
     /// Whether this window can make an account unusable.
@@ -541,6 +568,7 @@ impl QuotaWindow {
             || self.limit_tokens > 0
             || self.limit_input_tokens > 0
             || self.limit_output_tokens > 0
+            || self.limit_usd_cents > 0
     }
 }
 

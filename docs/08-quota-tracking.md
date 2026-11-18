@@ -374,8 +374,12 @@ moment its quota returns. That is documented in
 
 What a client sees during a cooldown: nothing different, provided another step is usable. The request
 succeeds against a lower-priority step. If every step for every account is cooling down, the relay
-returns a 429 **of its own** — distinguishable from a forwarded one, which
-[the API reference](18-api-reference.md) describes.
+normally **tries the step that recovers soonest anyway** — a cooldown is a prediction, and the
+operator may have topped an account up out of band. One gate keeps that honest: when the soonest
+*stated* recovery is more than five minutes away (a provider saying "resets in 18 days"), dialling
+the account would only re-collect the same refusal, so the relay answers at once with a 429 **of its
+own** — distinguishable from a forwarded one, which [the API reference](18-api-reference.md)
+describes. An unknown recovery is still tried, because it may be imminent.
 
 ## The entry count caveat
 
@@ -389,7 +393,9 @@ The entries are small — a key, an instant, a reason, a failure count — and a
 retried until its window passes, so the practical ceiling is "models actually refused in the last
 window", not "models configured". That is still enough for a provider with hundreds of models and a
 per-model quota to be worth a glance: `/control/activity` lists every parked shape, and a `model` key
-shows up in composed form rather than as a bare account id.
+shows up in composed form rather than as a bare account id. Once the map grows past a safe size
+(1024 entries) expired entries are dropped on the next write, so a long-running relay stays bounded
+while a small map keeps its expired failure counts for growth.
 
 ## Why a 401 and a 429 are treated oppositely
 
@@ -445,6 +451,34 @@ Two consequences:
 - **The spend is attributed to each account, not to the combo.** Usage records show the losing legs
   against their own accounts. A combo-level view would be tidier but would misattribute the cost, and
   the cost is attached to the credential that was charged.
+
+## Money windows: `limit_usd_cents`
+
+A spend cap is a generic quota dimension like requests or tokens, not a provider feature. A window
+carries `limit_usd_cents` — the cap in **US cents**, `0` meaning unlimited — and it is measured from
+the same `account_spend` ledger the token windows use:
+
+```json
+{
+  "name": "monthly-usd-5",
+  "seconds": 2592000,
+  "limit_usd_cents": 500
+}
+```
+
+- The ledger records what the **upstream reported** spending in each generation's usage frame. The
+  parser accepts the common spellings (`total_cost`, `gateway_cost`, a dollar-valued `usage`, `cost`,
+  `cost_usd`, and a `usage`/`usageMetadata` wrapper) and converts dollars to cents; a generation that
+  reports nothing is an unknown spend (`None`), **never zero** — a stored zero would under-report a
+  money window.
+- The same rolling/fixed window arithmetic applies: the window is spent once the sum of reported cost
+  reaches the cap, and it recovers when the oldest required event ages out. A spent account is
+  skipped exactly like a cooling one (see `filter_spent_candidates`).
+- This is what makes a service like Vercel's AI Gateway (which reports spend per generation) a
+  one-line configuration: per-account `limit_usd_cents` windows, no provider-specific code. The
+  `vercel-ai-gateway` template note documents the shape.
+- The conductor shows declared windows in the quota view without contacting the provider; the relay
+  enforces them from its own ledger.
 
 ## Credit balances
 
@@ -573,10 +607,11 @@ the provider actually reports reaches the ledger:
   so a slow disk cannot stall a request, and when it is full the drop is recorded and surfaced. Losing
   a usage row is preferable to adding latency to a completion, and pretending the row exists is worse
   than both.
-- **Spend budgets are not enforced, and a credit balance is consulted on one route only.** Ordinary
-  requests can still be refused with a 402 the router did not predict. The exception is starting a
-  fine-tuning job: creation requires more than $15 of *known* credit — an account's declared
-  `credit_usd`, or a USD figure cached from the provider within the last 24 hours — and moves to the
+- **Spend is enforced only where it was declared.** Ordinary requests can still be refused with a
+  402 the router did not predict; a declared `limit_usd_cents` window is enforced from the ledger.
+  A credit balance is consulted on one route only: starting a fine-tuning job requires more than $15
+  of *known* credit — an account's declared `credit_usd`, or a USD figure cached from the provider
+  within the last 24 hours — and moves to the
   next funded account if the provider refuses for money. A job already created belongs to the
   provider's account and cannot be moved. The rule is in
   [key selection](05-key-selection.md#the-declared-balance-and-the-one-route-ranked-by-it).
