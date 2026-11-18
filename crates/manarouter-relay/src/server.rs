@@ -4101,6 +4101,19 @@ async fn attempt_step(
                 reason = refusal.reason;
                 named_wait = refusal.wait_ms.or(named_wait);
             }
+            // A 429 that names no recovery instant is still a failover signal: the account is
+            // unusable *right now*, so the request must move to a sibling immediately, and the
+            // account is parked only long enough to avoid being re-probed on the very next request.
+            // Without this fallback the config default (60s) would park an unstated 429 exactly
+            // like a spent balance, which makes a throttle look like a dead account.
+            if reason == select::CooldownReason::RateLimited && named_wait.is_none() {
+                named_wait = Some(UNSTATED_RATE_LIMIT_COOLDOWN_MS);
+                tracing::debug!(
+                    model = model_name,
+                    provider = %step.provider_id,
+                    "429 without a stated recovery; failing over and cooling briefly"
+                );
+            }
             // A model the *plan* does not include is not a spent account, and the difference is
             // worth two lines: the account keeps serving every other model, so parking it whole
             // would take request capacity away from the models that do work in order to punish
@@ -4757,6 +4770,14 @@ fn sticky_applies(combo: &mr_core::snapshot::ComboPlan) -> bool {
         mr_core::ComboStrategy::Priority | mr_core::ComboStrategy::ResetAwarePriority
     ) && combo.sticky_success_window_secs > 0
 }
+
+/// How long an unstated 429 cools the account before it may be tried again.
+///
+/// A provider that returns 429 without `Retry-After` or a body recovery instant is not naming a
+/// window; it is saying "not right now". The account is cooled just long enough that the next
+/// request does not immediately re-probe it, while siblings carry the load. This is deliberately
+/// far below the configured default (60s), which is for *spent* accounts and balances.
+const UNSTATED_RATE_LIMIT_COOLDOWN_MS: u64 = 2_000;
 
 /// The farthest known reset a combo will still dial in its last resort.
 ///
@@ -11433,6 +11454,129 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             response.headers().get("retry-after").is_some(),
             "the 429 must carry a Retry-After"
         );
+    }
+
+    /// A 429 with no `Retry-After` and no recovery instant still fails over to a sibling account,
+    /// and cools the refused account only briefly instead of for the 60s spent-account default.
+    #[tokio::test]
+    async fn an_unstated_429_fails_over_to_a_sibling_and_cools_briefly() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(
+            move |headers: HeaderMap| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    let authorized = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned();
+                    sink.lock()
+                        .unwrap()
+                        .push(authorized.clone());
+                    if authorized.contains("throttled-key") {
+                        // A bare 429: no Retry-After, no body wording.
+                        (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            r#"{"error":{"message":"too many requests"}}"#,
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                        )
+                    }
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}");
+
+        let mut provider = mr_core::model::Provider::new("shared", Dialect::OpenAi, &url);
+        let mut throttled = mr_core::model::Account::new("throttled");
+        throttled.secret_ref = Some("throttled-credential".to_owned());
+        let mut live = mr_core::model::Account::new("live");
+        live.secret_ref = Some("live-credential".to_owned());
+        provider.accounts = vec![throttled, live];
+        let mut entry = dm();
+        entry.id = "shared-model".to_owned();
+        entry.input_modalities = vec![InputModality::Text];
+        provider.models = vec![entry];
+
+        let presented = "mr-test-key";
+        let key_hash: String = RelayState::hash_presented(presented)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            client_keys: vec![mr_core::model::ClientKey {
+                id: mr_core::ids::ClientKeyId::from_raw("key-1"),
+                label: "test".to_owned(),
+                key_hash,
+                prefix: Some("mr-test".to_owned()),
+                enabled: true,
+                allow_models: Vec::new(),
+                allow_routes: Vec::new(),
+                allow_combos: Vec::new(),
+                limit_requests: 0,
+                limits: Default::default(),
+                note: None,
+            }],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("throttled-credential", "throttled-key").unwrap();
+        opened.put("live-credential", "live-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let response = chat(state.clone(), "shared/shared-model").await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the request must fail over to the sibling instead of failing"
+        );
+        let dialled = seen.lock().unwrap().clone();
+        assert_eq!(dialled.len(), 2, "both accounts should be attempted");
+        assert!(dialled[0].contains("throttled-key"));
+        assert!(dialled[1].contains("live-key"));
+
+        // The refused account is cooled only briefly (~2s), far below the 60s spent-account default.
+        let now_ms = mr_core::ids::now_millis().max(0) as u64;
+        let health = state.health.view();
+        let cooldown = health
+            .values()
+            .find(|c| c.reason == select::CooldownReason::RateLimited)
+            .expect("the refused account is cooled");
+        let wait = cooldown.until_ms.saturating_sub(now_ms);
+        assert!(wait <= 5_000, "unstated 429 cools briefly, got {wait} ms");
     }
 
     /// A `404` is the same class as a `400`: a statement about the request, not about the account.
