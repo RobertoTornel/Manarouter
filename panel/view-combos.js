@@ -1124,10 +1124,18 @@ export async function renderCombos(mount, ctx, selectedId) {
           closeDrawer();
           ctx.navigate(`#/combos/${encodeURIComponent(created?.id ?? payload.name)}`);
         } else {
-          await api.put(`/api/combos/${encodeURIComponent(saved.id)}`, payload);
+          const updated = await api.put(`/api/combos/${encodeURIComponent(saved.id)}`, payload);
           ctx.toast.success(`Combo ${payload.name} saved.`);
           clearDirty();
           closeDrawer();
+          // `ctx.navigate('#/combos')` is a no-op when we are already on that route, so the list
+          // would keep showing the pre-save copy. Patch the in-memory row and re-render in place.
+          const idx = combos.findIndex((c) => c.id === saved.id);
+          if (idx >= 0) {
+            combos[idx] = updated?.id ? updated : { ...payload, id: saved.id };
+            renderList();
+            renderSummary(right, combos[idx]);
+          }
           ctx.navigate('#/combos');
         }
       } catch (err) {
@@ -1151,6 +1159,19 @@ export async function renderCombos(mount, ctx, selectedId) {
         // The record is gone, so its editor must not ask to preserve unsaved edits on the way out.
         clearDirty();
         closeDrawer();
+        const idx = combos.findIndex((c) => c.id === saved.id);
+        if (idx >= 0) {
+          combos.splice(idx, 1);
+          if (selectedId === saved.id) selectedId = combos[0]?.id ?? null;
+          renderList();
+          count.textContent = `${combos.length} combo${combos.length === 1 ? '' : 's'}`;
+          if (selectedId) {
+            const found = combos.find((c) => c.id === selectedId);
+            if (found) renderSummary(right, found);
+          } else {
+            renderEmptyDetail();
+          }
+        }
         ctx.navigate('#/combos');
       } catch (err) {
         ctx.toast.error('Delete failed', err);
