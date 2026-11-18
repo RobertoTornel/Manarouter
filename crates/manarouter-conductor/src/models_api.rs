@@ -130,17 +130,37 @@ async fn test_model(
     let parsed: Value = serde_json::from_slice(&response_body)
         .map_err(|_| ApiError::bad_gateway("the model test returned invalid JSON"))?;
     if !status.is_success() {
-        let message = parsed
-            .get("error")
-            .and_then(|error| error.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("the relay refused the test");
+        let message = refusal_message(&parsed).unwrap_or("the relay refused the test");
         return Err(probe_failure(status, message));
     }
     let answer = tested_answer(&parsed)?;
     Ok(Json(
         json!({"provider": request.provider, "model": request.model, "ok": true, "response": answer}),
     ))
+}
+
+/// The sentence a refusal carries, whichever envelope it arrived in.
+///
+/// The relay hands its client's answer back with the upstream's body untouched, and upstreams do
+/// not agree on an envelope: OpenAI and Anthropic nest the sentence under `error.message`, fal.ai
+/// answers `{"detail": "User is locked. Reason: Exhausted balance. …"}`, a few send `error` as the
+/// string itself. Reading only `error.message` turned fal's exhausted-balance 403 into the panel's
+/// useless "the relay answered 403 Forbidden: the relay refused the test" while the real sentence
+/// sat in the relay's own log. The shapes read here are the same ones the relay's `refusal_text`
+/// reads when it classifies the refusal, so the panel and the log say the same thing.
+fn refusal_message(parsed: &Value) -> Option<&str> {
+    let error = parsed.get("error").unwrap_or(parsed);
+    [
+        error.get("message"),
+        error.get("detail"),
+        parsed.get("detail"),
+        parsed.get("message"),
+        Some(error),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .next()
 }
 
 /// The answer a successful probe actually delivered, or a failure that says why there is none.
@@ -152,6 +172,46 @@ async fn test_model(
 /// `length` means the allowance ran out (a reasoning model can spend all of it thinking), `stop`
 /// means the model genuinely answered with nothing.
 fn tested_answer(parsed: &Value) -> ApiResult<Value> {
+    // A Responses-shaped answer, which is what a responses-only provider (Codex) returns: the probe
+    // speaks the provider's own surface, so the answer arrives in that surface's shape. `output_text`
+    // is the flattened text the API itself provides; the `output` walk is its fallback.
+    if parsed.get("choices").is_none() && parsed.get("output").is_some() {
+        if let Some(text) = parsed
+            .get("output_text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+        {
+            return Ok(Value::String(text.to_owned()));
+        }
+        let texts: Vec<&str> = parsed
+            .get("output")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("content"))
+                    .filter_map(Value::as_array)
+                    .flat_map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|part| part.get("text"))
+                            .filter_map(Value::as_str)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let text = texts.join("");
+        if text.trim().is_empty() {
+            let status = parsed
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return Err(ApiError::bad_gateway(format!(
+                "the model answered with no text (status: {status})"
+            )));
+        }
+        return Ok(Value::String(text));
+    }
     let choice = parsed.get("choices").and_then(|c| c.get(0));
     let message = choice.and_then(|c| c.get("message"));
     // A tool call is a real answer that carries no prose, so an empty `content` next to one is not
@@ -398,6 +458,80 @@ mod tests {
         assert!(message.contains("120 s"), "{message}");
         assert!(message.contains("reasoning model"), "{message}");
         assert!(!message.contains("not answering"), "{message}");
+    }
+
+    /// Every refusal envelope an upstream uses must reach the panel in its own words.
+    ///
+    /// fal.ai answers an exhausted balance as `{"detail": "User is locked. Reason: Exhausted
+    /// balance. …"}` — no `error.message` anywhere. Reading only that one field turned the refusal
+    /// into "the relay refused the test" in the panel while the relay's log held the real sentence,
+    /// and the operator (rightly) read it as the relay failing rather than the account being empty.
+    #[test]
+    fn a_refusal_in_any_envelope_reaches_the_panel_in_its_own_words() {
+        let fal = json!({"detail": "User is locked. Reason: Exhausted balance. Top up your balance at fal.ai/dashboard/billing."});
+        assert_eq!(
+            refusal_message(&fal),
+            Some("User is locked. Reason: Exhausted balance. Top up your balance at fal.ai/dashboard/billing.")
+        );
+
+        // The shapes the relay's own classifier reads, in the same order.
+        assert_eq!(
+            refusal_message(&json!({"error": {"message": "openai shape"}})),
+            Some("openai shape")
+        );
+        assert_eq!(
+            refusal_message(&json!({"error": {"detail": "nested detail"}})),
+            Some("nested detail")
+        );
+        assert_eq!(
+            refusal_message(&json!({"message": "top-level message"})),
+            Some("top-level message")
+        );
+        assert_eq!(
+            refusal_message(&json!({"error": "error as a string"})),
+            Some("error as a string")
+        );
+        assert_eq!(refusal_message(&json!({"error": {"code": 403}})), None);
+        assert_eq!(refusal_message(&json!({})), None);
+    }
+
+    /// A responses-only provider answers in the Responses shape, and its text must be read there.
+    #[tokio::test]
+    async fn a_responses_shaped_answer_is_read_from_output() {
+        let answered = json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "OK"}]
+            }]
+        });
+        assert_eq!(
+            tested_answer(&answered).ok().expect("an answer passes"),
+            json!("OK")
+        );
+
+        let flat = json!({"status": "completed", "output_text": "OK", "output": []});
+        assert_eq!(
+            tested_answer(&flat).ok().expect("an answer passes"),
+            json!("OK")
+        );
+
+        let silent = json!({"status": "completed", "output": []});
+        let refusal = tested_answer(&silent)
+            .expect_err("no text is a failed test")
+            .into_response();
+        assert_eq!(refusal.status(), StatusCode::BAD_GATEWAY);
+        let body = String::from_utf8(
+            refusal
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("status: completed"), "{body}");
     }
 
     #[test]

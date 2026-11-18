@@ -140,12 +140,17 @@ check is the whole authorisation for them.
 
 | Method | Path | Answers |
 |---|---|---|
-| `POST` | `/control/probe` | Runs one small completion for a model or combo through the ordinary dispatch path — routing table, dialect translation, account selection, cooldowns, fallbacks — and returns the ordinary OpenAI response. This is what "test this model" and the combo health check use, which is why they work for every dialect rather than only the OpenAI shape. It sends **no output cap**, so the model answers inside the budget a real client would get; the earlier fixed 32-token cap let a reasoning model spend its whole allowance on thoughts and return an empty answer. |
+| `POST` | `/control/probe` | Runs one small completion for a model or combo through the ordinary dispatch path — routing table, dialect translation, account selection, cooldowns, fallbacks — and returns the ordinary OpenAI response. This is what "test this model" and the combo health check use, which is why they work for every dialect rather than only the OpenAI shape. It sends **no output cap**, so the model answers inside the budget a real client would get; the earlier fixed 32-token cap let a reasoning model spend its whole allowance on thoughts and return an empty answer. It also speaks **the surface the route declares**: chat completions when a step declares `chat`, the Responses surface when the steps declare only `responses` (Codex). Probing a responses-only provider through chat completions could only ever answer `unsupported_endpoint` at the capability gate, so the test failed without ever dialling a provider that works. |
 | `GET` | `/control/activity` | The combo decisions this process has made, newest first, and the account cooldowns it currently holds. It is answered from memory, by the process that made the decisions, because only that process knows which step a combo committed to. |
 
 The panel's "test" button goes through the conductor (`POST /api/models/test`), which asks this probe
 and then insists on a non-empty answer: a response with no text is reported as a failure naming the
-upstream `finish_reason`, never as a pass. The conductor allows the probe two minutes — a reasoning
+upstream `finish_reason` (or the Responses `status`), never as a pass. A Responses-shaped answer is
+read from `output_text`, falling back to the `output` text parts. When the route refuses, the
+conductor reports the upstream's own sentence from whichever envelope carried it — `error.message`,
+`error.detail`, a top-level `detail` or `message`, or `error` as a string — so a provider whose
+exhausted-balance refusal arrives as `{"detail": "…"}` is reported as exactly that, not as a generic
+relay refusal. The conductor allows the probe two minutes — a reasoning
 model can legitimately think for over a minute — and a failure to reach the relay is reported as a
 timeout or a transport error, not as "the relay is not running" unless the connection was actually
 refused.

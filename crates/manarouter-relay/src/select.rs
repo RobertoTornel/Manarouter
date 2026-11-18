@@ -574,6 +574,13 @@ pub fn account_candidates<'a>(
 /// caller uses this to make one last attempt on the step that recovers soonest. The model filter
 /// still applies — an account that is not allowed to serve this model will not start being allowed
 /// because the request was desperate.
+///
+/// The order is the recovery order, not the operator's: the caller is about to fail over across
+/// these accounts one by one, and the one that recovers soonest is the likeliest to answer —
+/// operator order would spend the first attempt on whichever account happens to be configured
+/// first, every time, and the retry loop would only reach a sibling the operator had already
+/// fixed once that account's park expired. An account with no cooldown entry recovers "now", and
+/// goes first.
 pub fn account_candidates_ignoring_cooldowns<'a>(
     provider: &'a ProviderPlan,
     strategy: KeyStrategy,
@@ -582,7 +589,12 @@ pub fn account_candidates_ignoring_cooldowns<'a>(
     now_ms: u64,
     model: &str,
 ) -> Vec<&'a AccountPlan> {
-    account_candidates_with(provider, strategy, counter, health, now_ms, model, false)
+    let mut candidates =
+        account_candidates_with(provider, strategy, counter, health, now_ms, model, false);
+    candidates.sort_by_key(|account| {
+        route_reset_instant(provider.id.as_str(), account.id.as_str(), model, health).unwrap_or(0)
+    });
+    candidates
 }
 
 fn account_candidates_with<'a>(
@@ -1444,6 +1456,47 @@ mod tests {
             pick_account(&p, KeyStrategy::Priority, 0, &healthy(), 0, "m").unwrap(),
             candidates[0]
         );
+    }
+
+    /// The last-resort order is the recovery order, not the operator's.
+    ///
+    /// When every account is cooling, the caller fails over across the cooling accounts one by one,
+    /// and the first attempt decides which one gets the request. Operator order spent that attempt
+    /// on the config-first account every time — the account that absorbed every last-resort request
+    /// while a sibling the operator had already fixed sat untried. Soonest recovery first, and an
+    /// account with no cooldown entry (recovered "now") ahead of every parked one.
+    #[test]
+    fn account_candidates_ignoring_cooldowns_are_in_recovery_order() {
+        let p = provider("p", vec![account("a"), account("b"), account("c")]);
+        let mut h = HashMap::new();
+        h.insert(
+            "a".to_owned(),
+            Cooldown {
+                until_ms: 9_000,
+                reason: CooldownReason::QuotaExhausted,
+                failures: 1,
+            },
+        );
+        h.insert(
+            "b".to_owned(),
+            Cooldown {
+                until_ms: 5_000,
+                reason: CooldownReason::QuotaExhausted,
+                failures: 1,
+            },
+        );
+        // `c` has no entry at all: it recovers now, ahead of both parked accounts.
+        let candidates =
+            account_candidates_ignoring_cooldowns(&p, KeyStrategy::Priority, 0, &h, 1_000, "m");
+        assert_eq!(candidate_ids(&candidates), vec!["c", "b", "a"]);
+
+        // The model filter still applies in this mode.
+        let mut limited = account("b");
+        limited.models_allow = vec!["only-this".into()];
+        let p = provider("p", vec![account("a"), limited]);
+        let candidates =
+            account_candidates_ignoring_cooldowns(&p, KeyStrategy::Priority, 0, &h, 1_000, "m");
+        assert_eq!(candidate_ids(&candidates), vec!["a"]);
     }
 
     #[test]

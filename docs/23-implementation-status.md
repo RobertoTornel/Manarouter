@@ -73,14 +73,14 @@ node --test panel/test/*.test.mjs
 # Browser workflow (local opt-in): Playwright and the browser binaries are not project dependencies.
 BROWSER=firefox PLAYWRIGHT_MODULE=/path/to/playwright FIREFOX_EXECUTABLE=/path/to/firefox node panel/test/browser.e2e.mjs
 ```
-For the revision described here the Rust and panel lines were re-run and passed: **2 116 workspace
+For the revision described here the Rust and panel lines were re-run and passed: **2 121 workspace
 tests** (0 failed, 4 ignored — the reference-vault refresh test and three `no_run` quota doctests), the
-same suite in `--release` (2 116 passed, 4 ignored), clean strict Clippy
+same suite in `--release` (2 121 passed, 4 ignored), clean strict Clippy
 (`cargo clippy --workspace --all-targets --all-features -- -D warnings`), **405/405 panel Node tests**,
 and `scripts/check-secrets.sh` (325 files, OK). The release binaries `mr`, `manarouter-relay` and
 `manarouter-conductor` 0.2.4 were built from this revision. `tools/mock-upstream`, the installer
 simulation and `tests/smoke_e2e.py` were **not** re-run locally for this revision; they were last green
-at the revision recorded in §1's history, and nothing in the Claude Code work touches installation or
+at the revision recorded in §1's history, and nothing in this revision touches installation or
 the startup path. The **smoke test, the installer test and the panel Node tests are wired into CI**;
 the browser test remains a local opt-in because Playwright and the browser binaries are not project
 dependencies.

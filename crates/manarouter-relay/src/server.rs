@@ -270,6 +270,49 @@ fn probe_payload(model: &str, prompt: &str) -> serde_json::Value {
     })
 }
 
+/// The same one completion, in the Responses shape, for a provider that declares no `chat` surface.
+///
+/// The capability gate refuses a route no step declares before dialect translation ever runs, so a
+/// chat-completions probe against a responses-only provider (Codex) can only ever answer
+/// `unsupported_endpoint` — a test that is guaranteed to fail, which reads as a broken provider
+/// that never even got dialled. The probe therefore speaks the surface the resolved provider
+/// declares: chat completions when it declares them, the Responses surface when it declares those
+/// instead. A model that resolves to nothing keeps the chat default, so its own `model_not_found`
+/// is what the caller reads.
+fn probe_responses_payload(model: &str, prompt: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "input": [{"role": "user", "content": prompt}],
+        "stream": false,
+    })
+}
+
+/// Which client surface a probe of `model` speaks, chosen from what its steps declare.
+fn probe_route(app: &AppState, model: &str) -> &'static str {
+    let table = Arc::clone(&*app.relay.table());
+    let steps: Vec<&StepPlan> = match table.snapshot.resolve(model) {
+        Resolution::Direct { step, .. } => vec![step],
+        Resolution::Combo { plan, .. } => plan.steps.iter().collect(),
+        Resolution::NotFound { .. } => Vec::new(),
+    };
+    let declares = |capability: Capability| {
+        steps.iter().any(|step| {
+            table
+                .snapshot
+                .providers()
+                .get(step.provider_index as usize)
+                .is_some_and(|provider| provider.capabilities.contains(&capability))
+        })
+    };
+    if declares(Capability::Chat) {
+        "/v1/chat/completions"
+    } else if declares(Capability::Responses) {
+        "/v1/responses"
+    } else {
+        "/v1/chat/completions"
+    }
+}
+
 /// `POST /control/probe` — run one real request for the control plane.
 ///
 /// The panel's "test model" and the combo health check used to speak the OpenAI shape themselves,
@@ -300,11 +343,16 @@ async fn control_probe(
         .prompt
         .filter(|prompt| !prompt.trim().is_empty())
         .unwrap_or_else(|| "Reply with the single word OK.".to_owned());
-    let payload = probe_payload(&body.model, &prompt);
+    let path = probe_route(&app, &body.model);
+    let payload = if path == "/v1/responses" {
+        probe_responses_payload(&body.model, &prompt)
+    } else {
+        probe_payload(&body.model, &prompt)
+    };
     let Ok(bytes) = serde_json::to_vec(&payload) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let Ok(uri) = "/v1/chat/completions".parse::<Uri>() else {
+    let Ok(uri) = path.parse::<Uri>() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let mut headers = HeaderMap::new();
@@ -2378,7 +2426,7 @@ async fn dispatch_routed(
             .map(|provider| provider.accounts.len().saturating_sub(1).min(8))
             .unwrap_or(0);
         let mut retries_left = account_retries;
-        let mut attempt = attempt_step(&attempt_ctx, step, is_sticky, false).await;
+        let mut attempt = attempt_step(&attempt_ctx, step, is_sticky, false, &[]).await;
         loop {
             let retry = match &attempt {
                 // A body to hand the client means the upstream answered and refused. That answer is
@@ -2401,7 +2449,7 @@ async fn dispatch_routed(
                 model = %step.model,
                 "retrying the same step on another account"
             );
-            attempt = attempt_step(&attempt_ctx, step, is_sticky, false).await;
+            attempt = attempt_step(&attempt_ctx, step, is_sticky, false, &[]).await;
         }
         match attempt {
             Attempt::Answer(response) => {
@@ -2425,7 +2473,7 @@ async fn dispatch_routed(
             Attempt::Failed {
                 response,
                 sticky_cleared,
-                retry_accounts: _,
+                ..
             } => {
                 if sticky_cleared {
                     sticky_index = None;
@@ -2517,6 +2565,14 @@ async fn dispatch_routed(
     // anything is the worst of the available answers: the operator sees a combo that died
     // instantly while the provider was fine. The step that recovers soonest is tried anyway, and
     // its answer — or its real error — is what the client gets.
+    //
+    // The retry runs *across the step's cooling accounts*, not just on the first of them. A
+    // cooldown says nothing about the present — an operator tops an account up, a window resets
+    // out of band — and trying only the config-first account meant that account absorbed every
+    // last-resort request while a fixed sibling sat untried until its own park expired. Each
+    // failure names the account it used, and the next attempt excludes it, so one request sweeps
+    // the cooling accounts in recovery order and stops at the first that answers. Bounded by the
+    // number of accounts, like the main loop's account retry.
     if last_failure.is_none() {
         if let Some(step) = last_resort_step(&app, &table, &steps, &raced, now_ms) {
             if activity.is_some() {
@@ -2527,7 +2583,33 @@ async fn dispatch_routed(
                 model = %step.model,
                 "every step is cooling down; trying the one that recovers soonest anyway"
             );
-            match attempt_step(&attempt_ctx, step, false, true).await {
+            let account_budget = table
+                .snapshot
+                .providers()
+                .get(step.provider_index as usize)
+                .map(|provider| provider.accounts.len().min(8))
+                .unwrap_or(0);
+            let mut tried: Vec<mr_core::ids::AccountId> = Vec::new();
+            let mut last_resort = attempt_step(&attempt_ctx, step, false, true, &tried).await;
+            loop {
+                match &last_resort {
+                    Attempt::Answer(response) => {
+                        // Moved out below by re-matching; the borrow here ends before the move.
+                        let _ = response;
+                        break;
+                    }
+                    Attempt::Failed {
+                        retry_accounts: true,
+                        account: Some(account),
+                        ..
+                    } if tried.len() + 1 < account_budget => {
+                        tried.push(account.clone());
+                        last_resort = attempt_step(&attempt_ctx, step, false, true, &tried).await;
+                    }
+                    _ => break,
+                }
+            }
+            match last_resort {
                 Attempt::Answer(response) => {
                     let wrapped = crate::recovery::wrap(
                         response,
@@ -2729,6 +2811,12 @@ enum Attempt {
     Failed {
         /// The failure response, when there is one to show the client.
         response: Option<Response>,
+        /// The account this attempt used, when it got that far.
+        ///
+        /// The last-resort retry loop carries these so it never dials the same cooling account
+        /// twice in one request: without the id, "try the next cooling account" has nothing to
+        /// exclude, and the loop would hammer the config-first account it already failed on.
+        account: Option<mr_core::ids::AccountId>,
         /// Whether the sticky preference was cleared by this attempt.
         sticky_cleared: bool,
         /// Whether trying this same step on **another of its accounts** could plausibly succeed.
@@ -3069,6 +3157,7 @@ async fn attempt_step(
     step: &StepPlan,
     is_sticky_step: bool,
     ignore_cooldowns: bool,
+    exclude_accounts: &[mr_core::ids::AccountId],
 ) -> Attempt {
     let app = actx.app;
     let table = actx.table.clone();
@@ -3166,10 +3255,13 @@ async fn attempt_step(
     // A step that names an account selection may be served by those accounts only. The filter is
     // applied to the selected list rather than inside the selectors so ordering, cooldown and
     // model checks keep their single implementation, and so a narrowed step still fails over
-    // among the accounts it was given.
+    // among the accounts it was given. The accounts a caller already tried in this request are
+    // out for the same reason: when cooldowns are being ignored the health filter cannot exclude
+    // them, and without the exclusion the retry would dial the same dead account again.
     let candidates: Vec<&mr_core::snapshot::AccountPlan> = candidates
         .into_iter()
         .filter(|account| select::step_allows_account(step, account))
+        .filter(|account| !exclude_accounts.contains(&account.id))
         .collect();
     if candidates.is_empty() {
         if is_sticky_step {
@@ -3248,6 +3340,8 @@ async fn attempt_step(
                     unusable_credential,
                 ),
             )),
+            // No account was usable, so there is no account to exclude from a retry.
+            account: None,
             sticky_cleared,
             retry_accounts: true,
         };
@@ -3480,6 +3574,7 @@ async fn attempt_step(
                     "account_placeholder_unfilled",
                     &message,
                 )),
+                account: Some(account.id.clone()),
                 sticky_cleared,
                 retry_accounts: true,
             };
@@ -3559,6 +3654,7 @@ async fn attempt_step(
                         "kv_budget_exceeded",
                         message,
                     )),
+                    account: Some(account.id.clone()),
                     sticky_cleared,
                     retry_accounts: false,
                 };
@@ -3909,6 +4005,7 @@ async fn attempt_step(
             if matches!(reason, select::CooldownReason::InvalidRequest) {
                 return Attempt::Failed {
                     response: Some(build_response(rebuilt, None)),
+                    account: Some(account.id.clone()),
                     sticky_cleared,
                     retry_accounts: false,
                 };
@@ -3943,6 +4040,7 @@ async fn attempt_step(
             );
             Attempt::Failed {
                 response: Some(build_response(rebuilt, None)),
+                account: Some(account.id.clone()),
                 sticky_cleared,
                 retry_accounts: true,
             }
@@ -4009,6 +4107,7 @@ async fn attempt_step(
             );
             Attempt::Failed {
                 response: None,
+                account: Some(account.id.clone()),
                 sticky_cleared,
                 retry_accounts: true,
             }
@@ -4221,7 +4320,7 @@ async fn attempt_from_owned(owned: &OwnedAttempt, step: &StepPlan, is_sticky: bo
         sticky_index: owned.sticky_index,
         pre_admitted: owned.pre_admitted.clone(),
     };
-    attempt_step(&ctx, step, is_sticky, false).await
+    attempt_step(&ctx, step, is_sticky, false, &[]).await
 }
 
 /// Run a hedged race over a combo's participants.
@@ -4259,6 +4358,7 @@ async fn run_hedge(
                 step,
                 sticky_step_is(actx.combo, actx.sticky_index, step),
                 false,
+                &[],
             );
             Box::pin(async move { (index, future.await) }) as PendingAttempt<'_>
         })
@@ -4961,14 +5061,17 @@ fn names_a_plan_limit(message: &str) -> bool {
 /// (`messages must not exceed 5 per request`) and attaching a day's cooldown to a validation error
 /// would take a healthy account out of rotation.
 fn stated_wait_ms(text: &str) -> Option<u64> {
-    const ANCHORS: [&str; 7] = [
+    const ANCHORS: [&str; 10] = [
         "resets in",
         "reset in",
         "resets every",
         "reset every",
         "retry in",
+        "retry after",
         "try again in",
+        "try again after",
         "available in",
+        "available after",
     ];
     let lower = text.to_ascii_lowercase();
     ANCHORS
@@ -7565,6 +7668,65 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             );
         }
     }
+
+    /// A relay whose only provider declares exactly `capabilities` and serves model `m`.
+    ///
+    /// The probe never reaches the upstream in these tests, so the base URL need not resolve.
+    fn probe_state(capabilities: Vec<Capability>) -> AppState {
+        let mut provider = provider_serving("p", "http://127.0.0.1:1", "m", &[InputModality::Text]);
+        provider.capabilities = capabilities;
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let vault = Arc::new(opened);
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        }
+    }
+
+    /// A responses-only provider must be probed on the Responses surface.
+    ///
+    /// The capability gate answers `unsupported_endpoint` before dialect translation, so probing
+    /// Codex through chat completions could never pass: the test would report a working provider
+    /// as broken without ever dialling it.
+    #[test]
+    fn a_responses_only_provider_is_probed_on_the_responses_surface() {
+        let state = probe_state(vec![Capability::Responses]);
+        assert_eq!(probe_route(&state, "p/m"), "/v1/responses");
+
+        let state = probe_state(vec![Capability::Chat, Capability::Responses]);
+        assert_eq!(probe_route(&state, "p/m"), "/v1/chat/completions");
+
+        let state = probe_state(vec![Capability::Chat]);
+        assert_eq!(
+            probe_route(&state, "p/missing"),
+            "/v1/chat/completions",
+            "an unknown model keeps the chat default so it reports model_not_found, not a route surprise"
+        );
+    }
+
     /// The upstream keys its prompt cache on `prompt_cache_key`, and the only honest source of one
     /// is the client's own session marker. Reading it off a header keeps the fast path free: no body
     /// is parsed just to find a cache key.
@@ -9207,7 +9369,16 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(stated_wait_ms("Resets every 24 hours"), Some(86_400_000));
         assert_eq!(stated_wait_ms("try again in 45 minutes"), Some(2_700_000));
         assert_eq!(stated_wait_ms("retry in 30s"), Some(30_000));
+        assert_eq!(
+            stated_wait_ms("Rate limit exceeded. Retry after 22s."),
+            Some(22_000)
+        );
+        assert_eq!(
+            stated_wait_ms("please try again after: 3 minutes"),
+            Some(3 * 60_000)
+        );
         assert_eq!(stated_wait_ms("available in 2 days"), Some(86_400_000));
+        assert_eq!(stated_wait_ms("available after 90 seconds"), Some(90_000));
         assert_eq!(
             stated_wait_ms("resets in 0 seconds"),
             None,
@@ -10666,6 +10837,129 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             second_seen.lock().unwrap().len(),
             1,
             "the fallback step was never reached"
+        );
+    }
+
+    /// When every account is cooling down, the last resort fails over across the cooling accounts.
+    ///
+    /// The step is skipped wholesale once its accounts are parked, and the last-resort attempt used
+    /// to dial only the config-first account — so a provider whose first account stayed exhausted
+    /// absorbed every desperate request while a sibling the operator had already topped up sat
+    /// untried until its own park expired. With both accounts cooling, the dead one recovering
+    /// soonest, a request must try it, fail, and move on to the live one.
+    #[tokio::test]
+    async fn the_last_resort_fails_over_across_cooling_accounts() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(
+            move |headers: HeaderMap, body: Bytes| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&body).to_string());
+                    let authorized = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned();
+                    if authorized.contains("dead-key") {
+                        (
+                            StatusCode::FORBIDDEN,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            r#"{"detail":"User is locked. Reason: Exhausted balance."}"#,
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                        )
+                    }
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}");
+
+        let mut provider = mr_core::model::Provider::new("shared", Dialect::OpenAi, &url);
+        let mut dead = mr_core::model::Account::new("dead");
+        dead.secret_ref = Some("dead-credential".to_owned());
+        let mut live = mr_core::model::Account::new("live");
+        live.secret_ref = Some("live-credential".to_owned());
+        provider.accounts = vec![dead, live];
+        let mut entry = dm();
+        entry.id = "shared-model".to_owned();
+        entry.input_modalities = vec![InputModality::Text];
+        provider.models = vec![entry];
+
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("dead-credential", "dead-key").unwrap();
+        opened.put("live-credential", "live-key").unwrap();
+        let vault = Arc::new(opened);
+
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        // Both accounts cooling; the dead one recovers soonest, so recovery order dials it first.
+        let plan = state.relay.table().snapshot.providers()[0].clone();
+        let now_ms = mr_core::ids::now_millis().max(0) as u64;
+        for (account, until_ms) in [
+            (&plan.accounts[0], now_ms + 60_000),
+            (&plan.accounts[1], now_ms + 120_000),
+        ] {
+            state.health.cool_down(
+                &select::cooldown_key(
+                    plan.cooldown_scope,
+                    plan.id.as_str(),
+                    account.id.as_str(),
+                    "shared-model",
+                    select::CooldownReason::QuotaExhausted,
+                ),
+                until_ms,
+                select::CooldownReason::QuotaExhausted,
+            );
+        }
+
+        let response = chat(state, "shared/shared-model").await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the last resort stopped at the first cooling account instead of failing over"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "both cooling accounts should have been tried"
         );
     }
 
