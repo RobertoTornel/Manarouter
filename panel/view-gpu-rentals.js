@@ -587,6 +587,9 @@ function normaliseDeployment(raw) {
     batch: objectOf(pick(deployment, 'batch')),
     maxModelLen: asNumber(pick(deployment, 'max_model_len')),
     maxNumSeqs: asNumber(pick(deployment, 'max_num_seqs')),
+    shutdownCooldownSecs: asNumber(pick(deployment, 'shutdown_cooldown_secs')),
+    baseUrl: asString(pick(raw, 'base_url', 'baseUrl')).trim(),
+    startupFlags: listOf(pick(deployment, 'startup_flags')).map(asString),
     enabled: asBool(pick(raw, 'enabled')),
     sizing,
     problems: listOf(pick(raw, 'problems')).map(objectOf).filter(Boolean),
@@ -1385,7 +1388,20 @@ async function renderInventory(mount, ctx) {
         if (!entries.length) return h('span', { class: 'hint' }, 'none');
         const title = entries.map(problemText).join(' · ');
         return chip(entries.length === 1 ? '1 problem' : `${entries.length} problems`, 'chip-red', title);
-      })()));
+      })()),
+      h('td', { class: 'actions' },
+        h('button', {
+          class: 'btn btn-sm btn-ghost', type: 'button',
+          'aria-label': `Edit deployment ${dep.providerId}`,
+          title: 'Edit deployment',
+          onclick: (ev) => { ev.stopPropagation(); void editDeploymentDialog(view, ctx, dep); },
+        }, 'Edit'),
+        h('button', {
+          class: 'btn btn-sm btn-ghost btn-quiet-danger', type: 'button',
+          'aria-label': `Delete deployment ${dep.providerId}`,
+          title: 'Delete deployment',
+          onclick: (ev) => { ev.stopPropagation(); void deleteDeploymentFlow(view, ctx, dep); },
+        }, 'Delete')));
 
       return row;
     });
@@ -1404,6 +1420,7 @@ async function renderInventory(mount, ctx) {
       { label: 'KV pool', num: true },
       { label: 'State' },
       { label: 'Problems' },
+      { label: '' },
     ], rows));
     const recordErrors = listOf(pick(view.rentals, 'errors'))
       .map((entry) => (typeof entry === 'string' ? entry.trim() : messageOf(entry)))
@@ -4164,6 +4181,159 @@ async function deleteAccountFlow(view, ctx, account) {
     await view?.refresh?.(true);
   } catch (err) {
     if (ctx && typeof ctx.toast?.error === 'function') ctx.toast.error('Could not delete the account', err);
+  }
+}
+
+/// Edit a deployment's vLLM settings and startup flags, regenerating the bundle.
+async function editDeploymentDialog(view, ctx, dep) {
+  const mod = await import('./gpu-setup-model.js').catch(() => null);
+  const wizard = freshWizard();
+  wizard.mod = mod ?? {};
+  wizard.view = view;
+  const values = {
+    providerId: dep?.providerId ?? '',
+    repo: dep?.repo ?? '',
+    gpu: dep?.gpu ?? '',
+    gpuCount: dep?.gpuCount ?? 1,
+    weightQuant: dep?.weightQuant ?? 'none',
+    kvCacheDtype: dep?.kvCacheDtype ?? 'auto',
+    maxModelLen: dep?.maxModelLen ?? '',
+    maxNumSeqs: dep?.maxNumSeqs ?? '',
+    shutdownCooldown: dep?.shutdownCooldownSecs ?? '',
+    baseUrl: dep?.baseUrl ?? '',
+    startupFlags: Array.isArray(dep?.startupFlags) ? dep.startupFlags.join('\n') : '',
+  };
+  const root = dialogRoot();
+  const state = { busy: false, error: null, result: null };
+
+  const done = contentDialog(root, 'Edit deployment', (body, close) => {
+    const fields = h('div', { class: 'form-fields' });
+    const actions = h('div', { class: 'dialog-actions' });
+
+    function textInput(name, { placeholder = '', type = 'text' } = {}) {
+      const input = h('input', {
+        class: 'input', type, name, placeholder, autocomplete: 'off', spellcheck: 'false',
+        oninput: (e) => { values[name] = e.target.value; },
+      });
+      input.dataset.field = name;
+      input.setAttribute('data-field', name);
+      return input;
+    }
+    function numberInput(name, { placeholder = '' } = {}) {
+      const input = h('input', {
+        class: 'input', type: 'number', name, placeholder, min: '0', step: '1', inputmode: 'numeric',
+        oninput: (e) => { values[name] = e.target.value; },
+      });
+      input.dataset.field = name;
+      input.setAttribute('data-field', name);
+      return input;
+    }
+
+    function paint() {
+      body.replaceChildren();
+      if (state.result) {
+        body.append(
+          h('h3', {}, 'Saved'),
+          kv([
+            ['Provider', state.result.providerId],
+            ['Bundle', state.result.bundleId],
+            ['Applies', state.result.appliesOn],
+          ]),
+          h('p', { class: 'hint' },
+            'The route stays live while the bundle is regenerated. Redeploy with the command shown in the deployment bundle view.'),
+          formActions(button('Done', () => close(true), { className: 'btn btn-primary' })),
+        );
+        return;
+      }
+      fields.replaceChildren(
+        field('Provider id', textInput('providerId', { readonly: true })),
+        field('Model (repo)', textInput('repo')),
+        field('GPU', textInput('gpu')),
+        field('GPU count', numberInput('gpuCount')),
+        field('Weight quant', textInput('weightQuant'), { hint: 'none, fp8, awq, …' }),
+        field('KV cache dtype', textInput('kvCacheDtype'), { hint: 'auto, fp8, bfloat16, …' }),
+        field('Max model len (blank = auto)', numberInput('maxModelLen')),
+        field('Max num seqs (blank = default)', numberInput('maxNumSeqs')),
+        field('Shutdown cooldown s (blank = default)', numberInput('shutdownCooldown')),
+        field('Endpoint URL override (blank = derive)', textInput('baseUrl'), { hint: 'Only needed when `modal deploy` printed a different URL.' }),
+        field('vLLM startup flags (one per line)',
+          h('textarea', {
+            class: 'input', rows: '5', 'data-field': 'startupFlags',
+            'aria-label': 'vLLM startup flags, one per line',
+            oninput: (e) => { values.startupFlags = e.target.value; },
+          }), { hint: 'Each line becomes one argument passed to `vllm serve` (e.g. --enable-prefix-caching, --gpu-memory-utilization 0.9, --max-num-batched-tokens).' }),
+      );
+      body.append(
+        h('p', { class: 'hint' },
+          'Changing the model, GPU or count revalidates against the catalog. Startup flags are passed verbatim after the generated vLLM arguments.'),
+        fields,
+      );
+      if (state.error) body.append(applyFieldErrors(body, state.error));
+      body.append(formActions(
+        ghostButton('Cancel', () => close(false)),
+        button(state.busy ? 'Saving…' : 'Save deployment', submit, {
+          className: 'btn btn-primary',
+          disabled: state.busy,
+        }),
+      ));
+    }
+    async function submit() {
+      if (state.busy) return;
+      state.error = null;
+      state.busy = true;
+      paint();
+      const deployment = {
+        repo: values.repo.trim(),
+        gpu: values.gpu.trim(),
+        gpu_count: Math.max(1, Math.trunc(Number(values.gpuCount) || 1)),
+        weight_quant: values.weightQuant.trim() || 'none',
+        kv_cache_dtype: values.kvCacheDtype.trim() || 'auto',
+      };
+      if (values.maxModelLen !== '') deployment.max_model_len = Math.max(0, Math.trunc(Number(values.maxModelLen) || 0));
+      if (values.maxNumSeqs !== '') deployment.max_num_seqs = Math.max(1, Math.trunc(Number(values.maxNumSeqs) || 1));
+      if (values.shutdownCooldown !== '') deployment.shutdown_cooldown_secs = Math.max(0, Math.trunc(Number(values.shutdownCooldown) || 0));
+      if (values.baseUrl.trim()) deployment.base_url = values.baseUrl.trim();
+      const flags = values.startupFlags.split('\n').map((s) => s.trim()).filter(Boolean);
+      if (flags.length) deployment.startup_flags = flags;
+      const payload = { action: 'update-deployment', provider_id: values.providerId, deployment };
+      try {
+        const response = objectOf(await api.post('/api/gpu/apply', payload)) ?? {};
+        state.result = {
+          providerId: asString(pick(response, 'provider_id')) || values.providerId,
+          bundleId: asString(pick(objectOf(response.bundle) ?? {}, 'id')),
+          appliesOn: asString(pick(response, 'applies_on')),
+        };
+        if (ctx && typeof ctx.toast?.success === 'function') ctx.toast.success('Deployment updated.');
+        await view?.refresh?.(true);
+      } catch (err) {
+        state.error = err;
+      } finally {
+        state.busy = false;
+        paint();
+      }
+    }
+
+    paint();
+  });
+  await done;
+}
+
+/// Delete a deployment after confirmation.
+async function deleteDeploymentFlow(view, ctx, dep) {
+  const ok = await (ctx.confirm ? ctx.confirm({
+    title: `Delete deployment “${dep.providerId}”?`,
+    message: 'The provider and route are removed. Any combo still using this provider must drop it '
+      + 'first.',
+    confirmLabel: 'Delete deployment',
+  }) : Promise.resolve(true));
+  if (!ok) return;
+  try {
+    const payload = { action: 'delete-deployment', provider_id: dep.providerId };
+    await api.post('/api/gpu/apply', payload);
+    if (ctx && typeof ctx.toast?.success === 'function') ctx.toast.success('Deployment deleted.');
+    await view?.refresh?.(true);
+  } catch (err) {
+    if (ctx && typeof ctx.toast?.error === 'function') ctx.toast.error('Could not delete the deployment', err);
   }
 }
 

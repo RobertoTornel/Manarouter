@@ -785,6 +785,10 @@ pub struct RentalDeployment {
     /// The sizing result the budget fields were derived from, kept for the same reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sizing: Option<Box<SizingResult>>,
+    /// Extra vLLM startup flags, one per command-line argument, passed through to the generated
+    /// app's launch command (for example `--enable-prefix-caching`, `--gpu-memory-utilization`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub startup_flags: Vec<String>,
     /// Fields this binary does not know about, preserved verbatim on round-trip.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -819,6 +823,7 @@ impl RentalDeployment {
             requantize: None,
             architecture: None,
             sizing: None,
+            startup_flags: Vec::new(),
             extra: Map::new(),
         }
     }

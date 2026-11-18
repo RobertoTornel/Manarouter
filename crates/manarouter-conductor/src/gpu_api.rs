@@ -1533,6 +1533,8 @@ async fn post_apply(
         Some("delete-account") => delete_account(&state, &map).await.map(Json),
         Some("create-hf-token") => create_hf_token(&state, &map).await.map(Json),
         Some("create-deployment") => create_deployment(&state, &map).await.map(Json),
+        Some("update-deployment") => update_deployment(&state, &map).await.map(Json),
+        Some("delete-deployment") => delete_deployment(&state, &map).await.map(Json),
         Some(other) => Err(ApiError::bad(
             "invalid_body",
             format!(
@@ -2068,6 +2070,387 @@ async fn delete_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
         "restart_pending": state.restart.is_pending(),
         "applies_on": "immediately",
     }))
+}
+
+/// Update a deployment's editable fields, re-generating the bundle and the provider in place.
+///
+/// Editing is identity-preserving: the provider id (derived from account+repo+mode+gpu count)
+/// stays the same, so the running relay keeps its route while the bundle and base URL are
+/// regenerated. `startup_flags`, `max_model_len`, `max_num_seqs`, `kv_cache_dtype`,
+/// `weight_quant`, `shutdown_cooldown_secs` and `base_url` are patchable; `accounts` may be
+/// replaced wholesale (the provider's account set is rebuilt from it).
+async fn update_deployment(state: &AppState, map: &Map<String, Value>) -> ApiResult<Value> {
+    let provider_id = match string_field(map, "provider_id") {
+        Some(id) => id,
+        None => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "the deployment needs a `provider_id` naming the provider to update",
+            ))
+        }
+    };
+
+    let guard = state.mutation_lock.lock().await;
+    let current = state.current_config().await;
+    let provider_index = current
+        .providers
+        .iter()
+        .position(|p| p.id.as_ref() == provider_id)
+        .ok_or_else(|| {
+            ApiError::not_found(format!("there is no provider with id `{provider_id}`"))
+        })?;
+
+    // The current deployment record is the base; edits are layered on top.
+    let mut provider = current.providers[provider_index].clone();
+    let mut deployment = parse_deployment(provider.id.as_ref(), &provider.extra)
+        .map_err(|e| ApiError::internal(format!("the deployment record could not be read: {e}")))?
+        .ok_or_else(|| {
+            ApiError::bad(
+                "not_a_rental_deployment",
+                format!("provider `{provider_id}` is not a rental deployment"),
+            )
+        })?;
+
+    let deployment_map = object_body(
+        map.get("deployment").cloned().unwrap_or(Value::Null),
+        "deployment",
+    )?;
+
+    if let Some(repo) = string_field(&deployment_map, "repo") {
+        if let Some(problem) = repo_problem(&repo) {
+            return Err(ApiError::bad("invalid_body", problem));
+        }
+        deployment.repo = repo;
+    }
+    if let Some(revision) = string_field(&deployment_map, "revision") {
+        deployment.revision = Some(revision);
+    }
+    if let Some(gpu_id) = string_field(&deployment_map, "gpu") {
+        let Some(gpu) = gpu_by_id(&gpu_id) else {
+            return Err(ApiError::bad(
+                "invalid_body",
+                format!("`{gpu_id}` is not a GPU id in the catalog"),
+            ));
+        };
+        deployment.gpu = gpu_id;
+        deployment.gpu_count = deployment_map
+            .get("gpu_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::from(deployment.gpu_count))
+            .max(1) as u32;
+        if u64::from(deployment.gpu_count) > u64::from(gpu.max_gpus_per_container) {
+            return Err(ApiError::bad(
+                "invalid_body",
+                format!(
+                    "`gpu_count` is {}, but this platform allows at most {} per container",
+                    deployment.gpu_count, gpu.max_gpus_per_container
+                ),
+            ));
+        }
+    } else if let Some(count) = deployment_map.get("gpu_count") {
+        let count = count.as_u64().unwrap_or(1).max(1);
+        let gpu = gpu_by_id(&deployment.gpu).ok_or_else(|| {
+            ApiError::bad("invalid_body", "the deployment's GPU is not in the catalog")
+        })?;
+        if count > u64::from(gpu.max_gpus_per_container) {
+            return Err(ApiError::bad(
+                "invalid_body",
+                format!(
+                    "`gpu_count` is {count}, but this platform allows at most {} per container",
+                    gpu.max_gpus_per_container
+                ),
+            ));
+        }
+        deployment.gpu_count = count as u32;
+    }
+    if let Some(quant) = string_field(&deployment_map, "weight_quant") {
+        deployment.weight_quant = quant;
+    }
+    if let Some(dtype) = string_field(&deployment_map, "kv_cache_dtype") {
+        deployment.kv_cache_dtype = dtype;
+    }
+    if let Some(len) = deployment_map.get("max_model_len") {
+        if len.is_null() {
+            deployment.max_model_len = None;
+        } else if let Some(value) = len.as_u64() {
+            deployment.max_model_len = Some(value);
+        } else {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "`max_model_len` must be a non-negative integer or null",
+            ));
+        }
+    }
+    if let Some(seqs) = deployment_map.get("max_num_seqs") {
+        if seqs.is_null() {
+            deployment.max_num_seqs = None;
+        } else if let Some(value) = seqs.as_u64() {
+            deployment.max_num_seqs = Some(value.min(u64::from(u32::MAX)) as u32);
+        } else {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "`max_num_seqs` must be a non-negative integer or null",
+            ));
+        }
+    }
+    if let Some(cooldown) = deployment_map.get("shutdown_cooldown_secs") {
+        if cooldown.is_null() {
+            deployment.shutdown_cooldown_secs = None;
+        } else if let Some(value) = cooldown.as_u64() {
+            deployment.shutdown_cooldown_secs = Some(value.min(u64::from(u32::MAX)) as u32);
+        } else {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "`shutdown_cooldown_secs` must be an integer or null",
+            ));
+        }
+    }
+    if let Some(flags) = deployment_map.get("startup_flags") {
+        if let Some(items) = flags.as_array() {
+            deployment.startup_flags = items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|flag| !flag.is_empty())
+                .map(str::to_owned)
+                .collect();
+        } else {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "`startup_flags` must be a list of command-line flags",
+            ));
+        }
+    }
+
+    // Re-validate the GPU/quant/dtype choices against the catalog.
+    let gpu = gpu_by_id(&deployment.gpu).ok_or_else(|| {
+        ApiError::bad("invalid_body", "the deployment's GPU is not in the catalog")
+    })?;
+    check_quant_and_dtype(&gpu, &deployment.weight_quant, &deployment.kv_cache_dtype)?;
+
+    let review = deployment.problems();
+    if !review.is_empty() {
+        let details: Vec<Value> = review
+            .iter()
+            .map(|(field, message)| json!({"field": field, "message": message}))
+            .collect();
+        return Err(ApiError::bad(
+            "invalid_body",
+            "the deployment is not consistent with the catalog",
+        )
+        .with_details(details));
+    }
+
+    let bundle = deployment_bundle(&provider.id.as_str().to_owned(), &deployment, gpu);
+    deployment.bundle_id = Some(bundle.id.clone());
+
+    // Rebuild the provider's account set from the deployment's account list.
+    let account_ids: Vec<String> = match map.get("accounts") {
+        Some(Value::Array(items)) if !items.is_empty() => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        _ => vec![deployment.account.clone()],
+    };
+    let mut accounts: Vec<&RentalAccount> = Vec::new();
+    let mut credential_ids: Vec<String> = Vec::new();
+    {
+        let vault = state.vault.lock().await;
+        for id in &account_ids {
+            let account = rental_accounts(&current)
+                .iter()
+                .find(|a| a.id == *id)
+                .ok_or_else(|| {
+                    ApiError::not_found(format!("there is no rental account with id `{id}`"))
+                })?;
+            if account.platform != RentalPlatform::Modal {
+                return Err(ApiError::bad(
+                    "unsupported_platform",
+                    format!("account `{id}` is not a modal account"),
+                ));
+            }
+            let credential_id = account
+                .secret_ref
+                .clone()
+                .unwrap_or_else(|| rental_credential_id(&account.id));
+            if !vault.contains(&credential_id) {
+                return Err(ApiError::bad(
+                    "missing_credential",
+                    format!(
+                        "rental account `{id}` has no credential at `{credential_id}` in the vault"
+                    ),
+                ));
+            }
+            credential_ids.push(credential_id);
+            accounts.push(account);
+        }
+    }
+
+    let extra = deployment
+        .to_extra_value()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    provider
+        .extra
+        .insert(mr_core::rental::RENTAL_EXTRA_KEY.to_owned(), extra);
+
+    if let Some(url) = string_field(&deployment_map, "base_url") {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "`base_url` must start with `http://` or `https://`",
+            ));
+        }
+        provider.base_url = url;
+    }
+    provider.accounts.clear();
+    for (rental, credential_id) in accounts.iter().zip(credential_ids.iter()) {
+        let mut account_row = mr_core::Account::new(rental.label.clone());
+        account_row.secret_ref = Some(credential_id.clone());
+        account_row.max_concurrent = 1;
+        provider.accounts.push(account_row);
+    }
+
+    let mut next = current.clone();
+    next.providers[provider_index] = provider.clone();
+    let restart_reason = change_needs_restart(&current, &next);
+    if let Err(error) = state.commit_locked(next).await {
+        return Err(error.into());
+    }
+    drop(guard);
+    if let Some(_reason) = restart_reason {
+        state.restart.request();
+    }
+
+    Ok(json!({
+        "action": "update-deployment",
+        "provider_id": provider.id.as_str(),
+        "deployment": {
+            "account": deployment.account,
+            "repo": deployment.repo,
+            "gpu": deployment.gpu,
+            "gpu_count": deployment.gpu_count,
+            "bundle_id": bundle.id,
+        },
+        "bundle": {
+            "id": bundle.id,
+            "filename": bundle.filename,
+            "command": bundle.command,
+        },
+        "restart_pending": state.restart.is_pending(),
+        "applies_on": if restart_reason.is_some() { "restart" } else { "immediately" },
+    }))
+}
+
+/// Delete a deployment: removes the derived provider (and thus the route) from the config.
+async fn delete_deployment(state: &AppState, map: &Map<String, Value>) -> ApiResult<Value> {
+    let provider_id = match string_field(map, "provider_id") {
+        Some(id) => id,
+        None => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "the deployment needs a `provider_id` naming the provider to delete",
+            ))
+        }
+    };
+
+    let guard = state.mutation_lock.lock().await;
+    let current = state.current_config().await;
+    let provider_index = current
+        .providers
+        .iter()
+        .position(|p| p.id.as_ref() == provider_id)
+        .ok_or_else(|| {
+            ApiError::not_found(format!("there is no provider with id `{provider_id}`"))
+        })?;
+    let provider = &current.providers[provider_index];
+    let deployment = parse_deployment(provider.id.as_ref(), &provider.extra)
+        .map_err(|e| ApiError::internal(format!("the deployment record could not be read: {e}")))?
+        .ok_or_else(|| {
+            ApiError::bad(
+                "not_a_rental_deployment",
+                format!("provider `{provider_id}` is not a rental deployment"),
+            )
+        })?;
+
+    // Do not remove a provider a combo still routes through.
+    let in_combo = current.combos.iter().any(|combo| {
+        combo
+            .steps
+            .iter()
+            .any(|step| step.provider.as_str() == provider_id)
+    });
+    if in_combo {
+        return Err(ApiError::bad(
+            "provider_in_use",
+            format!(
+                "provider `{provider_id}` is still a step of a combo; remove it from the combo \
+                 before deleting the deployment"
+            ),
+        ));
+    }
+
+    let mut next = current.clone();
+    next.providers.remove(provider_index);
+    if let Err(error) = state.commit_locked(next).await {
+        return Err(error.into());
+    }
+    drop(guard);
+
+    Ok(json!({
+        "action": "delete-deployment",
+        "deleted": provider_id,
+        "deployment": {
+            "account": deployment.account,
+            "repo": deployment.repo,
+        },
+        "restart_pending": state.restart.is_pending(),
+        "applies_on": "immediately",
+    }))
+}
+
+/// Validate a weight-quant and KV-cache-dtype combo against a GPU.
+fn check_quant_and_dtype(gpu: &GpuSpec, weight_quant: &str, kv_cache_dtype: &str) -> ApiResult<()> {
+    if weight_quant != "none" {
+        match resolve_quant_for(gpu, weight_quant) {
+            Some(verdict) => match verdict.support {
+                QuantSupport::Unsupported => {
+                    return Err(ApiError::bad(
+                        "unsupported_quantization",
+                        format!("{} cannot run `{weight_quant}`: {}", gpu.id, verdict.reason),
+                    ))
+                }
+                _ => {}
+            },
+            None => {
+                return Err(ApiError::bad(
+                    "invalid_body",
+                    format!("`{weight_quant}` is not a quantisation id in the catalog"),
+                ))
+            }
+        }
+    }
+    match resolve_kv_dtype_for(gpu, kv_cache_dtype) {
+        Some(verdict) => match verdict.support {
+            QuantSupport::Unsupported => {
+                return Err(ApiError::bad(
+                    "unsupported_kv_cache_dtype",
+                    format!(
+                        "{} cannot use `{kv_cache_dtype}`: {}",
+                        gpu.id, verdict.reason
+                    ),
+                ))
+            }
+            _ => {}
+        },
+        None => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                format!("`{kv_cache_dtype}` is not a KV-cache dtype in the catalog"),
+            ))
+        }
+    }
+    Ok(())
 }
 
 /// Create a Hugging Face token, or replace the value of one that already exists.
@@ -2669,6 +3052,19 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
     deployment.batch = batch;
     deployment.requantize = requantize;
     deployment.sizing = sizing;
+    deployment.startup_flags = deployment_map
+        .get("startup_flags")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|flag| !flag.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let review = deployment.problems();
     if !review.is_empty() {
         let details: Vec<Value> = review
@@ -2990,6 +3386,23 @@ fn deployment_bundle(provider_id: &str, deployment: &RentalDeployment, gpu: &Gpu
         Some(seqs) => format!("        \"--max-num-seqs\",\n        \"{seqs}\",\n"),
         None => String::new(),
     };
+    // Operator-supplied vLLM startup flags: each entry becomes one command-line argument, passed
+    // through verbatim after the generated ones so an explicit flag can override a default.
+    let startup_flags_args = {
+        let mut out = String::new();
+        for flag in &deployment.startup_flags {
+            let flag = flag.trim();
+            if flag.is_empty() {
+                continue;
+            }
+            if flag.starts_with(['-', '=']) || flag.contains(' ') || flag.contains('"') {
+                out.push_str(&format!("        {},\n", py_str(flag)));
+            } else {
+                out.push_str(&format!("        \"{flag}\",\n"));
+            }
+        }
+        out
+    };
 
     // What the recorded mode means for this file, in the file. A batch deployment gets the queue
     // that decides when a batch ships, and the file says so; a streaming deployment keeps serving
@@ -3123,7 +3536,7 @@ def serve() -> None:
         {vllm_port_arg},
         "--served-model-name",
         MODEL,
-{quant_args}{kv_args}{max_len_args}{max_seqs_args}    ]
+{quant_args}{kv_args}{max_len_args}{max_seqs_args}{startup_flags_args}    ]
 {serve_tail}
 "#,
         filename = "modal_app.py",
@@ -3139,6 +3552,7 @@ def serve() -> None:
         kv_args = kv_args,
         max_len_args = max_len_args,
         max_seqs_args = max_seqs_args,
+        startup_flags_args = startup_flags_args,
         batch_block = batch_block,
         max_inputs = max_inputs,
         vllm_port_arg = vllm_port_arg,
