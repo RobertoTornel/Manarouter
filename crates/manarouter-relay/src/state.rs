@@ -245,6 +245,8 @@ pub struct KeyEntry {
     pub allow_models: Vec<String>,
     /// Routes this key may use. Empty means any.
     pub allow_routes: Vec<String>,
+    /// Combos this key may use, by id or name. Empty means any.
+    pub allow_combos: Vec<String>,
     /// The flat, non-rolling request budget. Zero means unlimited.
     ///
     /// It travels with the key because the relay has to be able to answer "may this key make this
@@ -289,6 +291,7 @@ impl KeyEntry {
             hash,
             allow_models: key.allow_models.clone(),
             allow_routes: key.allow_routes.clone(),
+            allow_combos: key.allow_combos.clone(),
             limit_requests: key.limit_requests,
             limits: Arc::new(key.limits),
         })
@@ -644,6 +647,7 @@ mod tests {
             enabled,
             allow_models: Vec::new(),
             allow_routes: Vec::new(),
+            allow_combos: Vec::new(),
             limit_requests: 0,
             limits: Default::default(),
             note: None,
@@ -657,6 +661,7 @@ mod tests {
             hash: RelayState::hash_presented(key),
             allow_models: Vec::new(),
             allow_routes: Vec::new(),
+            allow_combos: Vec::new(),
             limit_requests: 0,
             limits: Arc::new(Default::default()),
         }

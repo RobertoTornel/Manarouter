@@ -659,6 +659,8 @@ export function buildOAuthAccountForm(p, ctx, onConnected, isDrawerOpen = () => 
 
 export async function renderProviders(mount, ctx) {
   let providers = [];
+  // Last "test all keys" verdict per provider id: { state: 'testing'|'ok'|'failed', detail }.
+  const keyTests = new Map();
   let drawerId = null;
   let drawerOpen = false;
   // True only while the inline provider detail is the panel in workWrap. The form and account
@@ -695,6 +697,7 @@ export async function renderProviders(mount, ctx) {
   let detailRow = null;
   const count = h('span', { class: 'count provider-count', 'aria-live': 'polite' });
   const newBtn = h('button', { class: 'btn btn-primary provider-add', type: 'button' }, icon('plus'), 'Add provider');
+  const testAllBtn = h('button', { class: 'btn btn-sm provider-test-all', type: 'button' }, icon('bolt'), 'Test all keys');
   // Per-account quota cache: key = "providerId|accountId" -> { remaining, total, windows, error, fetched_at }
   const quotaCache = new Map();
   let quotaLoaded = false;
@@ -764,6 +767,7 @@ export async function renderProviders(mount, ctx) {
       sortControl,
       h('span', { class: 'toolbar-divider', 'aria-hidden': 'true' }),
       refreshBtn,
+      testAllBtn,
       newBtn));
 
   mount.replaceChildren(toolbar, tableWrap, listFoot);
@@ -851,6 +855,65 @@ export async function renderProviders(mount, ctx) {
 
   sortSel.addEventListener('change', () => switchSort(sortSel.value));
   newBtn.addEventListener('click', () => { void openFormDrawer(null); });
+
+  /// Paint the per-provider verdict chip of the "test all keys" sweep.
+  function paintTestChip(providerId, verdict) {
+    keyTests.set(providerId, verdict);
+    const row = tableWrap.querySelector(`tr[data-provider-id="${CSS.escape(providerId)}"]`);
+    const chip = row?.querySelector('[data-test-chip]');
+    if (!chip) return;
+    chip.textContent = verdict.state === 'testing' ? 'Testing…'
+      : verdict.state === 'ok' ? 'key OK'
+        : 'key failed';
+    chip.className = 'provider-test-chip is-' + verdict.state;
+    chip.hidden = false;
+    chip.title = verdict.detail ?? '';
+  }
+
+  /// Test one enabled account path per provider, through the relay's loopback probe.
+  ///
+  /// The probe picks the provider's first enabled account and sends a tiny completion against its
+  /// first model, so "key OK" means the credential + routing for that provider answered.
+  async function testAllKeys() {
+    const targets = providers.filter((p) =>
+      Array.isArray(p.accounts) && p.accounts.some((a) => a && a.enabled !== false)
+      && Array.isArray(p.models) && p.models.length > 0);
+    if (!targets.length) {
+      ctx.toast.info('No provider has both an enabled account and a model to test.');
+      return;
+    }
+    testAllBtn.disabled = true;
+    let ok = 0;
+    let failed = 0;
+    for (const p of targets) {
+      paintTestChip(p.id, { state: 'testing' });
+      try {
+        const started = performance.now();
+        const result = await api.post('/api/models/test', {
+          provider: p.id,
+          model: p.models[0].id,
+          prompt: 'Reply with the single word OK.',
+        }, { skipAuthRedirect: true });
+        const ms = Math.round(performance.now() - started);
+        const answer = typeof result?.response === 'string' ? result.response.trim() : '';
+        paintTestChip(p.id, {
+          state: 'ok',
+          detail: `Answered in ${ms} ms${answer ? `: ${answer.slice(0, 120)}` : ''}`,
+        });
+        ok += 1;
+      } catch (err) {
+        paintTestChip(p.id, { state: 'failed', detail: err?.message ?? 'the request failed' });
+        failed += 1;
+      }
+    }
+    testAllBtn.disabled = false;
+    if (failed > 0) {
+      ctx.toast.warning(`Test all keys: ${ok} OK, ${failed} failed.`);
+    } else {
+      ctx.toast.success(`Test all keys: ${ok} providers answered.`);
+    }
+  }
+  testAllBtn.addEventListener('click', () => { void testAllKeys(); });
   refreshBtn.addEventListener('click', () => reload(true));
 
   // Out-of-band writes have to reach this table on their own.
@@ -1104,7 +1167,8 @@ export async function renderProviders(mount, ctx) {
           h('span', { class: 'provider-disclosure', 'aria-hidden': 'true' }, h('span', { class: 'provider-chevron' })),
           h('span', { class: 'provider-name', title: name }, name),
           h('span', { class: 'provider-id mono', title: 'Provider ID: ' + p.id }, p.id),
-          copyIdButton(p.id)),
+          copyIdButton(p.id),
+          h('span', { class: 'provider-test-chip', 'data-test-chip': '', hidden: true })),
         h('div', { class: 'provider-sub' },
           showDialect
             ? h('span', { class: 'provider-dialect', title: 'API dialect' }, dialect)

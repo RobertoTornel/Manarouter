@@ -65,6 +65,9 @@ pub struct CreateArgs {
     /// Restrict to these routes (`chat.completions`, ...).
     #[arg(long = "allow-routes", value_name = "ROUTES")]
     pub allow_routes: Vec<String>,
+    /// Restrict to these combos (by name or id; comma-separated or repeated).
+    #[arg(long = "allow-combos", value_name = "COMBOS")]
+    pub allow_combos: Vec<String>,
     /// Per-key request budget (0 = unlimited).
     #[arg(long, value_name = "N")]
     pub limit_requests: Option<u64>,
@@ -222,6 +225,28 @@ fn build_key(cfg: &Config, args: &CreateArgs) -> Result<(ClientKey, String), Cli
         }
     }
 
+    let mut allow_combos: Vec<String> = Vec::new();
+    for spec in &args.allow_combos {
+        for piece in spec.split(',') {
+            let piece = piece.trim();
+            if piece.is_empty() {
+                continue;
+            }
+            let known = cfg
+                .combos
+                .iter()
+                .any(|combo| combo.name == piece || combo.id.as_str() == piece);
+            if !known {
+                return Err(CliError::validation(format!(
+                    "--allow-combos: no combo named or identified by \"{piece}\" is configured"
+                )));
+            }
+            if !allow_combos.iter().any(|c| c == piece) {
+                allow_combos.push(piece.to_owned());
+            }
+        }
+    }
+
     let plaintext = generate_client_key();
     let key = ClientKey {
         id: ClientKeyId::generate(),
@@ -231,6 +256,7 @@ fn build_key(cfg: &Config, args: &CreateArgs) -> Result<(ClientKey, String), Cli
         enabled: true,
         allow_models,
         allow_routes,
+        allow_combos,
         limit_requests: args.limit_requests.unwrap_or(0),
         limits: Default::default(),
         note: args.note.clone(),
@@ -343,7 +369,7 @@ fn list(ctx: &Ctx) -> Result<(), CliError> {
         return print_json(&rows);
     }
     let mut t = Table::new([
-        "ID", "LABEL", "PREFIX", "MODELS", "ROUTES", "LIMIT", "ENABLED",
+        "ID", "LABEL", "PREFIX", "MODELS", "ROUTES", "COMBOS", "LIMIT", "ENABLED",
     ]);
     for k in &cfg.client_keys {
         t.row(vec![
@@ -359,6 +385,11 @@ fn list(ctx: &Ctx) -> Result<(), CliError> {
                 "(all)".to_owned()
             } else {
                 k.allow_routes.join(", ")
+            },
+            if k.allow_combos.is_empty() {
+                "(all)".to_owned()
+            } else {
+                k.allow_combos.join(", ")
             },
             if k.limit_requests == 0 {
                 "unlimited".to_owned()
@@ -530,6 +561,7 @@ mod tests {
             enabled: true,
             allow_models: vec!["gpt-5.5".into()],
             allow_routes: vec![],
+            allow_combos: vec![],
             limit_requests: 0,
             limits: Default::default(),
             note: None,
@@ -550,6 +582,7 @@ mod tests {
             print: false,
             allow_models: vec![],
             allow_routes: vec!["chat.completions".into(), "responses".into(), "chat".into()],
+            allow_combos: vec![],
             limit_requests: None,
             note: None,
         };
@@ -567,6 +600,7 @@ mod tests {
         // An unknown route is a usage error listing the choices.
         let args = CreateArgs {
             allow_routes: vec!["telepathy".into()],
+            allow_combos: vec![],
             ..args
         };
         let err = build_key(&cfg, &args).unwrap_err();
@@ -615,6 +649,7 @@ mod tests {
             print: false,
             allow_models: vec!["ghost-model".into()],
             allow_routes: vec![],
+            allow_combos: vec![],
             limit_requests: None,
             note: None,
         };
@@ -628,6 +663,7 @@ mod tests {
             print: false,
             allow_models: vec!["gpt-*".into(), "o3-*, o4-*".into(), "gpt-*".into()],
             allow_routes: vec![],
+            allow_combos: vec![],
             limit_requests: None,
             note: None,
         };
@@ -646,6 +682,7 @@ mod tests {
                     print: false,
                     allow_models: vec![],
                     allow_routes: vec![],
+                    allow_combos: vec![],
                     limit_requests: None,
                     note: None,
                 },
@@ -673,6 +710,7 @@ mod tests {
                 print: false,
                 allow_models: vec![],
                 allow_routes: vec!["chat".into()],
+                allow_combos: vec![],
                 limit_requests: Some(500),
                 note: Some("coding".into()),
             };
@@ -711,6 +749,7 @@ mod tests {
                     print: false,
                     allow_models: vec!["gpt-*".into()],
                     allow_routes: vec!["chat".into()],
+                    allow_combos: vec![],
                     limit_requests: Some(9),
                     note: Some("test".into()),
                 },
@@ -751,6 +790,7 @@ mod tests {
                         print: false,
                         allow_models: vec![],
                         allow_routes: vec![],
+                        allow_combos: vec![],
                         limit_requests: None,
                         note: None,
                     },

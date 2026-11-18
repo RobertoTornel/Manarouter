@@ -3971,6 +3971,7 @@ mod tests {
             enabled: true,
             allow_models: vec!["alpha/*".into()],
             allow_routes: vec!["chat".into()],
+            allow_combos: Vec::new(),
             limit_requests: 999,
             limits: KeyLimits {
                 session_5h: Some(KeyLimit {

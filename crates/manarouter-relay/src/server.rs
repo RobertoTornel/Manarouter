@@ -603,12 +603,74 @@ async fn list_models(State(app): State<AppState>, headers: HeaderMap) -> Respons
     }
 
     let table = app.relay.table();
-    let data = model_listing(&table.snapshot);
+    let data = match &auth {
+        AuthOutcome::Ok(key) => model_listing(&table.snapshot)
+            .into_iter()
+            .filter(|row| {
+                row.get("id")
+                    .and_then(|id| id.as_str())
+                    .is_some_and(|id| key_can_see_model(&table.snapshot, key, id))
+            })
+            .collect::<Vec<_>>(),
+        _ => model_listing(&table.snapshot),
+    };
 
     json_response(
         StatusCode::OK,
         serde_json::json!({ "object": "list", "data": data }),
     )
+}
+
+/// Whether a scoped key may see a row of the model listing.
+///
+/// A key scoped to combos sees only the combos it names (their plain id and every level variant)
+/// plus the models those combos' steps serve. A key with `allow_models` sees only matching ids.
+/// Both scopes may be combined; empty scopes mean no restriction.
+fn key_can_see_model(
+    snapshot: &mr_core::snapshot::RoutingSnapshot,
+    key: &crate::state::KeyEntry,
+    id: &str,
+) -> bool {
+    if key.allow_combos.is_empty() && key.allow_models.is_empty() {
+        return true;
+    }
+    let combo_ok = if key.allow_combos.is_empty() {
+        true
+    } else {
+        snapshot.combos().iter().any(|plan| {
+            let scoped = key
+                .allow_combos
+                .iter()
+                .any(|scope| scope == plan.id.as_str() || scope == plan.name.as_str());
+            if !scoped {
+                return false;
+            }
+            if id == plan.name.as_str() {
+                return true;
+            }
+            id.strip_prefix(&format!("{}-", plan.name))
+                .is_some_and(|suffix| {
+                    combo_listed_levels(plan)
+                        .iter()
+                        .any(|level| level.as_str() == suffix)
+                })
+                || plan.steps.iter().any(|step| {
+                    step.model == id
+                        || snapshot
+                            .providers()
+                            .get(step.provider_index as usize)
+                            .is_some_and(|provider| format!("{}/{}", provider.id, step.model) == id)
+                })
+        })
+    };
+    if !combo_ok {
+        return false;
+    }
+    key.allow_models.is_empty()
+        || key
+            .allow_models
+            .iter()
+            .any(|pattern| mr_core::model::glob_match(pattern, id) || pattern == "*")
 }
 
 /// `GET /v1/models/{model}`.
@@ -633,6 +695,18 @@ async fn retrieve_model(
     // A wildcard capture may keep the separator that the route pattern consumed; the listing never
     // contains it, so the name is compared without it either way.
     let model = model.strip_prefix('/').unwrap_or(&model);
+    let scoped = match &auth {
+        AuthOutcome::Ok(key) => !key_can_see_model(&table.snapshot, key, model),
+        _ => false,
+    };
+    if scoped {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            Dialect::OpenAi,
+            "model_not_found",
+            &format!("the model \"{model}\" is not in this key's scope"),
+        );
+    }
     match model_listing(&table.snapshot)
         .into_iter()
         .find(|row| row.get("id").and_then(|id| id.as_str()) == Some(model))
@@ -2226,6 +2300,33 @@ async fn dispatch_routed(
                 "model_not_found",
                 &reason,
             );
+        }
+    }
+
+    // A combo-scoped key may only address one of its combos. A direct provider/model request is
+    // outside every combo scope and is refused; the error names the scopes so the operator sees the
+    // key's intent rather than a mysterious 403.
+    if let AuthOutcome::Ok(key) = &auth {
+        if !key.allow_combos.is_empty() {
+            let allowed = match (&combo, &direct) {
+                (Some(plan), None) => key
+                    .allow_combos
+                    .iter()
+                    .any(|scope| scope == plan.id.as_str() || scope == plan.name.as_str()),
+                (None, Some(_)) | (Some(_), Some(_)) => false,
+                (None, None) => true,
+            };
+            if !allowed {
+                return error_response(
+                    StatusCode::FORBIDDEN,
+                    client_dialect,
+                    "key_scope_refused",
+                    &format!(
+                        "this client key is scoped to the combos: {}",
+                        key.allow_combos.join(", ")
+                    ),
+                );
+            }
         }
     }
 
@@ -10359,6 +10460,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 enabled: true,
                 allow_models: Vec::new(),
                 allow_routes: Vec::new(),
+                allow_combos: Vec::new(),
                 limit_requests: budget,
                 limits: Default::default(),
                 note: None,
@@ -11980,6 +12082,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 enabled: true,
                 allow_models: Vec::new(),
                 allow_routes: Vec::new(),
+                allow_combos: Vec::new(),
                 // No caps: the point is that usage is recorded even when nothing is enforced.
                 limit_requests: 0,
                 limits: Default::default(),
@@ -12111,6 +12214,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 enabled: true,
                 allow_models: Vec::new(),
                 allow_routes: Vec::new(),
+                allow_combos: Vec::new(),
                 limit_requests: 0,
                 limits: Default::default(),
                 note: None,
@@ -13941,6 +14045,139 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         let closed = activity.snapshot();
         assert!(closed[0].finished_at.is_some(), "the body was dropped");
         assert_eq!(closed[0].outcome, Some(crate::activity::Outcome::Ok));
+    }
+
+    #[tokio::test]
+    async fn a_combo_scoped_key_sees_only_its_combo_and_is_refused_beyond_it() {
+        let (url, _seen) = auth_recording_upstream().await;
+
+        let mut alpha = mr_core::model::Provider::new("alpha", Dialect::OpenAi, &url);
+        let mut account = mr_core::model::Account::new("a");
+        account.secret_ref = Some("a-credential".to_owned());
+        alpha.accounts = vec![account];
+        let mut shared = dm();
+        shared.id = "shared-model".to_owned();
+        shared.input_modalities = vec![InputModality::Text];
+        alpha.models = vec![shared];
+
+        let mut beta = mr_core::model::Provider::new("beta", Dialect::OpenAi, &url);
+        let mut baccount = mr_core::model::Account::new("b");
+        baccount.secret_ref = Some("b-credential".to_owned());
+        beta.accounts = vec![baccount];
+        let mut other = dm();
+        other.id = "other".to_owned();
+        other.input_modalities = vec![InputModality::Text];
+        beta.models = vec![other];
+
+        let combo = mr_core::model::Combo::new(
+            "chain",
+            mr_core::model::ComboStep::new("alpha", "shared-model"),
+        );
+
+        let presented = "mr-test-key";
+        let key_hash: String = RelayState::hash_presented(presented)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let config = mr_core::config::Config {
+            providers: vec![alpha, beta],
+            combos: vec![combo],
+            client_keys: vec![mr_core::model::ClientKey {
+                id: mr_core::ids::ClientKeyId::from_raw("key-scoped"),
+                label: "combo-scoped".to_owned(),
+                key_hash,
+                prefix: Some("mr-test".to_owned()),
+                enabled: true,
+                allow_models: Vec::new(),
+                allow_routes: Vec::new(),
+                allow_combos: vec!["chain".to_owned()],
+                limit_requests: 0,
+                limits: Default::default(),
+                note: None,
+            }],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("a-credential", "sk-a").unwrap();
+        opened.put("b-credential", "sk-b").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: false,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str("Bearer mr-test-key").unwrap(),
+        );
+
+        // The scoped visibility rule: the combo itself, its step's model are visible; the
+        // out-of-scope provider model is not.
+        let snapshot = state.relay.table().snapshot.clone();
+        let key = crate::state::KeyEntry::from_config(&config.client_keys[0]).expect("the key");
+        assert!(key_can_see_model(&snapshot, &key, "chain"));
+        assert!(key_can_see_model(&snapshot, &key, "shared-model"));
+        assert!(key_can_see_model(&snapshot, &key, "alpha/shared-model"));
+        assert!(!key_can_see_model(&snapshot, &key, "beta/other"));
+
+        // A direct, out-of-scope model is refused for this key.
+        let refused = dispatch(
+            state.clone(),
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers.clone(),
+            AxumBody::from(chat_body("beta/other")),
+        )
+        .await;
+        let refused_status = refused.status();
+        if refused_status != StatusCode::FORBIDDEN {
+            let body = axum::body::to_bytes(refused.into_body(), usize::MAX)
+                .await
+                .expect("read the refusal body");
+            panic!(
+                "out-of-scope request returned {refused_status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        // The scoped combo serves fine.
+        let served = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers,
+            AxumBody::from(chat_body("chain")),
+        )
+        .await;
+        if served.status() != StatusCode::OK {
+            let body = axum::body::to_bytes(served.into_body(), usize::MAX)
+                .await
+                .expect("read the refusal body");
+            panic!(
+                "scoped combo request failed: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
     }
 
     #[tokio::test]

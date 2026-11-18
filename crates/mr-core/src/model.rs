@@ -446,7 +446,7 @@ pub fn account_selector_matches(selector: &str, account: &Account) -> bool {
 /// Deliberately not a regex: this runs while compiling a snapshot, and a full regex engine would be
 /// a large dependency for what is always a prefix match in practice (`claude-*`, `gpt-*`). A
 /// mid-string `*` is treated literally.
-fn glob_match(pattern: &str, value: &str) -> bool {
+pub fn glob_match(pattern: &str, value: &str) -> bool {
     match pattern.strip_suffix('*') {
         Some(prefix) => value.starts_with(prefix),
         None => pattern == value,
@@ -1823,6 +1823,12 @@ pub struct ClientKey {
     /// If non-empty, the key may only call these routes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_routes: Vec<String>,
+    /// If non-empty, the key may only call these combos (matched against the combo's id or name).
+    ///
+    /// A combo-scoped key cannot address a provider/model directly, and `GET /v1/models` shows
+    /// only the models reachable through the scoped combos.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_combos: Vec<String>,
     /// Per-key request budget. Zero means unlimited.
     #[serde(default)]
     pub limit_requests: u64,
@@ -2601,6 +2607,7 @@ mod tests {
             enabled: true,
             allow_models: vec!["claude-*".into()],
             allow_routes: vec!["messages".into()],
+            allow_combos: Vec::new(),
             limit_requests: 0,
             limits: KeyLimits::default(),
             note: None,
@@ -2840,6 +2847,7 @@ mod tests {
             enabled: true,
             allow_models: Vec::new(),
             allow_routes: Vec::new(),
+            allow_combos: Vec::new(),
             limit_requests: 0,
             limits: KeyLimits::default(),
             note: None,

@@ -1076,6 +1076,7 @@ mod tests {
                 enabled: true,
                 allow_models: vec!["Brain".into()],
                 allow_routes: vec![],
+                allow_combos: Vec::new(),
                 limit_requests: 0,
                 limits: Default::default(),
                 note: None,

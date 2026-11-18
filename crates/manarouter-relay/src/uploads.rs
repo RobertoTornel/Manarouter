@@ -939,6 +939,7 @@ mod tests {
                 enabled: true,
                 allow_models: Vec::new(),
                 allow_routes: Vec::new(),
+                allow_combos: Vec::new(),
                 limit_requests: 0,
                 limits: Default::default(),
                 note: None,

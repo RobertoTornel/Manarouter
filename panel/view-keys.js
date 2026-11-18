@@ -74,6 +74,7 @@ export async function renderKeys(mount, ctx) {
         h('td', {}, k.enabled === false ? chip('disabled', 'chip-neutral') : chip('enabled', 'chip-green')),
         allowCell(k.allow_models),
         allowCell(k.allow_routes),
+        allowCell(k.allow_combos),
         h('td', { class: 'num keys-req' }, k.limit_requests ? formatCompact(k.limit_requests) : '∞'),
         h('td', { class: 'keys-caps-cell' }, rollingCaps(k.limits)),
         h('td', { class: 'actions keys-actions' }, editBtn, rotateBtn, delBtn)));
@@ -88,6 +89,7 @@ export async function renderKeys(mount, ctx) {
           h('th', { scope: 'col' }, 'State'),
           h('th', { scope: 'col' }, 'Allowed models'),
           h('th', { scope: 'col' }, 'Allowed routes'),
+          h('th', { scope: 'col' }, 'Allowed combos'),
           h('th', { scope: 'col' }, 'Req limit'),
           h('th', { scope: 'col' }, 'Rolling caps'),
           h('th', { scope: 'col' }, ''))),
@@ -173,6 +175,8 @@ export async function renderKeys(mount, ctx) {
     models.value = listToLines(k?.allow_models);
     const routes = h('textarea', { class: 'input', 'data-field': 'allow_routes', rows: '3', 'aria-label': 'Allowed routes, one per line' });
     routes.value = listToLines(k?.allow_routes);
+    const combos = h('textarea', { class: 'input', 'data-field': 'allow_combos', rows: '2', 'aria-label': 'Allowed combos, one per line' });
+    combos.value = listToLines(k?.allow_combos);
     const limit = h('input', { class: 'input', type: 'number', min: '0', 'data-field': 'limit_requests', value: k?.limit_requests ?? 0 });
     const note = h('input', { class: 'input', type: 'text', 'data-field': 'note', value: k?.note ?? '' });
     const enabled = toggle('Key enabled', { checked: k?.enabled ?? true });
@@ -194,6 +198,7 @@ export async function renderKeys(mount, ctx) {
           ...capInputs(k?.limits))),
       field('Allowed models (one per line, empty = all models)', models, { hint: 'Empty list means no restriction.' }),
       field('Allowed routes (one per line, empty = all routes)', routes),
+      field('Allowed combos (one per line, empty = all combos)', combos, { hint: 'Combo names or ids. A combo-scoped key can only call those combos, and sees only their models in the model list.' }),
       field('Note', note),
       enabled.row,
       h('div', { class: 'dialog-actions' }, cancel, save));
@@ -216,6 +221,7 @@ export async function renderKeys(mount, ctx) {
         label: label.value || 'unnamed key',
         allow_models: linesToList(models.value),
         allow_routes: linesToList(routes.value),
+        allow_combos: linesToList(combos.value),
         limit_requests: Number(limit.value) || 0,
         note: note.value || null,
         enabled: enabled.input.checked,
