@@ -371,6 +371,10 @@ pub struct StepPlan {
     pub pricing: Option<PricingPlan>,
     /// Declared or discovered context window. Provider-level max_context overrides this value.
     pub context_length: Option<u32>,
+    /// The model's declared output-token ceiling, when known. The request path clamps a client's
+    /// `max_tokens` family to this so an upstream cap (for example agnes's 65536) cannot refuse
+    /// every request with a constant body.
+    pub max_output_tokens: Option<u32>,
     /// Which of the provider's accounts this step may use, resolved from the authored selectors.
     ///
     /// `None` means every account, which is what a step that names no selection means and what
@@ -2019,6 +2023,7 @@ fn plan_step(
         reasoning_json: reasoning_fragments(provider.dialect, model, levels),
         input_modalities: modalities,
         pricing: model.pricing.clone(),
+        max_output_tokens: model.max_output_tokens,
         // A direct `provider/model` resolution has no authored step and therefore no selection;
         // `add_authored` fills this in for a combo step.
         accounts: None,
@@ -2662,6 +2667,13 @@ fn encode_step(encoder: &mut Encoder, step: &StepPlan) {
     }
     encoder.put_u32(step.input_modalities);
     encode_pricing(encoder, step.pricing.as_ref());
+    match step.max_output_tokens {
+        None => encoder.put_bool(false),
+        Some(tokens) => {
+            encoder.put_bool(true);
+            encoder.put_u32(tokens);
+        }
+    }
     encoder.put_u32(step.context_length.unwrap_or(0));
     // A presence byte rather than a count, because "no selection" and "a selection that matched
     // nothing" are different answers: the first means every account, the second means none.
@@ -2770,6 +2782,11 @@ fn decode_step(
     }
     let input_modalities = reader.u32()?;
     let pricing = decode_pricing(reader)?;
+    let max_output_tokens = if reader.bool()? {
+        Some(reader.u32()?)
+    } else {
+        None
+    };
     let context_length = match reader.u32()? {
         0 => None,
         value => Some(value),
@@ -2810,6 +2827,7 @@ fn decode_step(
         reasoning_json,
         input_modalities,
         pricing,
+        max_output_tokens,
         context_length,
         accounts,
     })

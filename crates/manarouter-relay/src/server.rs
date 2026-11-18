@@ -48,7 +48,6 @@ use mr_core::ids::ProviderId;
 use mr_core::oauth::platform as oauth_platform;
 use mr_core::oauth::refresh::Refresher;
 use mr_core::secret::Vault;
-use mr_core::model::ModelEntry;
 use mr_core::snapshot::{AccountPlan, ProviderPlan, Resolution, StepPlan};
 
 use mr_dialects::{translate_request, TranslateCtx};
@@ -3886,7 +3885,7 @@ async fn attempt_step(
     // for more, the upstream refuses the whole request; clamping the request down to the model's
     // own ceiling is the only honest fix — it lowers a number, never raises one — and it keeps a
     // combo step from failing on every request with a constant body.
-    current_body = clamp_generation_caps(current_body, &provider.models, &step.model);
+    current_body = clamp_generation_caps(current_body, step.max_output_tokens);
     let mut reconciled_once = false;
 
     // The dial is recorded before the request goes out, so a refused request still counts against
@@ -6539,13 +6538,8 @@ fn build_response_with_spend(
 /// lowered to the ceiling; unknown bodies and bodies without a matching model pass through
 /// untouched. The result is re-encoded (compact), so the bytes are not guaranteed identical even
 /// when nothing changed — callers treat it as a fresh body.
-fn clamp_generation_caps(body: Bytes, models: &[ModelEntry], model_id: &str) -> Bytes {
-    let Some(ceiling) = models
-        .iter()
-        .find(|entry| entry.id == model_id)
-        .and_then(|entry| entry.max_output_tokens)
-        .filter(|ceiling| *ceiling > 0)
-    else {
+fn clamp_generation_caps(body: Bytes, ceiling: Option<u32>) -> Bytes {
+    let Some(ceiling) = ceiling.filter(|ceiling| *ceiling > 0) else {
         return body;
     };
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
@@ -7224,6 +7218,7 @@ mod tests {
             reasoning_json: Default::default(),
             input_modalities: 1,
             pricing: None,
+            max_output_tokens: None,
             context_length: None,
             accounts: None,
         }
@@ -9570,7 +9565,6 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(exhausted_by_body(br#"{"error":{}}"#), None);
     }
 
-    #[test]
     #[test]
     fn a_google_style_resource_exhausted_429_is_a_quota_refusal() {
         // Captured live: Google/Vertex answers 429 with a `status` field, a numeric `code`, and a
@@ -14257,6 +14251,27 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             AxumBody::from(chat_body(model)),
         )
         .await
+    }
+
+    #[test]
+    fn generation_token_caps_are_clamped_to_the_models_ceiling() {
+        let body = Bytes::from(
+            r#"{"model":"m","messages":[],"max_tokens":100000,"max_completion_tokens":200000,"temperature":0.2}"#,
+        );
+        let clamped = clamp_generation_caps(body, Some(65_536));
+        let value: serde_json::Value = serde_json::from_slice(&clamped).expect("still JSON");
+        assert_eq!(value["max_tokens"], 65_536);
+        assert_eq!(value["max_completion_tokens"], 65_536);
+        assert_eq!(value["temperature"], 0.2);
+        // No ceiling means no rewrite.
+        let body = Bytes::from(r#"{"model":"m","messages":[],"max_tokens":99999}"#);
+        assert_eq!(clamp_generation_caps(body.clone(), None), body);
+        // An under-cap request passes through unchanged.
+        let body = Bytes::from(r#"{"model":"m","messages":[],"max_tokens":1000}"#);
+        assert_eq!(clamp_generation_caps(body.clone(), Some(65_536)), body);
+        // Non-JSON passes through untouched.
+        let body = Bytes::from("not json");
+        assert_eq!(clamp_generation_caps(body.clone(), Some(65_536)), body);
     }
 
     #[tokio::test]

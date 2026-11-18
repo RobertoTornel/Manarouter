@@ -2231,7 +2231,7 @@ async fn update_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
     let gpu = gpu_by_id(&deployment.gpu).ok_or_else(|| {
         ApiError::bad("invalid_body", "the deployment's GPU is not in the catalog")
     })?;
-    check_quant_and_dtype(&gpu, &deployment.weight_quant, &deployment.kv_cache_dtype)?;
+    check_quant_and_dtype(gpu, &deployment.weight_quant, &deployment.kv_cache_dtype)?;
 
     let review = deployment.problems();
     if !review.is_empty() {
@@ -2246,7 +2246,7 @@ async fn update_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
         .with_details(details));
     }
 
-    let bundle = deployment_bundle(&provider.id.as_str().to_owned(), &deployment, gpu);
+    let bundle = deployment_bundle(provider.id.as_str(), &deployment, gpu);
     deployment.bundle_id = Some(bundle.id.clone());
 
     // Rebuild the provider's account set from the deployment's account list. Only *enabled*
@@ -2501,7 +2501,7 @@ async fn deploy_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
             let text = text.trim();
             if text.len() > 1500 {
                 let mut out = text[text.len() - 1500..].to_string();
-                out.insert_str(0, "…");
+                out.insert(0, '…');
                 out
             } else {
                 text.to_string()
@@ -2610,15 +2610,14 @@ async fn delete_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
 fn check_quant_and_dtype(gpu: &GpuSpec, weight_quant: &str, kv_cache_dtype: &str) -> ApiResult<()> {
     if weight_quant != "none" {
         match resolve_quant_for(gpu, weight_quant) {
-            Some(verdict) => match verdict.support {
-                QuantSupport::Unsupported => {
+            Some(verdict) => {
+                if verdict.support == QuantSupport::Unsupported {
                     return Err(ApiError::bad(
                         "unsupported_quantization",
                         format!("{} cannot run `{weight_quant}`: {}", gpu.id, verdict.reason),
-                    ))
+                    ));
                 }
-                _ => {}
-            },
+            }
             None => {
                 return Err(ApiError::bad(
                     "invalid_body",
@@ -2628,18 +2627,17 @@ fn check_quant_and_dtype(gpu: &GpuSpec, weight_quant: &str, kv_cache_dtype: &str
         }
     }
     match resolve_kv_dtype_for(gpu, kv_cache_dtype) {
-        Some(verdict) => match verdict.support {
-            QuantSupport::Unsupported => {
+        Some(verdict) => {
+            if verdict.support == QuantSupport::Unsupported {
                 return Err(ApiError::bad(
                     "unsupported_kv_cache_dtype",
                     format!(
                         "{} cannot use `{kv_cache_dtype}`: {}",
                         gpu.id, verdict.reason
                     ),
-                ))
+                ));
             }
-            _ => {}
-        },
+        }
         None => {
             return Err(ApiError::bad(
                 "invalid_body",
@@ -5235,7 +5233,7 @@ mod tests {
             .expect("deployment");
         let accounts = deployment.selected_accounts();
         assert_eq!(accounts.len(), 3);
-        assert_eq!(accounts[1].enabled, false);
+        assert!(!accounts[1].enabled);
         assert_eq!(
             deployment.enabled_accounts(),
             vec!["mana-modal", "third-rental"]

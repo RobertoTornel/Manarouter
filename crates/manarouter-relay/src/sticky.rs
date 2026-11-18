@@ -223,6 +223,7 @@ mod tests {
             reasoning_json: Default::default(),
             input_modalities: 1,
             pricing: None,
+            max_output_tokens: None,
             context_length: None,
             accounts: None,
         }

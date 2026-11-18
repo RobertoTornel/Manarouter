@@ -154,7 +154,7 @@ impl OAuthPlatform for MistralVibe {
             return Err(oauth_failure(
                 super::refresh::FailureClass::Transient,
                 "Mistral Vibe token",
-                format!("HTTP {}: {}", reply.status, &reply.body),
+                format!("HTTP {}: {}", reply.status, reply.body),
             ));
         }
         token_set_from(&reply.body, None)
@@ -175,7 +175,7 @@ impl OAuthPlatform for MistralVibe {
             return Err(oauth_failure(
                 super::refresh::FailureClass::Transient,
                 "Mistral Vibe refresh",
-                format!("HTTP {}: {}", reply.status, &reply.body),
+                format!("HTTP {}: {}", reply.status, reply.body),
             ));
         }
         token_set_from(&reply.body, Some(refresh_token))
@@ -198,7 +198,7 @@ impl OAuthPlatform for MistralVibe {
             return Err(oauth_failure(
                 FailureClass::Transient,
                 "Mistral Vibe userinfo",
-                format!("HTTP {}: {}", reply.status, &reply.body),
+                format!("HTTP {}: {}", reply.status, reply.body),
             ));
         }
         let value: Value = serde_json::from_str(&reply.body)

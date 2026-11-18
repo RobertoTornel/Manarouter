@@ -148,7 +148,7 @@ pub const SNAPSHOT_MAGIC: [u8; 8] = *b"MROUTES1";
 /// account that has declared one would be compiled without it and never be
 /// held back — the frame must be rebuilt from authored config instead of
 /// reinterpreted.
-pub const SNAPSHOT_VERSION: u32 = 26;
+pub const SNAPSHOT_VERSION: u32 = 27;
 
 /// Current on-disk database schema version.
 ///
