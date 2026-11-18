@@ -723,6 +723,13 @@ impl HuggingFaceToken {
 pub struct RentalDeployment {
     /// [`RentalAccount::id`] this deployment bills against.
     pub account: String,
+    /// The full ordered account set for this deployment, when more than one is selected.
+    ///
+    /// Each entry may be toggled on or off per model; disabled accounts stay in the record but are
+    /// skipped when the derived provider is built and when the deployment is run. `None` means the
+    /// legacy single-account form: [`Self::account`] alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<Vec<DeploymentAccountRef>>,
     /// [`HuggingFaceToken::id`] this deployment uses when its repository is gated.
     ///
     /// `None` is the ordinary case for a public checkpoint. The token is *not* reached through the
@@ -798,6 +805,51 @@ fn default_gpu_count() -> u32 {
     1
 }
 
+/// One selected account of a deployment, with its per-model toggle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeploymentAccountRef {
+    /// [`RentalAccount::id`].
+    pub id: String,
+    /// Whether this account is currently in rotation for this model.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl DeploymentAccountRef {
+    /// An enabled account reference.
+    pub fn enabled(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            enabled: true,
+        }
+    }
+}
+
+impl RentalDeployment {
+    /// The ordered accounts this deployment uses, honoring the per-model toggles.
+    ///
+    /// Falls back to the legacy single `account` when no list is stored.
+    pub fn selected_accounts(&self) -> Vec<DeploymentAccountRef> {
+        match &self.accounts {
+            Some(list) if !list.is_empty() => list.clone(),
+            _ => vec![DeploymentAccountRef::enabled(self.account.clone())],
+        }
+    }
+
+    /// The enabled accounts of this deployment, in stored order.
+    pub fn enabled_accounts(&self) -> Vec<String> {
+        self.selected_accounts()
+            .into_iter()
+            .filter(|a| a.enabled)
+            .map(|a| a.id)
+            .collect()
+    }
+}
+
 impl RentalDeployment {
     /// The smallest coherent deployment: an account, a repo and a card.
     pub fn new(
@@ -807,6 +859,7 @@ impl RentalDeployment {
     ) -> Self {
         Self {
             account: account.into(),
+            accounts: None,
             hf_token: None,
             repo: repo.into(),
             revision: None,

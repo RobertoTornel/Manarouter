@@ -1157,8 +1157,12 @@ test('a recorded account is reused for another rental, and a duplicate id is ref
     fire(reuse[0], 'click');
     await settle(4);
     assert.equal(posts.length, 0, 'reuse posts nothing');
-    const account = mount.querySelector('[data-field="accountId"]');
-    assert.equal(account.value, 'mana-modal', 'the reused id is the draft\'s account');
+    const accountRow = descendants(mount).find((el) => el.classList?.contains('gpu-account-row')
+      && String(el.textContent ?? '').includes('mana-modal'));
+
+    assert.ok(accountRow, 'the reused account appears in the selection');
+    const chk = accountRow.querySelector('input[type="checkbox"]');
+    assert.equal(chk && chk.checked, true, 'the reused account is included');
     assert.equal(advanceButton(mount).textContent.trim(), 'Continue',
       'nothing is written, so the button does not promise a write');
     assert.match(textOf(mount), /Reuses a recorded account: nothing is written/);
@@ -1311,9 +1315,11 @@ test('the deploy window shows every step at once and reuses the recorded account
     // The account is chosen, never created here: creating one is the page's own action.
     assert.equal(document.body.querySelector('[data-field="accountMode"]'), null,
       'the window does not offer to create an account a second time');
-    const account = document.body.querySelector('[data-field="accountId"]');
-    assert.ok(account, 'the recorded account is named');
-    assert.equal(account.value, 'mana-modal');
+    const accountRow = descendants(document.body).find((el) => el.classList?.contains('gpu-account-row')
+      && String(el.textContent ?? '').includes('mana-modal'));
+    assert.ok(accountRow, 'the recorded account is named');
+    assert.equal(accountRow.querySelector('input[type="checkbox"]')?.checked, true,
+      'the recorded account is included by default');
 
     // The fill policy is a choice of the deployment, and the timeout only exists when it is chosen.
     assert.ok(document.body.querySelector('[data-field="mode"]'), 'the window offers the mode axis');

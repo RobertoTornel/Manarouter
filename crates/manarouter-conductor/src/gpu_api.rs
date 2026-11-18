@@ -83,9 +83,9 @@ use mr_core::lane::{plan_lane, LaneKind, Traffic};
 use mr_core::model::ModelEntry;
 use mr_core::quota::http::{QuotaHttp, QuotaRequest};
 use mr_core::rental::{
-    hf_token_vault_id, parse_deployment, plan_launch, BatchFill, BatchShape, HuggingFaceToken,
-    RentalAccount, RentalDeployment, RentalMode, RentalPlan, RentalPlatform, RentalSchedule,
-    RequantizePlan,
+    hf_token_vault_id, parse_deployment, plan_launch, BatchFill, BatchShape, DeploymentAccountRef,
+    HuggingFaceToken, RentalAccount, RentalDeployment, RentalMode, RentalPlan, RentalPlatform,
+    RentalSchedule, RequantizePlan,
 };
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -1235,6 +1235,10 @@ pub async fn rentals_body(state: &AppState) -> Value {
                     "model": model,
                     "model_in_provider": model.is_some(),
                     "account": deployment.account,
+                    "accounts": deployment.selected_accounts().iter().map(|a| json!({
+                        "id": a.id,
+                        "enabled": a.enabled,
+                    })).collect::<Vec<_>>(),
                     "hf_token": deployment.hf_token,
                     "repo": deployment.repo,
                     "revision": deployment.revision,
@@ -1535,6 +1539,7 @@ async fn post_apply(
         Some("create-deployment") => create_deployment(&state, &map).await.map(Json),
         Some("update-deployment") => update_deployment(&state, &map).await.map(Json),
         Some("delete-deployment") => delete_deployment(&state, &map).await.map(Json),
+        Some("deploy-deployment") => deploy_deployment(&state, &map).await.map(Json),
         Some(other) => Err(ApiError::bad(
             "invalid_body",
             format!(
@@ -2026,8 +2031,8 @@ async fn delete_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
         .filter_map(|provider| {
             let deployment = parse_deployment(provider.id.as_ref(), &provider.extra).ok()?;
             deployment
-                .is_some_and(|d| d.account == id)
-                .then(|| provider.id.as_str().to_owned())
+                .filter(|d| d.account == id || d.selected_accounts().iter().any(|a| a.id == id))
+                .map(|_| provider.id.as_str().to_owned())
         })
         .collect();
     if !referencing.is_empty() {
@@ -2244,20 +2249,21 @@ async fn update_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
     let bundle = deployment_bundle(&provider.id.as_str().to_owned(), &deployment, gpu);
     deployment.bundle_id = Some(bundle.id.clone());
 
-    // Rebuild the provider's account set from the deployment's account list.
-    let account_ids: Vec<String> = match map.get("accounts") {
-        Some(Value::Array(items)) if !items.is_empty() => items
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect(),
-        _ => vec![deployment.account.clone()],
-    };
+    // Rebuild the provider's account set from the deployment's account list. Only *enabled*
+    // accounts join the provider: the relay fails over across exactly those, and a toggled-off
+    // account stays in the record but is skipped here.
+    let parsed_accounts = parse_deployment_accounts(map.get("accounts"), &deployment.account)?;
+    let selected = parsed_accounts
+        .clone()
+        .unwrap_or_else(|| vec![DeploymentAccountRef::enabled(deployment.account.clone())]);
+    deployment.accounts = parsed_accounts;
+
     let mut accounts: Vec<&RentalAccount> = Vec::new();
     let mut credential_ids: Vec<String> = Vec::new();
     {
         let vault = state.vault.lock().await;
-        for id in &account_ids {
+        for account_ref in selected.iter().filter(|a| a.enabled) {
+            let id = &account_ref.id;
             let account = rental_accounts(&current)
                 .iter()
                 .find(|a| a.id == *id)
@@ -2285,6 +2291,12 @@ async fn update_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
             credential_ids.push(credential_id);
             accounts.push(account);
         }
+    }
+    if accounts.is_empty() {
+        return Err(ApiError::bad(
+            "invalid_body",
+            "at least one selected account must be enabled",
+        ));
     }
 
     let extra = deployment
@@ -2339,6 +2351,191 @@ async fn update_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
         },
         "restart_pending": state.restart.is_pending(),
         "applies_on": if restart_reason.is_some() { "restart" } else { "immediately" },
+    }))
+}
+
+/// Sequential `modal deploy` of a deployment across its enabled accounts.
+///
+/// Each enabled account gets its own bundle (account-specific app name) in a state-directory
+/// staging folder, and `modal deploy` is run to completion for one account before the next starts,
+/// with a short pause in between. This is what makes a multi-account model come online one account
+/// at a time instead of racing two cold starts against each other.
+async fn deploy_deployment(state: &AppState, map: &Map<String, Value>) -> ApiResult<Value> {
+    let provider_id = match string_field(map, "provider_id") {
+        Some(id) => id,
+        None => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "the deployment needs a `provider_id` naming the provider to deploy",
+            ))
+        }
+    };
+    // Optional pause between accounts, in seconds (default 5).
+    let pause_secs = map
+        .get("pause_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(5)
+        .min(60);
+
+    let config = state.current_config().await;
+    let provider = config
+        .providers
+        .iter()
+        .find(|p| p.id.as_ref() == provider_id)
+        .ok_or_else(|| {
+            ApiError::not_found(format!("there is no provider with id `{provider_id}`"))
+        })?;
+    let deployment = parse_deployment(provider.id.as_ref(), &provider.extra)
+        .map_err(|e| ApiError::internal(format!("the deployment record could not be read: {e}")))?
+        .ok_or_else(|| {
+            ApiError::bad(
+                "not_a_rental_deployment",
+                format!("provider `{provider_id}` is not a rental deployment"),
+            )
+        })?;
+
+    let account_ids = deployment.enabled_accounts();
+    if account_ids.is_empty() {
+        return Err(ApiError::bad(
+            "invalid_body",
+            "the deployment has no enabled accounts to bring online",
+        ));
+    }
+
+    // The Modal CLI must exist; deploying is an explicit operator action, so failure is loud.
+    let modal_cli = "modal";
+    let check = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(modal_cli)
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("could not probe the modal CLI: {e}")))?;
+    match check {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(ApiError::bad(
+                "modal_cli_unavailable",
+                "the `modal` CLI exists but `modal --version` failed; log in with `modal login` \
+                 first",
+            ))
+        }
+        Err(e) => {
+            return Err(ApiError::bad(
+                "modal_cli_unavailable",
+                format!(
+                    "the `modal` CLI is not installed on the control plane host (needed to deploy \
+                     these accounts): {e}. Install it and `modal login`, then retry"
+                ),
+            ))
+        }
+    }
+
+    // Stage bundles next to the configuration (the config directory is the one durable, writable
+    // location this process is guaranteed to own).
+    let staging_root = state
+        .config_path
+        .parent()
+        .map(|dir| dir.join("gpu-deploys").join(&provider_id))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/gpu-deploys").join(&provider_id));
+    std::fs::create_dir_all(&staging_root).map_err(|e| {
+        ApiError::internal(format!(
+            "could not create the deploy staging directory {}: {e}",
+            staging_root.display()
+        ))
+    })?;
+
+    let gpu = gpu_by_id(&deployment.gpu).ok_or_else(|| {
+        ApiError::bad("invalid_body", "the deployment's GPU is not in the catalog")
+    })?;
+
+    let mut results: Vec<Value> = Vec::with_capacity(account_ids.len());
+    for account_id in &account_ids {
+        let mut per_account = deployment.clone();
+        per_account.account = account_id.clone();
+        let bundle = deployment_bundle(&provider_id, &per_account, gpu);
+
+        let dir = staging_root.join(account_id);
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            ApiError::internal(format!(
+                "could not create the staging directory {}: {e}",
+                dir.display()
+            ))
+        })?;
+        std::fs::write(dir.join(&bundle.filename), &bundle.text).map_err(|e| {
+            ApiError::internal(format!(
+                "could not write the bundle {}: {e}",
+                dir.join(&bundle.filename).display()
+            ))
+        })?;
+
+        let started = std::time::Instant::now();
+        let deploy_dir = dir.clone();
+        let deploy_cmd = bundle.command.clone();
+        let status = tokio::task::spawn_blocking(move || {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&deploy_cmd)
+                .current_dir(&deploy_dir)
+                .output();
+            match output {
+                Ok(out) => Ok((out.status, out.stdout, out.stderr)),
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("the deploy task failed: {e}")))?;
+
+        let (ok, stdout, stderr) = match status {
+            Ok(status) => status,
+            Err(e) => {
+                return Err(ApiError::internal(format!(
+                    "could not run `modal deploy` in {}: {e}",
+                    dir.display()
+                )))
+            }
+        };
+        let tail = |bytes: &[u8]| -> String {
+            let text = String::from_utf8_lossy(bytes);
+            let text = text.trim();
+            if text.len() > 1500 {
+                let mut out = text[text.len() - 1500..].to_string();
+                out.insert_str(0, "…");
+                out
+            } else {
+                text.to_string()
+            }
+        };
+        results.push(json!({
+            "account": account_id,
+            "ok": ok.success(),
+            "exit": ok.code(),
+            "duration_ms": started.elapsed().as_millis(),
+            "bundle_id": bundle.id,
+            "bundle_file": format!("{}/{}", dir.display(), bundle.filename),
+            "output_tail": tail(&stdout),
+            "error_tail": tail(&stderr),
+        }));
+
+        // Wait a bit before starting the next account, so the previous cold start settles.
+        if account_id != account_ids.last().unwrap() && pause_secs > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(pause_secs)).await;
+        }
+    }
+
+    let ok_count = results
+        .iter()
+        .filter(|r| r.get("ok") == Some(&json!(true)))
+        .count();
+    Ok(json!({
+        "action": "deploy-deployment",
+        "provider_id": provider_id,
+        "pause_secs": pause_secs,
+        "accounts": results,
+        "ok": ok_count,
+        "failed": results.len() - ok_count,
+        "applies_on": "immediately",
     }))
 }
 
@@ -2451,6 +2648,67 @@ fn check_quant_and_dtype(gpu: &GpuSpec, weight_quant: &str, kv_cache_dtype: &str
         }
     }
     Ok(())
+}
+
+/// Parse the `accounts` payload into ordered account references with per-model toggles.
+///
+/// Accepts a list of objects (`{"id": ..., "enabled": bool}`) or plain id strings. `None`/empty
+/// means the legacy single `account_id` form.
+fn parse_deployment_accounts(
+    value: Option<&Value>,
+    _fallback: &str,
+) -> ApiResult<Option<Vec<DeploymentAccountRef>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let items = value.as_array().ok_or_else(|| {
+        ApiError::bad(
+            "invalid_body",
+            "`accounts` must be a list of account ids or objects",
+        )
+    })?;
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if let Some(id) = item.as_str() {
+            out.push(DeploymentAccountRef::enabled(id.trim().to_owned()));
+        } else if let Some(obj) = item.as_object() {
+            let id = obj
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    ApiError::bad(
+                        "invalid_body",
+                        "each `accounts` object needs a non-empty `id`",
+                    )
+                })?;
+            let enabled = obj.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+            out.push(DeploymentAccountRef {
+                id: id.to_owned(),
+                enabled,
+            });
+        } else {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "each `accounts` entry must be an id string or an object with `id`",
+            ));
+        }
+    }
+    // Reject duplicates so provider account sets stay unambiguous.
+    let mut seen = std::collections::HashSet::new();
+    for account in &out {
+        if !seen.insert(account.id.clone()) {
+            return Err(ApiError::bad(
+                "invalid_body",
+                format!("account `{}` is listed more than once", account.id),
+            ));
+        }
+    }
+    Ok(Some(out))
 }
 
 /// Create a Hugging Face token, or replace the value of one that already exists.
@@ -2864,15 +3122,13 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
     // A deployment may bill through one account or several: the provider gets one credential per
     // chosen account, and the relay fails over across them exactly as it does for a provider with
     // several accounts.
-    let account_ids: Vec<String> = match map
-        .get("accounts")
-        .or_else(|| deployment_map.get("accounts"))
-    {
-        Some(Value::Array(items)) if !items.is_empty() => items
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect(),
+    let parsed_accounts = parse_deployment_accounts(
+        map.get("accounts")
+            .or_else(|| deployment_map.get("accounts")),
+        &account_id,
+    )?;
+    let selected = match parsed_accounts {
+        Some(list) if !list.is_empty() => list,
         _ => {
             if account_id.is_empty() {
                 return Err(ApiError::bad(
@@ -2881,17 +3137,13 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
                      an `accounts` list of several",
                 ));
             }
-            vec![account_id.clone()]
+            vec![DeploymentAccountRef::enabled(account_id.clone())]
         }
     };
-    if account_ids.is_empty() {
-        return Err(ApiError::bad(
-            "invalid_body",
-            "`accounts` must name at least one configured rental account",
-        ));
-    }
-    let mut accounts: Vec<&RentalAccount> = Vec::with_capacity(account_ids.len());
-    for id in &account_ids {
+
+    let mut accounts: Vec<&RentalAccount> = Vec::with_capacity(selected.len());
+    for account_ref in selected.iter().filter(|a| a.enabled) {
+        let id = &account_ref.id;
         match rental_accounts(&current).iter().find(|a| a.id == *id) {
             Some(account) => {
                 if account.platform != RentalPlatform::Modal {
@@ -2912,6 +3164,12 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
                 )));
             }
         }
+    }
+    if accounts.is_empty() {
+        return Err(ApiError::bad(
+            "invalid_body",
+            "at least one selected account must be enabled",
+        ));
     }
     let account = accounts[0];
 
@@ -3038,6 +3296,9 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
         };
 
     let mut deployment = RentalDeployment::new(account.id.clone(), &repo, gpu.id);
+    // Stored in the record even when only the legacy single-account form was used: it becomes the
+    // source of truth for the derived provider's account set and for sequential deploys.
+    deployment.accounts = Some(selected.clone());
     deployment.hf_token = hf_token;
     deployment.gpu_count = gpu_count as u32;
     deployment.weight_quant = weight_quant;
@@ -4914,6 +5175,71 @@ mod tests {
                 "the vault entry is gone"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_deployment_honors_per_model_account_toggles() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = state_in(dir.path());
+        for (id, credential) in [
+            ("mana-modal", "wk-one-id.ws-one-secret"),
+            ("second-rental", "wk-two-id.ws-two-secret"),
+            ("third-rental", "wk-three-id.ws-three-secret"),
+        ] {
+            create_modal_account(&state, id, "mana", credential).await;
+        }
+
+        // The second account is included-but-disabled: it stays in the record and is skipped when
+        // the provider is built (failover set = enabled accounts only).
+        let created = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "accounts": [
+                    {"id": "mana-modal", "enabled": true},
+                    {"id": "second-rental", "enabled": false},
+                    {"id": "third-rental", "enabled": true},
+                ],
+                "deployment": {
+                    "repo": "Qwen/Qwen3-8B",
+                    "gpu": "H100",
+                    "gpu_count": 1,
+                    "max_model_len": 32768,
+                },
+            }),
+        )
+        .await
+        .expect("create a multi-account deployment with toggles");
+        let provider_id = created["provider_id"].as_str().expect("provider id");
+        let config = state.current_config().await;
+        let provider = config
+            .providers
+            .iter()
+            .find(|p| p.id.as_ref() == provider_id)
+            .expect("provider exists");
+        assert_eq!(provider.accounts.len(), 2, "disabled account is skipped");
+        assert_eq!(provider.accounts[0].label.as_deref(), Some("mana-modal"));
+        assert_eq!(provider.accounts[1].label.as_deref(), Some("third-rental"));
+        assert_eq!(
+            provider.accounts[0].secret_ref,
+            Some("rental:mana-modal".to_owned())
+        );
+        assert_eq!(
+            provider.accounts[1].secret_ref,
+            Some("rental:third-rental".to_owned())
+        );
+
+        // The recorded deployment keeps all three entries with their toggles.
+        let deployment = parse_deployment(provider_id, &provider.extra)
+            .expect("parse")
+            .expect("deployment");
+        let accounts = deployment.selected_accounts();
+        assert_eq!(accounts.len(), 3);
+        assert_eq!(accounts[1].enabled, false);
+        assert_eq!(
+            deployment.enabled_accounts(),
+            vec!["mana-modal", "third-rental"]
+        );
     }
 
     #[tokio::test]

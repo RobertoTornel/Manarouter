@@ -590,6 +590,14 @@ function normaliseDeployment(raw) {
     shutdownCooldownSecs: asNumber(pick(deployment, 'shutdown_cooldown_secs')),
     baseUrl: asString(pick(raw, 'base_url', 'baseUrl')).trim(),
     startupFlags: listOf(pick(deployment, 'startup_flags')).map(asString),
+    accounts: listOf(pick(raw, 'accounts'))
+      .map(objectOf)
+      .filter(Boolean)
+      .map((entry) => ({
+        id: asString(pick(entry, 'id')).trim(),
+        enabled: asBool(pick(entry, 'enabled')) !== false,
+      }))
+      .filter((entry) => entry.id),
     enabled: asBool(pick(raw, 'enabled')),
     sizing,
     problems: listOf(pick(raw, 'problems')).map(objectOf).filter(Boolean),
@@ -1360,7 +1368,23 @@ async function renderInventory(mount, ctx) {
         },
       },
       h('td', {}, h('span', { class: 'mono' }, dashes(dep.providerId))),
-      h('td', {}, mono(dep.accountId)),
+      h('td', {}, (() => {
+        const accts = Array.isArray(dep.accounts) && dep.accounts.length ? dep.accounts : [{ id: dep.accountId, enabled: true }];
+        return h('div', { class: 'gpu-dep-accounts' },
+          ...accts.map((entry) => {
+            const chip = h('button', {
+              type: 'button',
+              class: 'gpu-dep-account' + (entry.enabled ? ' is-on' : ' is-off'),
+              title: `${entry.id} — ${entry.enabled ? 'enabled for this model (click to disable)' : 'disabled for this model (click to enable)'}`,
+              'aria-label': `${entry.enabled ? 'Disable' : 'Enable'} account ${entry.id} for this deployment`,
+              onclick: (ev) => {
+                ev.stopPropagation();
+                void toggleDeploymentAccount(view, ctx, dep, entry.id);
+              },
+            }, h('span', { class: 'mono' }, entry.id), h('span', { class: 'gpu-dep-account-state' }, entry.enabled ? 'on' : 'off'));
+            return chip;
+          }));
+      })()),
       h('td', {}, h('span', { class: 'mono' }, dashes(dep.repo)),
         dep.maxModelLen === null ? null : h('span', { class: 'hint' }, ` · ${formatCompact(dep.maxModelLen)} ctx`)),
       h('td', {},
@@ -2392,7 +2416,87 @@ function fieldRow(wizard, desc) {
   if (desc.kind === 'readout') return readoutRow(desc);
   if (desc.kind === 'select') return selectRow(wizard, desc);
   if (desc.kind === 'choice') return choiceRow(wizard, desc);
+  if (desc.kind === 'accounts-multi') return accountsMultiRow(wizard, desc);
   return inputRow(wizard, desc);
+}
+
+/// Clickable multi-account selector with a per-model enable toggle for each included account.
+///
+/// Reads/writes `draft[name]` as an array of `{id, enabled}` in the account list's order.
+/// Excluded accounts remain unlisted; included but disabled accounts stay in the record and are
+/// skipped when the deployment is built or run.
+function accountsMultiRow(wizard, desc) {
+  const name = asString(desc.name).trim();
+  const accounts = listOf(wizard.accounts)
+    .map(objectOf)
+    .filter(Boolean)
+    .map((account) => asString(pick(account, 'id')).trim())
+    .filter(Boolean);
+  const raw = desc.value ?? draftGet(wizard.draft, name);
+  let current = Array.isArray(raw) ? raw : [];
+  if (!current.length) {
+    // Legacy drafts carry a single `accountId`; show it as the one included account.
+    const legacy = asString(draftGet(wizard.draft, 'accountId')).trim();
+    if (legacy) current = [{ id: legacy, enabled: true }];
+  }
+  current = current.map((entry) => ({
+    id: asString(pick(entry, 'id')).trim(),
+    enabled: asBool(pick(entry, 'enabled')) !== false,
+  })).filter((entry) => entry.id);
+
+
+  const commit = (next) => {
+    draftSet(wizard.draft, name, next);
+    wizard.dirty = true;
+    wizard.validation = null;
+    wizard.applyError = null;
+    wizard.bundle = null;
+    paintSetup(wizard, wizard.mount, wizard.ctx, wizard.current);
+  };
+
+  const list = h('div', { class: 'gpu-accounts-multi' });
+  for (const id of accounts) {
+    const entry = current.find((c) => c.id === id);
+    const included = Boolean(entry);
+    const enabled = included ? entry.enabled : true;
+
+    const check = h('input', {
+      type: 'checkbox',
+      'aria-label': `Include account ${id}`,
+      onchange: (e) => {
+        const next = current.slice();
+        if (e.target.checked) {
+          next.push({ id, enabled: true });
+        } else {
+          const idx = next.findIndex((c) => c.id === id);
+          if (idx >= 0) next.splice(idx, 1);
+        }
+        commit(next);
+      },
+    });
+    check.checked = included;
+    const toggleBtn = h('button', {
+      type: 'button',
+      class: 'gpu-account-toggle' + (enabled ? ' is-on' : ' is-off'),
+      disabled: !included,
+      'aria-label': `${enabled ? 'Disable' : 'Enable'} account ${id} for this model`,
+      title: enabled ? 'Enabled for this model — click to disable' : 'Disabled for this model — click to enable',
+      onclick: (e) => {
+        e.preventDefault();
+        const next = current.slice();
+        const idx = next.findIndex((c) => c.id === id);
+        if (idx >= 0) next[idx] = { id, enabled: !next[idx].enabled };
+        commit(next);
+      },
+    }, enabled ? 'on' : 'off');
+    list.append(h('div', { class: 'gpu-account-row' }, check, h('span', { class: 'mono' }, id), toggleBtn));
+  }
+
+  const row = h('div', { class: 'gpu-field' },
+    h('div', { class: 'gpu-field-label' }, asString(desc.label) || name),
+    list);
+  if (desc.hint) row.append(richHint(desc.hint));
+  return row;
 }
 
 function chooseOptions(wizard, desc) {
@@ -2858,6 +2962,7 @@ function accountsReferencePanel(wizard) {
   const useAccount = (id) => {
     commitField(wizard, 'accountMode', 'existing');
     commitField(wizard, 'accountId', id);
+    commitField(wizard, 'selectedAccounts', [{ id, enabled: true }]);
     paintSetup(wizard, wizard.mount, wizard.ctx, wizard.current);
   };
   const rows = accounts.map((a) => h('tr', {},
@@ -4316,6 +4421,26 @@ async function editDeploymentDialog(view, ctx, dep) {
     paint();
   });
   await done;
+}
+
+/// Toggle one account's per-model enable flag, persisting through update-deployment.
+async function toggleDeploymentAccount(view, ctx, dep, accountId) {
+  const accts = Array.isArray(dep.accounts) && dep.accounts.length
+    ? dep.accounts
+    : [{ id: dep.accountId, enabled: true }];
+  const next = accts.map((entry) => entry.id === accountId
+    ? { id: entry.id, enabled: !entry.enabled }
+    : { id: entry.id, enabled: entry.enabled });
+  try {
+    const payload = { action: 'update-deployment', provider_id: dep.providerId, accounts: next };
+    await api.post('/api/gpu/apply', payload);
+    if (ctx && typeof ctx.toast?.success === 'function') {
+      ctx.toast.success(`Account ${accountId} ${next.find((a) => a.id === accountId).enabled ? 'enabled' : 'disabled'} for this deployment.`);
+    }
+    await view?.refresh?.(true);
+  } catch (err) {
+    if (ctx && typeof ctx.toast?.error === 'function') ctx.toast.error('Could not toggle the account', err);
+  }
 }
 
 /// Delete a deployment after confirmation.

@@ -313,7 +313,7 @@ test('emptyDraft fills every documented key and starts on Modal with no plan cla
     tokenSecret: '',
     apiTokenId: '',
     apiTokenSecret: '',
-    extraAccounts: '',
+    selectedAccounts: null,
     accountMode: 'new',
     hfTokenNeeded: false,
     hfTokenId: '',
@@ -397,7 +397,7 @@ test('every field carries the same shape, so the panel can render one loop', () 
       assert.deepEqual(Object.keys(field).sort(), [...shape].sort(), `${step.id}.${field.name}`);
       assert.ok(Array.isArray(field.notes), `${step.id}.${field.name}.notes must be an array`);
       assert.equal(typeof field.name, 'string');
-      assert.ok(['text', 'password', 'number', 'select', 'choice', 'readout', 'toggle', 'textarea'].includes(field.kind),
+      assert.ok(['text', 'password', 'number', 'select', 'choice', 'readout', 'toggle', 'textarea', 'accounts-multi'].includes(field.kind),
         `${step.id}.${field.name} has an unexpected kind ${field.kind}`);
     }
   }
@@ -413,7 +413,7 @@ test('stepList field inventory is stable per step', () => {
     // ones for a reuse. Exactly one is visible, keyed by `accountMode`, so the duplicate is the
     // inventory being honest rather than two fields.
     account: [
-      'accountMode', 'accountId', 'accountId', 'extraAccounts', 'workspace', 'plan', 'tokenId',
+      'accountMode', 'accountId', 'selectedAccounts', 'workspace', 'plan', 'tokenId',
       'tokenSecret', 'apiTokenId', 'apiTokenSecret', 'planMarker', 'accountCredentialNote',
     ],
     model: [
@@ -1661,13 +1661,17 @@ test('reusing an account names one that is recorded, and asks for no credential'
   const reuse = draft({ accountMode: 'existing', accountId: 'mana-modal', workspace: '', tokenId: '', tokenSecret: '' });
   assert.deepEqual(validateStep(reuse, 'account', CATALOG, accounts).problems, [],
     'a reused account writes nothing, so it needs no workspace or credential');
-  assert.deepEqual(validateStep({ ...reuse, accountId: '' }, 'account', CATALOG, accounts).problems, [{
-    field: 'accountId',
-    message: 'Choose the recorded account this rental bills through.',
+  assert.deepEqual(validateStep({ ...reuse, accountId: '', selectedAccounts: [] }, 'account', CATALOG, accounts).problems, [{
+    field: 'selectedAccounts',
+    message: 'Choose at least one recorded account this rental bills through.',
   }]);
-  assert.deepEqual(validateStep({ ...reuse, accountId: 'ghost' }, 'account', CATALOG, accounts).problems, [{
-    field: 'accountId',
+  assert.deepEqual(validateStep({ ...reuse, accountId: '', selectedAccounts: [{ id: 'ghost', enabled: true }] }, 'account', CATALOG, accounts).problems, [{
+    field: 'selectedAccounts',
     message: '"ghost" is not a recorded account on this platform, so there is nothing to reuse.',
+  }]);
+  assert.deepEqual(validateStep({ ...reuse, accountId: '', selectedAccounts: [{ id: 'mana-modal', enabled: false }] }, 'account', CATALOG, accounts).problems, [{
+    field: 'selectedAccounts',
+    message: 'At least one selected account must be enabled for this model.',
   }]);
 });
 

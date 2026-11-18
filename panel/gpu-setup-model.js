@@ -360,9 +360,9 @@ export function emptyDraft(platformId) {
     // rentals, and the account's credential is written once.
     accountMode: 'new',
     accountId: '',
-    // Additional rental accounts the deployment should also bill through (comma-separated ids),
-    // for failover across several accounts. Empty means only `accountId`.
-    extraAccounts: '',
+    // Accounts selected for this deployment, each with its per-model toggle. Null means the legacy
+    // single-account form (`accountId` alone).
+    selectedAccounts: null,
     // Shown on the list instead of the id when the operator gives one. Empty falls back to the id,
     // which is what a flow that never asked for a label has always recorded.
     accountLabel: '',
@@ -1870,13 +1870,14 @@ export function stepList(draft, catalog = null) {
           value: fieldValue(d, 'accountId'), placeholder: 'mana-modal',
           hint: 'Local identifier for the account, and the name of its vault entry. Several rentals may name the same account.',
         }),
-        selectField({
-          name: 'accountId', label: 'Account', optionsSource: 'accounts', required: true,
-          visible: d.accountMode === 'existing',
-          value: fieldValue(d, 'accountId'),
-          hint: 'A recorded account. Its credential stays where it is; this rental only names it.',
-        }),
-        textField({ name: 'extraAccounts', label: 'Also bill through (optional)', kind: 'text', required: false, visible: d.accountMode === 'existing', value: fieldValue(d, 'extraAccounts'), placeholder: 'account-id-2, account-id-3', hint: 'Comma-separated rental account ids. The deployment fails over across all of them like a multi-account provider.' }),
+        {
+          name: 'selectedAccounts', label: 'Accounts', kind: 'accounts-multi',
+          required: true, visible: d.accountMode === 'existing',
+          value: fieldValue(d, 'selectedAccounts'),
+          hint: 'Click an account to include it in this model. Use its toggle to take it out of rotation for this model without forgetting it; the deployment comes online across the included accounts sequentially, and the relay fails over between the enabled ones.',
+          options: null, optionsSource: null, placeholder: null, min: null, max: null, step: null,
+          unit: null, readOnly: false, notes: [], enabled: true,
+        },
         textField({ name: 'workspace', label: 'Modal workspace', required: true, visible: d.accountMode !== 'existing', value: fieldValue(d, 'workspace'), placeholder: 'mana', hint: 'The workspace this account\'s apps deploy into, for example `mana`. Not a secret: it is the half of the endpoint URL Manarouter can know without deploying.' }),
         selectField({ name: 'plan', label: 'Plan', optionsSource: 'plans', required: true, visible: d.accountMode !== 'existing', value: planLabel, hint: 'Unknown is a real answer and is never rendered as free or as paid.' }),
         textField({ name: 'tokenId', label: 'Modal proxy token id', kind: 'password', required: true, visible: d.accountMode !== 'existing', value: fieldValue(d, 'tokenId'), placeholder: 'wk-…', hint: 'Half of the Modal proxy token pair: the `wk-…` id the relay sends as `Modal-Key`. Stored in the vault; never rendered back.' }),
@@ -2224,12 +2225,23 @@ export function validateStep(draft, stepId, catalog = null, accounts = null) {
     const recorded = asArray(accounts).map(asObject);
     const reuse = d.accountMode === 'existing';
     if (reuse) {
-      // Reusing an account names it and nothing else: its workspace, plan and credential are
-      // already recorded, and re-sending them would be a second write of the same secret.
-      if (!d.accountId) {
-        problems.push(problem('accountId', 'Choose the recorded account this rental bills through.'));
-      } else if (!recorded.some((account) => text(account.id) === d.accountId)) {
-        problems.push(problem('accountId', `"${d.accountId}" is not a recorded account on this platform, so there is nothing to reuse.`));
+      // Reusing accounts names them and nothing else: workspace, plan and credential are already
+      // recorded. `selectedAccounts` is the clickable list; it falls back to `accountId` for
+      // drafts written before the multi-select existed.
+      const selected = Array.isArray(d.selectedAccounts) && d.selectedAccounts.length
+        ? d.selectedAccounts
+        : (d.accountId ? [{ id: d.accountId, enabled: true }] : []);
+      if (!selected.length) {
+        problems.push(problem('selectedAccounts', 'Choose at least one recorded account this rental bills through.'));
+      } else {
+        for (const account of selected) {
+          if (!recorded.some((r) => text(r.id) === text(account.id))) {
+            problems.push(problem('selectedAccounts', `"${text(account.id)}" is not a recorded account on this platform, so there is nothing to reuse.`));
+          }
+        }
+        if (!selected.some((account) => account.enabled !== false)) {
+          problems.push(problem('selectedAccounts', 'At least one selected account must be enabled for this model.'));
+        }
       }
     } else {
       if (!d.accountId) {
@@ -2966,13 +2978,12 @@ export function applyPayload(draft, sizing) {
   // The token is named by id beside the account id, not inside the account: the same token may be
   // named by deployments on several accounts, and this one may need none.
   const hfToken = d.hfTokenId || null;
-  const accountIds = [
-    String(d.accountId || '').trim(),
-    ...String(d.extraAccounts || '').split(',').map((s) => s.trim()),
-  ].filter((value, index, all) => value && all.indexOf(value) === index);
-  const accountField = accountIds.length === 1
-    ? { account_id: accountIds[0] }
-    : { accounts: accountIds };
+  const selected = Array.isArray(d.selectedAccounts) && d.selectedAccounts.length
+    ? d.selectedAccounts
+    : (d.accountId ? [{ id: d.accountId, enabled: true }] : []);
+  const accountField = selected.length === 1
+    ? { account_id: selected[0].id }
+    : { accounts: selected };
   return hfToken
     ? { action: 'create-deployment', ...accountField, hf_token: hfToken, deployment }
     : { action: 'create-deployment', ...accountField, deployment };
