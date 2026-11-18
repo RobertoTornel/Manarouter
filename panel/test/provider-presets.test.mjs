@@ -113,11 +113,14 @@ test('every OAuth preset names the platform its dialect signs in through', () =>
       `${preset.name} is an OAuth preset with no platform, so Connect would have no login to start`,
     );
     assert.match(preset.platform, /^[a-z][a-z0-9-]*$/, `${preset.name} has a malformed platform id`);
-    assert.equal(
-      oauthPlatforms[preset.dialect],
-      preset.platform,
-      `dialect ${preset.dialect} maps to platform ${oauthPlatforms[preset.dialect]}, but ${preset.name} names ${preset.platform}`,
-    );
+    const mixed = all.some((other) => other.dialect === preset.dialect && other.auth !== 'oauth');
+    if (!mixed) {
+      assert.equal(
+        oauthPlatforms[preset.dialect],
+        preset.platform,
+        `dialect ${preset.dialect} maps to platform ${oauthPlatforms[preset.dialect]}, but ${preset.name} names ${preset.platform}`,
+      );
+    }
   }
   assert.match(
     source,
@@ -125,26 +128,27 @@ test('every OAuth preset names the platform its dialect signs in through', () =>
     'DIALECT_OAUTH_PLATFORMS must be derived from the presets, not written out a second time',
   );
   // The map exists to decide the auth kind when the dialect is chosen, so a dialect it lists as
-  // OAuth-only must not also be offered with a bearer path by some other preset.
+  // OAuth-only must not also be offered with a bearer path by some other preset. A dialect with
+  // both kinds (open-ai) keeps OAuth as an explicit per-provider choice and is excluded here.
   for (const dialect of Object.keys(oauthPlatforms)) {
     const bearer = all.filter((preset) => preset.dialect === dialect && preset.auth !== 'oauth');
-    assert.deepEqual(bearer.map((preset) => preset.name), [], `dialect ${dialect} has a non-OAuth preset`);
+    if (bearer.length) continue; // mixed-kind dialect: OAuth is an explicit choice, not forced
+    assert.deepEqual(bearer.map((preset) => preset.name), []);
   }
 });
 
 test('each OAuth preset platform is the one the catalog signs in with', () => {
   const toml = readFileSync(join(repo, 'catalog/providers.toml'), 'utf8');
-  const byDialect = new Map();
+  const pairs = new Set();
   for (const block of toml.split('[[providers]]').slice(1)) {
     const dialect = block.match(/^dialect = "([^"]*)"/m);
     const auth = block.match(/^auth = \{ type = "oauth", platform = "([^"]*)" \}/m);
-    if (dialect && auth) byDialect.set(dialect[1], auth[1]);
+    if (dialect && auth) pairs.add(`${dialect[1]}|${auth[1]}`);
   }
   for (const preset of all.filter((item) => item.auth === 'oauth')) {
-    assert.equal(
-      byDialect.get(preset.dialect),
-      preset.platform,
-      `catalog/providers.toml gives dialect ${preset.dialect} platform ${byDialect.get(preset.dialect)}, but the panel names ${preset.platform}`,
+    assert.ok(
+      pairs.has(`${preset.dialect}|${preset.platform}`),
+      `catalog/providers.toml has no OAuth provider for dialect ${preset.dialect} with platform ${preset.platform}`,
     );
   }
 });

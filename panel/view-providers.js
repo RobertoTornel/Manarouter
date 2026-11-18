@@ -375,6 +375,7 @@ const PROVIDER_PRESETS = {
     { name: 'Cursor', dialect: 'cursor', baseUrl: 'https://api2.cursor.sh', auth: 'oauth', platform: 'cursor', capabilities: ['chat'], hint: 'Cursor — OAuth sign-in from the panel. The sign-in finishes in Cursor’s own tab and the panel learns of it by polling, so nothing is ever pasted back here.' },
     { name: 'Z Code', dialect: 'zcode', baseUrl: 'https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1', auth: 'oauth', platform: 'zcode', capabilities: ['messages', 'tool-calling', 'reasoning'], hint: 'Z.ai coding plan — sign in with the ZCode desktop app’s own login flow; the link opens at zcode.z.ai and the panel waits for the browser.' },
     { name: 'Claude Code', dialect: 'claude-cli', baseUrl: 'https://api.anthropic.com/v1', auth: 'oauth', platform: 'claude', capabilities: ['messages', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'Claude Code with a Claude subscription (Pro/Max) — sign-in happens on claude.ai and Anthropic shows a one-time code; the panel asks you to paste it. Do not add an API key: the subscription token is the credential, and an sk-ant-api… key is refused on this surface.' },
+    { name: 'Mistral Vibe', dialect: 'open-ai', baseUrl: 'https://api.mistral.ai/v1', auth: 'oauth', platform: 'mistral-vibe', capabilities: ['chat', 'responses', 'models', 'tool-calling', 'reasoning'], hint: 'Mistral Vibe — OAuth sign-in from the panel (loopback PKCE at auth.mistral.ai). No API key: the Vibe bearer is the credential.' },
     { name: 'Command Code', dialect: 'command-code-go', baseUrl: 'https://api.commandcode.ai', auth: 'bearer', capabilities: ['chat', 'models', 'tool-calling', 'reasoning'], hint: 'Command Code — bearer auth.' },
     { name: 'Modal vLLM', dialect: 'modal-vllm', baseUrl: '', auth: 'modal', hint: 'Enter your Modal app’s HTTPS public URL (for example https://your-app--serve.modal.run). Add the Modal Token ID.Token Secret as the account secret after saving; the panel sends it as Modal-Key and Modal-Secret headers.' },
     { name: 'OpenCode Zen', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/v1', auth: 'bearer', capabilities: ['chat', 'responses', 'models', 'tool-calling', 'reasoning'], hint: 'OpenCode Console, pay-as-you-go. Needs a funded key: the free models are refused outside the OpenCode client, so they cannot be routed from here.' },
@@ -408,6 +409,14 @@ const DIALECT_OAUTH_PLATFORMS = Object.freeze(Object.fromEntries(
     .filter((preset) => preset.auth === 'oauth' && preset.platform)
     .map((preset) => [preset.dialect, preset.platform]),
 ));
+
+/// Dialects that also have at least one bearer/API-key preset. For those, OAuth is a choice, not
+/// the only credential path: choosing the dialect must not force OAuth.
+const DIALECT_HAS_NON_OAUTH = new Set(
+  PROVIDER_PRESETS.platforms
+    .filter((preset) => preset.auth !== 'oauth')
+    .map((preset) => preset.dialect),
+);
 
 const AUTH_KINDS = [
   ['bearer', 'Authorization: Bearer'],
@@ -3189,7 +3198,7 @@ export async function renderProviders(mount, ctx) {
     function renderAuthWarn() {
       authWarn.replaceChildren();
       const platform = DIALECT_OAUTH_PLATFORMS[dialectIn.value];
-      if (!platform || authSel.value === 'oauth') return;
+      if (!platform || DIALECT_HAS_NON_OAUTH.has(dialectIn.value) || authSel.value === 'oauth') return;
       const fix = h('button', { class: 'btn', type: 'button' }, `Switch to the ${platform} OAuth login`);
       fix.addEventListener('click', () => {
         authSel.value = 'oauth';
@@ -3344,7 +3353,7 @@ export async function renderProviders(mount, ctx) {
       // as it stands, because `oauth` is still a valid choice there and rewriting it would throw
       // away a working sign-in.
       const platform = DIALECT_OAUTH_PLATFORMS[dialectIn.value];
-      if (platform && authSel.value !== 'oauth') {
+      if (platform && !DIALECT_HAS_NON_OAUTH.has(dialectIn.value) && authSel.value !== 'oauth') {
         authSel.value = 'oauth';
         authPlatform.value = platform;
       }
