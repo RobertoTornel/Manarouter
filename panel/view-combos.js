@@ -1122,20 +1122,16 @@ export async function renderCombos(mount, ctx, selectedId) {
           ctx.toast.success(`Combo ${payload.name} created.`);
           clearDirty();
           closeDrawer();
+          await refreshCombos();
           ctx.navigate(`#/combos/${encodeURIComponent(created?.id ?? payload.name)}`);
         } else {
-          const updated = await api.put(`/api/combos/${encodeURIComponent(saved.id)}`, payload);
+          await api.put(`/api/combos/${encodeURIComponent(saved.id)}`, payload);
           ctx.toast.success(`Combo ${payload.name} saved.`);
           clearDirty();
           closeDrawer();
-          // `ctx.navigate('#/combos')` is a no-op when we are already on that route, so the list
-          // would keep showing the pre-save copy. Patch the in-memory row and re-render in place.
-          const idx = combos.findIndex((c) => c.id === saved.id);
-          if (idx >= 0) {
-            combos[idx] = updated?.id ? updated : { ...payload, id: saved.id };
-            renderList();
-            renderSummary(right, combos[idx]);
-          }
+          await refreshCombos();
+          const found = combos.find((c) => c.id === saved.id);
+          if (found) renderSummary(right, found);
           ctx.navigate('#/combos');
         }
       } catch (err) {
@@ -1159,18 +1155,13 @@ export async function renderCombos(mount, ctx, selectedId) {
         // The record is gone, so its editor must not ask to preserve unsaved edits on the way out.
         clearDirty();
         closeDrawer();
-        const idx = combos.findIndex((c) => c.id === saved.id);
-        if (idx >= 0) {
-          combos.splice(idx, 1);
-          if (selectedId === saved.id) selectedId = combos[0]?.id ?? null;
-          renderList();
-          count.textContent = `${combos.length} combo${combos.length === 1 ? '' : 's'}`;
-          if (selectedId) {
-            const found = combos.find((c) => c.id === selectedId);
-            if (found) renderSummary(right, found);
-          } else {
-            renderEmptyDetail();
-          }
+        await refreshCombos();
+        if (selectedId === saved.id) selectedId = combos[0]?.id ?? null;
+        if (selectedId) {
+          const found = combos.find((c) => c.id === selectedId);
+          if (found) renderSummary(right, found);
+        } else {
+          renderEmptyDetail();
         }
         ctx.navigate('#/combos');
       } catch (err) {
@@ -1181,6 +1172,15 @@ export async function renderCombos(mount, ctx, selectedId) {
     // Re-render in the same slot: an existing combo's editor lives in the drawer, and the inline
     // right-hand slot would leave the old, still-dirty drawer mounted beside a second form.
     revertBtn.addEventListener('click', () => { clearDirty(); renderEditor(saved, target); });
+
+    /// Re-fetch the combo list so the master-detail view always mirrors the backend, even when a
+    /// response shape or a navigation subtlety lets a local patch go stale. Lives at the editor
+    /// scope so both the save and the delete paths use the same refresh.
+    async function refreshCombos() {
+      combos = extractList(await api.get('/api/combos'), 'combos');
+      renderList();
+      count.textContent = `${combos.length} combo${combos.length === 1 ? '' : 's'}`;
+    }
 
     const editor = h('form', { class: 'combo-editor', onsubmit: (e) => e.preventDefault() },
       title,
