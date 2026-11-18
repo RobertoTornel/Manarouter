@@ -47,6 +47,7 @@ pub mod copilot;
 pub mod cursor;
 pub mod flow;
 pub mod migrate;
+pub mod mistral_vibe;
 pub mod reference;
 pub mod refresh;
 pub mod session;
@@ -758,6 +759,7 @@ use claude::Claude;
 use codex::Codex;
 use copilot::Copilot;
 use cursor::Cursor;
+use mistral_vibe::MistralVibe;
 use zcode::Zcode;
 
 static CLAUDE: Claude = Claude;
@@ -766,10 +768,18 @@ static COPILOT: Copilot = Copilot;
 static ANTIGRAVITY: Antigravity = Antigravity::ide();
 static CURSOR: Cursor = Cursor;
 static ZCODE: Zcode = Zcode;
+static MISTRAL_VIBE: MistralVibe = MistralVibe;
 
 /// Registration order for implemented platforms, matching `catalog/providers.toml`.
-static PLATFORMS: [&'static dyn OAuthPlatform; 6] =
-    [&CODEX, &COPILOT, &ANTIGRAVITY, &CURSOR, &ZCODE, &CLAUDE];
+static PLATFORMS: [&'static dyn OAuthPlatform; 7] = [
+    &CODEX,
+    &COPILOT,
+    &ANTIGRAVITY,
+    &CURSOR,
+    &ZCODE,
+    &CLAUDE,
+    &MISTRAL_VIBE,
+];
 
 /// Every registered platform. Required to resolve every `AuthKind::OAuth` catalogue id — see
 /// the tests at the bottom of this file, which check both directions.

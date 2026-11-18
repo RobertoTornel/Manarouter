@@ -216,6 +216,23 @@ seconds = 18000
 reset_only = true
 
 [[providers]]
+id = "mistral-vibe"
+label = "Mistral Vibe"
+dialect = "open-ai"
+base_url = "https://api.mistral.ai/v1"
+auth = { type = "oauth", platform = "mistral-vibe" }
+oauth_platform = "mistral-vibe"
+capabilities = ["chat", "responses", "models", "tool-calling", "reasoning"]
+key_strategy = "round-robin"
+note = "OAuth only: the Mistral Vibe desktop login (Ory PKCE at auth.mistral.ai) produces a bearer that the OpenAI-compatible API at api.mistral.ai accepts. The login is loopback PKCE with a local listener; the panel opens the URL and receives the callback on this machine. UNCERTAIN: the Ory paths and the embedded client id were extracted from the Vibe 1.2.0 desktop installer and are the Ory defaults, not yet verified against a live login; if authorization fails, compare the URL the desktop app opens and adjust catalog oauth_* entries."
+docs_url = "https://www.mistral.ai/vibe"
+oauth_authorize_url = "https://auth.mistral.ai/oauth2/auth"
+oauth_token_url = "https://auth.mistral.ai/oauth2/token"
+oauth_client_id = "88df79e3-3a98-4624-92fe-c607ecf06f1d"
+oauth_scopes = "openid profile email offline_access"
+headers = { "user-agent" = "vibe-desktop/1.2.0" }
+
+[[providers]]
 id = "claude-code"
 label = "Claude Code (Claude subscription)"
 dialect = "claude-cli"

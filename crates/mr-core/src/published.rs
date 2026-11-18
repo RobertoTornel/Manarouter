@@ -184,6 +184,28 @@ pub mod openai {
     pub const DEVICE_VERIFY: &str = "https://auth.openai.com/codex/device";
 }
 
+/// The Mistral endpoints used by the Vibe desktop login and by the OpenAI-compatible API.
+///
+/// The Vibe desktop app authenticates through Ory at `auth.mistral.ai` with PKCE (S256); the
+/// values below are the Ory defaults plus the client id embedded in the desktop bundle.
+/// `// UNCERTAIN:` the Ory paths are the standard ones Ory serves; they were not verified against
+/// a live login, and the client id may be per-app. If authorize fails, compare the URL with what
+/// the desktop app opens.
+pub mod mistral_vibe {
+    /// The authorization endpoint on the Ory deployment.
+    pub const AUTHORIZE: &str = "https://auth.mistral.ai/oauth2/auth";
+    /// The token endpoint: code exchange and refresh, both form-encoded.
+    pub const TOKEN: &str = "https://auth.mistral.ai/oauth2/token";
+    /// OIDC userinfo, used for account identity.
+    pub const USERINFO: &str = "https://auth.mistral.ai/userinfo";
+    /// The OpenAI-compatible API origin.
+    pub const API: &str = "https://api.mistral.ai";
+    /// The OAuth client id embedded in the Vibe desktop app (v1.2.0).
+    pub const CLIENT_ID: &str = "88df79e3-3a98-4624-92fe-c607ecf06f1d";
+    /// The scopes the desktop login requests.
+    pub const SCOPES: &str = "openid profile email offline_access";
+}
+
 /// The Anthropic endpoints used by the Claude Code login and by Claude inference.
 ///
 /// Claude's login is the odd one among these platforms in a way that decides where every value
