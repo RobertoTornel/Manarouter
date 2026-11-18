@@ -309,7 +309,7 @@ export async function renderOverview(mount, ctx) {
   }
 
   async function probeRelay() {
-    const url = relayProbeUrl(ctx.state.ports?.relay, globalThis.location?.hostname);
+    const url = relayProbeUrl(ctx.state.ports?.relay, globalThis.location?.hostname, globalThis.location?.protocol);
     relayState = { status: 'probing', url: url || '', ms: null, err: null };
     renderRelay();
 

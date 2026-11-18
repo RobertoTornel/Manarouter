@@ -28,6 +28,17 @@ test('an explicit non-loopback address is probed as configured', () => {
   assert.equal(relayProbeUrl(relay('100.104.1.69'), '127.0.0.1'), 'http://100.104.1.69:20900/healthz');
 });
 
+test('an HTTPS panel probes the relay through the same host on 443', () => {
+  // A tailnet panel is HTTPS; a plain-http probe from that page would be blocked as mixed content.
+  assert.equal(relayProbeUrl(relay('0.0.0.0'), 'pc.nutria-ordinal.ts.net', 'https:'),
+    'https://pc.nutria-ordinal.ts.net/healthz');
+  assert.equal(relayProbeUrl(relay('127.0.0.1'), 'pc.nutria-ordinal.ts.net', 'https:'),
+    'https://pc.nutria-ordinal.ts.net/healthz');
+  // A local HTTP page keeps probing the loopback listener with its raw port.
+  assert.equal(relayProbeUrl(relay('127.0.0.1'), '127.0.0.1', 'http:'),
+    'http://127.0.0.1:20900/healthz');
+});
+
 test('an IPv6 literal stays bracketed, and a missing port yields null', () => {
   assert.equal(relayProbeUrl(relay('fd7a:115c:a1e0::1'), '127.0.0.1'), 'http://[fd7a:115c:a1e0::1]:20900/healthz');
   assert.equal(relayProbeUrl({ host: '127.0.0.1' }), null);

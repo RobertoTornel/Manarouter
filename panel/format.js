@@ -190,7 +190,7 @@ export function describePortChange(ports) {
  * root has no handler, so probing it logged a 404 on every visit to the overview and answered a
  * different question ("is something listening") than the one the panel asks ("is the relay up").
  */
-export function relayProbeUrl(relay, pageHost) {
+export function relayProbeUrl(relay, pageHost, pageProtocol = 'http:') {
   if (!relay || typeof relay !== 'object') return null;
   const port = relay.running_port ?? relay.port;
   if (port == null || port === '') return null;
@@ -204,6 +204,13 @@ export function relayProbeUrl(relay, pageHost) {
   const pageIsRemote = typeof pageHost === 'string' && pageHost !== '' &&
     pageHost !== '127.0.0.1' && pageHost !== 'localhost' && pageHost !== '[::1]';
   if (wildcard || (loopback && pageIsRemote)) host = pageIsRemote ? pageHost : '127.0.0.1';
+  // An HTTPS panel is served through a TLS terminator (for example a tailnet's `tailscale serve`),
+  // and the relay answers on the same host's default 443 route — not on its raw listener, which
+  // speaks plain HTTP. Probing `http://` from an HTTPS page would be blocked as mixed content
+  // before it ever left the browser, so the probe inherits the page's scheme and drops the port.
+  if (pageProtocol === 'https:' && (wildcard || pageIsRemote)) {
+    return `https://${host}/healthz`;
+  }
   if (host.includes(':') && !(host.startsWith('[') && host.endsWith(']'))) host = `[${host}]`;
   return `http://${host}:${port}/healthz`;
 }
