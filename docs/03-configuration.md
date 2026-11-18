@@ -74,14 +74,17 @@ state and restart" is only safe when neither of those matters to you.
     "port": 20900,
     "reuse_port": true,       // carried in the schema but read by nothing: one socket is bound,
                               // with SO_REUSEPORT set unconditionally (see below)
-    "backlog": 1024           // also carried but not applied to the socket today
+    "backlog": 1024,          // also carried but not applied to the socket today
+    "tls": null               // optional: { "cert": "/path/cert.pem", "key": "/path/key.pem" }
+                              // turns this listener into HTTPS (see "TLS over a tailnet" below)
   },
 
   "control": {
     "host": "127.0.0.1",
     "port": 20901,
     "allow_remote_without_password": false,
-    "password_hash": null     // Argon2id, never a plaintext password
+    "password_hash": null,    // Argon2id, never a plaintext password
+    "tls": null               // same optional cert/key pair as the relay: HTTPS for panel + API
   },
 
   "providers": [ /* §4 */ ],
@@ -159,6 +162,26 @@ Both are carried in the schema so an existing file keeps loading, and both are *
 `SO_REUSEPORT` on it unconditionally. That flag is what lets a second *process* share the port; it does
 not fan a single process out across CPUs. `backlog` is never applied to the socket, so you get the
 operating system's default. Neither field is wrong to set, and neither does anything yet.
+
+### TLS over a tailnet
+
+Each listener takes an optional `tls` block — `{ "cert": <pem path>, "key": <pem path> }` — and when
+it is present the listener serves **HTTPS** instead of HTTP. The simplest source of a publicly trusted
+pair on a Tailscale tailnet is Tailscale's own certificate command:
+
+```sh
+tailscale cert <machine>.<tailnet>.ts.net
+# writes <machine>.<tailnet>.ts.net.crt (chain) and ...key (PKCS#8)
+```
+
+Point `relay.tls` / `control.tls` at those two files and restart the service. Both listeners read the
+files at startup, so a renewal (Tailscale rotates these by default every 90 days) requires a restart;
+Tailscale also runs its own `tailscale serve` proxy, which terminates TLS at the tailnet edge and
+forwards to a loopback listener — that path needs no `tls` block at all. The bind host is separate:
+`0.0.0.0` makes the listener reachable on every interface (including the tailnet), while the loopback
+default keeps it local. Opening the **control** listener beyond loopback is what
+`allow_remote_without_password` governs — keep that false unless the panel is deliberately password-
+protected or the tailnet is trusted.
 
 ### `quotaProbe`
 

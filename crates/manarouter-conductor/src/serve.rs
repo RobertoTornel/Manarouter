@@ -33,9 +33,13 @@ use crate::state::AppState;
 /// and the operating system's reason, and asks the question the operator actually has to answer
 /// (is something else already on this port?).
 pub async fn serve(state: AppState) -> Result<(), String> {
-    let (host, port) = {
+    let (host, port, tls) = {
         let config = state.current_config().await;
-        (config.control.host.clone(), config.control.port)
+        (
+            config.control.host.clone(),
+            config.control.port,
+            config.control.tls.clone(),
+        )
     };
 
     let listener = tokio::net::TcpListener::bind((host.as_str(), port))
@@ -74,20 +78,75 @@ pub async fn serve(state: AppState) -> Result<(), String> {
         other if other.contains(':') && !other.starts_with('[') => format!("[{other}]"),
         other => other.to_owned(),
     };
-    let origin = format!("http://{display_host}:{bound_port}");
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let origin = format!("{scheme}://{display_host}:{bound_port}");
     tracing::info!(
         "control plane listening on {origin} (panel: {origin}/, API: {origin}/api/health)"
     );
 
     let application = app(state.clone());
-    axum::serve(
-        listener,
-        application.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal(state))
-    .await
-    .map_err(|e| format!("the control plane stopped with an error: {e}"))?;
+    match tls {
+        Some(files) => {
+            let config = mr_core::tls::server_config(
+                std::path::Path::new(&files.cert),
+                std::path::Path::new(&files.key),
+            )
+            .map_err(|e| format!("the control plane TLS configuration is invalid: {e}"))?;
+            let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+            serve_tls(listener, application, acceptor, shutdown_signal(state)).await?;
+        }
+        None => {
+            axum::serve(
+                listener,
+                application.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal(state))
+            .await
+            .map_err(|e| format!("the control plane stopped with an error: {e}"))?;
+        }
+    }
     tracing::info!("control plane stopped");
+    Ok(())
+}
+
+/// Serve the control plane over TLS: wrap each accepted connection, then serve the application on
+/// it. Same accept-loop shape as the relay's TLS listener.
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    acceptor: tokio_rustls::TlsAcceptor,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> Result<(), String> {
+    let mut shutdown = std::pin::pin!(shutdown);
+    loop {
+        let accepted = tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                tracing::debug!(error = %e, "control accept failed");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            match acceptor.accept(stream).await {
+                Ok(tls_stream) => {
+                    let io = hyper_util::rt::TokioIo::new(tls_stream);
+                    let service = hyper_util::service::TowerToHyperService::new(app);
+                    let service =
+                        hyper::server::conn::http1::Builder::new().serve_connection(io, service);
+                    if let Err(e) = service.await {
+                        tracing::debug!(%peer, error = %e, "a TLS connection ended with an error");
+                    }
+                }
+                Err(e) => tracing::debug!(%peer, error = %e, "a TLS handshake failed"),
+            }
+        });
+    }
     Ok(())
 }
 

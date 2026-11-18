@@ -47,6 +47,7 @@ pub mod rental;
 pub mod secret;
 pub mod snapshot;
 pub mod store;
+pub mod tls;
 pub mod usage;
 
 pub use error::{Error, Result};

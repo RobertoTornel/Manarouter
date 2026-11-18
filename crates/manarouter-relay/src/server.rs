@@ -6460,17 +6460,81 @@ fn bind_reuseport(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
 }
 
 /// Serve until the process is asked to stop.
-pub async fn serve(state: AppState, addr: SocketAddr) -> std::io::Result<()> {
+///
+/// `tls` is the optional certificate/key pair; when present the listener speaks HTTPS by wrapping
+/// every accepted connection in TLS before handing it to the router (see [`crate::tls`] via
+/// `mr_core::tls`). Without it, the listener is plain HTTP.
+pub async fn serve(
+    state: AppState,
+    addr: SocketAddr,
+    tls: Option<mr_core::config::TlsFiles>,
+) -> std::io::Result<()> {
     let listener = bind_reuseport(addr)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
-    tracing::info!(%addr, "relay listening");
+    match tls {
+        Some(files) => {
+            let config = mr_core::tls::server_config(
+                std::path::Path::new(&files.cert),
+                std::path::Path::new(&files.key),
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+            tracing::info!(%addr, "relay listening with TLS");
+            let app = router(state);
+            serve_tls(listener, app, acceptor).await
+        }
+        None => {
+            tracing::info!(%addr, "relay listening");
+            axum::serve(
+                listener,
+                router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+        }
+    }
+}
 
-    axum::serve(
-        listener,
-        router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
+/// Accept plain TCP connections, wrap each in TLS, and serve the application over it.
+///
+/// Graceful shutdown mirrors the plain listener: stop accepting when the signal arrives; in-flight
+/// connections are left to finish and dropped when the process exits.
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> std::io::Result<()> {
+    let mut shutdown = std::pin::pin!(shutdown_signal());
+    loop {
+        let accepted = tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                tracing::debug!(error = %e, "relay accept failed");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            match acceptor.accept(stream).await {
+                Ok(tls_stream) => {
+                    let io = hyper_util::rt::TokioIo::new(tls_stream);
+                    let service = hyper_util::service::TowerToHyperService::new(app);
+                    let service =
+                        hyper::server::conn::http1::Builder::new().serve_connection(io, service);
+                    if let Err(e) = service.await {
+                        tracing::debug!(%peer, error = %e, "a TLS connection ended with an error");
+                    }
+                }
+                Err(e) => tracing::debug!(%peer, error = %e, "a TLS handshake failed"),
+            }
+        });
+    }
+    Ok(())
 }
 
 /// Resolve when the process is asked to stop.

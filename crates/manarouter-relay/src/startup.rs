@@ -272,7 +272,8 @@ pub async fn serve(options: RelayOptions) -> Result<(), StartupError> {
     // it from the release feed in the background instead of pinning a literal. The request path
     // only reads the cache; a failed probe leaves the last known version (or the fallback) in place.
     mr_core::quota::antigravity::spawn_version_refresher();
-    server::serve(state, addr)
+    let tls = config.relay.tls.clone();
+    server::serve(state, addr, tls)
         .await
         .map_err(|e| StartupError::new(format!("the listener failed: {e}")))
 }

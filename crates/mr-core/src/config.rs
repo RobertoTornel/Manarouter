@@ -191,6 +191,10 @@ pub struct Listener {
     ///
     /// **Not applied yet** — the socket uses the operating system's default backlog.
     pub backlog: u32,
+    /// Optional TLS termination: when `cert` and `key` PEM paths are present, this listener serves
+    /// HTTPS instead of HTTP. The obvious source of a trusted pair on a tailnet is `tailscale cert`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsFiles>,
 }
 
 impl Default for Listener {
@@ -200,8 +204,18 @@ impl Default for Listener {
             port: DEFAULT_RELAY_PORT,
             reuse_port: true,
             backlog: 1024,
+            tls: None,
         }
     }
+}
+
+/// Certificate and private-key PEM paths for a listener's TLS termination.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TlsFiles {
+    /// Path to the PEM certificate (chain).
+    pub cert: String,
+    /// Path to the PEM private key (PKCS#8).
+    pub key: String,
 }
 
 /// The control plane's listener, plus its panel protection.
@@ -220,6 +234,11 @@ pub struct ControlListener {
     pub allow_remote_without_password: bool,
     /// Argon2id hash of the panel password, if one is set. Never the password itself.
     pub password_hash: Option<String>,
+    /// Optional TLS termination: when `cert` and `key` PEM paths are present, the panel and its
+    /// API serve HTTPS instead of HTTP. The obvious source of a trusted pair on a tailnet is
+    /// `tailscale cert`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsFiles>,
 }
 
 impl Default for ControlListener {
@@ -229,6 +248,7 @@ impl Default for ControlListener {
             port: DEFAULT_CONTROL_PORT,
             allow_remote_without_password: false,
             password_hash: None,
+            tls: None,
         }
     }
 }
@@ -1821,6 +1841,43 @@ mod tests {
     use crate::ids::{AccountId, ComboId};
     use crate::model::{Account, ComboStep, ModelEntry, ModelSource};
     use crate::rental::{HuggingFaceToken, RentalPlan};
+
+    #[test]
+    fn listener_tls_round_trips_and_defaults_to_absent() {
+        let default = Listener::default();
+        assert_eq!(default.tls, None);
+        let with_tls = Listener {
+            tls: Some(TlsFiles {
+                cert: "/var/lib/tailscale/certs/tailnet.pem".into(),
+                key: "/var/lib/tailscale/certs/tailnet-key.pem".into(),
+            }),
+            ..Listener::default()
+        };
+        let json = serde_json::to_string(&with_tls).expect("serialize");
+        assert!(json.contains("tls"), "{json}");
+        let back: Listener = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.tls, with_tls.tls);
+        // A v1-era listener without the field still loads.
+        let legacy = serde_json::from_str::<Listener>(
+            r#"{"host":"127.0.0.1","port":20900,"reuse_port":true,"backlog":1024}"#,
+        )
+        .expect("legacy listener loads");
+        assert_eq!(legacy.tls, None);
+    }
+
+    #[test]
+    fn control_listener_tls_round_trips() {
+        let with_tls = ControlListener {
+            tls: Some(TlsFiles {
+                cert: "/tmp/cert.pem".into(),
+                key: "/tmp/key.pem".into(),
+            }),
+            ..ControlListener::default()
+        };
+        let json = serde_json::to_string(&with_tls).expect("serialize");
+        let back: ControlListener = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.tls, with_tls.tls);
+    }
 
     fn provider(id: &str) -> Provider {
         Provider::new(id, crate::Dialect::OpenAi, "https://example.test")
