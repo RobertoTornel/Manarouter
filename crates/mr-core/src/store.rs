@@ -90,6 +90,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V3,
     MIGRATION_V4,
     MIGRATION_V5,
+    MIGRATION_V6,
 ];
 
 /// Schema v1: four tables, their indexes, and the revision/tombstone columns every row carries
@@ -284,6 +285,31 @@ CREATE TABLE IF NOT EXISTS gpu_usage (
 );
 
 CREATE INDEX IF NOT EXISTS gpu_usage_by_provider_time ON gpu_usage(provider_id, created_at);
+"#;
+
+/// Schema v6: what each account has spent, against the windows the operator declared.
+///
+/// A declared quota window needs a history to be measured against, and the history cannot be a
+/// copy of `key_usage` — that table is keyed by client key, so an account's spend drawn from it
+/// would lose the account each row was spent on. One row per dialled account, appended once, is
+/// the whole ledger: rolling windows need the events themselves, not a counter that would reset
+/// and hand back quota the operator has already spent.
+///
+/// Token columns are nullable for exactly the reason `usage` makes them nullable: a response that
+/// reported no counts is an unknown spend, and a stored zero would make `SUM` under-report. A
+/// missing row after a rebuild is a known-zero window, not an unknown one.
+const MIGRATION_V6: &str = r#"
+CREATE TABLE IF NOT EXISTS account_spend (
+    id                 TEXT PRIMARY KEY,
+    provider_id        TEXT NOT NULL,
+    account_id         TEXT NOT NULL,
+    prompt_tokens      INTEGER,
+    completion_tokens  INTEGER,
+    occurred_at        INTEGER NOT NULL,
+    created_at         INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS account_spend_by_account_time ON account_spend(account_id, occurred_at);
 "#;
 
 /// Compile-time guarantee that every migration has a schema version and vice versa.
@@ -923,6 +949,195 @@ impl ProviderQuotaState {
             created_at: now,
             updated_at: now,
         }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Per-account spend ledger
+// -------------------------------------------------------------------------------------------------
+
+/// One request's spend, attributed to the account that served it.
+///
+/// Appended once when the relay dials the account, and updated once when the upstream's reported
+/// counts arrive — a dialled request is a fact about the account immediately, while its token cost
+/// is unknown until the reply. The row is keyed by its request id, so recording the dial and then
+/// settling the same request touches one row rather than two tables.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountSpendRecord {
+    /// The row id (a UUIDv7 string). One per dialled request.
+    pub id: String,
+    /// The provider the account belongs to.
+    pub provider_id: String,
+    /// The account that was dialled.
+    pub account_id: AccountId,
+    /// Prompt tokens the upstream reported, if it reported any.
+    pub prompt_tokens: Option<u64>,
+    /// Completion tokens the upstream reported, if it reported any.
+    pub completion_tokens: Option<u64>,
+    /// When the request was dialled, in milliseconds since the epoch.
+    pub occurred_at: Millis,
+    /// When the row was written, in milliseconds since the epoch.
+    pub created_at: Millis,
+}
+
+impl AccountSpendRecord {
+    /// A request dialled at `occurred_at`, with no reported tokens yet.
+    pub fn new(provider_id: impl Into<String>, account_id: AccountId, occurred_at: Millis) -> Self {
+        Self {
+            id: new_id(),
+            provider_id: provider_id.into(),
+            account_id,
+            prompt_tokens: None,
+            completion_tokens: None,
+            occurred_at,
+            created_at: Millis::now(),
+        }
+    }
+
+    /// Attach the token counts the upstream reported.
+    pub fn with_tokens(mut self, prompt: Option<u64>, completion: Option<u64>) -> Self {
+        self.prompt_tokens = prompt;
+        self.completion_tokens = completion;
+        self
+    }
+}
+
+impl Store {
+    /// Append one dialled request to the per-account spend ledger.
+    ///
+    /// The request counts the moment the relay chooses the account, not when the answer arrives:
+    /// a refusal still spent a request against the plan, and counting only fulfilled requests
+    /// would let a dead account be dialled without limit. Re-recording the same id is a no-op
+    /// (`ON CONFLICT DO NOTHING`), which makes a retry safe.
+    pub fn record_account_spend(&self, record: &AccountSpendRecord) -> Result<()> {
+        let guard = self.guard()?;
+        guard.execute(
+            "INSERT INTO account_spend (id, provider_id, account_id, prompt_tokens, \
+             completion_tokens, occurred_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(id) DO NOTHING",
+            params![
+                record.id,
+                record.provider_id,
+                record.account_id.as_str(),
+                record
+                    .prompt_tokens
+                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                record
+                    .completion_tokens
+                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                record.occurred_at.as_millis(),
+                record.created_at.as_millis(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Attach the upstream's reported token counts to the spend row for one request.
+    ///
+    /// Idempotent in the useful direction: a second answer carrying the same counts replaces them
+    /// rather than adding a second row, so a reply that streams its usage in pieces cannot
+    /// double-count. Counts that are unknown stay unknown: a `None` field is left as it was
+    /// instead of being written as zero.
+    pub fn settle_account_spend(
+        &self,
+        id: &str,
+        prompt_tokens: Option<u64>,
+        completion_tokens: Option<u64>,
+    ) -> Result<()> {
+        let guard = self.guard()?;
+        guard.execute(
+            "UPDATE account_spend SET \
+             prompt_tokens = COALESCE(?1, prompt_tokens), \
+             completion_tokens = COALESCE(?2, completion_tokens) \
+             WHERE id = ?3",
+            params![
+                prompt_tokens.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                completion_tokens.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The spend events of one account at or after `since_ms`, oldest first.
+    ///
+    /// Oldest first so a rolling window's recovery can walk the order that matters; the caller
+    /// filters to the window it cares about.
+    pub fn account_spend_since(
+        &self,
+        account_id: &str,
+        since_ms: u64,
+    ) -> Result<Vec<crate::account_quota::SpendEvent>> {
+        let guard = self.guard()?;
+        let mut stmt = guard.prepare(
+            "SELECT prompt_tokens, completion_tokens, occurred_at FROM account_spend \
+             WHERE account_id = ?1 AND occurred_at >= ?2 ORDER BY occurred_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![account_id, since_ms], |row| {
+            let prompt: Option<i64> = row.get(0)?;
+            let completion: Option<i64> = row.get(1)?;
+            let occurred_at: i64 = row.get(2)?;
+            Ok(crate::account_quota::SpendEvent {
+                at_ms: u64::try_from(occurred_at).unwrap_or(0),
+                input_tokens: prompt.and_then(|v| u64::try_from(v).ok()),
+                output_tokens: completion.and_then(|v| u64::try_from(v).ok()),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The spend events of every account of one provider at or after `since_ms`, grouped by account.
+    ///
+    /// One query for the quota page, which renders every account on a provider at once rather than
+    /// one at a time.
+    pub fn account_spend_by_provider_since(
+        &self,
+        provider_id: &str,
+        since_ms: u64,
+    ) -> Result<std::collections::BTreeMap<AccountId, Vec<crate::account_quota::SpendEvent>>> {
+        let guard = self.guard()?;
+        let mut stmt = guard.prepare(
+            "SELECT account_id, prompt_tokens, completion_tokens, occurred_at FROM account_spend \
+             WHERE provider_id = ?1 AND occurred_at >= ?2 ORDER BY account_id ASC, occurred_at ASC",
+        )?;
+        let rows = stmt.query_map(params![provider_id, since_ms], |row| {
+            let account: String = row.get(0)?;
+            let prompt: Option<i64> = row.get(1)?;
+            let completion: Option<i64> = row.get(2)?;
+            let occurred_at: i64 = row.get(3)?;
+            Ok((
+                AccountId::from_raw(account),
+                crate::account_quota::SpendEvent {
+                    at_ms: u64::try_from(occurred_at).unwrap_or(0),
+                    input_tokens: prompt.and_then(|v| u64::try_from(v).ok()),
+                    output_tokens: completion.and_then(|v| u64::try_from(v).ok()),
+                },
+            ))
+        })?;
+        let mut out: std::collections::BTreeMap<AccountId, Vec<crate::account_quota::SpendEvent>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let (account, event) = row?;
+            out.entry(account).or_default().push(event);
+        }
+        Ok(out)
+    }
+
+    /// Delete ledger rows that happened before `before`, returning how many were removed.
+    ///
+    /// The ledger grows with traffic, so it needs a retention policy. Retention is by dial time,
+    /// not by write time: a row settled late about an old request is still old.
+    pub fn prune_account_spend(&self, before: Millis) -> Result<u64> {
+        let guard = self.guard()?;
+        let removed = guard.execute(
+            "DELETE FROM account_spend WHERE occurred_at < ?1",
+            params![before.as_millis()],
+        )?;
+        Ok(u64::try_from(removed).unwrap_or(0))
     }
 }
 
@@ -3074,6 +3289,97 @@ mod tests {
         let window = store.key_window_usage("key-a", t(0)).expect("query");
         assert_eq!(window.requests, 1);
         assert_eq!(window.total_tokens(), 7);
+    }
+
+    // -- the per-account spend ledger --------------------------------------------------
+
+    #[test]
+    fn a_dialled_request_counts_immediately_and_its_tokens_arrive_on_settle() {
+        let store = Store::open_in_memory().expect("open");
+        let record = AccountSpendRecord::new("vercel", account("a"), t(10_000));
+        store.record_account_spend(&record).expect("record");
+        // Until the upstream reports anything, the request still counts: a refusal spent a
+        // request against the plan even though its tokens are unknown.
+        let before = store.account_spend_since("acct-a", 0).expect("query");
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].input_tokens, None);
+        assert_eq!(before[0].output_tokens, None);
+
+        store
+            .settle_account_spend(&record.id, Some(120), Some(30))
+            .expect("settle");
+        let after = store.account_spend_since("acct-a", 0).expect("query");
+        assert_eq!(after.len(), 1, "settling updates the same row");
+        assert_eq!(after[0].input_tokens, Some(120));
+        assert_eq!(after[0].output_tokens, Some(30));
+    }
+
+    #[test]
+    fn settling_twice_replaces_rather_than_adds_and_never_erases_unknown_counts() {
+        let store = Store::open_in_memory().expect("open");
+        let record = AccountSpendRecord::new("vercel", account("a"), t(1_000));
+        store.record_account_spend(&record).expect("record");
+        store
+            .settle_account_spend(&record.id, Some(10), Some(5))
+            .expect("settle");
+        // A second settlement carrying only one count must not erase the other.
+        store
+            .settle_account_spend(&record.id, Some(10), None)
+            .expect("settle again");
+        let events = store.account_spend_since("acct-a", 0).expect("query");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].input_tokens, Some(10));
+        assert_eq!(events[0].output_tokens, Some(5));
+    }
+
+    #[test]
+    fn spend_reads_are_scoped_by_account_and_bounded_by_time() {
+        let store = Store::open_in_memory().expect("open");
+        for (acct, at) in [("a", 1_000i64), ("a", 2_000), ("b", 1_500), ("a", 500)] {
+            let record = AccountSpendRecord::new("vercel", account(acct), t(at));
+            store.record_account_spend(&record).expect("record");
+        }
+        let all_a = store.account_spend_since("acct-a", 0).expect("query");
+        assert_eq!(all_a.len(), 3, "only the account's own rows");
+        assert_eq!(all_a[0].at_ms, 500, "oldest first");
+        assert_eq!(all_a[1].at_ms, 1_000, "in dial order, not write order");
+        let from_1000 = store.account_spend_since("acct-a", 1_000).expect("query");
+        assert_eq!(from_1000.len(), 2);
+
+        let by_provider = store
+            .account_spend_by_provider_since("vercel", 0)
+            .expect("query");
+        assert_eq!(by_provider.len(), 2);
+        assert_eq!(by_provider[&account("a")].len(), 3);
+        assert_eq!(by_provider[&account("b")].len(), 1);
+        assert!(store
+            .account_spend_by_provider_since("nope", 0)
+            .expect("query")
+            .is_empty());
+    }
+
+    #[test]
+    fn recording_the_same_spend_row_twice_does_not_double_count() {
+        let store = Store::open_in_memory().expect("open");
+        let record = AccountSpendRecord::new("vercel", account("a"), t(10));
+        store.record_account_spend(&record).expect("first");
+        store.record_account_spend(&record).expect("second");
+        let events = store.account_spend_since("acct-a", 0).expect("query");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn pruning_account_spend_removes_only_rows_older_than_the_cutoff() {
+        let store = Store::open_in_memory().expect("open");
+        for at in [100i64, 200, 300] {
+            let record = AccountSpendRecord::new("vercel", account("a"), t(at));
+            store.record_account_spend(&record).expect("record");
+        }
+        let removed = store.prune_account_spend(t(250)).expect("prune");
+        assert_eq!(removed, 2);
+        let remaining = store.account_spend_since("acct-a", 0).expect("query");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].at_ms, 300);
     }
 
     // -- the provider quota cache -------------------------------------------------------

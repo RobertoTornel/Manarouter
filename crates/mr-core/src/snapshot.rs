@@ -543,6 +543,20 @@ pub struct AccountPlan {
     /// for a number the router never spends. `None` means the operator declared nothing; it is not
     /// a zero balance. A declared zero is `Some(0)`.
     pub credit_cents: Option<u64>,
+    /// The declared quota windows that can stop this account, already resolved against the
+    /// provider's defaults.
+    ///
+    /// Resolved, not authored: an account with windows of its own uses those, and an account
+    /// without them inherits the provider's. Doing it here means the request path never has to know
+    /// which level a window came from, and the two levels cannot be applied inconsistently by
+    /// different callers.
+    ///
+    /// Only windows that constrain something are kept — a window with every limit at zero, or one
+    /// marked [`crate::model::QuotaWindow::reset_only`], is a reset clock rather than a limit and
+    /// is carried by the configuration, not by the data plane. A window whose length is not
+    /// positive is dropped too: there is no interval to count over, and enforcement cannot be
+    /// derived from it.
+    pub quota: Vec<crate::model::QuotaWindow>,
 }
 
 /// A compiled client key: everything the relay needs to authenticate a request and charge it to
@@ -767,7 +781,12 @@ impl RoutingSnapshot {
                 .into_iter()
                 .map(|a| {
                     let person = config.person_for_account(a).map(|p| p.proxy.as_str());
-                    account_plan(provider.id.as_str(), a, person)
+                    account_plan(
+                        provider.id.as_str(),
+                        a,
+                        person,
+                        provider.effective_windows(a),
+                    )
                 })
                 .collect();
 
@@ -1719,7 +1738,15 @@ fn temp_sibling(path: &Path) -> PathBuf {
 /// with no OAuth reference falls back to the conventional [`account_secret_id`] vault path, and an
 /// OAuth account keeps only its metadata reference. The relay opens the vault after resolving its
 /// metadata record; this module only handles ids.
-fn account_plan(provider_id: &str, account: &Account, person_proxy: Option<&str>) -> AccountPlan {
+///
+/// `windows` is the account's **effective** quota declaration — its own if it wrote any, otherwise
+/// the provider's — so that resolution happens once, here, rather than on every request.
+fn account_plan(
+    provider_id: &str,
+    account: &Account,
+    person_proxy: Option<&str>,
+    windows: &[crate::model::QuotaWindow],
+) -> AccountPlan {
     let secret_ref = match &account.secret_ref {
         Some(explicit) => Some(explicit.clone()),
         None if account.oauth_ref.is_none() => {
@@ -1752,6 +1779,15 @@ fn account_plan(provider_id: &str, account: &Account, person_proxy: Option<&str>
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
         credit_cents: account.credit_usd.map(cents_from_usd),
+        // Only windows that can actually stop an account are compiled: an inert window is dead
+        // weight on the hot path, and a window with no positive length has no interval to count
+        // over — the configuration validator already refuses it, but a hand-built `Config` gets
+        // the same treatment here rather than an infinite one.
+        quota: windows
+            .iter()
+            .filter(|window| window.seconds > 0 && window.constrains())
+            .cloned()
+            .collect(),
     }
 }
 
@@ -2542,6 +2578,30 @@ fn encode_account(encoder: &mut Encoder, account: &AccountPlan) {
     // balance. A sentinel rather than a separate presence byte because no real balance is within
     // 18 quintillion dollars of the maximum.
     encoder.put_u64(account.credit_cents.unwrap_or(u64::MAX));
+    // The account's effective quota windows — the ones that can stop it. Encoded so the data plane
+    // enforces exactly what the operator declared without re-reading the configuration on the
+    // request path, which is the same reason a client key's windows are compiled in.
+    encoder.put_u32(u32::try_from(account.quota.len()).unwrap_or(u32::MAX));
+    for window in &account.quota {
+        encode_quota_window(encoder, window);
+    }
+}
+
+/// Encode one declared quota window.
+///
+/// Every dimension is written, including the ones at zero, because "unlimited tokens" and "no
+/// token dimension at all" are the same statement here — the window says which dimensions it
+/// limits by setting them above zero, and a decoder that guessed would be inventing a limit.
+fn encode_quota_window(encoder: &mut Encoder, window: &crate::model::QuotaWindow) {
+    let name = encoder.opt_str_id(window.name.as_deref());
+    encoder.put_u32(name);
+    encoder.put_u8(window.kind as u8);
+    encoder.put_i64(window.seconds);
+    encoder.put_u64(window.limit_requests);
+    encoder.put_u64(window.limit_tokens);
+    encoder.put_u64(window.limit_input_tokens);
+    encoder.put_u64(window.limit_output_tokens);
+    encoder.put_bool(window.reset_only);
 }
 
 /// Encode an auth kind.
@@ -3313,6 +3373,48 @@ fn decode_account(reader: &mut Reader, strings: &[String]) -> Result<AccountPlan
             u64::MAX => None,
             cents => Some(cents),
         },
+        quota: {
+            let count = reader.u32()? as usize;
+            let mut quota = Vec::with_capacity(count.min(64));
+            for _ in 0..count {
+                quota.push(decode_quota_window(reader, strings)?);
+            }
+            quota
+        },
+    })
+}
+
+/// Decode one declared quota window written by [`encode_quota_window`].
+fn decode_quota_window(
+    reader: &mut Reader,
+    strings: &[String],
+) -> Result<crate::model::QuotaWindow> {
+    Ok(crate::model::QuotaWindow {
+        name: reader.opt_string(strings)?,
+        kind: window_kind_from_tag(reader.u8()?)?,
+        seconds: reader.i64()?,
+        limit_requests: reader.u64()?,
+        limit_tokens: reader.u64()?,
+        limit_input_tokens: reader.u64()?,
+        limit_output_tokens: reader.u64()?,
+        reset_only: reader.bool()?,
+    })
+}
+
+/// Decode a window kind tag.
+fn window_kind_from_tag(tag: u8) -> Result<crate::dialect::WindowKind> {
+    // `WindowKind` is `#[repr(u8)]` with tags from zero, so the tag *is* the discriminant; the
+    // order is asserted by the exhaustive match's arms rather than by a hand-copied number.
+    use crate::dialect::WindowKind;
+    Ok(match tag {
+        0 => WindowKind::Rolling,
+        1 => WindowKind::Fixed,
+        2 => WindowKind::ProviderDeclared,
+        other => {
+            return Err(Error::Snapshot(format!(
+                "snapshot quota window kind {other} is not one this binary knows"
+            )))
+        }
     })
 }
 
@@ -3944,6 +4046,51 @@ mod tests {
         let snapshot = RoutingSnapshot::compile(&config).unwrap();
         let step = &snapshot.providers()[0].steps[0];
         assert_eq!(step.context_length, Some(262_144));
+    }
+
+    #[test]
+    fn quota_windows_are_resolved_onto_accounts_and_round_trip() {
+        // No provider id appears here: the compiler carries whatever windows the operator
+        // declared, which is what makes the feature work for every provider rather than one.
+        let mut config = Config::default();
+        let mut provider = provider("generic");
+        provider.quota = vec![crate::model::QuotaWindow::requests_per(3600, 100)];
+        let mut first = account("a", "a", 0);
+        let mut second = account("b", "b", 1);
+        // An account's own windows replace the provider's; an account with none inherits them.
+        second.quota = vec![crate::model::QuotaWindow::requests_per(60, 5)];
+        // A window that constrains nothing, and one with no positive length, never reach the
+        // data plane: enforcement cannot be derived from either.
+        second.quota.push(crate::model::QuotaWindow {
+            seconds: 60,
+            ..Default::default()
+        });
+        second.quota.push(crate::model::QuotaWindow {
+            seconds: 0,
+            limit_requests: 9,
+            ..Default::default()
+        });
+        provider.accounts = vec![first.clone(), second.clone()];
+        provider.models = vec![model("m")];
+        config.providers = vec![provider];
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+        let accounts = &snapshot.providers()[0].accounts;
+        assert_eq!(accounts[0].quota.len(), 1);
+        assert_eq!(accounts[0].quota[0].limit_requests, 100);
+        assert_eq!(accounts[1].quota.len(), 1);
+        assert_eq!(accounts[1].quota[0].seconds, 60);
+
+        let bytes = snapshot.encode().unwrap();
+        let decoded = RoutingSnapshot::decode(&bytes).unwrap();
+        assert_eq!(decoded, snapshot);
+        assert_eq!(
+            decoded.providers()[0].accounts[1].quota[0].limit_requests,
+            5,
+            "the binary frame must carry the windows the relay enforces"
+        );
+        // An unrelated config shape must not gain windows by accident.
+        first.quota.clear();
+        assert!(accounts[0].quota.len() == 1);
     }
 
     #[test]

@@ -399,6 +399,12 @@ fn reports_quota(
     account: &Account,
     probe: &mr_core::quota::probe::QuotaProbeConfig,
 ) -> bool {
+    // A declared window is also quota: it has a limit and a reset, both of which the relay
+    // enforces from its own ledger. Without this the account is invisible in the quota view
+    // even though it is capped — the operator sees no row for a limit that does bind.
+    if !provider.effective_windows(account).is_empty() {
+        return true;
+    }
     let quota_account = mr_core::quota::registry::QuotaAccount::from_account(account);
     let Some(fetcher) = default_registry().lookup(
         provider.dialect,

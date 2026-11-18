@@ -73,9 +73,9 @@ node --test panel/test/*.test.mjs
 # Browser workflow (local opt-in): Playwright and the browser binaries are not project dependencies.
 BROWSER=firefox PLAYWRIGHT_MODULE=/path/to/playwright FIREFOX_EXECUTABLE=/path/to/firefox node panel/test/browser.e2e.mjs
 ```
-For the revision described here the Rust and panel lines were re-run and passed: **2 121 workspace
-tests** (0 failed, 4 ignored — the reference-vault refresh test and three `no_run` quota doctests), the
-same suite in `--release` (2 121 passed, 4 ignored), clean strict Clippy
+For the revision described here the Rust and panel lines were re-run and passed: **2 142 workspace
+tests** (0 failed, 1 ignored — the reference-vault refresh test), the
+same suite in `--release` (2 142 passed, 1 ignored), clean strict Clippy
 (`cargo clippy --workspace --all-targets --all-features -- -D warnings`), **405/405 panel Node tests**,
 and `scripts/check-secrets.sh` (325 files, OK). The release binaries `mr`, `manarouter-relay` and
 `manarouter-conductor` 0.2.4 were built from this revision. `tools/mock-upstream`, the installer
@@ -84,6 +84,12 @@ at the revision recorded in §1's history, and nothing in this revision touches 
 the startup path. The **smoke test, the installer test and the panel Node tests are wired into CI**;
 the browser test remains a local opt-in because Playwright and the browser binaries are not project
 dependencies.
+
+The 2 142 count includes the generic per-account quota round: `mr_core::account_quota` (window
+arithmetic with no provider name in it), the `account_spend` ledger (schema v6) and snapshot window
+round-trip (binary `SNAPSHOT_VERSION` 25), the relay's dial recording + token settlement +
+candidate filtering (`crates/manarouter-relay/src/account_spend.rs`), and the conductor's
+declared-window quota rows.
 
 
 The OmniRoute migration was verified against a live installation as well, which is a network operation

@@ -1207,6 +1207,8 @@ async fn forward_with_bytes(
             now_ms,
             &step.model,
         );
+        let candidates =
+            crate::account_spend::filter_spent_candidates(candidates, &app.quota_store, now_ms);
         let mut usable = Vec::new();
         for account in candidates {
             match account_credential(&app, step, account).await {
@@ -1275,6 +1277,15 @@ async fn forward_with_bytes(
         }
 
         for (account, credential, oauth_headers) in usable {
+            // Same spend accounting as the model-bound path: the dial is recorded before it goes
+            // out, and the answer settles the token counts.
+            let spend_ticket = crate::account_spend::AccountSpendTicket::open(
+                std::sync::Arc::clone(&app.quota_store),
+                std::sync::Arc::clone(&app.health),
+                provider.id.as_str(),
+                account,
+                now_ms,
+            );
             // The client's own path, treated as a dialect path so `build_url` performs the same
             // version reconciliation it performs for every other route: a base URL ending in
             // `/v1` does not produce `/v1/v1/...`, and a base without one gets it added.
@@ -1346,7 +1357,7 @@ async fn forward_with_bytes(
                             account.id.as_str(),
                             &step.model,
                         );
-                        return build_response(response, ticket.take());
+                        return build_response_with_spend(response, ticket.take(), spend_ticket);
                     }
                     // The account was refused rather than the job: a sibling account of the same
                     // provider may serve it, exactly as it would for a chat request. A refusal
@@ -1405,7 +1416,7 @@ async fn forward_with_bytes(
                         last_failure = Some(build_response(response, None));
                         continue;
                     }
-                    return build_response(response, ticket.take());
+                    return build_response_with_spend(response, ticket.take(), spend_ticket);
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -3263,6 +3274,11 @@ async fn attempt_step(
         .filter(|account| select::step_allows_account(step, account))
         .filter(|account| !exclude_accounts.contains(&account.id))
         .collect();
+    // An account whose declared quota windows are full is skipped like a cooling one: failover to
+    // a sibling is the whole point of holding several accounts, and a spent account that answered
+    // 429 would only cost the request a round trip to learn what the ledger already knows.
+    let candidates =
+        crate::account_spend::filter_spent_candidates(candidates, &app.quota_store, now_ms);
     if candidates.is_empty() {
         if is_sticky_step {
             if let Some(combo) = combo {
@@ -3752,6 +3768,17 @@ async fn attempt_step(
     let mut current_body = outgoing;
     let mut reconciled_once = false;
 
+    // The dial is recorded before the request goes out, so a refused request still counts against
+    // a request budget. The ticket settles the upstream's reported token counts when the answer
+    // ends, and parks the account until a full declared window frees.
+    let spend_ticket = crate::account_spend::AccountSpendTicket::open(
+        std::sync::Arc::clone(&app.quota_store),
+        std::sync::Arc::clone(&app.health),
+        provider.id.as_str(),
+        account,
+        now_ms,
+    );
+
     let response = loop {
         let sent = match cursor_prepared.take() {
             // The ordinary path: one request, one response, through the pooled client.
@@ -3886,7 +3913,8 @@ async fn attempt_step(
             // `data:` frames instead of the one document it asked for.
             let response_translated = translated_body || step.dialect == Dialect::Cursor;
             let client_response =
-                build_client_response(ctx, response_translated, response, ticket).await;
+                build_client_response(ctx, response_translated, response, ticket, spend_ticket)
+                    .await;
             // A stored response is recorded on its way out, not after: the body is a stream, and the
             // relay only sees its bytes once. Skipped for a translated answer, whose bytes are this
             // relay's dialect rather than the provider's object.
@@ -5904,9 +5932,10 @@ async fn build_client_response(
     translated: bool,
     upstream: crate::upstream::UpstreamResponse,
     ticket: Option<std::sync::Arc<crate::quota::QuotaTicket>>,
+    spend_ticket: Option<std::sync::Arc<crate::account_spend::AccountSpendTicket>>,
 ) -> Response {
     if !translated {
-        return build_response(upstream, ticket);
+        return build_response_with_spend(upstream, ticket, spend_ticket);
     }
 
     let status = upstream.status;
@@ -5925,14 +5954,20 @@ async fn build_client_response(
         let client_streaming = ctx.client_streaming;
         let model = ctx.upstream_model.to_owned();
 
-        let frames = BodyStream::new(match &ticket {
-            // The tap is only present for a metered key. Wrapping every body would mean parsing
-            // every frame of every request, and the accounting is only worth that where a cap
-            // depends on it.
-            Some(ticket) => http_body_util::combinators::UnsyncBoxBody::new(
+        let frames = BodyStream::new(match (&ticket, &spend_ticket) {
+            (Some(ticket), Some(spend)) => http_body_util::combinators::UnsyncBoxBody::new(
+                crate::account_spend::SpendBody::new(
+                    crate::quota::TapBody::new(upstream.body, std::sync::Arc::clone(ticket)),
+                    std::sync::Arc::clone(spend),
+                ),
+            ),
+            (Some(ticket), None) => http_body_util::combinators::UnsyncBoxBody::new(
                 crate::quota::TapBody::new(upstream.body, std::sync::Arc::clone(ticket)),
             ),
-            None => http_body_util::combinators::UnsyncBoxBody::new(upstream.body),
+            (None, Some(spend)) => http_body_util::combinators::UnsyncBoxBody::new(
+                crate::account_spend::SpendBody::new(upstream.body, std::sync::Arc::clone(spend)),
+            ),
+            (None, None) => http_body_util::combinators::UnsyncBoxBody::new(upstream.body),
         });
         // The buffer is carried across frames because a `data:` line has no obligation to arrive in
         // one piece; translating a half-line would corrupt the stream in a way that looks like an
@@ -6004,13 +6039,28 @@ async fn build_client_response(
         });
         AxumBody::new(StreamBody::new(stream))
     } else {
-        let collected = match &ticket {
-            Some(ticket) => {
+        // The non-streaming answer still passes through the taps: tokens the upstream reported are
+        // the spend the account is charged for, whether the client asked for a stream or not.
+        let collected = match (&ticket, &spend_ticket) {
+            (Some(ticket), Some(spend)) => {
+                crate::account_spend::SpendBody::new(
+                    crate::quota::TapBody::new(upstream.body, std::sync::Arc::clone(ticket)),
+                    std::sync::Arc::clone(spend),
+                )
+                .collect()
+                .await
+            }
+            (Some(ticket), None) => {
                 crate::quota::TapBody::new(upstream.body, std::sync::Arc::clone(ticket))
                     .collect()
                     .await
             }
-            None => upstream.body.collect().await,
+            (None, Some(spend)) => {
+                crate::account_spend::SpendBody::new(upstream.body, std::sync::Arc::clone(spend))
+                    .collect()
+                    .await
+            }
+            (None, None) => upstream.body.collect().await,
         };
         match collected {
             Ok(collected) => {
@@ -6258,14 +6308,31 @@ fn build_response(
     upstream: crate::upstream::UpstreamResponse,
     ticket: Option<std::sync::Arc<crate::quota::QuotaTicket>>,
 ) -> Response {
+    build_response_with_spend(upstream, ticket, None)
+}
+
+fn build_response_with_spend(
+    upstream: crate::upstream::UpstreamResponse,
+    ticket: Option<std::sync::Arc<crate::quota::QuotaTicket>>,
+    spend_ticket: Option<std::sync::Arc<crate::account_spend::AccountSpendTicket>>,
+) -> Response {
     let status = upstream.status;
-    let mut response = Response::new(AxumBody::new(match &ticket {
+    let mut response = Response::new(AxumBody::new(match (&ticket, &spend_ticket) {
         // The tap reads the bytes the client is about to receive and changes none of them; it only
         // notices what the upstream said it spent.
-        Some(ticket) => http_body_util::combinators::UnsyncBoxBody::new(
+        (Some(ticket), Some(spend)) => {
+            http_body_util::combinators::UnsyncBoxBody::new(crate::account_spend::SpendBody::new(
+                crate::quota::TapBody::new(upstream.body, std::sync::Arc::clone(ticket)),
+                std::sync::Arc::clone(spend),
+            ))
+        }
+        (Some(ticket), None) => http_body_util::combinators::UnsyncBoxBody::new(
             crate::quota::TapBody::new(upstream.body, std::sync::Arc::clone(ticket)),
         ),
-        None => http_body_util::combinators::UnsyncBoxBody::new(upstream.body),
+        (None, Some(spend)) => http_body_util::combinators::UnsyncBoxBody::new(
+            crate::account_spend::SpendBody::new(upstream.body, std::sync::Arc::clone(spend)),
+        ),
+        (None, None) => http_body_util::combinators::UnsyncBoxBody::new(upstream.body),
     }));
     *response.status_mut() = status;
 
@@ -10799,6 +10866,88 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             "messages": [{"role": "user", "content": "hello"}],
         })
         .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_spent_declared_window_skips_to_the_next_account_without_dialling_it() {
+        let (url, seen) = fake_upstream().await;
+        let mut provider = provider_serving("only", &url, "shared-model", &[InputModality::Text]);
+        let mut spent = mr_core::model::Account::new("only");
+        spent.secret_ref = Some("test-credential".to_owned());
+        spent.quota = vec![mr_core::model::QuotaWindow::requests_per(3600, 1)];
+        let mut fresh = mr_core::model::Account::new("spare");
+        fresh.secret_ref = Some("test-credential".to_owned());
+        fresh.quota = vec![mr_core::model::QuotaWindow::requests_per(3600, 100)];
+        provider.accounts = vec![spent, fresh];
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        // The first account has used its single request in the last hour.
+        let now = mr_core::ids::Millis::now().as_millis() as u64;
+        let prior = mr_core::store::AccountSpendRecord::new(
+            "only",
+            mr_core::ids::AccountId::from_raw("only".to_owned()),
+            mr_core::ids::Millis::now(),
+        );
+        store.record_account_spend(&prior).unwrap();
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(
+                serde_json::json!({
+                    "model": "only/shared-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the fresh account should serve when the first is spent"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "exactly one dial should go upstream, to the usable account"
+        );
+        let spent_events = store
+            .account_spend_since("only", now.saturating_sub(3_600_000))
+            .unwrap();
+        assert_eq!(
+            spent_events.len(),
+            1,
+            "the spent account must not be dialled again"
+        );
     }
 
     /// A 4xx from one step must advance the combo, not end the request.

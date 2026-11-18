@@ -49,6 +49,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
+pub mod account_spend;
 pub mod activity;
 pub mod batch;
 pub mod count_tokens;

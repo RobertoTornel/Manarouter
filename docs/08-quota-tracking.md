@@ -92,19 +92,47 @@ provider nobody wrote a reader for. It is a sibling of `quota`, not a part of it
 probing**, where the list can be reordered and reset to the built-in one; the file remains the only
 place an individual account's own override is written.
 
-Per-account windows are declared on the account:
+Per-account windows are declared on the account (the field is `quota`; `windows` is accepted as an
+alias because that is the name this example has always used):
 
 ```json
 {
   "provider": "openai",
   "label": "work",
-  "windows": [
+  "quota": [
     { "name": "rpm", "kind": "rolling", "seconds": 60, "limit_requests": 500 },
     { "name": "daily", "kind": "fixed", "seconds": 86400, "limit_requests": 10000 },
     { "name": "weekly", "kind": "provider-declared", "seconds": 0, "limit_tokens": 0 }
   ]
 }
 ```
+
+The same two levels exist on the provider: `provider.quota` is the default applied to every
+account, and an account's own non-empty list replaces the provider's for that account only.
+`Provider::effective_windows` is the one place that decides that — the snapshot compiler resolves
+it onto `AccountPlan.quota`, and the relay never re-decides it.
+
+**Declared windows now bound the request path.** There is no provider, dialect or model name
+anywhere in this: the accounting module (`crates/mr-core/src/account_quota.rs`) only knows
+windows, events and instants.
+
+- The relay records one `account_spend` row per dialled request, before the request goes out, so
+  a refused request still counts against a request budget. Token columns stay `NULL` until the
+  upstream reports them; an unknown count is not a zero count.
+- The response body is tapped (the same `UsageTap` the per-key ledger uses) and the reported
+  input/output counts settle the row. A stream that reported nothing leaves the counts unknown.
+- Before a step is attempted, candidates are filtered against the ledger
+  (`crates/manarouter-relay/src/account_spend.rs::filter_spent_candidates`): an account whose
+  window is full is skipped like a cooling one, so failover moves to a sibling. A just-settled
+  account that became full is parked under `QuotaExhausted` until the window frees, which is
+  what the reset-aware view shows.
+- A window with no positive limit, or with `reset_only: true`, never makes an account unusable:
+  it is displayed and tracked. `provider-declared` windows are unmeasured locally — the upstream
+  is the authority, and the live signals above remain the first reading.
+
+The quota view reports declared windows as well as fetched ones: an account whose only quota is a
+declared window gets a row (with a synthetic window from its own numbers) even when no fetcher
+exists for its dialect.
 
 ### The three window kinds
 

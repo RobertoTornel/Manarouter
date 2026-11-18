@@ -295,7 +295,11 @@ pub struct Account {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models_deny: Vec<String>,
     /// Per-account quota windows, when they differ from the provider's.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// `windows` is accepted as an alias: the quota documentation has always shown the field
+    /// under that name, and rejecting it would make the documented example a parse error for the
+    /// operator who copied it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "windows")]
     pub quota: Vec<QuotaWindow>,
     /// Free-form tags naming who the account belongs to, or what it is for.
     ///
@@ -454,7 +458,7 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 /// Windows are the input to reset-aware scheduling: when every window on every account of a step is
 /// exhausted, the step is demoted rather than removed, and a timer restores it at the earliest
 /// reset.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaWindow {
     /// Operator-facing name, for example `5h` or `monthly`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -524,6 +528,20 @@ impl QuotaWindow {
             || self.limit_input_tokens > 0
             || self.limit_output_tokens > 0
     }
+
+    /// Whether this window can make an account unusable.
+    ///
+    /// Stricter than [`Self::is_effective`]: a `reset_only` window is effective — it is shown to the
+    /// operator and its reset instant is tracked — but it constrains nothing, because the operator
+    /// wrote it to say "watch this clock" rather than "stop here". Counting it as a limit would
+    /// turn a monitoring declaration into a refusal, which is the opposite of what was asked.
+    #[inline]
+    pub const fn constrains(&self) -> bool {
+        self.limit_requests > 0
+            || self.limit_tokens > 0
+            || self.limit_input_tokens > 0
+            || self.limit_output_tokens > 0
+    }
 }
 
 /// A provider: an upstream that speaks one dialect and holds one or more accounts.
@@ -560,7 +578,9 @@ pub struct Provider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_synced_at: Option<Millis>,
     /// Provider-wide quota windows, applied to any account that does not override them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// `windows` is accepted as an alias for the same reason as on [`Account`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "windows")]
     pub quota: Vec<QuotaWindow>,
     /// Whether the operator has this provider enabled.
     #[serde(default = "default_true")]
@@ -2487,6 +2507,47 @@ mod tests {
         // The account that declares nothing still inherits the provider default rather than
         // becoming unlimited.
         assert_eq!(p.effective_windows(&p.accounts[0])[0].seconds, 3600);
+    }
+
+    #[test]
+    fn quota_windows_accept_the_documented_windows_name() {
+        // docs/08 shows the account example with "windows"; rejecting it would make the
+        // documented example a parse error.
+        let account: Account = serde_json::from_value(serde_json::json!({
+            "id": "a",
+            "windows": [
+                { "name": "rpm", "kind": "rolling", "seconds": 60, "limit_requests": 500 }
+            ]
+        }))
+        .expect("alias accepted");
+        assert_eq!(account.quota.len(), 1);
+        assert_eq!(account.quota[0].name.as_deref(), Some("rpm"));
+        assert_eq!(account.quota[0].limit_requests, 500);
+
+        let provider: Provider = serde_json::from_value(serde_json::json!({
+            "id": "p",
+            "dialect": "open-ai",
+            "base_url": "https://example.com/v1",
+            "windows": [
+                { "seconds": 3600, "limit_requests": 100 }
+            ]
+        }))
+        .expect("provider alias accepted");
+        assert_eq!(provider.quota.len(), 1);
+        assert_eq!(provider.quota[0].limit_requests, 100);
+    }
+
+    #[test]
+    fn window_that_only_tracks_a_reset_constrains_nothing() {
+        // A reset_only window is effective — it is shown and its reset is tracked — but it must
+        // never make an account unusable: the operator wrote it to say "watch this clock".
+        let reset_only = QuotaWindow {
+            reset_only: true,
+            ..QuotaWindow::default()
+        };
+        assert!(reset_only.is_effective());
+        assert!(!reset_only.constrains());
+        assert!(QuotaWindow::requests_per(3600, 1).constrains());
     }
 
     #[test]

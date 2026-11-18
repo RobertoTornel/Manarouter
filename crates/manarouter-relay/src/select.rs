@@ -896,6 +896,7 @@ mod tests {
             proxy: None,
             placeholders: Default::default(),
             credit_cents: None,
+            quota: Vec::new(),
         }
     }
 
