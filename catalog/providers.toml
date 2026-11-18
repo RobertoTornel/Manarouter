@@ -502,13 +502,14 @@ note = "UNCERTAIN: the OmniRoute executor selects the chat or responses URL per 
 id = "cloudflare-ai"
 label = "Cloudflare Workers AI"
 dialect = "open-ai"
-base_url = "https://api.cloudflare.com/client/v4/accounts/{account_id}"
+base_url = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
 auth = { type = "bearer" }
-capabilities = ["chat", "embeddings", "models"]
-note = "UNCERTAIN: the registry base stops at /client/v4/accounts; the account id is a path segment. Replace {account_id} in base_url with your own account id — the relay substitutes nothing — and the Cloudflare Workers AI path is appended to that base URL. The Workers AI binding also exposes embeddings and images."
+capabilities = ["chat", "embeddings", "models", "tool-calling", "reasoning"]
+note = "Workers AI speaks the OpenAI-compatible surface on /ai/v1. The {account_id} placeholder is filled from the account's placeholders (one provider, several accounts, several values), never from the template; the credential is a Cloudflare API token sent as a Bearer header. Models are namespaced (e.g. @cf/meta/llama-3.1-8b-instruct) and are synced from the account's model list; chat and text-embedding routes are overridden to the Workers AI path here."
 
 [providers.route_overrides]
-chat-completions = "ai/v1/chat/completions"
+chat-completions = "chat/completions"
+embeddings = "embeddings"
 
 [[providers]]
 id = "deepinfra"

@@ -8203,6 +8203,27 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     }
 
     #[test]
+    fn cloudflare_workers_ai_composes_its_openai_compatible_surface() {
+        // The shipped `cloudflare-ai` template: base ends at the account's `/ai/v1` surface, and
+        // the operator overrides key the chat and embeddings routes to it. The account-id
+        // placeholder is filled later by `substitute`; URL composition must leave it intact.
+        let s = step(
+            Dialect::OpenAi,
+            "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+        );
+        assert_eq!(
+            build_url(&s, UpstreamPath::Operator("chat/completions")).as_deref(),
+            Some(
+                "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
+            )
+        );
+        assert_eq!(
+            build_url(&s, UpstreamPath::Operator("embeddings")).as_deref(),
+            Some("https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/embeddings")
+        );
+    }
+
+    #[test]
     fn a_relative_route_override_gains_its_separator() {
         let s = step(Dialect::OpenAi, "https://example.com");
         let over = "v1/other".to_string();

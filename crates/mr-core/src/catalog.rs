@@ -1171,8 +1171,10 @@ mod tests {
     #[test]
     fn cloudflare_ai_names_its_account_id_as_a_placeholder() {
         // The account id can only travel as an explicit placeholder in the base URL; the relay
-        // fills it from the account's `placeholders` map at request time. A route override carries
-        // no braces, because the override is a path the *provider* documents, not an account value.
+        // fills it from the account's `placeholders` map at request time. The base ends at the
+        // account's `/ai/v1` OpenAI-compatible surface, so the route override is the remainder of
+        // the path, and carries no braces — the override is a path the *provider* documents, not
+        // an account value.
         let cloudflare = catalog()
             .get("cloudflare-ai")
             .expect("cloudflare-ai is shipped");
@@ -1190,7 +1192,7 @@ mod tests {
             !value.contains('{'),
             "the route override must be a plain relative path, got {value:?}"
         );
-        assert_eq!(value, "ai/v1/chat/completions");
+        assert_eq!(value, "chat/completions");
     }
 
     #[test]

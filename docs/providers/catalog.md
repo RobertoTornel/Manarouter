@@ -32,7 +32,7 @@ account*, so their `base_url` carries a placeholder:
 
 | id | base URL | name |
 |---|---|---|
-| `cloudflare-ai` | `https://api.cloudflare.com/client/v4/accounts/{account_id}` | `account_id` |
+| `cloudflare-ai` | `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1` | `account_id` |
 | `snowflake` | `https://{account}.snowflakecomputing.com/api/v2` | `account` |
 
 Note the second one: the placeholder is in the **host**, not the path. That is why the rule below is
@@ -157,7 +157,7 @@ route override carries one.
 | `chenzk` ⚠ | Chenzk API | `open-ai` | `https://chenzk.top/v1` | `bearer` | chat, models, tool-calling |
 | `chutes` ⚠ | Chutes.ai | `open-ai` | `https://llm.chutes.ai/v1` | `bearer` | chat, models, tool-calling |
 | `cloudcode-one` ⚠ | CloudCode.ONE | `open-ai` | `https://api.cloudcode.one/v1` | `bearer` | chat, models, tool-calling |
-| `cloudflare-ai` ⚠ | Cloudflare Workers AI | `open-ai` | `https://api.cloudflare.com/client/v4/accounts/{account_id}` | `bearer` | chat, embeddings, models |
+| `cloudflare-ai` ⚠ | Cloudflare Workers AI | `open-ai` | `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1` | `bearer` | chat, embeddings, models, tool-calling, reasoning |
 | `codestral` ⚠ | Codestral | `open-ai` | `https://codestral.mistral.ai/v1` | `bearer` | chat, models, tool-calling |
 | `cohere` | Cohere | `open-ai` | `https://api.cohere.com/compatibility/v1` | `bearer` | chat, embeddings, models, tool-calling, reasoning, vision |
 | `coze` ⚠ | Coze | `open-ai` | `https://api.coze.com/v1` | `bearer` | chat, models, tool-calling |
@@ -351,7 +351,11 @@ UNCERTAIN: the OmniRoute executor selects the chat or responses URL per model.
 
 ### `cloudflare-ai`
 
-UNCERTAIN: the registry base stops at /client/v4/accounts; the account id is a path segment, recorded in route_overrides. The Workers AI binding also exposes embeddings and images.
+The OpenAI-compatible surface (`/ai/v1/chat/completions`, `/ai/v1/embeddings`) is documented by
+Cloudflare; the account id is a path segment filled from the account's `placeholders`, and the chat
+and embeddings routes are keyed through `route_overrides`. UNCERTAIN: the `/ai/v1/models` listing and
+image generation are not exercised here; model ids are namespaced (`@cf/...`) and are synced from the
+account's own model list.
 
 
 ### `free-ai`
