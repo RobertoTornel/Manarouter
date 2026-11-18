@@ -5586,6 +5586,7 @@ fn upstream_path<'a>(
 fn dialect_version(dialect: Dialect) -> Option<&'static str> {
     match dialect {
         Dialect::OpenAi => Some("v1"),
+        Dialect::MistralVibe => Some("v1"),
         Dialect::Anthropic => Some("v1"),
         // The plan base URL is `…/api/v1/zcode-plan/anthropic`, i.e. it already carries the `v1` of
         // the API prefix but not the one the Messages endpoint needs, so the version is added.
@@ -5724,7 +5725,7 @@ fn build_url(step: &StepPlan, path: UpstreamPath<'_>) -> Option<String> {
 /// each route lives; a provider that deviates from it says so in `route_overrides`.
 fn default_path(dialect: Dialect, route: RouteKind) -> &'static str {
     match dialect {
-        Dialect::OpenAi => match route {
+        Dialect::OpenAi | Dialect::MistralVibe => match route {
             RouteKind::ChatCompletions => "/v1/chat/completions",
             RouteKind::Responses => "/v1/responses",
             RouteKind::Embeddings => "/v1/embeddings",

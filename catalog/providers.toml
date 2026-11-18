@@ -218,7 +218,7 @@ reset_only = true
 [[providers]]
 id = "mistral-vibe"
 label = "Mistral Vibe"
-dialect = "open-ai"
+dialect = "mistral-vibe"
 base_url = "https://api.mistral.ai/v1"
 auth = { type = "oauth", platform = "mistral-vibe" }
 oauth_platform = "mistral-vibe"

@@ -2193,7 +2193,11 @@ fn dialect_reasoning_fragment(
         // Cursor is grouped here only because the match must be total: the early return above
         // answers for it before this table is reached, and reading the effort spelling the other
         // dialects use is a truer summary of "no field on the wire" than inventing a shape.
-        Dialect::OpenAi | Dialect::Copilot | Dialect::CommandCodeGo | Dialect::Cursor => {
+        Dialect::OpenAi
+        | Dialect::MistralVibe
+        | Dialect::Copilot
+        | Dialect::CommandCodeGo
+        | Dialect::Cursor => {
             serde_json::json!({ "reasoning_effort": effort })
         }
         Dialect::Codex => {
@@ -2259,8 +2263,11 @@ fn effort_spelling(dialect: Dialect, level: ReasoningLevel) -> &'static str {
     match dialect {
         // `xhigh` is the ceiling for the OpenAI-shaped providers, so the two tiers above it land
         // there rather than being passed through.
-        Dialect::OpenAi | Dialect::Copilot | Dialect::CommandCodeGo | Dialect::Codex => match level
-        {
+        Dialect::OpenAi
+        | Dialect::MistralVibe
+        | Dialect::Copilot
+        | Dialect::CommandCodeGo
+        | Dialect::Codex => match level {
             ReasoningLevel::Minimal => "minimal",
             ReasoningLevel::Low => "low",
             ReasoningLevel::Medium => "medium",

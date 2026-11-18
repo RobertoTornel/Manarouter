@@ -187,7 +187,7 @@ export function buildRedirectPaste(p, ctx, session) {
 // `open-ai`, `parse` wants `openai`. A value here that the backend rejects turns "Add provider"
 // into a save-time error, which is how the pre-rename `command-code` spelling was caught. The Rust
 // test `the_panel_offers_only_dialects_this_binary_deserialises` pins this list.
-const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm', 'cursor', 'zcode', 'claude-cli'];
+const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm', 'cursor', 'zcode', 'claude-cli', 'mistral-vibe'];
 // Must list exactly the capability spellings the backend *deserialises* (mr-core `dialect.rs`,
 // serde kebab-case) and in the enum's order: `panel/test/capabilities.test.mjs` pins the ids to
 // the Rust variants. A checkbox spelling the server refuses turns "Create provider" into a
@@ -375,7 +375,7 @@ const PROVIDER_PRESETS = {
     { name: 'Cursor', dialect: 'cursor', baseUrl: 'https://api2.cursor.sh', auth: 'oauth', platform: 'cursor', capabilities: ['chat'], hint: 'Cursor — OAuth sign-in from the panel. The sign-in finishes in Cursor’s own tab and the panel learns of it by polling, so nothing is ever pasted back here.' },
     { name: 'Z Code', dialect: 'zcode', baseUrl: 'https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1', auth: 'oauth', platform: 'zcode', capabilities: ['messages', 'tool-calling', 'reasoning'], hint: 'Z.ai coding plan — sign in with the ZCode desktop app’s own login flow; the link opens at zcode.z.ai and the panel waits for the browser.' },
     { name: 'Claude Code', dialect: 'claude-cli', baseUrl: 'https://api.anthropic.com/v1', auth: 'oauth', platform: 'claude', capabilities: ['messages', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'Claude Code with a Claude subscription (Pro/Max) — sign-in happens on claude.ai and Anthropic shows a one-time code; the panel asks you to paste it. Do not add an API key: the subscription token is the credential, and an sk-ant-api… key is refused on this surface.' },
-    { name: 'Mistral Vibe', dialect: 'open-ai', baseUrl: 'https://api.mistral.ai/v1', auth: 'oauth', platform: 'mistral-vibe', capabilities: ['chat', 'responses', 'models', 'tool-calling', 'reasoning'], hint: 'Mistral Vibe — OAuth sign-in from the panel (loopback PKCE at auth.mistral.ai). No API key: the Vibe bearer is the credential.' },
+    { name: 'Mistral Vibe', dialect: 'mistral-vibe', baseUrl: 'https://api.mistral.ai/v1', auth: 'oauth', platform: 'mistral-vibe', capabilities: ['chat', 'responses', 'models', 'tool-calling', 'reasoning'], hint: 'Mistral Vibe — OAuth sign-in from the panel (loopback PKCE at auth.mistral.ai). No API key: the Vibe bearer is the credential.' },
     { name: 'Command Code', dialect: 'command-code-go', baseUrl: 'https://api.commandcode.ai', auth: 'bearer', capabilities: ['chat', 'models', 'tool-calling', 'reasoning'], hint: 'Command Code — bearer auth.' },
     { name: 'Modal vLLM', dialect: 'modal-vllm', baseUrl: '', auth: 'modal', hint: 'Enter your Modal app’s HTTPS public URL (for example https://your-app--serve.modal.run). Add the Modal Token ID.Token Secret as the account secret after saving; the panel sends it as Modal-Key and Modal-Secret headers.' },
     { name: 'OpenCode Zen', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/v1', auth: 'bearer', capabilities: ['chat', 'responses', 'models', 'tool-calling', 'reasoning'], hint: 'OpenCode Console, pay-as-you-go. Needs a funded key: the free models are refused outside the OpenCode client, so they cannot be routed from here.' },
@@ -393,6 +393,7 @@ const DIALECT_BASE_URLS = {
   copilot: 'https://api.githubcopilot.com',
   cursor: 'https://api2.cursor.sh',
   'claude-cli': 'https://api.anthropic.com/v1',
+  'mistral-vibe': 'https://api.mistral.ai/v1',
 };
 // The dialects that have no API-key path: their request builders expect the header an OAuth
 // login produces, and the Cursor transport refuses a turn before opening a socket when no such

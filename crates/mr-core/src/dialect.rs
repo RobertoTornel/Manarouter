@@ -149,6 +149,12 @@ pub enum Dialect {
     /// copies out of it. That is also why this is not in [`Dialect::is_passthrough_to`]: a request
     /// needs a different body and a different set of headers.
     ClaudeCli = 11,
+    /// Mistral Vibe: the OpenAI-compatible surface at `api.mistral.ai/v1`, authenticated with the
+    /// bearer the Vibe desktop login (Ory PKCE at `auth.mistral.ai`) mints.
+    ///
+    /// The body is OpenAI-shaped and is forwarded byte-for-byte from an OpenAI client; the dialect
+    /// exists because the credential is OAuth-only and the surface is Mistral's own.
+    MistralVibe = 12,
 }
 
 impl Dialect {
@@ -174,6 +180,7 @@ impl Dialect {
             9 => Self::Cursor,
             10 => Self::Zcode,
             11 => Self::ClaudeCli,
+            12 => Self::MistralVibe,
             _ => return None,
         })
     }
@@ -201,6 +208,7 @@ impl Dialect {
             Self::Cursor => "cursor",
             Self::Zcode => "zcode",
             Self::ClaudeCli => "claude-cli",
+            Self::MistralVibe => "mistral-vibe",
         }
     }
 
@@ -249,6 +257,7 @@ impl Dialect {
             // copying from `cursor-agent --version` is most likely to write.
             "cursor" | "cursor-agent" | "cursoragent" => Self::Cursor,
             "zcode" | "z-code" | "zcode-plan" => Self::Zcode,
+            "mistral-vibe" | "vibe" | "mistralvibe" => Self::MistralVibe,
             _ => return None,
         })
     }
@@ -262,7 +271,10 @@ impl Dialect {
     pub const fn is_passthrough_to(self, other: Self) -> bool {
         matches!(
             (self, other),
-            (Self::OpenAi, Self::OpenAi) | (Self::Anthropic, Self::Anthropic)
+            (Self::OpenAi, Self::OpenAi)
+                | (Self::OpenAi, Self::MistralVibe)
+                | (Self::MistralVibe, Self::MistralVibe)
+                | (Self::Anthropic, Self::Anthropic)
         )
     }
 
@@ -279,7 +291,7 @@ impl Dialect {
     }
 
     /// Every dialect, in snapshot order. Useful for exhaustive tests.
-    pub const ALL: [Dialect; 12] = [
+    pub const ALL: [Dialect; 13] = [
         Self::OpenAi,
         Self::Anthropic,
         Self::Google,
@@ -292,6 +304,7 @@ impl Dialect {
         Self::Cursor,
         Self::Zcode,
         Self::ClaudeCli,
+        Self::MistralVibe,
     ];
 
     /// The reasoning levels this dialect can put on the wire as *themselves*, ascending.
@@ -314,9 +327,12 @@ impl Dialect {
     /// configuration validator cannot disagree about the vocabulary of a dialect.
     pub const fn expressible_reasoning_levels(self) -> &'static [ReasoningLevel] {
         match self {
-            Self::OpenAi | Self::Copilot | Self::CommandCodeGo | Self::Codex | Self::ModalVllm => {
-                &NAMED_EFFORT_LEVELS
-            }
+            Self::OpenAi
+            | Self::MistralVibe
+            | Self::Copilot
+            | Self::CommandCodeGo
+            | Self::Codex
+            | Self::ModalVllm => &NAMED_EFFORT_LEVELS,
             // The budget dialects and AI Studio take a level or budget into their own fields.
             // Every tier is expressible for the same reason — the upper tiers share a ceiling.
             Self::Anthropic
@@ -1551,7 +1567,7 @@ mod tests {
         // misread snapshot byte would otherwise route traffic to an unrelated provider. The value
         // after the last dialect is the one a new variant would take, so this line moves with the
         // enum: `ClaudeCli` is 11, and 12 is still unassigned.
-        assert_eq!(Dialect::from_u8(12), None);
+        assert_eq!(Dialect::from_u8(13), None);
         assert_eq!(Dialect::from_u8(255), None);
     }
 
@@ -1561,7 +1577,10 @@ mod tests {
             for b in Dialect::ALL {
                 let expected = matches!(
                     (a, b),
-                    (Dialect::OpenAi, Dialect::OpenAi) | (Dialect::Anthropic, Dialect::Anthropic)
+                    (Dialect::OpenAi, Dialect::OpenAi)
+                        | (Dialect::OpenAi, Dialect::MistralVibe)
+                        | (Dialect::MistralVibe, Dialect::MistralVibe)
+                        | (Dialect::Anthropic, Dialect::Anthropic)
                 );
                 assert_eq!(a.is_passthrough_to(b), expected, "{a:?} -> {b:?}");
             }
@@ -1852,6 +1871,7 @@ mod tests {
             (Dialect::Cursor, "cursor"),
             (Dialect::Zcode, "zcode"),
             (Dialect::ClaudeCli, "claude-cli"),
+            (Dialect::MistralVibe, "mistral-vibe"),
         ];
         assert_eq!(expected.len(), Dialect::ALL.len());
         for (dialect, id) in expected {
