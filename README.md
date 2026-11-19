@@ -212,9 +212,10 @@ Two scripts are worth knowing about:
 
 **Current implementation note:** `mr serve` runs both processes together with one Ctrl-C to stop
 them — it spawns the conductor and relay as child processes, so they keep the separate runtimes the
-[architecture](docs/01-architecture.md#2-why-two-processes) depends on. `mr config` and `mr vault`
-are still not implemented. The product is under active development; see
-[`docs/23-implementation-status.md`](docs/23-implementation-status.md) for current limitations.
+[architecture](docs/01-architecture.md#2-why-two-processes) depends on. `mr config` (show/validate/
+edit), `mr vault` (inspect/rekey) and `mr doctor` (installation checks) are implemented. The product
+is under active development; see [`docs/23-implementation-status.md`](docs/23-implementation-status.md)
+for current limitations.
 
 ---
 
