@@ -740,9 +740,11 @@ impl CooldownScope {
 }
 
 fn default_capabilities() -> Vec<Capability> {
-    // Every capability on by default: a new provider is a blank best-effort surface, and the
-    // operator can uncheck what the upstream does not serve. The panel mirrors this exact list.
-    Capability::ALL.to_vec()
+    // A safe baseline for programmatic/absent lists: text chat + models. The *panel* defaults a
+    // new provider to every capability (the operator unchecks what the upstream does not serve),
+    // but an engine-side blanket-all would break dialects that cannot serve every route — for
+    // example Modal vLLM, whose deployments would fail validation for embeddings/video/etc.
+    vec![Capability::Chat, Capability::Models]
 }
 fn default_connect_timeout_ms() -> u64 {
     10_000

@@ -5164,11 +5164,34 @@ fn exhausted_by_body(body: &[u8]) -> Option<BodyRefusal> {
     let wait_ms = announced
         .or(google_short_wait)
         .or_else(|| names_a_spent_balance(message).then_some(SPENT_BALANCE_PARK_MS));
+    // A body that states a recovery wait but is an ordinary *throttle* — "Rate limit exceeded …
+    // Retry after 12s" — must stay RateLimited: it is not a spent window. Parking it as quota
+    // changes its lifecycle (longer default park, different panel wording). Only genuine
+    // exhaustion/spend/plan refusals become QuotaExhausted.
+    if !exhausted
+        && !spent_account
+        && !names_a_plan_limit(message)
+        && is_rate_limit_message(message)
+    {
+        return Some(BodyRefusal {
+            reason: select::CooldownReason::RateLimited,
+            wait_ms: announced,
+            scope: None,
+        });
+    }
     Some(BodyRefusal {
         reason: select::CooldownReason::QuotaExhausted,
         wait_ms,
         scope: None,
     })
+}
+
+/// Whether a refusal message reads as an ordinary throttle rather than a spent window.
+fn is_rate_limit_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    ["rate limit", "too many requests", "throttl"]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
 }
 
 /// Whether a message says the account itself cannot pay, rather than the request being wrong.
@@ -7277,6 +7300,10 @@ mod tests {
 
         let mut config = mr_core::config::Config::default();
         let mut provider = mr_core::model::Provider::new("p1", dialect, "https://p1.example/v1");
+        // Text-only by default: the model-level assertions in these tests (level ladders,
+        // listing shapes) assume the provider has not inherited the all-on capability default,
+        // which would grant reasoning and change the ladder.
+        provider.capabilities = vec![Capability::Chat, Capability::Models];
         provider.models = vec![ModelEntry {
             id: model_id.into(),
             source: ModelSource::Manual,
@@ -9566,6 +9593,20 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     }
 
     #[test]
+    fn a_stated_throttle_retry_is_rate_limited_not_quota() {
+        // Vercel's meta team limit: "Rate limit exceeded ... Retry after 12s." It is a throttle,
+        // not a spent window, and must not get quota treatment (hour park / quota wording).
+        let body = br#"{"error":{"message":"Rate limit exceeded for meta/muse-ember: this team's limit of 5 requests per minute was reached. Retry after 12s.","type":"rate_limit_exceeded"}}"#;
+        let refusal = exhausted_by_body(body).expect("a throttle with a wait");
+        assert_eq!(refusal.reason, select::CooldownReason::RateLimited);
+        assert_eq!(refusal.wait_ms, Some(12_000));
+        // "too many requests" without a wait is left to the status classifier (RateLimited),
+        // which is exactly the right fallback: no body-level wait exists to honor.
+        let body = br#"{"error":{"message":"Too many requests. Please retry later."}}"#;
+        assert_eq!(exhausted_by_body(body), None);
+    }
+
+    #[test]
     fn a_google_style_resource_exhausted_429_is_a_quota_refusal() {
         // Captured live: Google/Vertex answers 429 with a `status` field, a numeric `code`, and a
         // message that only says "check quota". It used to be read as a plain throttle (kind was
@@ -10134,6 +10175,10 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         modalities: &[InputModality],
     ) -> mr_core::model::Provider {
         let mut provider = mr_core::model::Provider::new(id, Dialect::OpenAi, base_url);
+        // This helper models the pre-default text-only provider: the gating tests that use it
+        // assert routes *without* the right capability are refused, so it must not inherit the
+        // all-on default. Capability-positive tests use `provider_with_capabilities`.
+        provider.capabilities = vec![Capability::Chat, Capability::Models];
         let mut account = mr_core::model::Account::new(id);
         // An account without an explicit reference falls back to a conventional vault path, so the
         // test names one explicitly and puts a value there.

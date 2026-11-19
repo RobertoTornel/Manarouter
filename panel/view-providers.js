@@ -525,9 +525,24 @@ export function buildOAuthAccountForm(p, ctx, onConnected, isDrawerOpen = () => 
       redirectUri = new URL(authorizeUrl).searchParams.get('redirect_uri');
     } catch { redirectUri = null; }
     redirectPaste.show(redirectUri);
+    const urlBox = h('input', {
+      class: 'input mono', type: 'text', readonly: true,
+      value: authorizeUrl, spellcheck: 'false',
+      'aria-label': 'Authorization URL (for troubleshooting)',
+      title: 'Full authorization URL — copy this if login fails so it can be diagnosed',
+    });
+    urlBox.addEventListener('focus', () => urlBox.select());
+    const copyUrl = h('button', { class: 'btn btn-sm btn-ghost', type: 'button' }, 'Copy URL');
+    copyUrl.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(authorizeUrl);
+        copyUrl.textContent = 'Copied';
+      } catch { urlBox.select(); }
+    });
     progress.replaceChildren(
       h('span', {}, 'Waiting for you to finish signing in… '),
       h('a', { href: authorizeUrl, target: '_blank', rel: 'noopener noreferrer' }, 'Reopen the page'),
+      h('div', { class: 'toolbar', style: 'margin-top:8px;gap:6px;' }, urlBox, copyUrl),
     );
     try {
       const done = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/complete`, { provider_id: p.id });
