@@ -676,6 +676,15 @@ the scopes; [OAuth: Antigravity](12-oauth-antigravity.md) for the login.
 
 ---
 
+## `mistral-vibe` — the OpenAI-compatible surface behind the Vibe login
+
+Mistral Vibe signs in with Ory PKCE at `auth.mistral.ai` (loopback, on the client's
+pre-registered ports) and the resulting bearer authenticates the standard OpenAI-compatible API at
+`api.mistral.ai/v1`. The dialect is a passthrough to `open-ai`: a chat-completions client needs no
+body translation, and the Responses surface is served by the ordinary Responses translator. The
+login is documented in [OAuth overview](10-oauth-overview.md) and the catalogue entry in
+[providers/catalog.md](providers/catalog.md).
+
 ## `command-code-go` — the Command Code CLI envelope
 
 **On the wire.** `api.commandcode.ai/alpha/generate`, which returns its own event stream rather than
