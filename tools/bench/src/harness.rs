@@ -137,6 +137,7 @@ impl Harness {
             quota_store: Arc::clone(&oauth_store),
             activity: Arc::new(manarouter_relay::activity::ActivityLog::new()),
             sticky_success: Arc::new(StickySuccess::default()),
+            account_inflight: Arc::new(manarouter_relay::state::AccountInflight::default()),
             kv_usage: Arc::new(manarouter_relay::kv_budget::AdmissionPool::new()),
             // A lane with no disk state and no workers. The bench measures the request path, and a
             // lane that recovered an operator's real batches would be both slow and surprising.
