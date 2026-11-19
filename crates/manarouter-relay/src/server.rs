@@ -2580,6 +2580,13 @@ async fn dispatch_routed(
                             let capped = stated.min(rate_limit_retry.max_stated_wait_ms);
                             wait_horizon_ms = wait_horizon_ms.max(capped);
                         }
+                        if !absorbing {
+                            tracing::info!(
+                                provider = %step.provider_id,
+                                model = %step.model,
+                                "absorbing upstream rate limit; retrying silently"
+                            );
+                        }
                         absorbing = true;
                     }
                     // Every account of this step is cooling down — the same condition as above, just
