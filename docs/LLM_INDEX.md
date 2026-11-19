@@ -122,7 +122,7 @@ Router/
     │       ├── catalog.rs          loads catalog/providers.toml into ProviderTemplates
     │       ├── error.rs            Error enum
     │       ├── published.rs        ★ OAuth public client constants, assembled from fragments
-    │       └── oauth/              ★ per-platform login/token/refresh (codex, copilot, antigravity)
+    │       └── oauth/              ★ per-platform login/token/refresh (codex, copilot, antigravity, cursor, zcode, claude, mistral-vibe)
     ├── mr-dialects/                translation; nothing here runs when dialects match
     │   └── src/
     │       ├── lib.rs              ★ the dispatch + TranslateCtx contract
