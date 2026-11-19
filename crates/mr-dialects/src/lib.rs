@@ -40,6 +40,7 @@ pub mod google;
 pub mod openai;
 pub mod responses;
 pub mod sse;
+pub mod vibe;
 pub mod zcode;
 
 /// Per-process storage for the Gemini thought signatures a client cannot carry itself.
@@ -273,6 +274,12 @@ pub fn translate_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Option<T
         // socket opened, even though the transport would have accepted the body unchanged.
         (Dialect::OpenAi, Dialect::Cursor) => Ok(None),
 
+        // Mistral Vibe: the LeChat consumer surface. An OpenAI client's chat body is translated
+        // into the `create` envelope; there is no Anthropic-shaped HTTP completion surface (the
+        // app's Anthropic-style code surface is not the inference target), so an Anthropic client
+        // is refused rather than silently mangled.
+        (Dialect::OpenAi, Dialect::MistralVibe) => vibe::from_pivot_request(ctx, body).map(Some),
+
         (from, to) => Err(TranslateError::Unsupported {
             from: from.as_str(),
             to: to.as_str(),
@@ -324,6 +331,7 @@ pub fn translate_response_body(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<By
         (Dialect::OpenAi, Dialect::Codex) | (Dialect::Anthropic, Dialect::Codex) => {
             responses::to_pivot_response(ctx, body)
         }
+        (Dialect::OpenAi, Dialect::MistralVibe) => vibe::to_pivot_response(ctx, body),
         _ if ctx.is_passthrough() => Ok(Bytes::copy_from_slice(body)),
         (from, to) => Err(TranslateError::Unsupported {
             from: from.as_str(),
@@ -381,6 +389,10 @@ pub fn translate_sse_data(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<Stri
         (Dialect::OpenAi, Dialect::Codex) | (Dialect::Anthropic, Dialect::Codex) => {
             responses::sse_to_pivot(ctx, data)
         }
+        // Mistral Vibe's frames are length-prefixed JSONL and are driven through
+        // `vibe::Translator` directly by the relay (see server.rs), not through this generic SSE
+        // entry, so there is deliberately no arm here: the fallback below reports the pairing as
+        // unsupported if a non-relay caller ever reaches it.
         _ if ctx.is_passthrough() => Ok(vec![data.to_owned()]),
         (from, to) => Err(TranslateError::Unsupported {
             from: from.as_str(),

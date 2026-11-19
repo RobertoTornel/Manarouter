@@ -676,13 +676,22 @@ the scopes; [OAuth: Antigravity](12-oauth-antigravity.md) for the login.
 
 ---
 
-## `mistral-vibe` — the OpenAI-compatible surface behind the Vibe login
+## `mistral-vibe` — the LeChat consumer surface behind the Vibe login
 
 Mistral Vibe signs in with Ory PKCE at `auth.mistral.ai` (loopback, on the client's
-pre-registered ports) and the resulting bearer authenticates the standard OpenAI-compatible API at
-`api.mistral.ai/v1`. The dialect is a passthrough to `open-ai`: a chat-completions client needs no
-body translation, and the Responses surface is served by the ordinary Responses translator. The
-login is documented in [OAuth overview](10-oauth-overview.md) and the catalogue entry in
+pre-registered ports). Ory mints an opaque access token *and* a JWT `id_token`; the LeChat
+consumer backend (`chat.mistral.ai`) authenticates with the JWT — the public `api.mistral.ai/v1`
+surface rejects both Ory tokens with `Invalid API Key`. Inference goes to
+`POST https://chat.mistral.ai/api/chat`.
+
+The app posts a `create`/`append` envelope and receives a `text/event-stream` body whose frames
+are length-prefixed JSONL (`N:{"json":{...}}`) carrying replacement patches. The dialect is
+therefore a real translation surface: an OpenAI Chat Completions request is folded into a `create`
+envelope (`productType: "work"`) carrying the last user text, and the streamed patches are diffed
+into OpenAI chat-completion chunks so the client sees one answer (`crates/mr-dialects/src/vibe.rs`).
+The relay attaches the desktop app's own user agent, and the OAuth layer keeps the `id_token` in
+the token set's `extra` so it can be attached as the bearer. The login is documented in
+[OAuth overview](10-oauth-overview.md) and the catalogue entry in
 [providers/catalog.md](providers/catalog.md).
 
 ## `command-code-go` — the Command Code CLI envelope

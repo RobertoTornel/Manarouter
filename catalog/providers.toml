@@ -219,12 +219,12 @@ reset_only = true
 id = "mistral-vibe"
 label = "Mistral Vibe"
 dialect = "mistral-vibe"
-base_url = "https://api.mistral.ai/v1"
+base_url = "https://chat.mistral.ai"
 auth = { type = "oauth", platform = "mistral-vibe" }
 oauth_platform = "mistral-vibe"
-capabilities = ["chat", "responses", "models", "tool-calling", "reasoning"]
+capabilities = ["chat", "models", "reasoning"]
 key_strategy = "round-robin"
-note = "OAuth only: the Mistral Vibe desktop login (Ory PKCE at auth.mistral.ai) produces a bearer that the OpenAI-compatible API at api.mistral.ai accepts. The login is loopback PKCE on an ephemeral port with the /auth/oidc/callback path and audience https://api.mistral.ai, matching the installed Vibe 1.2.0 desktop app; the panel opens the URL and receives the callback on this machine. The client id was extracted from the Vibe 1.2.0 desktop installer and is the Ory default, not verified against a live login; if authorization fails, compare the URL the desktop app opens and adjust catalog oauth_* entries."
+note = "OAuth only: the Mistral Vibe desktop login (Ory PKCE at auth.mistral.ai) mints an opaque access token plus a JWT id_token. The LeChat consumer backend (chat.mistral.ai/api/chat) authenticates with the id_token — the public api.mistral.ai/v1 surface rejects both Ory tokens with Invalid API Key — and serves the subscription models (glm-5-latest-short etc). The relay translates OpenAI chat-completions requests into the app's create-envelope and streams the answer back as OpenAI SSE."
 docs_url = "https://www.mistral.ai/vibe"
 oauth_authorize_url = "https://auth.mistral.ai/oauth2/auth"
 oauth_token_url = "https://auth.mistral.ai/oauth2/token"

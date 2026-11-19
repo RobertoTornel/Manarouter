@@ -272,7 +272,6 @@ impl Dialect {
         matches!(
             (self, other),
             (Self::OpenAi, Self::OpenAi)
-                | (Self::OpenAi, Self::MistralVibe)
                 | (Self::MistralVibe, Self::MistralVibe)
                 | (Self::Anthropic, Self::Anthropic)
         )
@@ -287,7 +286,10 @@ impl Dialect {
     /// the relay's own OpenAI-SSE rendering is always the source of the client's bytes.
     #[inline]
     pub const fn force_stream(self) -> bool {
-        matches!(self, Self::Codex | Self::Antigravity | Self::Cursor)
+        matches!(
+            self,
+            Self::Codex | Self::Antigravity | Self::Cursor | Self::MistralVibe
+        )
     }
 
     /// Every dialect, in snapshot order. Useful for exhaustive tests.
@@ -1578,7 +1580,6 @@ mod tests {
                 let expected = matches!(
                     (a, b),
                     (Dialect::OpenAi, Dialect::OpenAi)
-                        | (Dialect::OpenAi, Dialect::MistralVibe)
                         | (Dialect::MistralVibe, Dialect::MistralVibe)
                         | (Dialect::Anthropic, Dialect::Anthropic)
                 );

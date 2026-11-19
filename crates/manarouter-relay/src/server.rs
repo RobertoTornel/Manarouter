@@ -6200,6 +6200,18 @@ fn upstream_headers(
         }
     }
 
+    // Mistral Vibe: the LeChat consumer gateway recognizes the desktop app's own fingerprint. The
+    // app sends `accept: */*` (the generic block above may have set `text/event-stream` because the
+    // dialect forces streaming; the gateway is permissive, but mirroring the app is the safest
+    // shape). The bearer is `apply_auth`'s business and already attached.
+    if step.dialect == Dialect::MistralVibe {
+        map.insert("accept", HeaderValue::from_static("*/*"));
+        map.entry("user-agent").or_insert_with(|| {
+            HeaderValue::from_str(mr_dialects::vibe::VIBE_USER_AGENT)
+                .unwrap_or_else(|_| HeaderValue::from_static("vibe-desktop/1.2.0"))
+        });
+    }
+
     map
 }
 
@@ -6396,6 +6408,9 @@ async fn build_client_response(
         // Codex is the other dialect whose stream state is per answer, and for the same reason: a
         // thread-local cannot tell two answers in flight on one worker apart.
         let mut responses = mr_dialects::responses::Translator::new();
+        // Mistral Vibe is the same: its frames are replacement patches, and diffing against
+        // per-thread text would let two concurrent answers bleed into each other.
+        let mut vibe = mr_dialects::vibe::Translator::new();
         // A `None` marker closes the stream: it is how the last partial line in `pending` and any
         // closing frame the translator still owes the client get written before the body ends.
         let frames = frames
@@ -6422,6 +6437,7 @@ async fn build_client_response(
                             &ctx,
                             &mut commandcode,
                             &mut responses,
+                                                        &mut vibe,
                             pending,
                             &chunk,
                         )
@@ -6434,6 +6450,7 @@ async fn build_client_response(
                         &ctx,
                         &mut commandcode,
                         &mut responses,
+                                                &mut vibe,
                         pending,
                         *failed,
                     )),
@@ -6524,6 +6541,7 @@ fn translate_stream_chunk(
     ctx: &TranslateCtx<'_>,
     commandcode: &mut mr_dialects::commandcode::Translator,
     responses: &mut mr_dialects::responses::Translator,
+    vibe: &mut mr_dialects::vibe::Translator,
     pending: &mut Vec<u8>,
     chunk: &Bytes,
 ) -> Vec<Result<Bytes, hyper::Error>> {
@@ -6567,6 +6585,8 @@ fn translate_stream_chunk(
                 mr_dialects::commandcode::translate(commandcode, ctx, data)
             } else if ctx.upstream_dialect == Dialect::Codex && !ctx.is_passthrough() {
                 responses.translate(ctx, data)
+            } else if ctx.upstream_dialect == Dialect::MistralVibe && !ctx.is_passthrough() {
+                vibe.translate(ctx, data)
             } else {
                 mr_dialects::translate_sse_data(ctx, data)
             } {
@@ -6584,6 +6604,22 @@ fn translate_stream_chunk(
             },
             // Command Code metadata JSON is intentionally suppressed.
             None if ctx.upstream_dialect == Dialect::CommandCodeGo => {}
+            // Mistral Vibe's frames are length-prefixed JSONL (`N:{json}`) with no `data:` field.
+            // Feed the whole line to the per-stream translator.
+            None if ctx.upstream_dialect == Dialect::MistralVibe && !pass_through => {
+                match vibe.translate(ctx, trimmed) {
+                    Ok(lines) => {
+                        for line in lines {
+                            if !line.is_empty() {
+                                out.push(Ok(translated_frame(&line)));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not translate a Vibe stream frame");
+                    }
+                }
+            }
             // A comment is a keep-alive: no payload, ignored by every SSE parser.
             None if trimmed.starts_with(':') => out.push(Ok(Bytes::from(format!("{trimmed}\n")))),
             None if pass_through => out.push(Ok(Bytes::from(format!("{trimmed}\n")))),
@@ -6608,6 +6644,7 @@ fn flush_stream_chunk(
     ctx: &TranslateCtx<'_>,
     commandcode: &mut mr_dialects::commandcode::Translator,
     responses: &mut mr_dialects::responses::Translator,
+    vibe: &mut mr_dialects::vibe::Translator,
     pending: &mut Vec<u8>,
     upstream_failed: bool,
 ) -> Vec<Result<Bytes, hyper::Error>> {
@@ -6619,12 +6656,20 @@ fn flush_stream_chunk(
             ctx,
             commandcode,
             responses,
+            vibe,
             pending,
             &Bytes::from(tail),
         ));
     }
     if ctx.upstream_dialect == Dialect::Codex && !ctx.is_passthrough() {
         for line in responses.finish(ctx) {
+            if !line.is_empty() {
+                out.push(Ok(translated_frame(&line)));
+            }
+        }
+    }
+    if ctx.upstream_dialect == Dialect::MistralVibe && !ctx.is_passthrough() {
+        for line in vibe.finish(ctx) {
             if !line.is_empty() {
                 out.push(Ok(translated_frame(&line)));
             }
@@ -7925,13 +7970,14 @@ mod tests {
             &ctx,
             &mut commandcode,
             &mut responses,
-            &mut pending,
+                        &mut mr_dialects::vibe::Translator::new(),
+&mut pending,
             &metadata
         )
         .is_empty());
         let token = Bytes::from_static(b"{\"type\":\"text-delta\",\"text\":\"OK\"}\n");
         let output =
-            translate_stream_chunk(&ctx, &mut commandcode, &mut responses, &mut pending, &token);
+            translate_stream_chunk(&ctx, &mut commandcode, &mut responses, &mut mr_dialects::vibe::Translator::new(), &mut pending, &token);
         let output = output.into_iter().map(Result::unwrap).collect::<Vec<_>>();
         assert_eq!(output.len(), 1);
         let text = std::str::from_utf8(&output[0]).unwrap();
@@ -7945,7 +7991,8 @@ mod tests {
             &ctx,
             &mut commandcode,
             &mut responses,
-            &mut pending,
+                        &mut mr_dialects::vibe::Translator::new(),
+&mut pending,
             &finish,
         );
         let text = output
@@ -7985,7 +8032,7 @@ mod tests {
 response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hi\"}\n\n",
         );
         let out =
-            translate_stream_chunk(&ctx, &mut translator, &mut responses, &mut pending, &chunk);
+            translate_stream_chunk(&ctx, &mut translator, &mut responses, &mut mr_dialects::vibe::Translator::new(), &mut pending, &chunk);
         let text = out
             .into_iter()
             .map(Result::unwrap)
@@ -8026,7 +8073,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
         );
         let out =
-            translate_stream_chunk(&ctx, &mut translator, &mut responses, &mut pending, &chunk);
+            translate_stream_chunk(&ctx, &mut translator, &mut responses, &mut mr_dialects::vibe::Translator::new(), &mut pending, &chunk);
         let text = out
             .into_iter()
             .map(Result::unwrap)
@@ -8061,7 +8108,8 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             &ctx,
             &mut translator,
             &mut responses,
-            &mut pending,
+                        &mut mr_dialects::vibe::Translator::new(),
+&mut pending,
             &Bytes::from_static(b"data: {\"id\":\"x\",\"choices\":[]}\n\n"),
         );
         let text = out
@@ -8090,7 +8138,8 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             &ctx,
             &mut translator,
             &mut responses,
-            &mut pending,
+                        &mut mr_dialects::vibe::Translator::new(),
+&mut pending,
             &Bytes::from_static(b": keep-alive\n"),
         );
         let text = out
@@ -8130,7 +8179,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                     cc: &mut mr_dialects::commandcode::Translator,
                     pending: &mut Vec<u8>,
                     frame: &'static [u8]| {
-            translate_stream_chunk(&ctx, cc, open, pending, &Bytes::from_static(frame))
+            translate_stream_chunk(&ctx, cc, open, &mut mr_dialects::vibe::Translator::new(), pending, &Bytes::from_static(frame))
                 .into_iter()
                 .map(Result::unwrap)
                 .map(|b| String::from_utf8(b.to_vec()).unwrap())
@@ -8365,12 +8414,13 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             &ctx,
             &mut cc,
             &mut open,
+                        &mut mr_dialects::vibe::Translator::new(),
             &mut pending,
             &Bytes::from_static(
                 b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}",
             ),
         );
-        let out = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending, false);
+        let out = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut mr_dialects::vibe::Translator::new(), &mut pending, false);
         let text = out
             .into_iter()
             .map(Result::unwrap)
@@ -8392,7 +8442,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         );
         assert!(pending.is_empty(), "the buffer is drained");
         // A second flush, as the body ending twice would do, says nothing again.
-        assert!(flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending, false).is_empty());
+        assert!(flush_stream_chunk(&ctx, &mut cc, &mut open, &mut mr_dialects::vibe::Translator::new(), &mut pending, false).is_empty());
     }
 
     /// A Gemini body that ends cleanly without a finish reason is still closed as an answer.
@@ -8424,12 +8474,13 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 &ctx,
                 &mut cc,
                 &mut open,
+                                &mut mr_dialects::vibe::Translator::new(),
                 &mut pending,
                 &Bytes::from_static(
                     b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"notice\"}]}}]}",
                 ),
             );
-            let text = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending, false)
+            let text = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut mr_dialects::vibe::Translator::new(), &mut pending, false)
                 .into_iter()
                 .map(Result::unwrap)
                 .map(|b| String::from_utf8(b.to_vec()).unwrap())
@@ -8448,7 +8499,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 "{upstream_dialect:?}: {text:?}"
             );
             assert!(
-                flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending, false).is_empty(),
+                flush_stream_chunk(&ctx, &mut cc, &mut open, &mut mr_dialects::vibe::Translator::new(), &mut pending, false).is_empty(),
                 "{upstream_dialect:?}: closing twice says nothing the second time"
             );
         }
@@ -8473,12 +8524,13 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             &ctx,
             &mut cc,
             &mut open,
+                        &mut mr_dialects::vibe::Translator::new(),
             &mut pending,
             &Bytes::from_static(
                 b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"half\"}]}}]}",
             ),
         );
-        let text = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending, true)
+        let text = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut mr_dialects::vibe::Translator::new(), &mut pending, true)
             .into_iter()
             .map(Result::unwrap)
             .map(|b| String::from_utf8(b.to_vec()).unwrap())
@@ -8524,6 +8576,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 &ctx,
                 t,
                 &mut responses,
+                                &mut mr_dialects::vibe::Translator::new(),
                 pending,
                 &Bytes::from_static(frame.as_bytes()),
             );
@@ -8637,7 +8690,8 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 &ctx,
                 &mut t,
                 &mut responses,
-                &mut pending,
+                                &mut mr_dialects::vibe::Translator::new(),
+&mut pending,
                 &Bytes::from_static(frame.as_bytes()),
             );
         }

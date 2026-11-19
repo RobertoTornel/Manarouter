@@ -96,6 +96,12 @@ fn token_set_from(body: &str, previous_refresh: Option<&str>) -> Result<TokenSet
     if let Some(token_type) = value.get("token_type").and_then(Value::as_str) {
         tokens.token_type = token_type.to_owned();
     }
+    // Ory issues an opaque `access_token` *and* a JWT `id_token`. The LeChat backend
+    // (`chat.mistral.ai`) authenticates with the JWT; the opaque token is not accepted there.
+    // Keep the id token in `extra` so the relay can attach it as the bearer.
+    if let Some(id_token) = value.get("id_token").and_then(Value::as_str) {
+        tokens.extra.insert("id_token".into(), json!(id_token));
+    }
     tokens.expires_at = expires_at_from_secs(expires_in);
     Ok(tokens)
 }
@@ -238,9 +244,16 @@ impl OAuthPlatform for MistralVibe {
     }
 
     fn apply_credential(&self, tokens: &TokenSet) -> Vec<(HeaderName, HeaderValue)> {
+        // The LeChat consumer surface accepts the Ory `id_token` (a JWT), not the opaque
+        // `access_token`. Send the JWT when we have one; fall back to the opaque token so a
+        // plain Ory session still has some credential to present.
+        let bearer = tokens
+            .extra
+            .get("id_token")
+            .and_then(Value::as_str)
+            .unwrap_or(&tokens.access_token);
         vec![
-            header("authorization", &format!("Bearer {}", tokens.access_token))
-                .expect("static header name"),
+            header("authorization", &format!("Bearer {bearer}")).expect("static header name"),
         ]
     }
 
@@ -261,6 +274,8 @@ impl OAuthPlatform for MistralVibe {
             "email": previous.extra.get("email").cloned().unwrap_or(Value::Null),
         });
         tokens.extra.insert("account".into(), prev);
+        // A fresh id token was minted by the refresh grant; the previous one is dead the moment
+        // it expires, so carry no stale copy forward. TokenSet carries its own extra already.
         Ok(tokens)
     }
 }
@@ -291,5 +306,37 @@ mod tests {
     /// duplicating the encoder here.
     fn urlencoding_path() -> String {
         flow::url_encode(mistral_vibe::LOOPBACK_CALLBACK_PATH)
+    }
+
+    /// The Ory response carries both an opaque `access_token` and a JWT `id_token`. The LeChat
+    /// backend authenticates with the JWT, so the exchange must keep it — dropping it was the
+    /// original bug: every request went out with the opaque token and the consumer gateway
+    /// rejected it.
+    #[test]
+    fn the_token_set_keeps_the_id_token_and_the_credential_sends_it() {
+        let body = r#"{"access_token":"ory_at_opaque","id_token":"eyJhbGciOiJSUz","refresh_token":"ory_rt_x","expires_in":3599,"scope":"openid email profile offline_access","token_type":"bearer"}"#;
+        let tokens = token_set_from(body, None).unwrap();
+        assert_eq!(tokens.access_token, "ory_at_opaque");
+        assert_eq!(
+            tokens.extra.get("id_token").and_then(|v| v.as_str()),
+            Some("eyJhbGciOiJSUz")
+        );
+        let headers = MistralVibe.apply_credential(&tokens);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(
+            headers[0].1.to_str().unwrap(),
+            "Bearer eyJhbGciOiJSUz",
+            "the relay must attach the id_token, not the opaque access token"
+        );
+    }
+
+    /// Without an id token (a bare Ory exchange), the opaque token is what we have to present.
+    #[test]
+    fn the_credential_falls_back_to_the_opaque_token_without_an_id_token() {
+        let body = r#"{"access_token":"ory_at_opaque","refresh_token":"ory_rt_x","expires_in":3599,"token_type":"bearer"}"#;
+        let tokens = token_set_from(body, None).unwrap();
+        assert!(tokens.extra.get("id_token").is_none());
+        let headers = MistralVibe.apply_credential(&tokens);
+        assert_eq!(headers[0].1.to_str().unwrap(), "Bearer ory_at_opaque");
     }
 }
