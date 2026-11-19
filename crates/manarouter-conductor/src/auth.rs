@@ -40,6 +40,9 @@ pub const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 /// The cookie name. Namespaced so it does not collide with anything else on the loopback host.
 pub const SESSION_COOKIE: &str = "manarouter_session";
 
+/// How long a failed login sleeps before answering, so online guessing is slow.
+const LOGIN_FAILURE_DELAY_MS: u64 = 200;
+
 /// Hash a password for storage.
 ///
 /// Argon2id is used with the crate's defaults, which are the OWASP-recommended parameters. The
@@ -271,6 +274,9 @@ impl PanelAuth {
         if verify_password(password, stored) {
             Some(self.sessions.issue())
         } else {
+            // A failed login costs a small fixed delay on top of the argon2 hash, so online
+            // guessing against a control plane reachable from the tailnet is slow.
+            std::thread::sleep(std::time::Duration::from_millis(LOGIN_FAILURE_DELAY_MS));
             None
         }
     }
