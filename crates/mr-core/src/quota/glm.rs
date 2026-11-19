@@ -168,7 +168,7 @@ impl QuotaFetcher for Glm {
 
         let body = response.json()?;
         check_envelope(&body)?;
-        Ok(assemble(parse_limits(&body)?))
+        assemble(parse_limits(&body)?)
     }
 }
 
@@ -452,7 +452,12 @@ fn attach_details(mut quota: UsageQuota, limit: &Value) -> UsageQuota {
 
 /// One `UsageQuota` for the account: the most binding window, every window listed as a
 /// duration-labelled detail.
-fn assemble(windows: Vec<(String, UsageQuota)>) -> UsageQuota {
+fn assemble(windows: Vec<(String, UsageQuota)>) -> Result<UsageQuota> {
+    if windows.is_empty() {
+        return Err(Error::NotFound(
+            "GLM quota response contained no usage windows".into(),
+        ));
+    }
     const PRIORITY: &[&str] = &["session", "weekly", "mcp_monthly"];
     let primary = PRIORITY
         .iter()
@@ -474,7 +479,7 @@ fn assemble(windows: Vec<(String, UsageQuota)>) -> UsageQuota {
             used: detail.used,
         });
     }
-    quota
+    Ok(quota)
 }
 
 /// The display name upstream gives each window.
@@ -1032,5 +1037,11 @@ mod tests {
             reset_at_millis(&json!({"nextResetTime": "1735689600000"})),
             Some(1_735_689_600_000)
         );
+    }
+
+    #[test]
+    fn assemble_refuses_empty_windows_instead_of_panicking() {
+        let error = assemble(Vec::new()).expect_err("empty windows must error");
+        assert!(matches!(error, Error::NotFound(_)), "{error:?}");
     }
 }
