@@ -5818,7 +5818,10 @@ fn upstream_path<'a>(
 fn dialect_version(dialect: Dialect) -> Option<&'static str> {
     match dialect {
         Dialect::OpenAi => Some("v1"),
-        Dialect::MistralVibe => Some("v1"),
+        // Vibe's LeChat backend lives at the origin root (`POST /api/chat`), with no version
+        // segment anywhere — like Cursor, where the RPC path is absolute. Adding one produces
+        // `/v1/api/chat`, which the consumer gateway 404s.
+        Dialect::MistralVibe => None,
         Dialect::Anthropic => Some("v1"),
         // The plan base URL is `…/api/v1/zcode-plan/anthropic`, i.e. it already carries the `v1` of
         // the API prefix but not the one the Messages endpoint needs, so the version is added.
