@@ -596,6 +596,18 @@ resumable and they are worth reading before starting over:
 These are gitignored deliberately. Shipping a file that does not compile, to record that someone once
 tried, trades a working tree for a note — and the note can live outside the build.
 
+## 6.5. Night sweep (2026-11-19): behavior changes now live
+
+- **Silent 429 absorption (config `rateLimitRetry`)** — every upstream 429, including Google/Vertex
+  `RESOURCE_EXHAUSTED`, is waited out and retried on the same provider instead of surfacing. A
+  *stated* `Retry-After` is honored up to `max_stated_wait_ms` (default 120s), even beyond the 10s
+  default budget. Rate limits never advance a combo; only quota exhaustion (after the budget) does.
+- **Snapshot format v28** — compilation behavior changed (catalog output/context fallbacks), so the
+  frame version was bumped to force upgraded relays to rebuild cached frames instead of reusing
+  digest-stable ones compiled by older logic.
+- **Catalog ceilings** — bundled model metadata now carries `max_output_tokens`/`context_length`
+  (+4,605 models), and the snapshot compiler falls back to it (fixed agnes `max_tokens` 400s).
+
 ## 7. Why this file is in the repository
 
 A reader deciding whether to use this project needs to know which of its sentences are backed by
