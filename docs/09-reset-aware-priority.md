@@ -164,9 +164,10 @@ restart changes nothing about cooldowns, and the conductor being absent does not
 
 The request path reads `config.quota` from the relay's live state rather than from a compiled
 constant, and that state is refreshed from `config.json` whenever the routing table is republished.
-Editing `default_cooldown_secs` (60), `auth_failure_cooldown_secs` (900), `live_signals_win` or
-`failures_before_dead` therefore takes effect on the next republish, without a restart. Nothing about
-the cooldown is persisted, so the panel's live view of it depends on relay-local state, not on
+Editing `default_cooldown_secs` (60), `auth_failure_cooldown_secs` (900) or `live_signals_win`
+therefore takes effect on the next republish, without a restart. (`failures_before_dead` is read
+live too, but as documented above it is intent until it is wired into the request path.) Nothing
+about the cooldown is persisted, so the panel's live view of it depends on relay-local state, not on
 `state.sqlite`.
 
 ## Worked example
