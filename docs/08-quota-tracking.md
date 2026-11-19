@@ -381,6 +381,14 @@ the account would only re-collect the same refusal, so the relay answers at once
 own** — distinguishable from a forwarded one, which [the API reference](18-api-reference.md)
 describes. An unknown recovery is still tried, because it may be imminent.
 
+Before any client-visible 429 exists, the relay tries to absorb it: every upstream 429 (including
+Google/Vertex's `RESOURCE_EXHAUSTED` spelling) is waited out and retried on the same provider for up
+to the `rateLimitRetry.max_wait_ms` budget, so a transient throttle never surfaces to the client and
+never spends the next combo step on a limit the whole provider shares. Only after the budget is spent
+does the refusal surface, and a 429 classified as quota exhaustion (not a plain throttle) may then
+fail the combo over to the next provider. See the `rateLimitRetry` section in
+[03-configuration.md](03-configuration.md).
+
 ## The entry count caveat
 
 A cooldown entry disappears when its key next **succeeds**, or when a selection notices it has expired;
