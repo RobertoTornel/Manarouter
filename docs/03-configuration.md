@@ -656,8 +656,9 @@ one refusal that never advances a combo; spent quota, bad credentials and transp
 | Field | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Wait and retry on `429` instead of surfacing it. Set `false` to return the upstream `429` immediately (it still never advances the combo). |
-| `max_wait_ms` | `10000` | Total budget, in milliseconds, to keep waiting before the `429` is surfaced. If the upstream names a recovery longer than this, the refusal is surfaced at once with the upstream's own `Retry-After`. |
-| `poll_interval_ms` | `2000` | How long to sleep between retries while waiting. |
+| `max_wait_ms` | `10000` | Budget, in milliseconds, to keep waiting for an **unstated** recovery before the `429` is surfaced. |
+| `max_stated_wait_ms` | `120000` | Ceiling, in milliseconds, for a **stated** recovery (`Retry-After`). A provider that says "retry after 35s" is honored up to this cap even when that exceeds `max_wait_ms` — the relay sleeps to the stated recovery instead of surfacing the moment the default budget runs out. |
+| `poll_interval_ms` | `2000` | How long to sleep between retries while waiting for an unstated recovery. |
 
 Concurrent requests are spread across a provider's accounts: account selection prefers the
 least-busy account (fewest in-flight requests), so a burst of requests across an `N`-account provider

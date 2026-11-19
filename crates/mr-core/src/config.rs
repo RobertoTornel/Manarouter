@@ -82,6 +82,11 @@ pub struct RateLimitRetryConfig {
     pub enabled: bool,
     /// Total budget, in milliseconds, to keep waiting and retrying before the 429 surfaces.
     pub max_wait_ms: u64,
+    /// The ceiling, in milliseconds, for a *stated* recovery (`Retry-After`). When the provider
+    /// names a recovery, it is honored up to this cap even if it exceeds `max_wait_ms` — a
+    /// provider saying "retry after 35s" is telling the truth, and surfacing the 429 the moment
+    /// it exceeds a short default budget would defeat silent handling.
+    pub max_stated_wait_ms: u64,
     /// How long, in milliseconds, to sleep between retries while waiting.
     pub poll_interval_ms: u64,
 }
@@ -91,6 +96,7 @@ impl Default for RateLimitRetryConfig {
         Self {
             enabled: true,
             max_wait_ms: 10_000,
+            max_stated_wait_ms: 120_000,
             poll_interval_ms: 2_000,
         }
     }

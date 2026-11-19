@@ -2556,18 +2556,29 @@ async fn dispatch_routed(
         if rate_limit_retry.enabled {
             let mut absorbing = false;
             let patience_started = std::time::Instant::now();
+            // The wait horizon: the configured budget, extended to honor a stated recovery
+            // (`Retry-After`) up to `max_stated_wait_ms`. A provider that says "retry after 35s"
+            // is telling the truth; surfacing the 429 the moment that outlives a short default
+            // budget would defeat silent handling.
+            let mut wait_horizon_ms = rate_limit_retry.max_wait_ms;
             'patience: loop {
+                let stated_wait = match &attempt {
+                    Attempt::Failed {
+                        response: Some(resp),
+                        ..
+                    } if resp.status() == StatusCode::TOO_MANY_REQUESTS => {
+                        retry_after_ms(resp.headers())
+                    }
+                    _ => None,
+                };
                 match &attempt {
                     Attempt::Failed {
                         response: Some(resp),
                         ..
                     } if resp.status() == StatusCode::TOO_MANY_REQUESTS => {
-                        // A stated recovery beyond the whole budget is not worth polling for: answer
-                        // immediately with the upstream's own recovery instant.
                         if let Some(stated) = retry_after_ms(resp.headers()) {
-                            if stated >= rate_limit_retry.max_wait_ms {
-                                break 'patience;
-                            }
+                            let capped = stated.min(rate_limit_retry.max_stated_wait_ms);
+                            wait_horizon_ms = wait_horizon_ms.max(capped);
                         }
                         absorbing = true;
                     }
@@ -2582,11 +2593,17 @@ async fn dispatch_routed(
                     _ => break 'patience,
                 }
                 let spent = patience_started.elapsed().as_millis() as u64;
-                let remaining_budget = rate_limit_retry.max_wait_ms.saturating_sub(spent);
-                if remaining_budget == 0 {
+                let remaining = wait_horizon_ms.saturating_sub(spent);
+                if remaining == 0 {
                     break 'patience;
                 }
-                let sleep_ms = remaining_budget.min(rate_limit_retry.poll_interval_ms);
+                // With a stated recovery, sleep straight to it; otherwise poll at the configured
+                // interval so an unstated throttle is retried promptly.
+                let sleep_ms = if stated_wait.is_some() {
+                    remaining
+                } else {
+                    remaining.min(rate_limit_retry.poll_interval_ms)
+                };
                 tracing::debug!(
                     provider = %step.provider_id,
                     model = %step.model,
@@ -11915,6 +11932,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             rate_limit_retry: mr_core::config::RateLimitRetryConfig {
                 enabled: true,
                 max_wait_ms: 1_500,
+                max_stated_wait_ms: 1_200,
                 poll_interval_ms: 300,
             },
             ..Default::default()
@@ -11999,6 +12017,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             rate_limit_retry: mr_core::config::RateLimitRetryConfig {
                 enabled: true,
                 max_wait_ms: 800,
+                max_stated_wait_ms: 1_200,
                 poll_interval_ms: 200,
             },
             ..Default::default()
@@ -12166,6 +12185,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             rate_limit_retry: mr_core::config::RateLimitRetryConfig {
                 enabled: true,
                 max_wait_ms: 1_500,
+                max_stated_wait_ms: 1_200,
                 poll_interval_ms: 300,
             },
             ..Default::default()
@@ -12250,6 +12270,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             rate_limit_retry: mr_core::config::RateLimitRetryConfig {
                 enabled: true,
                 max_wait_ms: 800,
+                max_stated_wait_ms: 1_200,
                 poll_interval_ms: 200,
             },
             ..Default::default()
@@ -12303,6 +12324,101 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             second_seen.lock().unwrap().len(),
             1,
             "the fallback step served after the exhausted provider's budget ran out"
+        );
+    }
+
+    /// A stated recovery (`Retry-After`) is honored even when it outlives the default budget: the
+    /// relay waits it out (up to `max_stated_wait_ms`) instead of surfacing the 429 the moment it
+    /// exceeds `max_wait_ms`.
+    #[tokio::test]
+    async fn a_stated_retry_after_is_honoured_even_beyond_the_default_budget() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(move |_body: Bytes| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push("dialled".to_owned());
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [
+                        (axum::http::header::RETRY_AFTER, "35"),
+                        (axum::http::header::CONTENT_TYPE, "application/json"),
+                    ],
+                    r#"{"error":{"message":"rate limit exceeded, retry after 35s"}}"#,
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}");
+
+        let mut provider = keyless_provider();
+        provider.auth = AuthKind::Bearer;
+        provider.base_url = url;
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            rate_limit_retry: mr_core::config::RateLimitRetryConfig {
+                enabled: true,
+                max_wait_ms: 800,
+                max_stated_wait_ms: 1_200,
+                poll_interval_ms: 200,
+            },
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Arc::new(mr_core::secret::Vault::open(dir.path()).unwrap());
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let started = std::time::Instant::now();
+        let resp = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            HeaderMap::new(),
+            AxumBody::from(
+                r#"{"model":"local/m","messages":[{"role":"user","content":"hi"}]}"#.to_owned(),
+            ),
+        )
+        .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        // The upstream always 429s here, so after honoring the stated recovery the request must
+        // surface the 429 — but only after waiting the *stated* recovery (capped at 1200ms), not
+        // instantly at the 800ms budget. We cannot distinguish "waited 1200" from "waited 3600"
+        // cheaply, so assert it waited beyond the default budget at least.
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            elapsed_ms >= 1_000,
+            "the stated recovery should be honored past the 800ms budget, waited {elapsed_ms}ms"
+        );
+        assert!(
+            elapsed_ms < 10_000,
+            "the stated wait must still be bounded, took {elapsed_ms}ms"
         );
     }
 
