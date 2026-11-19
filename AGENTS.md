@@ -41,7 +41,8 @@ Useful CLI commands (use `mr <command> --help` for exact options):
 
 `mr serve` now runs both processes together for a foreground session, and is the quickest way to
 start everything; the README still documents the two-process launch and the systemd units, which are
-the supported way to run it unattended. `mr config` and `mr vault` are not implemented yet. Likewise,
+the supported way to run it unattended. `mr config` (show/validate/edit) and `mr vault` (inspect/rekey)
+are implemented, as is `mr doctor` for installation checks. Likewise,
 consult `docs/23-implementation-status.md` before claiming a feature is implemented; command names may
 exist before all behavior does.
 
