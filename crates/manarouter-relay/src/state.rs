@@ -350,6 +350,11 @@ pub struct RelayState {
     /// who hand-edits `quota` in config.json and sees "routing table reloaded" would reasonably
     /// expect the new cooldown to apply — and would silently keep the old one until a restart.
     quota_config: ArcSwap<mr_core::config::QuotaConfig>,
+    /// Silent rate-limit retry configuration, from config.json (`rateLimitRetry`).
+    ///
+    /// Swapped whole on reload for the same reason as `quota_config`: a hand edit must take
+    /// effect without a restart.
+    rate_limit_retry: ArcSwap<mr_core::config::RateLimitRetryConfig>,
 }
 
 impl RelayState {
@@ -364,6 +369,7 @@ impl RelayState {
             config_dir: mr_core::config::config_dir(),
             proxy_selection: ProxySelectionState::new(&config.proxies),
             quota_config: ArcSwap::from_pointee(config.quota.clone()),
+            rate_limit_retry: ArcSwap::from_pointee(config.rate_limit_retry.clone()),
         }
     }
 
@@ -373,6 +379,13 @@ impl RelayState {
     /// account down for a different length than another.
     pub fn quota_config(&self) -> std::sync::Arc<mr_core::config::QuotaConfig> {
         self.quota_config.load_full()
+    }
+
+    /// The configured silent rate-limit retry settings.
+    ///
+    /// Read once per request so one request does not observe two different settings.
+    pub fn rate_limit_retry_config(&self) -> std::sync::Arc<mr_core::config::RateLimitRetryConfig> {
+        self.rate_limit_retry.load_full()
     }
 
     /// Load the snapshot and configuration from disk.
@@ -680,6 +693,9 @@ mod tests {
             config_dir: std::path::PathBuf::from("/tmp"),
             proxy_selection: ProxySelectionState::empty(),
             quota_config: ArcSwap::from_pointee(mr_core::config::QuotaConfig::default()),
+            rate_limit_retry: ArcSwap::from_pointee(
+                mr_core::config::RateLimitRetryConfig::default(),
+            ),
         }
     }
 

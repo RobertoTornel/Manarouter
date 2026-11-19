@@ -2417,6 +2417,7 @@ async fn dispatch_routed(
     // --- Try each step in order, until one answers successfully. ---
     let mut last_failure: Option<Response> = None;
     let quota = app.relay.quota_config();
+    let rate_limit_retry = app.relay.rate_limit_retry_config();
     // The model the request should be retried against when no step can carry its modality.
     let mut fallback_target: Option<String> = None;
     // Why the steps were skipped, so a refusal that tried nothing can name the reason instead of
@@ -2516,6 +2517,11 @@ async fn dispatch_routed(
         }
     }
 
+    // Set when a step was refused with a rate limit and the silent-retry budget ran out: the
+    // combo must stop here. A rate limit is not a reason to spend the next provider on the same
+    // throttle, so the request ends with the 429 instead of advancing.
+    let mut stop_advancing = false;
+
     for step in &steps {
         // A step that was in the race has already been tried.
         if raced.iter().any(|tried| std::ptr::eq(*tried, *step)) {
@@ -2531,37 +2537,76 @@ async fn dispatch_routed(
         // candidates again and lands on the next account. Bounded by the number of accounts, so a
         // provider whose every account refuses costs one attempt each and then falls through to
         // the next step as before.
-        let account_retries = table
-            .snapshot
-            .providers()
-            .get(step.provider_index as usize)
-            .map(|provider| provider.accounts.len().saturating_sub(1).min(8))
-            .unwrap_or(0);
-        let mut retries_left = account_retries;
-        let mut attempt = attempt_step(&attempt_ctx, step, is_sticky, false, &[]).await;
-        loop {
-            let retry = match &attempt {
-                // A body to hand the client means the upstream answered and refused. That answer is
-                // worth retrying on a sibling account only when another of *this step's* accounts
-                // is still usable and the refusal was about the credential rather than the bytes;
-                // a request the upstream rejected as malformed fails identically everywhere.
-                Attempt::Failed { retry_accounts, .. } => {
-                    *retry_accounts
-                        && retries_left > 0
-                        && step_has_a_live_account(&app, &table, step, now_ms)
+        let mut attempt = attempt_step_across_accounts(&attempt_ctx, step, is_sticky, false).await;
+
+        // Silent rate-limit handling. A rate-limited provider is throttled, not dead: the request
+        // must neither surface the 429 nor advance to another combo step. When enabled, wait out
+        // the provider's recovery (bounded by `max_wait_ms`) and retry the same provider. Only
+        // when the budget runs out does the refusal surface — and even then it ends the combo
+        // rather than advancing it.
+        if rate_limit_retry.enabled {
+            let mut absorbing = false;
+            let patience_started = std::time::Instant::now();
+            'patience: loop {
+                match &attempt {
+                    Attempt::Failed {
+                        advance_step: false,
+                        response: Some(resp),
+                        ..
+                    } => {
+                        // A stated recovery beyond the whole budget is not worth polling for: answer
+                        // immediately with the upstream's own recovery instant.
+                        if let Some(stated) = retry_after_ms(resp.headers()) {
+                            if stated >= rate_limit_retry.max_wait_ms {
+                                break 'patience;
+                            }
+                        }
+                        absorbing = true;
+                    }
+                    // Every account of this step is cooling down — the same condition as above, just
+                    // learned from the health map instead of from a fresh refusal.
+                    Attempt::Skip {
+                        cause: SkipCause::NoUsableAccount,
+                        ..
+                    } => {
+                        absorbing = true;
+                    }
+                    _ => break 'patience,
                 }
-                _ => false,
-            };
-            if !retry {
-                break;
+                let spent = patience_started.elapsed().as_millis() as u64;
+                let remaining_budget = rate_limit_retry.max_wait_ms.saturating_sub(spent);
+                if remaining_budget == 0 {
+                    break 'patience;
+                }
+                let sleep_ms = remaining_budget.min(rate_limit_retry.poll_interval_ms);
+                tracing::debug!(
+                    provider = %step.provider_id,
+                    model = %step.model,
+                    wait_ms = sleep_ms,
+                    "absorbing upstream rate limit; waiting and retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                // Re-probe with cooldowns ignored: the whole point of the wait is to *test* the
+                // recovery, and a selection that respects the prediction would skip the cooling
+                // account and learn nothing. The polling budget is the bound on how often.
+                attempt = attempt_step_across_accounts(&attempt_ctx, step, is_sticky, true).await;
             }
-            retries_left -= 1;
-            tracing::debug!(
-                provider = %step.provider_id,
-                model = %step.model,
-                "retrying the same step on another account"
-            );
-            attempt = attempt_step(&attempt_ctx, step, is_sticky, false, &[]).await;
+            if absorbing
+                && matches!(
+                    attempt,
+                    Attempt::Failed {
+                        advance_step: false,
+                        ..
+                    }
+                )
+            {
+                tracing::warn!(
+                    provider = %step.provider_id,
+                    model = %step.model,
+                    wait_ms = rate_limit_retry.max_wait_ms,
+                    "upstream stayed rate-limited past the silent-retry budget; surfacing the 429"
+                );
+            }
         }
         match attempt {
             Attempt::Answer(response) => {
@@ -2585,12 +2630,16 @@ async fn dispatch_routed(
             Attempt::Failed {
                 response,
                 sticky_cleared,
+                advance_step,
                 ..
             } => {
                 if sticky_cleared {
                     sticky_index = None;
                 }
                 last_failure = response;
+                if !advance_step {
+                    stop_advancing = true;
+                }
             }
             Attempt::Skip {
                 sticky_cleared,
@@ -2610,6 +2659,40 @@ async fn dispatch_routed(
                 return response;
             }
         }
+        if stop_advancing {
+            break;
+        }
+    }
+
+    // A rate limit held past the silent-retry budget: end the request with the refusal (the
+    // upstream's own 429, or the relay's with the earliest known recovery) instead of trying
+    // further combo steps or rerouting on modality.
+    if stop_advancing {
+        failed_combo(&app, activity, attempted.as_deref(), now_ms);
+        if let Some(response) = last_failure {
+            return response;
+        }
+        let wait_secs = app
+            .health
+            .earliest_reset()
+            .filter(|until| *until > now_ms)
+            .map(|until| until.saturating_sub(now_ms) / 1000);
+        let message = skipped_steps_message(&skip_causes, wait_secs);
+        let mut response = error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            client_dialect,
+            "no_usable_accounts",
+            &message,
+        );
+        if let Some(until) = app.health.earliest_reset() {
+            let secs = until.saturating_sub(now_ms) / 1000;
+            if secs > 0 {
+                if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
+                    response.headers_mut().insert("retry-after", v);
+                }
+            }
+        }
+        return response;
     }
 
     // No step could carry the request's modality. The configured default names a model that can,
@@ -2956,6 +3039,15 @@ enum Attempt {
         /// to the same step under a different credential cannot change that answer, so retrying
         /// only burns an attempt and delays the step the combo configured for exactly this case.
         retry_accounts: bool,
+        /// Whether the caller should continue to the next combo step after this failure.
+        ///
+        /// `false` for a rate limit: the provider is throttled, not dead, and advancing would
+        /// spend the next step on a limit the whole provider shares. The caller absorbs the 429
+        /// (waiting and retrying, when configured) and only surfaces it if the limit persists —
+        /// it never advances the combo for a throttle. Every other failure — spent quota, bad
+        /// credential, transport error — advances, so a combo still survives what it exists to
+        /// survive.
+        advance_step: bool,
     },
     /// The step failed in a way that ends the request rather than the attempt.
     Fatal {
@@ -3278,6 +3370,54 @@ fn client_session_hint(headers: &HeaderMap) -> Option<&str> {
     })
 }
 
+/// Run one attempt at one step, retrying across the step's sibling accounts while a failure says
+/// another credential could plausibly answer.
+///
+/// This is the account-retry loop of the ordinary sequential path, extracted so the silent
+/// rate-limit patience can re-run the same loop after waiting for a recovery.
+async fn attempt_step_across_accounts(
+    actx: &AttemptContext<'_>,
+    step: &StepPlan,
+    is_sticky: bool,
+    ignore_cooldowns: bool,
+) -> Attempt {
+    let app = actx.app;
+    let table = actx.table.clone();
+    let account_retries = table
+        .snapshot
+        .providers()
+        .get(step.provider_index as usize)
+        .map(|provider| provider.accounts.len().saturating_sub(1).min(8))
+        .unwrap_or(0);
+    let mut retries_left = account_retries;
+    let mut attempt = attempt_step(actx, step, is_sticky, ignore_cooldowns, &[]).await;
+    loop {
+        let retry = match &attempt {
+            // A body to hand the client means the upstream answered and refused. That answer is
+            // worth retrying on a sibling account only when another of *this step's* accounts
+            // is still usable and the refusal was about the credential rather than the bytes;
+            // a request the upstream rejected as malformed fails identically everywhere.
+            Attempt::Failed { retry_accounts, .. } => {
+                *retry_accounts
+                    && retries_left > 0
+                    && step_has_a_live_account(app, &table, step, actx.now_ms)
+            }
+            _ => false,
+        };
+        if !retry {
+            break;
+        }
+        retries_left -= 1;
+        tracing::debug!(
+            provider = %step.provider_id,
+            model = %step.model,
+            "retrying the same step on another account"
+        );
+        attempt = attempt_step(actx, step, is_sticky, ignore_cooldowns, &[]).await;
+    }
+    attempt
+}
+
 async fn attempt_step(
     actx: &AttemptContext<'_>,
     step: &StepPlan,
@@ -3475,6 +3615,7 @@ async fn attempt_step(
             account: None,
             sticky_cleared,
             retry_accounts: true,
+            advance_step: true,
         };
     };
 
@@ -3708,6 +3849,7 @@ async fn attempt_step(
                 account: Some(account.id.clone()),
                 sticky_cleared,
                 retry_accounts: true,
+                advance_step: true,
             };
         }
     };
@@ -3788,6 +3930,7 @@ async fn attempt_step(
                     account: Some(account.id.clone()),
                     sticky_cleared,
                     retry_accounts: false,
+                    advance_step: true,
                 };
             }
         }
@@ -4181,6 +4324,7 @@ async fn attempt_step(
                     account: Some(account.id.clone()),
                     sticky_cleared,
                     retry_accounts: false,
+                    advance_step: true,
                 };
             }
             let effective_scope = if modal_cold_start || model_unavailable {
@@ -4216,6 +4360,10 @@ async fn attempt_step(
                 account: Some(account.id.clone()),
                 sticky_cleared,
                 retry_accounts: true,
+                // A rate limit says the provider is throttled, not dead: the request must not
+                // advance to another combo step, and the caller absorbs it (waiting and retrying)
+                // instead of surfacing it.
+                advance_step: reason != select::CooldownReason::RateLimited,
             }
         }
         Err(e) => {
@@ -4283,6 +4431,7 @@ async fn attempt_step(
                 account: Some(account.id.clone()),
                 sticky_cleared,
                 retry_accounts: true,
+                advance_step: true,
             }
         }
     }
@@ -11414,6 +11563,13 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
 
         let config = mr_core::config::Config {
             providers: vec![provider],
+            // This test is about the last-resort walk, not about silent rate-limit absorption:
+            // keep the pre-parked cooldowns visible to it without waiting out the 10s default
+            // budget first.
+            rate_limit_retry: mr_core::config::RateLimitRetryConfig {
+                enabled: false,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
@@ -11518,6 +11674,13 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
 
         let config = mr_core::config::Config {
             providers: vec![provider],
+            // This test is about the last-resort rule for a far stated reset, not about silent
+            // rate-limit absorption: the pre-parked account must answer at once, without the
+            // silent-retry budget being spent first.
+            rate_limit_retry: mr_core::config::RateLimitRetryConfig {
+                enabled: false,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
@@ -11701,6 +11864,255 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             .expect("the refused account is cooled");
         let wait = cooldown.until_ms.saturating_sub(now_ms);
         assert!(wait <= 5_000, "unstated 429 cools briefly, got {wait} ms");
+    }
+
+    /// A rate-limited upstream is absorbed: the relay waits out the throttle and retries the same
+    /// provider, so the client sees a success rather than a 429 — and the combo never advances
+    /// past it.
+    #[tokio::test]
+    async fn a_rate_limited_upstream_is_absorbed_and_retried_within_the_budget() {
+        let (url, seen) = mock_upstream_custom(|attempt, _body| {
+            if attempt < 2 {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    r#"{"error":{"message":"too many requests"}}"#,
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                )
+            }
+        })
+        .await;
+        let mut provider = keyless_provider();
+        provider.auth = AuthKind::Bearer;
+        provider.base_url = url;
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            rate_limit_retry: mr_core::config::RateLimitRetryConfig {
+                enabled: true,
+                max_wait_ms: 1_500,
+                poll_interval_ms: 300,
+            },
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Arc::new(mr_core::secret::Vault::open(dir.path()).unwrap());
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+        let resp = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            HeaderMap::new(),
+            AxumBody::from(
+                r#"{"model":"local/m","messages":[{"role":"user","content":"hi"}]}"#.to_owned(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the absorbed 429s must not surface to the client"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            3,
+            "two 429s were absorbed, the third attempt served"
+        );
+    }
+
+    /// A rate limit must never advance the combo to the next provider: the throttle belongs to the
+    /// provider, not to its availability, and the next step would only re-collect the same 429.
+    #[tokio::test]
+    async fn a_rate_limit_does_not_advance_the_combo_to_the_next_step() {
+        let (first_url, first_seen) = refusing_upstream(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"too many requests"}}"#,
+        )
+        .await;
+        let (second_url, second_seen) = fake_upstream().await;
+
+        let mut combo = mr_core::model::Combo::new(
+            "failover",
+            mr_core::model::ComboStep::new("first", "shared-model"),
+        );
+        combo
+            .steps
+            .push(mr_core::model::ComboStep::new("second", "shared-model"));
+
+        let config = mr_core::config::Config {
+            providers: vec![
+                provider_serving("first", &first_url, "shared-model", &[InputModality::Text]),
+                provider_serving(
+                    "second",
+                    &second_url,
+                    "shared-model",
+                    &[InputModality::Text],
+                ),
+            ],
+            combos: vec![combo],
+            rate_limit_retry: mr_core::config::RateLimitRetryConfig {
+                enabled: true,
+                max_wait_ms: 800,
+                poll_interval_ms: 200,
+            },
+            ..Default::default()
+        };
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(failover_body()),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the 429 must surface once the silent-retry budget is spent"
+        );
+        assert!(
+            !first_seen.lock().unwrap().is_empty(),
+            "the rate-limited step was tried"
+        );
+        assert_eq!(
+            second_seen.lock().unwrap().len(),
+            0,
+            "a rate limit must not fail the combo over to the next provider"
+        );
+    }
+
+    /// With the setting off, the upstream 429 surfaces immediately — but still never advances the
+    /// combo to the next provider.
+    #[tokio::test]
+    async fn a_disabled_rate_limit_setting_surfaces_the_429_immediately() {
+        let (first_url, first_seen) = refusing_upstream(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"too many requests"}}"#,
+        )
+        .await;
+        let (second_url, second_seen) = fake_upstream().await;
+
+        let mut combo = mr_core::model::Combo::new(
+            "failover",
+            mr_core::model::ComboStep::new("first", "shared-model"),
+        );
+        combo
+            .steps
+            .push(mr_core::model::ComboStep::new("second", "shared-model"));
+
+        let config = mr_core::config::Config {
+            providers: vec![
+                provider_serving("first", &first_url, "shared-model", &[InputModality::Text]),
+                provider_serving(
+                    "second",
+                    &second_url,
+                    "shared-model",
+                    &[InputModality::Text],
+                ),
+            ],
+            combos: vec![combo],
+            rate_limit_retry: mr_core::config::RateLimitRetryConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(failover_body()),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "with the setting off the 429 surfaces right away"
+        );
+        assert_eq!(first_seen.lock().unwrap().len(), 1, "exactly one attempt");
+        assert_eq!(
+            second_seen.lock().unwrap().len(),
+            0,
+            "even with the setting off, a rate limit must not advance the combo"
+        );
     }
 
     /// A `404` is the same class as a `400`: a statement about the request, not about the account.
@@ -14604,6 +15016,12 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         provider.base_url = url;
         let config = mr_core::config::Config {
             providers: vec![provider],
+            // The reasoning-effort tests assert exact attempt counts; the silent rate-limit
+            // retry is not what they exercise, so it is switched off.
+            rate_limit_retry: mr_core::config::RateLimitRetryConfig {
+                enabled: false,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();

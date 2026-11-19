@@ -81,6 +81,14 @@ pub const QUOTA_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(15);
 const USED_KEYS: [&str; 4] = ["used", "used_tokens", "usage", "total_used"];
 /// Keys the conventional path reads a limit from.
 const TOTAL_KEYS: [&str; 4] = ["total", "limit", "total_granted", "quota"];
+/// Keys the conventional path reads the *amount left* from, when the payload reports no limit.
+///
+/// A spend-based reporting (Vercel's `/v1/credits` answers `{"balance": …,
+/// "total_used": …}`) never states a cap, but the remaining balance is the same fact:
+/// `total` is derived as `used + remaining` rather than invented.
+const REMAINING_KEYS: [&str; 2] = ["remaining", "balance"];
+/// Keys the conventional path reads a currency label from, when the payload carries one.
+const CURRENCY_KEYS: [&str; 2] = ["currency", "unit"];
 /// Keys the conventional path reads a reset instant from. Both spellings, because upstreams send
 /// both.
 const RESET_KEYS: [&str; 6] = [
@@ -447,6 +455,18 @@ fn assemble(
     }
     .with_source(source);
 
+    // A currency declared on the entries travels as the quota's unit — but only when every entry
+    // agrees on it; a mixed-currency account is not a single dollar balance.
+    let currencies: Vec<&str> = mapped
+        .iter()
+        .filter_map(|entry| entry.currency.as_deref())
+        .collect();
+    if let Some(first) = currencies.first() {
+        if currencies.iter().all(|currency| currency == first) {
+            quota = quota.with_unit(*first);
+        }
+    }
+
     if let Some(plan) = plan {
         quota = quota.with_display_name(plan);
     } else if mapped.len() == 1 {
@@ -488,19 +508,36 @@ pub(crate) fn conventional_quota(body: &Value, provider_id: &str) -> Result<Usag
             USED_KEYS.join(", ")
         ))
     })?;
-    let total = number_at(scope, &TOTAL_KEYS).ok_or_else(|| {
-        Error::NotFound(format!(
-            "the quota endpoint for provider {provider_id:?} reported no limit (looked for {})",
-            TOTAL_KEYS.join(", ")
-        ))
-    })?;
+    let total = number_at(scope, &TOTAL_KEYS);
+    let remaining = number_at(scope, &REMAINING_KEYS);
+    // A spend-based report (Vercel's `/v1/credits` answers `{"balance": …, "total_used": …}`)
+    // never states a cap, but the remaining balance is the same fact: `total` is derived as
+    // `used + remaining`. Without either a limit or a balance there is no quota to report.
+    let total = match (total, remaining) {
+        (Some(total), _) => total,
+        (None, Some(remaining)) => used + remaining,
+        (None, None) => {
+            return Err(Error::NotFound(format!(
+                "the quota endpoint for provider {provider_id:?} reported no limit (looked for {}) and no remaining balance (looked for {})",
+                TOTAL_KEYS.join(", "),
+                REMAINING_KEYS.join(", ")
+            )))
+        }
+    };
     let reset = RESET_KEYS
         .iter()
         .find_map(|key| scope.get(*key))
         .cloned()
         .unwrap_or(Value::Null);
 
-    Ok(UsageQuota::from_usage(used, total, &reset).with_source(OpenAiCompat::ID))
+    let mut quota = UsageQuota::from_usage(used, total, &reset).with_source(OpenAiCompat::ID);
+    if let Some(currency) = CURRENCY_KEYS
+        .iter()
+        .find_map(|key| scope.get(*key).and_then(Value::as_str))
+    {
+        quota = quota.with_unit(currency);
+    }
+    Ok(quota)
 }
 
 #[async_trait]
@@ -1135,5 +1172,47 @@ mod tests {
         let declared = account(json!("https://api.example.test/quota"));
         assert!(declared_endpoint(&declared).is_some());
         assert!(OpenAiCompat::new().supports(Dialect::Anthropic, "x", &declared));
+    }
+
+    #[test]
+    fn conventional_quota_accepts_a_spend_report_without_a_limit() {
+        // Vercel's /v1/credits shape: a balance and total_used, no cap. The total is derived.
+        let body = json!({ "balance": 37.5, "total_used": 12.5, "currency": "USD" });
+        let quota = conventional_quota(&body, "vercel").expect("balance + used");
+        assert_eq!(quota.used, 12.5);
+        assert_eq!(quota.total, 50.0);
+        assert_eq!(quota.remaining, 37.5);
+        assert!(quota.fraction_reported);
+        assert_eq!(quota.unit.as_deref(), Some("USD"));
+    }
+
+    #[test]
+    fn conventional_quota_needs_a_limit_or_a_balance() {
+        let body = json!({ "total_used": 12.5 });
+        let error = conventional_quota(&body, "vercel").expect_err("neither limit nor balance");
+        assert!(matches!(error, Error::NotFound(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn declared_quotas_carry_a_shared_currency_as_the_unit() {
+        let fake = FakeHttp::serving(r#"{"data":{"used":2,"limit":8}}"#);
+        let quota = fetch(
+            &fake,
+            json!({
+                "url": "https://api.example.test/quota",
+                "quotas": {
+                    "credits": {
+                        "used": "$.data.used",
+                        "total": "$.data.limit",
+                        "currency": "USD"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("declared");
+        assert_eq!(quota.used, 2.0);
+        assert_eq!(quota.total, 8.0);
+        assert_eq!(quota.unit.as_deref(), Some("USD"));
     }
 }

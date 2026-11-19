@@ -68,6 +68,34 @@ pub fn is_remote_exposed(host: &str) -> bool {
     !is_loopback(host)
 }
 
+/// How the relay treats an upstream rate limit (HTTP 429).
+///
+/// By default a transient throttle is **absorbed**: the relay waits out the recovery (up to
+/// `max_wait_ms`) and retries the same provider, so an upstream 429 never surfaces to the
+/// client, never fails over to another combo step, and never spends a sibling account on a
+/// limit the whole provider shares. Set `enabled: false` to surface the upstream 429 right
+/// away instead.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RateLimitRetryConfig {
+    /// Whether upstream 429s are absorbed by waiting and retrying.
+    pub enabled: bool,
+    /// Total budget, in milliseconds, to keep waiting and retrying before the 429 surfaces.
+    pub max_wait_ms: u64,
+    /// How long, in milliseconds, to sleep between retries while waiting.
+    pub poll_interval_ms: u64,
+}
+
+impl Default for RateLimitRetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_wait_ms: 10_000,
+            poll_interval_ms: 2_000,
+        }
+    }
+}
+
 /// The whole authored configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -111,6 +139,11 @@ pub struct Config {
     /// read from `quota_probe` too so it matches the rest of this file's snake_case keys.
     #[serde(rename = "quotaProbe", alias = "quota_probe")]
     pub quota_probe: QuotaProbeConfig,
+
+    /// Silent rate-limit handling: whether an upstream 429 is waited out and retried instead of
+    /// being surfaced to the client (or failing the combo over to another provider).
+    #[serde(rename = "rateLimitRetry", alias = "rate_limit_retry")]
+    pub rate_limit_retry: RateLimitRetryConfig,
 
     /// Latency-tuning knobs, all with defaults that are right for a laptop.
     pub latency: LatencyConfig,
@@ -690,6 +723,7 @@ impl Default for Config {
             client_keys: Vec::new(),
             quota: QuotaConfig::default(),
             quota_probe: QuotaProbeConfig::default(),
+            rate_limit_retry: RateLimitRetryConfig::default(),
             latency: LatencyConfig::default(),
             routing: RoutingConfig::default(),
             proxies: Vec::new(),
