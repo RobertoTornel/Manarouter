@@ -239,6 +239,7 @@ pub fn build_state(
         oauth_store,
         sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
         activity: Arc::new(crate::activity::ActivityLog::new()),
+        account_inflight: Arc::new(crate::state::AccountInflight::default()),
         kv_usage,
         batch,
     };

@@ -583,7 +583,35 @@ pub fn account_candidates<'a>(
     now_ms: u64,
     model: &str,
 ) -> Vec<&'a AccountPlan> {
-    account_candidates_with(provider, strategy, counter, health, now_ms, model, true)
+    account_candidates_with(
+        provider, strategy, counter, health, now_ms, model, true, None,
+    )
+}
+
+/// The same ordered list, preferring the least-busy account when several are eligible.
+///
+/// `load` is the in-flight request count per account id, from the relay's live counter. A stable
+/// sort keeps the order the strategy produced within each equal-load group, so priority and
+/// round-robin orderings still decide who wins when nobody is busy.
+pub fn account_candidates_with_load<'a>(
+    provider: &'a ProviderPlan,
+    strategy: KeyStrategy,
+    counter: u64,
+    health: &HashMap<String, Cooldown>,
+    now_ms: u64,
+    model: &str,
+    load: &HashMap<String, u64>,
+) -> Vec<&'a AccountPlan> {
+    account_candidates_with(
+        provider,
+        strategy,
+        counter,
+        health,
+        now_ms,
+        model,
+        true,
+        Some(load),
+    )
 }
 
 /// The same ordered list, but with the cooldown filter left out.
@@ -609,14 +637,44 @@ pub fn account_candidates_ignoring_cooldowns<'a>(
     now_ms: u64,
     model: &str,
 ) -> Vec<&'a AccountPlan> {
-    let mut candidates =
-        account_candidates_with(provider, strategy, counter, health, now_ms, model, false);
+    account_candidates_ignoring_cooldowns_with_load(
+        provider,
+        strategy,
+        counter,
+        health,
+        now_ms,
+        model,
+        &HashMap::new(),
+    )
+}
+
+/// The recovery-order variant, preferring the least-busy account within each recovery instant.
+pub fn account_candidates_ignoring_cooldowns_with_load<'a>(
+    provider: &'a ProviderPlan,
+    strategy: KeyStrategy,
+    counter: u64,
+    health: &HashMap<String, Cooldown>,
+    now_ms: u64,
+    model: &str,
+    load: &HashMap<String, u64>,
+) -> Vec<&'a AccountPlan> {
+    let mut candidates = account_candidates_with(
+        provider,
+        strategy,
+        counter,
+        health,
+        now_ms,
+        model,
+        false,
+        Some(load),
+    );
     candidates.sort_by_key(|account| {
         route_reset_instant(provider.id.as_str(), account.id.as_str(), model, health).unwrap_or(0)
     });
     candidates
 }
 
+#[allow(clippy::too_many_arguments)] // selection inputs are a single decision; a context struct here would be ceremony
 fn account_candidates_with<'a>(
     provider: &'a ProviderPlan,
     strategy: KeyStrategy,
@@ -625,6 +683,7 @@ fn account_candidates_with<'a>(
     now_ms: u64,
     model: &str,
     respect_cooldowns: bool,
+    load: Option<&HashMap<String, u64>>,
 ) -> Vec<&'a AccountPlan> {
     // Candidates in the operator's order. `priority` is expressed by the order of the account list
     // in the configuration, so nothing here needs to sort for that strategy.
@@ -660,6 +719,13 @@ fn account_candidates_with<'a>(
             // measurement — a real least-used needs a counter the relay does not keep per account.
             candidates.sort_by_key(|a| std::cmp::Reverse(a.max_concurrent));
         }
+    }
+
+    // Spread concurrent load: when several accounts are eligible, prefer the least-busy one so a
+    // burst of concurrent requests does not pile onto a single key and trip its rate limit. The
+    // sort is stable, so equal-load candidates keep the ordering the strategy produced.
+    if let Some(load) = load {
+        candidates.sort_by_key(|account| load.get(account.id.as_str()).copied().unwrap_or(0));
     }
     candidates
 }
@@ -1001,6 +1067,26 @@ mod tests {
 
     fn healthy() -> HashMap<String, Cooldown> {
         HashMap::new()
+    }
+
+    #[test]
+    fn account_candidates_with_load_prefers_the_least_busy_account() {
+        let p = provider("p", vec![account("a1"), account("a2"), account("a3")]);
+        let mut load = HashMap::new();
+        load.insert("a1".to_owned(), 3u64);
+        load.insert("a2".to_owned(), 0u64);
+        load.insert("a3".to_owned(), 1u64);
+        let candidates =
+            account_candidates_with_load(&p, KeyStrategy::Priority, 0, &healthy(), 0, "m", &load);
+        let ids: Vec<&str> = candidates.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["a2", "a3", "a1"]);
+
+        // Equal loads keep the operator order untouched.
+        let empty = HashMap::new();
+        let candidates =
+            account_candidates_with_load(&p, KeyStrategy::Priority, 0, &healthy(), 0, "m", &empty);
+        let ids: Vec<&str> = candidates.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["a1", "a2", "a3"]);
     }
 
     #[test]

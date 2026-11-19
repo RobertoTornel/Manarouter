@@ -915,6 +915,7 @@ mod tests {
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         }

@@ -1470,6 +1470,7 @@ mod tests {
             quota_store: std::sync::Arc::clone(&store),
             sticky_success: std::sync::Arc::new(crate::sticky::StickySuccess::default()),
             activity: std::sync::Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: std::sync::Arc::new(crate::state::AccountInflight::default()),
             kv_usage: std::sync::Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         };

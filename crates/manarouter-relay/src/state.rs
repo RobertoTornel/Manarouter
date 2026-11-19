@@ -228,6 +228,59 @@ fn step_counter_key(step: &StepPlan) -> ComboId {
     ComboId::from_raw(format!("{}#{}", step.provider_id, step.model))
 }
 
+/// Per-account in-flight request counts, for spreading concurrent load across a provider's accounts.
+///
+/// A provider that rate-limits under concurrency is usually throttling *one key*, not the whole
+/// account pool: if every concurrent request lands on the same account, that account absorbs the
+/// whole burst and 429s while its siblings sit idle. Account selection reads these counts and
+/// prefers the least-busy account, so N concurrent requests across an N-account provider spread one
+/// per account.
+#[derive(Debug, Default)]
+pub struct AccountInflight {
+    counts: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl AccountInflight {
+    /// A consistent snapshot of in-flight counts, keyed by account id.
+    pub fn snapshot(&self) -> std::collections::HashMap<String, u64> {
+        self.counts.lock().expect("not poisoned").clone()
+    }
+
+    /// Mark one more request as in flight on `account_id`; the returned lease releases it when it
+    /// drops.
+    pub fn begin(&self, account_id: &str) -> InflightLease<'_> {
+        let mut counts = self.counts.lock().expect("not poisoned");
+        *counts.entry(account_id.to_owned()).or_insert(0) += 1;
+        InflightLease {
+            inflight: self,
+            account_id: account_id.to_owned(),
+        }
+    }
+
+    fn end(&self, account_id: &str) {
+        let mut counts = self.counts.lock().expect("not poisoned");
+        if let Some(count) = counts.get_mut(account_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(account_id);
+            }
+        }
+    }
+}
+
+/// Releases an in-flight count when the request it belongs to finishes.
+#[derive(Debug)]
+pub struct InflightLease<'a> {
+    inflight: &'a AccountInflight,
+    account_id: String,
+}
+
+impl Drop for InflightLease<'_> {
+    fn drop(&mut self) {
+        self.inflight.end(&self.account_id);
+    }
+}
+
 /// A client key, reduced to what authentication actually needs.
 ///
 /// The plaintext is not stored, in memory or on disk. A key is verified by hashing what the client

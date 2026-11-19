@@ -118,6 +118,9 @@ pub struct AppState {
     pub no_key_required: bool,
     /// Account health, as the relay has observed it.
     pub health: Arc<Health>,
+    /// Per-account in-flight request counts, for spreading concurrent requests across a provider's
+    /// accounts (least-busy account first).
+    pub account_inflight: Arc<crate::state::AccountInflight>,
     /// The credential vault.
     ///
     /// Opened once at startup rather than per request: it decrypts a file, and putting disk I/O and
@@ -1271,15 +1274,17 @@ async fn forward_with_bytes(
     }
 
     let mut last_failure: Option<Response> = None;
+    let load = app.account_inflight.snapshot();
     for (provider, step) in targets {
         let counter = table.advance_account_rr(step);
-        let candidates = select::account_candidates(
+        let candidates = select::account_candidates_with_load(
             provider,
             provider.key_strategy,
             counter,
             &health,
             now_ms,
             &step.model,
+            &load,
         );
         let candidates =
             crate::account_spend::filter_spent_candidates(candidates, &app.quota_store, now_ms);
@@ -3499,23 +3504,26 @@ async fn attempt_step(
     }
 
     let account_counter = table.advance_account_rr(step);
+    let load = app.account_inflight.snapshot();
     let candidates = if ignore_cooldowns {
-        select::account_candidates_ignoring_cooldowns(
+        select::account_candidates_ignoring_cooldowns_with_load(
             provider,
             provider.key_strategy,
             account_counter,
             &health,
             now_ms,
             &step.model,
+            &load,
         )
     } else {
-        select::account_candidates(
+        select::account_candidates_with_load(
             provider,
             provider.key_strategy,
             account_counter,
             &health,
             now_ms,
             &step.model,
+            &load,
         )
     };
     // A step that names an account selection may be served by those accounts only. The filter is
@@ -4034,6 +4042,7 @@ async fn attempt_step(
     // The dial is recorded before the request goes out, so a refused request still counts against
     // a request budget. The ticket settles the upstream's reported token counts when the answer
     // ends, and parks the account until a full declared window frees.
+    let _inflight = app.account_inflight.begin(account.id.as_str());
     let spend_ticket = crate::account_spend::AccountSpendTicket::open(
         std::sync::Arc::clone(&app.quota_store),
         std::sync::Arc::clone(&app.health),
@@ -8220,6 +8229,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         }
@@ -10423,6 +10433,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
@@ -10520,6 +10531,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         };
@@ -10627,6 +10639,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         };
@@ -10798,6 +10811,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
@@ -11026,6 +11040,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
@@ -11368,6 +11383,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         };
@@ -11427,6 +11443,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         };
@@ -11597,6 +11614,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         };
@@ -11707,6 +11725,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         };
@@ -11840,6 +11859,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         };
@@ -11917,6 +11937,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         };
@@ -12002,6 +12023,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         };
@@ -12089,6 +12111,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         };
@@ -12204,6 +12227,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         };
@@ -12330,6 +12354,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
@@ -12478,6 +12503,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
@@ -12694,6 +12720,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
@@ -12803,6 +12830,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
@@ -12934,6 +12962,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
@@ -13168,6 +13197,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
@@ -13606,6 +13636,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
@@ -14032,6 +14063,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
@@ -14351,6 +14383,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         }
@@ -14556,6 +14589,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         };
@@ -14681,6 +14715,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
@@ -14832,6 +14867,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         };
@@ -15044,6 +15080,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         };
@@ -15318,6 +15355,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
         }
