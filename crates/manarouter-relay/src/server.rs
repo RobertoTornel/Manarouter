@@ -2544,21 +2544,24 @@ async fn dispatch_routed(
         // the next step as before.
         let mut attempt = attempt_step_across_accounts(&attempt_ctx, step, is_sticky, false).await;
 
-        // Silent rate-limit handling. A rate-limited provider is throttled, not dead: the request
-        // must neither surface the 429 nor advance to another combo step. When enabled, wait out
-        // the provider's recovery (bounded by `max_wait_ms`) and retry the same provider. Only
-        // when the budget runs out does the refusal surface — and even then it ends the combo
-        // rather than advancing it.
+        // Silent rate-limit handling. A throttled provider is not dead: the request must neither
+        // surface the 429 nor — for a throttle — advance to another combo step. When enabled, wait
+        // out the provider's recovery (bounded by `max_wait_ms`) and retry the same provider. Only
+        // when the budget runs out does the refusal surface.
+        //
+        // Every 429 is absorbed, whatever it was classified as. Google/Vertex answers a throttle as
+        // `429 RESOURCE_EXHAUSTED`, which the body reader classifies as quota-exhausted (so it may
+        // still fail the combo over once the budget is spent); absorbing the *status* first is what
+        // stops a transient "Resource has been exhausted" from ever reaching the client.
         if rate_limit_retry.enabled {
             let mut absorbing = false;
             let patience_started = std::time::Instant::now();
             'patience: loop {
                 match &attempt {
                     Attempt::Failed {
-                        advance_step: false,
                         response: Some(resp),
                         ..
-                    } => {
+                    } if resp.status() == StatusCode::TOO_MANY_REQUESTS => {
                         // A stated recovery beyond the whole budget is not worth polling for: answer
                         // immediately with the upstream's own recovery instant.
                         if let Some(stated) = retry_after_ms(resp.headers()) {
@@ -2596,15 +2599,14 @@ async fn dispatch_routed(
                 // account and learn nothing. The polling budget is the bound on how often.
                 attempt = attempt_step_across_accounts(&attempt_ctx, step, is_sticky, true).await;
             }
-            if absorbing
-                && matches!(
-                    attempt,
-                    Attempt::Failed {
-                        advance_step: false,
-                        ..
-                    }
-                )
-            {
+            let surfaced_429 = matches!(
+                &attempt,
+                Attempt::Failed {
+                    response: Some(resp),
+                    ..
+                } if resp.status() == StatusCode::TOO_MANY_REQUESTS
+            );
+            if absorbing && surfaced_429 {
                 tracing::warn!(
                     provider = %step.provider_id,
                     model = %step.model,
@@ -12135,6 +12137,172 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             second_seen.lock().unwrap().len(),
             0,
             "even with the setting off, a rate limit must not advance the combo"
+        );
+    }
+
+    /// Google/Vertex-style `429 RESOURCE_EXHAUSTED` is a throttle in a quota costume: it must be
+    /// absorbed like any other 429 instead of surfacing to the client.
+    #[tokio::test]
+    async fn a_resource_exhausted_429_is_absorbed_and_retried_within_the_budget() {
+        let (url, seen) = mock_upstream_custom(|attempt, _body| {
+            if attempt < 2 {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    r#"{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}"#,
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                )
+            }
+        })
+        .await;
+        let mut provider = keyless_provider();
+        provider.auth = AuthKind::Bearer;
+        provider.base_url = url;
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            rate_limit_retry: mr_core::config::RateLimitRetryConfig {
+                enabled: true,
+                max_wait_ms: 1_500,
+                poll_interval_ms: 300,
+            },
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Arc::new(mr_core::secret::Vault::open(dir.path()).unwrap());
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+        let resp = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            HeaderMap::new(),
+            AxumBody::from(
+                r#"{"model":"local/m","messages":[{"role":"user","content":"hi"}]}"#.to_owned(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the absorbed RESOURCE_EXHAUSTED 429s must not surface"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            3,
+            "two RESOURCE_EXHAUSTED 429s were absorbed, the third attempt served"
+        );
+    }
+
+    /// A *persistent* `429 RESOURCE_EXHAUSTED` is quota exhaustion: once the silent-retry budget is
+    /// spent, the combo falls over to the next provider — the only failure class that does.
+    #[tokio::test]
+    async fn a_persistent_resource_exhausted_429_falls_over_after_the_budget() {
+        let (first_url, first_seen) = refusing_upstream(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}"#,
+        )
+        .await;
+        let (second_url, second_seen) = fake_upstream().await;
+
+        let mut combo = mr_core::model::Combo::new(
+            "failover",
+            mr_core::model::ComboStep::new("first", "shared-model"),
+        );
+        combo
+            .steps
+            .push(mr_core::model::ComboStep::new("second", "shared-model"));
+
+        let config = mr_core::config::Config {
+            providers: vec![
+                provider_serving("first", &first_url, "shared-model", &[InputModality::Text]),
+                provider_serving(
+                    "second",
+                    &second_url,
+                    "shared-model",
+                    &[InputModality::Text],
+                ),
+            ],
+            combos: vec![combo],
+            rate_limit_retry: mr_core::config::RateLimitRetryConfig {
+                enabled: true,
+                max_wait_ms: 800,
+                poll_interval_ms: 200,
+            },
+            ..Default::default()
+        };
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(failover_body()),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "persistent quota exhaustion falls over to the next provider after the budget"
+        );
+        assert!(
+            !first_seen.lock().unwrap().is_empty(),
+            "the exhausted step was tried"
+        );
+        assert_eq!(
+            second_seen.lock().unwrap().len(),
+            1,
+            "the fallback step served after the exhausted provider's budget ran out"
         );
     }
 
