@@ -2544,18 +2544,15 @@ async fn dispatch_routed(
         // the next step as before.
         let mut attempt = attempt_step_across_accounts(&attempt_ctx, step, is_sticky, false).await;
 
-        // Silent rate-limit handling. A throttled provider is not dead: the request must neither
-        // surface the 429 nor — for a throttle — advance to another combo step. When enabled, wait
-        // out the provider's recovery (bounded by `max_wait_ms`) and retry the same provider. Only
-        // when the budget runs out does the refusal surface.
-        //
-        // Every 429 is absorbed, whatever it was classified as. Google/Vertex answers a throttle as
-        // `429 RESOURCE_EXHAUSTED`, which the body reader classifies as quota-exhausted (so it may
-        // still fail the combo over once the budget is spent); absorbing the *status* first is what
-        // stops a transient "Resource has been exhausted" from ever reaching the client.
+        // Silent rate-limit handling. A throttled account is not dead: the request must neither
+        // surface the 429 nor advance to another combo step. Try sibling accounts first, then wait
+        // and retry this provider indefinitely until one succeeds. Set `enabled: false` to return
+        // the upstream 429 immediately. Google/Vertex's RESOURCE_EXHAUSTED wording is ambiguous
+        // between exhausted quota and a temporary cooldown, so it is treated as an account-local
+        // cooldown: siblings can serve, and if none can, this request remains parked.
         if rate_limit_retry.enabled {
             let mut absorbing = false;
-            let patience_started = std::time::Instant::now();
+            let mut patience_started = std::time::Instant::now();
             // The wait horizon: the configured budget, extended to honor a stated recovery
             // (`Retry-After`) up to `max_stated_wait_ms`. A provider that says "retry after 35s"
             // is telling the truth; surfacing the 429 the moment that outlives a short default
@@ -2602,6 +2599,29 @@ async fn dispatch_routed(
                 let spent = patience_started.elapsed().as_millis() as u64;
                 let remaining = wait_horizon_ms.saturating_sub(spent);
                 if remaining == 0 {
+                    // A 429 is a provider cooldown, not a client-visible failure. We have already
+                    // retried every eligible sibling account; if they are still cooling, keep this
+                    // request parked and retry the same provider again rather than leaking the 429
+                    // or advancing the combo to a different provider. This is intentionally an
+                    // indefinite wait for callers who opted into silent rate-limit handling; set
+                    // `enabled: false` to return an upstream 429 immediately instead.
+                    if matches!(
+                        &attempt,
+                        Attempt::Failed {
+                            response: Some(resp),
+                            ..
+                        } if resp.status() == StatusCode::TOO_MANY_REQUESTS
+                    ) {
+                        tracing::warn!(
+                            provider = %step.provider_id,
+                            model = %step.model,
+                            wait_ms = wait_horizon_ms,
+                            "rate limit persists; continuing to hold request silently"
+                        );
+                        patience_started = std::time::Instant::now();
+                        wait_horizon_ms = rate_limit_retry.max_wait_ms;
+                        continue 'patience;
+                    }
                     break 'patience;
                 }
                 // With a stated recovery, sleep straight to it; otherwise poll at the configured
@@ -2622,21 +2642,6 @@ async fn dispatch_routed(
                 // recovery, and a selection that respects the prediction would skip the cooling
                 // account and learn nothing. The polling budget is the bound on how often.
                 attempt = attempt_step_across_accounts(&attempt_ctx, step, is_sticky, true).await;
-            }
-            let surfaced_429 = matches!(
-                &attempt,
-                Attempt::Failed {
-                    response: Some(resp),
-                    ..
-                } if resp.status() == StatusCode::TOO_MANY_REQUESTS
-            );
-            if absorbing && surfaced_429 {
-                tracing::warn!(
-                    provider = %step.provider_id,
-                    model = %step.model,
-                    wait_ms = wait_horizon_ms,
-                    "upstream stayed rate-limited past the silent-retry horizon; surfacing the 429"
-                );
             }
         }
         match attempt {
@@ -3421,30 +3426,35 @@ async fn attempt_step_across_accounts(
         .map(|provider| provider.accounts.len().saturating_sub(1).min(8))
         .unwrap_or(0);
     let mut retries_left = account_retries;
-    let mut attempt = attempt_step(actx, step, is_sticky, ignore_cooldowns, &[]).await;
+    let mut tried_accounts = Vec::with_capacity(account_retries + 1);
+    let mut attempt = attempt_step(actx, step, is_sticky, ignore_cooldowns, &tried_accounts).await;
     loop {
-        let retry = match &attempt {
-            // A body to hand the client means the upstream answered and refused. That answer is
-            // worth retrying on a sibling account only when another of *this step's* accounts
-            // is still usable and the refusal was about the credential rather than the bytes;
-            // a request the upstream rejected as malformed fails identically everywhere.
-            Attempt::Failed { retry_accounts, .. } => {
-                *retry_accounts
-                    && retries_left > 0
-                    && step_has_a_live_account(app, &table, step, actx.now_ms)
-            }
-            _ => false,
+        let retry_account = match &attempt {
+            // A body to hand the client means the upstream answered and refused. Retry on another
+            // account only for an account-local failure; malformed requests are identical on all.
+            Attempt::Failed {
+                retry_accounts: true,
+                account: Some(account),
+                ..
+            } => Some(account.clone()),
+            _ => None,
         };
+        let retry = retry_account.is_some()
+            && retries_left > 0
+            && (ignore_cooldowns || step_has_a_live_account(app, &table, step, actx.now_ms));
         if !retry {
             break;
         }
         retries_left -= 1;
+        if let Some(account) = retry_account {
+            tried_accounts.push(account);
+        }
         tracing::debug!(
             provider = %step.provider_id,
             model = %step.model,
             "retrying the same step on another account"
         );
-        attempt = attempt_step(actx, step, is_sticky, ignore_cooldowns, &[]).await;
+        attempt = attempt_step(actx, step, is_sticky, ignore_cooldowns, &tried_accounts).await;
     }
     attempt
 }
@@ -4364,6 +4374,11 @@ async fn attempt_step(
             }
             let effective_scope = if modal_cold_start || model_unavailable {
                 mr_core::model::CooldownScope::Model
+            } else if reason == select::CooldownReason::RateLimited {
+                // A 429/cooldown is per credential: park this account so sibling accounts of the
+                // same provider can take over. Applying a provider-wide configured scope here would
+                // cool every sibling at once and make the relay either leak the 429 or sit idle.
+                mr_core::model::CooldownScope::Account
             } else {
                 refusal_wait
                     .and_then(|refusal| refusal.scope)
@@ -5287,10 +5302,12 @@ fn exhausted_by_body(body: &[u8]) -> Option<BodyRefusal> {
         .unwrap_or_default();
     let kind_lower = kind.to_ascii_lowercase();
     let status_lower = status_kind.to_ascii_lowercase();
+    let resource_exhausted =
+        kind_lower == "resource_exhausted" || status_lower.contains("resource_exhausted");
     let exhausted = matches!(
         kind_lower.as_str(),
-        "usage_limit_reached" | "rate_limit_reached" | "insufficient_quota" | "resource_exhausted"
-    ) || status_lower.contains("resource_exhausted");
+        "usage_limit_reached" | "rate_limit_reached" | "insufficient_quota"
+    ) || resource_exhausted;
     let seconds = error
         .get("resets_in_seconds")
         .and_then(serde_json::Value::as_u64)
@@ -5321,9 +5338,7 @@ fn exhausted_by_body(body: &[u8]) -> Option<BodyRefusal> {
     // seconds to a couple of minutes, not on a billing cycle. A stated reset still wins; without
     // one, cool briefly so a combo can retry the step soon instead of holding it for the sixty
     // second spent-account default.
-    let google_short_wait = status_lower
-        .contains("resource_exhausted")
-        .then_some(10_000);
+    let google_short_wait = resource_exhausted.then_some(10_000);
 
     // A plan that does not include the model is a refusal about *that model*, not about the
     // credential: the same account can still serve everything else its plan covers. It is read
@@ -5352,15 +5367,20 @@ fn exhausted_by_body(body: &[u8]) -> Option<BodyRefusal> {
     // Retry after 12s" — must stay RateLimited: it is not a spent window. Parking it as quota
     // changes its lifecycle (longer default park, different panel wording). Only genuine
     // exhaustion/spend/plan refusals become QuotaExhausted.
-    if !exhausted
-        && !spent_account
-        && !names_a_plan_limit(message)
-        && is_rate_limit_message(message)
+    if resource_exhausted
+        || (!exhausted
+            && !spent_account
+            && !names_a_plan_limit(message)
+            && is_rate_limit_message(message))
     {
+        // Google-style RESOURCE_EXHAUSTED is used for transient per-account cooldowns as well as
+        // actual exhausted quota. Without a quota reader proving the account has no remaining
+        // capacity, treat it as a rate limit: cool this account, try its siblings, and keep the
+        // request waiting rather than leaking the upstream 429 or advancing to another provider.
         return Some(BodyRefusal {
             reason: select::CooldownReason::RateLimited,
-            wait_ms: announced,
-            scope: None,
+            wait_ms: announced.or(google_short_wait),
+            scope: Some(mr_core::model::CooldownScope::Account),
         });
     }
     Some(BodyRefusal {
@@ -9800,17 +9820,22 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         // step could serve. Recognizing it lets the combo exhaust it fast and report it as quota.
         let body = br#"{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}"#;
         let refusal = exhausted_by_body(body).expect("resource exhausted is a refusal");
-        assert_eq!(refusal.reason, select::CooldownReason::QuotaExhausted);
+        assert_eq!(refusal.reason, select::CooldownReason::RateLimited);
         assert_eq!(
             refusal.wait_ms,
             Some(10_000),
-            "google-style exhaustion cools briefly so a combo can retry soon"
+            "Google RESOURCE_EXHAUSTED is treated as a per-account cooldown"
+        );
+        assert_eq!(
+            refusal.scope,
+            Some(mr_core::model::CooldownScope::Account),
+            "a throttled Google account must not cooldown its siblings"
         );
         // The canonical spelling is read the same way.
         let canonical =
             br#"{"status":"RESOURCE_EXHAUSTED","message":"Resource has been exhausted."}"#;
         let refusal = exhausted_by_body(canonical).expect("canonical spelling");
-        assert_eq!(refusal.reason, select::CooldownReason::QuotaExhausted);
+        assert_eq!(refusal.reason, select::CooldownReason::RateLimited);
         assert_eq!(refusal.wait_ms, Some(10_000));
     }
 
@@ -12244,14 +12269,24 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         );
     }
 
-    /// A *persistent* `429 RESOURCE_EXHAUSTED` is quota exhaustion: once the silent-retry budget is
-    /// spent, the combo falls over to the next provider — the only failure class that does.
+    /// A persistent `429 RESOURCE_EXHAUSTED` stays on its provider and remains invisible while the
+    /// cooldown is active. When it recovers, the same request succeeds; the next combo step is never
+    /// used for a cooldown that may recover.
     #[tokio::test]
-    async fn a_persistent_resource_exhausted_429_falls_over_after_the_budget() {
-        let (first_url, first_seen) = refusing_upstream(
-            StatusCode::TOO_MANY_REQUESTS,
-            r#"{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}"#,
-        )
+    async fn a_persistent_resource_exhausted_429_is_held_silently_until_recovery() {
+        let (first_url, first_seen) = mock_upstream_custom(|attempt, _body| {
+            if attempt < 4 {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    r#"{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}"#,
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                )
+            }
+        })
         .await;
         let (second_url, second_seen) = fake_upstream().await;
 
@@ -12321,22 +12356,23 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "persistent quota exhaustion falls over to the next provider after the budget"
+            "the upstream's transient RESOURCE_EXHAUSTED 429s are hidden until recovery"
         );
-        assert!(
-            !first_seen.lock().unwrap().is_empty(),
-            "the exhausted step was tried"
+        assert_eq!(
+            first_seen.lock().unwrap().len(),
+            5,
+            "the same provider was retried until it recovered"
         );
         assert_eq!(
             second_seen.lock().unwrap().len(),
-            1,
-            "the fallback step served after the exhausted provider's budget ran out"
+            0,
+            "a temporary account cooldown must not advance to another provider"
         );
     }
 
     /// A stated recovery (`Retry-After`) is honored even when it outlives the default budget: the
-    /// relay waits it out (up to `max_stated_wait_ms`) instead of surfacing the 429 the moment it
-    /// exceeds `max_wait_ms`.
+    /// relay waits it out (up to `max_stated_wait_ms`) and retries successfully instead of
+    /// surfacing the 429 the moment it exceeds `max_wait_ms`.
     #[tokio::test]
     async fn a_stated_retry_after_is_honoured_even_beyond_the_default_budget() {
         let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -12344,15 +12380,31 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         let app = Router::new().fallback(any(move |_body: Bytes| {
             let sink = Arc::clone(&sink);
             async move {
-                sink.lock().unwrap().push("dialled".to_owned());
-                (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [
-                        (axum::http::header::RETRY_AFTER, "35"),
-                        (axum::http::header::CONTENT_TYPE, "application/json"),
-                    ],
-                    r#"{"error":{"message":"rate limit exceeded, retry after 35s"}}"#,
-                )
+                let attempt = {
+                    let mut seen = sink.lock().unwrap();
+                    let attempt = seen.len();
+                    seen.push("dialled".to_owned());
+                    attempt
+                };
+                if attempt == 0 {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [
+                            (axum::http::header::RETRY_AFTER, "1"),
+                            (axum::http::header::CONTENT_TYPE, "application/json"),
+                        ],
+                        r#"{"error":{"message":"rate limit exceeded, retry after 1s"}}"#,
+                    )
+                } else {
+                    (
+                        StatusCode::OK,
+                        [
+                            (axum::http::header::CONTENT_TYPE, "application/json"),
+                            (axum::http::header::RETRY_AFTER, "0"),
+                        ],
+                        r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                    )
+                }
             }
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -12414,19 +12466,16 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
-        // The upstream always 429s here, so after honoring the stated recovery the request must
-        // surface the 429 — but only after waiting the *stated* recovery (capped at 1200ms), not
-        // instantly at the 800ms budget. We cannot distinguish "waited 1200" from "waited 3600"
-        // cheaply, so assert it waited beyond the default budget at least.
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the 429 must stay hidden until the provider recovers"
+        );
         assert!(
             elapsed_ms >= 1_000,
             "the stated recovery should be honored past the 800ms budget, waited {elapsed_ms}ms"
         );
-        assert!(
-            elapsed_ms < 10_000,
-            "the stated wait must still be bounded, took {elapsed_ms}ms"
-        );
+        assert_eq!(seen.lock().unwrap().len(), 2, "retry after the stated wait");
     }
 
     /// A `404` is the same class as a `400`: a statement about the request, not about the account.

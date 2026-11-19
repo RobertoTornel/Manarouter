@@ -202,8 +202,12 @@ pub mod mistral_vibe {
     pub const API: &str = "https://api.mistral.ai";
     /// The OAuth client id embedded in the Vibe desktop app (v1.2.0).
     pub const CLIENT_ID: &str = "88df79e3-3a98-4624-92fe-c607ecf06f1d";
-    /// The scopes the desktop login requests.
-    pub const SCOPES: &str = "openid profile email offline_access";
+    /// API audience from the desktop app's OIDC authorization request.
+    pub const AUDIENCE: &str = "https://api.mistral.ai";
+    /// The OIDC callback path; the desktop binds an ephemeral loopback port.
+    pub const LOOPBACK_CALLBACK_PATH: &str = "/auth/oidc/callback";
+    /// The scopes the desktop login requests, in its observed order.
+    pub const SCOPES: &str = "openid email profile offline_access";
 }
 
 /// The Anthropic endpoints used by the Claude Code login and by Claude inference.

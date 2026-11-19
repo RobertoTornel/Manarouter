@@ -46,14 +46,23 @@ const REFRESH_LEAD_SECS: u64 = 60 * 60;
 /// Build the authorization URL for a loopback listener on `port`.
 fn authorization_url(state: &str, pkce: Option<&Pkce>, port: u16) -> String {
     let challenge = pkce.map(Pkce::challenge).unwrap_or_default();
+    // Captured from the installed Vibe 1.2.0 app's authorize URL. Its registered loopback URI
+    // includes this path (not `/`) and the API audience. Ory rejects even a correct client id when
+    // the redirect path differs from its registered URI.
+    let redirect_uri = format!(
+        "http://127.0.0.1:{port}{}",
+        mistral_vibe::LOOPBACK_CALLBACK_PATH
+    );
     format!(
-        "{}?client_id={}&response_type=code&redirect_uri={}&scope={}\
-         &code_challenge={}&code_challenge_method=S256&state={}",
+        "{}?audience={}&client_id={}&code_challenge={}&code_challenge_method=S256\
+         &nonce={}&redirect_uri={}&response_type=code&scope={}&state={}",
         mistral_vibe::AUTHORIZE,
+        flow::url_encode(mistral_vibe::AUDIENCE),
         flow::url_encode(mistral_vibe::CLIENT_ID),
-        flow::url_encode(&format!("http://127.0.0.1:{port}/")),
-        flow::url_encode(mistral_vibe::SCOPES),
         flow::url_encode(challenge),
+        flow::url_encode(state),
+        flow::url_encode(&redirect_uri),
+        flow::url_encode(mistral_vibe::SCOPES),
         flow::url_encode(state),
     )
 }
@@ -110,15 +119,14 @@ impl OAuthPlatform for MistralVibe {
     }
 
     fn redirect_ports(&self) -> RedirectPorts {
-        // The Vibe desktop app's Ory client is registered for two specific loopback ports; the
-        // binary bundles `:4202` and `:8242` near its OIDC callback server. Using an ephemeral
-        // port makes Ory answer `invalid_request` ("redirect_uri does not match any of the
-        // pre-registered redirect urls"), which is exactly the failure observed at login.
+        // Vibe binds an ephemeral loopback port and registers the `/auth/oidc/callback` path;
+        // the OAuth redirect URI must match that path exactly. `validates_redirect_port` is false
+        // below because the port is chosen at runtime, as in the installed desktop app.
         RedirectPorts {
             host: "127.0.0.1",
-            primary: 4202,
-            fallback: Some(8242),
-            path: "/",
+            primary: 0,
+            fallback: None,
+            path: "/auth/oidc/callback",
         }
     }
 
@@ -127,7 +135,7 @@ impl OAuthPlatform for MistralVibe {
     }
 
     fn validates_redirect_port(&self) -> bool {
-        true
+        false
     }
 
     fn authorization_url(&self, state: &str, pkce: Option<&Pkce>, port: u16) -> Result<String> {
@@ -136,7 +144,10 @@ impl OAuthPlatform for MistralVibe {
 
     async fn exchange_code(&self, code: &str, pkce: Option<&Pkce>, port: u16) -> Result<TokenSet> {
         let http = Http::shared()?;
-        let redirect_uri = format!("http://127.0.0.1:{port}/");
+        let redirect_uri = format!(
+            "http://127.0.0.1:{port}{}",
+            mistral_vibe::LOOPBACK_CALLBACK_PATH
+        );
         let mut pairs: Vec<(&str, &str)> = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -251,5 +262,34 @@ impl OAuthPlatform for MistralVibe {
         });
         tokens.extra.insert("account".into(), prev);
         Ok(tokens)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The authorize URL must match the registered client: the `/auth/oidc/callback` path and the
+    /// `audience` parameter are what Ory compares byte-for-byte. Captured from the installed Vibe
+    /// 1.2.0 app after its login was refused as `invalid_request` with a bare `/` redirect.
+    #[test]
+    fn the_authorize_url_matches_the_desktop_registration() {
+        let pkce = Pkce::generate();
+        let url = authorization_url("state-value", Some(&pkce), 45_921);
+        assert!(url.starts_with("https://auth.mistral.ai/oauth2/auth?"));
+        assert!(url.contains("audience=https%3A%2F%2Fapi.mistral.ai"));
+        assert!(url.contains(&format!(
+            "redirect_uri=http%3A%2F%2F127.0.0.1%3A45921{}",
+            urlencoding_path()
+        )));
+        assert!(url.contains("scope=openid%20email%20profile%20offline_access"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("state=state-value"));
+    }
+
+    /// `flow::url_encode` percent-encodes the path's slash; keep the expectation honest instead of
+    /// duplicating the encoder here.
+    fn urlencoding_path() -> String {
+        flow::url_encode(mistral_vibe::LOOPBACK_CALLBACK_PATH)
     }
 }
