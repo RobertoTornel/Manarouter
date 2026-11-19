@@ -633,3 +633,32 @@ a secret that window is the difference between a defence and a gesture.
 - `docs/32-accounts-tags-and-egress.md` — account selection, tags, people and proxy fallback
 - `docs/21-security.md` — the vault, the panel and the threat model
 - `docs/22-sync-design.md` — why unknown keys are preserved
+
+---
+
+## 13. Rate-limit handling (`rateLimitRetry`)
+
+An upstream `429` is a throttle, not a death: the provider is busy, not broken. By default the relay
+**absorbs** it — it waits out the recovery and retries the same provider, so a transient rate limit
+neither surfaces to the client nor fails the combo over to the next provider (a rate limit is the
+one refusal that never advances a combo; spent quota, bad credentials and transport errors still do).
+
+```json
+{
+  "rateLimitRetry": {
+    "enabled": true,
+    "max_wait_ms": 10000,
+    "poll_interval_ms": 2000
+  }
+}
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Wait and retry on `429` instead of surfacing it. Set `false` to return the upstream `429` immediately (it still never advances the combo). |
+| `max_wait_ms` | `10000` | Total budget, in milliseconds, to keep waiting before the `429` is surfaced. If the upstream names a recovery longer than this, the refusal is surfaced at once with the upstream's own `Retry-After`. |
+| `poll_interval_ms` | `2000` | How long to sleep between retries while waiting. |
+
+Concurrent requests are spread across a provider's accounts: account selection prefers the
+least-busy account (fewest in-flight requests), so a burst of requests across an `N`-account provider
+lands roughly one per account instead of piling onto a single key.
