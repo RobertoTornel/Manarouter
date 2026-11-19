@@ -148,7 +148,13 @@ pub const SNAPSHOT_MAGIC: [u8; 8] = *b"MROUTES1";
 /// account that has declared one would be compiled without it and never be
 /// held back — the frame must be rebuilt from authored config instead of
 /// reinterpreted.
-pub const SNAPSHOT_VERSION: u32 = 27;
+/// Version 28 changed *how* frames are compiled, not what they encode: model
+/// output ceilings (and context windows) now fall back to the bundled catalog,
+/// so a frame compiled by an older binary lacks ceilings a newer one would
+/// attach. The format itself is unchanged — the version bump exists to force
+/// a rebuild after an upgrade, otherwise the digest-stable cache would keep
+/// serving a frame the new logic would compile differently.
+pub const SNAPSHOT_VERSION: u32 = 28;
 
 /// Current on-disk database schema version.
 ///
