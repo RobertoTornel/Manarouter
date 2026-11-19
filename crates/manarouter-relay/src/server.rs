@@ -2627,8 +2627,8 @@ async fn dispatch_routed(
                 tracing::warn!(
                     provider = %step.provider_id,
                     model = %step.model,
-                    wait_ms = rate_limit_retry.max_wait_ms,
-                    "upstream stayed rate-limited past the silent-retry budget; surfacing the 429"
+                    wait_ms = wait_horizon_ms,
+                    "upstream stayed rate-limited past the silent-retry horizon; surfacing the 429"
                 );
             }
         }
