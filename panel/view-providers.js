@@ -229,7 +229,12 @@ const CAPABILITY_GROUPS = [
 // The same pair `default_capabilities()` in mr-core fills in when a provider's `capabilities` key
 // is absent. A hand-edited config can also carry an empty array, which the server refuses, so the
 // form treats that as absent too rather than presenting an unticked provider it cannot save.
-const DEFAULT_CAPABILITIES = ['chat', 'models'];
+const DEFAULT_CAPABILITIES = [
+  'chat', 'responses', 'embeddings', 'audio-transcription', 'audio-speech',
+  'images-generations', 'models', 'messages', 'tool-calling', 'reasoning', 'vision',
+  'audio-translation', 'images-edits', 'images-variations', 'moderations', 'video',
+  'realtime', 'vector-stores', 'containers', 'fine-tuning', 'evals', 'search',
+];
 
 /// Filter a Set/array of wire ids through the table's order, dropping ids this panel does not
 /// know. Stable order keeps saves diff-clean. Dropping rather than throwing is deliberate: a

@@ -138,14 +138,15 @@ test('capabilityIds keeps table order and drops unknown ids', () => {
   assert.deepEqual([...idsFor(['models', 'teleport', 'chat'])], ['chat', 'models']);
 });
 
-test('the provider form saves capabilities and defaults to chat + models', () => {
+test('the provider form saves capabilities and defaults to everything', () => {
   assert.match(source, /checkbox\.input\.setAttribute\('data-capability', capability\.id\)/);
   assert.match(source, /payload\.capabilities = selectedCapabilities;/);
-  assert.match(source, /const DEFAULT_CAPABILITIES = \['chat', 'models'\]/);
+  assert.match(source, /const DEFAULT_CAPABILITIES = \[\n  'chat', 'responses'/);
+  assert.match(source, /\'evals', 'search',\n\]/);
   assert.match(
     source,
     /isEdit && Array\.isArray\(p\.capabilities\) && p\.capabilities\.length > 0\s*\? new Set\(p\.capabilities\)\s*: new Set\(DEFAULT_CAPABILITIES\)/,
-    'edit should tick exactly the server array, while create and an absent/empty array default to chat + models',
+    'edit should tick exactly the server array, while create and an absent/empty array default to every capability',
   );
 });
 
@@ -164,6 +165,6 @@ test('the detail drawer has a capabilities row', () => {
   assert.match(
     source,
     /Array\.isArray\(p\.capabilities\) && p\.capabilities\.length\s*\? p\.capabilities\s*: DEFAULT_CAPABILITIES/,
-    'an absent or empty array should display the server default, chat and models',
+    'an absent or empty array should display the server default, every capability',
   );
 });

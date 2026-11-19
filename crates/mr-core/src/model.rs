@@ -740,7 +740,9 @@ impl CooldownScope {
 }
 
 fn default_capabilities() -> Vec<Capability> {
-    vec![Capability::Chat, Capability::Models]
+    // Every capability on by default: a new provider is a blank best-effort surface, and the
+    // operator can uncheck what the upstream does not serve. The panel mirrors this exact list.
+    Capability::ALL.to_vec()
 }
 fn default_connect_timeout_ms() -> u64 {
     10_000
