@@ -2023,14 +2023,23 @@ fn plan_step(
         reasoning_json: reasoning_fragments(provider.dialect, model, levels),
         input_modalities: modalities,
         pricing: model.pricing.clone(),
-        max_output_tokens: model.max_output_tokens,
+        max_output_tokens: model.max_output_tokens.or_else(|| {
+            // The catalog knows the upstream's output ceiling for many models (including ones
+            // whose API listing omits it, e.g. agnes). Without it the relay cannot clamp a
+            // client's `max_tokens` and the upstream refuses the request with a 400.
+            crate::catalog::catalog().model_max_output_tokens(provider.id.as_str(), &model.id)
+        }),
         // A direct `provider/model` resolution has no authored step and therefore no selection;
         // `add_authored` fills this in for a combo step.
         accounts: None,
         context_length: model.context_length.or_else(|| {
-            provider
-                .max_context
-                .and_then(|context| u32::try_from(context).ok())
+            crate::catalog::catalog()
+                .model_context_length(provider.id.as_str(), &model.id)
+                .or_else(|| {
+                    provider
+                        .max_context
+                        .and_then(|context| u32::try_from(context).ok())
+                })
         }),
     }
 }
@@ -5678,6 +5687,25 @@ mod tests {
             }))
         );
     }
+    #[test]
+    fn the_catalog_output_ceiling_is_the_fallback_when_a_model_declares_none() {
+        // agnes's API listing omits `max_output_tokens`, but the bundled catalog knows the
+        // upstream cap is 65536. A step for that model must carry the ceiling so the relay can
+        // clamp client caps instead of letting every large request be refused with a 400.
+        let p = level_provider("agnes", vec![with_levels("agnes-3.0-flash", &[])]);
+        let config = Config {
+            providers: vec![p],
+            ..Config::default()
+        };
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+        let step = &snapshot.providers()[0].steps[0];
+        assert_eq!(step.max_output_tokens, Some(65_536));
+        assert!(
+            step.context_length.is_some(),
+            "the catalog context window should fill in as well"
+        );
+    }
+
     #[test]
     fn the_ai_studio_surface_is_fitted_to_its_own_budget_range_not_only_the_models_ceiling() {
         // Measured against the public API on 2026-11-11 with an AI Studio key: a body carrying

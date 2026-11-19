@@ -228,7 +228,14 @@ DEFAULT_SOURCE = Path(__file__).resolve().parent.parent / ".research" / "omnirou
 SOURCE_LABEL = "omniroute v16.3.5 model metadata (.research/omniroute_models.json)"
 FORMAT_VERSION = 1
 
-VALUE_KEY_ORDER = ("levels", "modalities", "provider_ids", "providers")
+VALUE_KEY_ORDER = (
+    "levels",
+    "modalities",
+    "max_output_tokens",
+    "context_length",
+    "provider_ids",
+    "providers",
+)
 
 
 def normalise_level(raw: object) -> str | None:
@@ -274,32 +281,39 @@ def canonical_order(values: set[str], vocabulary: list[str]) -> list[str]:
 
 
 class Accumulator:
-    """Union of levels/modalities/providers for one merge key."""
+    """Union of levels/modalities/providers/ceilings for one merge key."""
 
-    __slots__ = ("levels", "modalities", "providers", "provider_ids")
+    __slots__ = ("levels", "modalities", "providers", "provider_ids", "max_output_tokens", "context_length")
 
     def __init__(self) -> None:
         self.levels: set[str] = set()
         self.modalities: set[str] = set()
         self.providers: set[str] = set()
         self.provider_ids: set[str] = set()
+        self.max_output_tokens: int | None = None
+        self.context_length: int | None = None
 
     def value(self) -> dict[str, object] | None:
-        """The emitted value, or None when neither ``levels`` nor ``modalities`` applies.
+        """The emitted value, or None when no seedable key applies.
 
         Provider lists alone are not enough to justify an entry: an entry is emitted only
-        when it carries at least one of the two seedable keys.
+        when it carries at least one of the seedable keys (levels, non-default
+        modalities, or a ceiling).
         """
         value: dict[str, object] = {}
         levels = canonical_order(self.levels, CANONICAL_LEVELS)
         modalities = canonical_order(self.modalities, CANONICAL_MODALITIES)
         has_modalities = bool(modalities) and modalities != ["text"]
-        if not levels and not has_modalities:
+        if not levels and not has_modalities and self.max_output_tokens is None and self.context_length is None:
             return None
         if levels:
             value["levels"] = levels
         if has_modalities:
             value["modalities"] = modalities
+        if self.max_output_tokens is not None:
+            value["max_output_tokens"] = self.max_output_tokens
+        if self.context_length is not None:
+            value["context_length"] = self.context_length
         if self.provider_ids:
             value["provider_ids"] = sorted(self.provider_ids)
         if self.providers:
@@ -359,6 +373,8 @@ def build_document(models: list[dict]) -> tuple[dict, dict]:
         "aliased_providers": 0,
         "stripped_prefixes": 0,
         "entries_without_provider": 0,
+        "with_output_ceiling": 0,
+        "with_context_length": 0,
     }
 
     for entry in models:
@@ -377,6 +393,16 @@ def build_document(models: list[dict]) -> tuple[dict, dict]:
 
         levels = entry_levels(entry)
         modalities = entry_modalities(entry)
+        output_ceiling = int(entry["max_output_tokens"]) if isinstance(
+            entry.get("max_output_tokens"), int
+        ) and entry["max_output_tokens"] > 0 else None
+        context_length = int(entry["context_length"]) if isinstance(
+            entry.get("context_length"), int
+        ) and entry["context_length"] > 0 else None
+        if output_ceiling is not None:
+            stats["with_output_ceiling"] += 1
+        if context_length is not None:
+            stats["with_context_length"] += 1
 
         for field in ("effort_tiers", capability_map(entry).get("effort_tiers")):
             if isinstance(field, list):
@@ -387,6 +413,14 @@ def build_document(models: list[dict]) -> tuple[dict, dict]:
         target = by_model.setdefault(model_id, Accumulator())
         target.levels.update(levels)
         target.modalities.update(modalities)
+        if output_ceiling is not None:
+            target.max_output_tokens = (
+                max(target.max_output_tokens, output_ceiling) if target.max_output_tokens is not None else output_ceiling
+            )
+        if context_length is not None:
+            target.context_length = (
+                max(target.context_length, context_length) if target.context_length is not None else context_length
+            )
         if raw_provider:
             target.providers.add(family)
             target.provider_ids.add(raw_provider)
@@ -397,6 +431,14 @@ def build_document(models: list[dict]) -> tuple[dict, dict]:
             pair = by_provider_model.setdefault(f"{family}/{key_id}", Accumulator())
             pair.levels.update(levels)
             pair.modalities.update(modalities)
+            if output_ceiling is not None:
+                pair.max_output_tokens = (
+                    max(pair.max_output_tokens, output_ceiling) if pair.max_output_tokens is not None else output_ceiling
+                )
+            if context_length is not None:
+                pair.context_length = (
+                    max(pair.context_length, context_length) if pair.context_length is not None else context_length
+                )
             pair.providers.add(family)
             pair.provider_ids.add(raw_provider)
         else:

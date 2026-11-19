@@ -314,7 +314,22 @@ impl Catalog {
         Some(ModelMeta {
             levels: &entry.levels,
             modalities: &entry.modalities,
+            max_output_tokens: entry.max_output_tokens,
+            context_length: entry.context_length,
         })
+    }
+
+    /// The bundled ceiling for a model's output tokens, when the table knows one. Used by the
+    /// snapshot compiler as a fallback when the operator's model entry carries no ceiling of its
+    /// own — a request larger than the upstream's cap would otherwise be refused with a 400.
+    pub fn model_max_output_tokens(&self, provider_id: &str, model_id: &str) -> Option<u32> {
+        self.model_meta(provider_id, model_id)?.max_output_tokens
+    }
+
+    /// The bundled context window for a model, when the table knows one. Used by the snapshot
+    /// compiler as a fallback when the operator's entry carries none.
+    pub fn model_context_length(&self, provider_id: &str, model_id: &str) -> Option<u32> {
+        self.model_meta(provider_id, model_id)?.context_length
     }
 
     /// Case-insensitive search over id, label and note — what the panel's "add provider" box calls.
@@ -507,6 +522,10 @@ pub struct ModelMeta<'a> {
     pub levels: &'a [ReasoningLevel],
     /// Input types the model accepts. Empty means "text only, as far as the table knows".
     pub modalities: &'a [InputModality],
+    /// The model's maximum output-token ceiling, when the table knows it.
+    pub max_output_tokens: Option<u32>,
+    /// The model's context window, when the table knows it.
+    pub context_length: Option<u32>,
 }
 
 /// The whole bundled table.
@@ -534,6 +553,12 @@ pub struct ModelMetaEntry {
     /// Input modalities, in canonical spelling.
     #[serde(default)]
     pub modalities: Vec<InputModality>,
+    /// Maximum output-token allowance, when the source dump reported one.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    /// Context window in tokens, when the source dump reported one.
+    #[serde(default)]
+    pub context_length: Option<u32>,
 }
 
 impl ModelMetaTable {
