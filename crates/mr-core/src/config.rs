@@ -89,6 +89,12 @@ pub struct RateLimitRetryConfig {
     pub max_stated_wait_ms: u64,
     /// How long, in milliseconds, to sleep between retries while waiting.
     pub poll_interval_ms: u64,
+    /// A hard ceiling on how long one request may stay parked on a persistent 429, in
+    /// milliseconds — including the "keep holding silently" cycles that would otherwise wait
+    /// forever. When the ceiling is reached the hold ends and the step is reported as failed,
+    /// so a dead-throttled provider fails over to the next combo step (or returns an error to
+    /// the client) instead of hanging the request indefinitely.
+    pub max_total_hold_ms: u64,
 }
 
 impl Default for RateLimitRetryConfig {
@@ -98,6 +104,7 @@ impl Default for RateLimitRetryConfig {
             max_wait_ms: 10_000,
             max_stated_wait_ms: 120_000,
             poll_interval_ms: 2_000,
+            max_total_hold_ms: 120_000,
         }
     }
 }
@@ -150,6 +157,15 @@ pub struct Config {
     /// being surfaced to the client (or failing the combo over to another provider).
     #[serde(rename = "rateLimitRetry", alias = "rate_limit_retry")]
     pub rate_limit_retry: RateLimitRetryConfig,
+
+    /// Debug logging of every admitted request's message payload, with a UTC timestamp.
+    ///
+    /// Off by default: request bodies can contain private user content, and writing them to the
+    /// relay's log is a deliberate privacy decision the operator must make. When enabled, each
+    /// routed request is logged with its timestamp, client dialect, method, route, resolved
+    /// model, and the request body (truncated to [`crate::config::DEBUG_LOG_BODY_MAX`] bytes).
+    #[serde(rename = "debugLogMessages", alias = "debug_log_messages")]
+    pub debug_log_messages: bool,
 
     /// Latency-tuning knobs, all with defaults that are right for a laptop.
     pub latency: LatencyConfig,
@@ -730,6 +746,7 @@ impl Default for Config {
             quota: QuotaConfig::default(),
             quota_probe: QuotaProbeConfig::default(),
             rate_limit_retry: RateLimitRetryConfig::default(),
+            debug_log_messages: false,
             latency: LatencyConfig::default(),
             routing: RoutingConfig::default(),
             proxies: Vec::new(),

@@ -56,6 +56,7 @@ use crate::model_scan::{multipart_boundary, scan_multipart_model, scan_request_h
 use crate::proxy::{self, ProxyEndpoint};
 use crate::recovery::RerunFactory;
 use crate::select::{self, Health};
+use crate::activity::Outcome;
 use crate::state::{AuthOutcome, ProxyLease, RelayState, RouteTable};
 use crate::upstream::{UpstreamError, UpstreamRequest};
 
@@ -975,6 +976,7 @@ async fn upload_training_file(
         total_timeout: Some(Duration::from_millis(
             target.step.total_timeout_ms.max(600_000),
         )),
+        emulate: false,
     };
     let response = target
         .app
@@ -1427,6 +1429,7 @@ async fn forward_with_bytes(
                 ttfb_timeout: Duration::from_millis(step.ttfb_timeout_ms),
                 total_timeout: (step.total_timeout_ms > 0)
                     .then(|| Duration::from_millis(step.total_timeout_ms)),
+                emulate: false,
             };
             match app.relay.upstream().send(request).await {
                 Ok(response) => {
@@ -2338,6 +2341,44 @@ async fn dispatch_routed(
     let health = app.health.view();
     let now_ms = mr_core::ids::now_millis().max(0) as u64;
 
+    // For a direct provider/model request the combo recording helpers do not run, but the request
+    // must still be visible in the panel's Recent Request Activity while it is in flight — and a
+    // direct request can wait arbitrarily long inside the silent rate-limit hold, so the entry has
+    // to begin now, before the first attempt, not when an answer arrives. This guard is attached
+    // to whichever response ends the request (success keeps it open for the body's lifetime;
+    // every failure path finishes it as failed).
+    let mut direct_guard: Option<crate::activity::ActivityGuard> = direct
+        .as_ref()
+        .map(|step| app.activity.begin("direct", model_name, &participant_id(step), now_ms));
+
+    // --- Debug request logging (default off). ---
+    //
+    // `debugLogMessages` writes every admitted request's payload and the resolved route to the
+    // relay log with a timestamp. Off by default because request bodies are private; when the
+    // operator enables it, the payload is the exact bytes the router is about to send, truncated
+    // so a long file upload cannot flood the log.
+    if app.relay.debug_log_messages() {
+        const DEBUG_LOG_BODY_MAX: usize = 4096;
+        let body_preview = if bytes.len() <= DEBUG_LOG_BODY_MAX {
+            String::from_utf8_lossy(&bytes).into_owned()
+        } else {
+            format!(
+                "{}…(truncated {} bytes)",
+                String::from_utf8_lossy(&bytes[..DEBUG_LOG_BODY_MAX]),
+                bytes.len()
+            )
+        };
+        tracing::info!(
+            ts_ms = mr_core::ids::now_millis(),
+            client_dialect = client_dialect.as_str(),
+            method = %method,
+            path = uri.path(),
+            model = model_name,
+            body = %body_preview,
+            "debugLogMessages: admitted request"
+        );
+    }
+
     // --- Step order. ---
     let mut sticky_index = None;
     let steps: Vec<&StepPlan> = match (combo, direct) {
@@ -2398,6 +2439,9 @@ async fn dispatch_routed(
         })
         .collect();
     if steps.is_empty() && declared_steps > 0 {
+        if let Some(guard) = direct_guard.take() {
+            guard.finish_failed();
+        }
         return error_response(
             StatusCode::NOT_FOUND,
             client_dialect,
@@ -2411,6 +2455,9 @@ async fn dispatch_routed(
     }
 
     if steps.is_empty() {
+        if let Some(guard) = direct_guard.take() {
+            guard.finish_failed();
+        }
         return error_response(
             StatusCode::NOT_FOUND,
             client_dialect,
@@ -2553,12 +2600,28 @@ async fn dispatch_routed(
         if rate_limit_retry.enabled {
             let mut absorbing = false;
             let mut patience_started = std::time::Instant::now();
+            // The hard ceiling on the whole hold: the silent-retry cycles below otherwise wait
+            // forever on a provider that is permanently throttled, which looks like a dead
+            // request to the client and stalls a combo's failover. Bound the total time this
+            // request may spend parked on a 429.
+            let total_hold_started = std::time::Instant::now();
             // The wait horizon: the configured budget, extended to honor a stated recovery
             // (`Retry-After`) up to `max_stated_wait_ms`. A provider that says "retry after 35s"
             // is telling the truth; surfacing the 429 the moment that outlives a short default
             // budget would defeat silent handling.
             let mut wait_horizon_ms = rate_limit_retry.max_wait_ms;
             'patience: loop {
+                if total_hold_started.elapsed().as_millis() as u64
+                    >= rate_limit_retry.max_total_hold_ms
+                {
+                    tracing::warn!(
+                        provider = %step.provider_id,
+                        model = %step.model,
+                        hold_ms = rate_limit_retry.max_total_hold_ms,
+                        "rate limit hold ceiling reached; stopping silent retry"
+                    );
+                    break 'patience;
+                }
                 let stated_wait = match &attempt {
                     Attempt::Failed {
                         response: Some(resp),
@@ -2569,6 +2632,21 @@ async fn dispatch_routed(
                     _ => None,
                 };
                 match &attempt {
+                    // RESOURCE_EXHAUSTED is not a throttle to sit on: it is the reset-aware
+                    // failover signal, and the account sweep has already tried every sibling.
+                    // Break out so the failure advances to the next combo step instead of
+                    // parking this request on a provider whose windows are all exhausted.
+                    Attempt::Failed {
+                        resource_exhausted: true,
+                        ..
+                    } => {
+                        tracing::info!(
+                            provider = %step.provider_id,
+                            model = %step.model,
+                            "resource-exhausted refusal; failing over instead of holding"
+                        );
+                        break 'patience;
+                    }
                     Attempt::Failed {
                         response: Some(resp),
                         ..
@@ -2661,6 +2739,9 @@ async fn dispatch_routed(
                         rerun_max_rounds: 0,
                     },
                 );
+                if let Some(guard) = direct_guard.take() {
+                    return crate::activity::watch(wrapped, guard);
+                }
                 return served_combo(&app, activity, participant_id(step), now_ms, wrapped);
             }
             Attempt::Failed {
@@ -2691,6 +2772,9 @@ async fn dispatch_routed(
                 }
             }
             Attempt::Fatal { response } => {
+                if let Some(guard) = direct_guard.take() {
+                    guard.finish_failed();
+                }
                 failed_combo(&app, activity, attempted.as_deref(), now_ms);
                 return response;
             }
@@ -2704,6 +2788,9 @@ async fn dispatch_routed(
     // upstream's own 429, or the relay's with the earliest known recovery) instead of trying
     // further combo steps or rerouting on modality.
     if stop_advancing {
+        if let Some(guard) = direct_guard.take() {
+            guard.finish_failed();
+        }
         failed_combo(&app, activity, attempted.as_deref(), now_ms);
         if let Some(response) = last_failure {
             return response;
@@ -2741,6 +2828,9 @@ async fn dispatch_routed(
             // A default that names no known model cannot be routed. Saying so is more useful than
             // letting the retry fail with a 404 for a model the client never asked for.
             if let Resolution::NotFound { reason } = table.snapshot.resolve(&target) {
+                if let Some(guard) = direct_guard.take() {
+                    guard.finish_failed();
+                }
                 return error_response(
                     StatusCode::NOT_IMPLEMENTED,
                     client_dialect,
@@ -2780,6 +2870,9 @@ async fn dispatch_routed(
                 )
                 .await;
             }
+        }
+        if let Some(guard) = direct_guard.take() {
+            guard.finish_failed();
         }
         return error_response(
             StatusCode::NOT_IMPLEMENTED,
@@ -2868,6 +2961,9 @@ async fn dispatch_routed(
                                 rerun_max_rounds: 0,
                             },
                         );
+                        if let Some(guard) = direct_guard.take() {
+                            return crate::activity::watch(wrapped, guard);
+                        }
                         return served_combo(&app, activity, participant_id(step), now_ms, wrapped);
                     }
                     Attempt::Failed {
@@ -2883,6 +2979,9 @@ async fn dispatch_routed(
     // Every step was tried. Where a provider gave a specific error, that is more informative than
     // anything synthesized here, so it is returned. Where the accounts were the problem, the answer
     // is our own 429 with the earliest known recovery.
+    if let Some(guard) = direct_guard.take() {
+        guard.finish_failed();
+    }
     failed_combo(&app, activity, attempted.as_deref(), now_ms);
     match last_failure {
         Some(r) => r,
@@ -3056,6 +3155,11 @@ enum Attempt {
     Failed {
         /// The failure response, when there is one to show the client.
         response: Option<Response>,
+        /// Whether the refusal is Google/Vertex-style RESOURCE_EXHAUSTED, the reset-aware
+        /// failover signal. Carried on the attempt so the silent-429 patience can tell a
+        /// throttle to sit out from an exhaustion to fail over past: both are status 429, and
+        /// only the body distinguishes them.
+        resource_exhausted: bool,
         /// The account this attempt used, when it got that far.
         ///
         /// The last-resort retry loop carries these so it never dials the same cooling account
@@ -3658,6 +3762,7 @@ async fn attempt_step(
             // No account was usable, so there is no account to exclude from a retry.
             account: None,
             sticky_cleared,
+            resource_exhausted: false,
             retry_accounts: true,
             advance_step: true,
         };
@@ -3892,6 +3997,7 @@ async fn attempt_step(
                 )),
                 account: Some(account.id.clone()),
                 sticky_cleared,
+                resource_exhausted: false,
                 retry_accounts: true,
                 advance_step: true,
             };
@@ -3973,6 +4079,7 @@ async fn attempt_step(
                     )),
                     account: Some(account.id.clone()),
                     sticky_cleared,
+                    resource_exhausted: false,
                     retry_accounts: false,
                     advance_step: true,
                 };
@@ -4124,6 +4231,9 @@ async fn attempt_step(
                                 .max(provider.cold_start_ttfb_timeout_ms.unwrap_or(0)),
                         )
                     }),
+                    // The Vibe consumer gateway wants the desktop app's Chromium fingerprint;
+                    // the rustls pool gets a Cloudflare challenge instead.
+                    emulate: step.dialect == Dialect::MistralVibe,
                 };
                 app.relay.upstream().send(request).await
             }
@@ -4325,6 +4435,14 @@ async fn attempt_step(
             if model_unavailable {
                 reason = select::CooldownReason::QuotaExhausted;
             }
+            // Google/Vertex-style RESOURCE_EXHAUSTED: fail over to the next account, and when
+            // every account of the provider is exhausted, advance to the next combo step. It is
+            // not a throttle that a request should sit on — each account's window resets on its
+            // own schedule, which is exactly what reset-aware priority means.
+            let resource_exhausted = response
+                .body
+                .first_frame_bytes()
+                .is_some_and(|b| refusal_is_resource_exhausted(&b));
             // A refusal used to leave no trace at all, which made the most expensive failure in
             // a combo — the one that silently sends every request to the next step — invisible.
             // The excerpt is what names the cause: `prefill_cap_refused` reads as a rate limit in
@@ -4368,6 +4486,7 @@ async fn attempt_step(
                     response: Some(build_response(rebuilt, None)),
                     account: Some(account.id.clone()),
                     sticky_cleared,
+                    resource_exhausted: false,
                     retry_accounts: false,
                     advance_step: true,
                 };
@@ -4409,11 +4528,14 @@ async fn attempt_step(
                 response: Some(build_response(rebuilt, None)),
                 account: Some(account.id.clone()),
                 sticky_cleared,
+                resource_exhausted,
                 retry_accounts: true,
                 // A rate limit says the provider is throttled, not dead: the request must not
                 // advance to another combo step, and the caller absorbs it (waiting and retrying)
-                // instead of surfacing it.
-                advance_step: reason != select::CooldownReason::RateLimited,
+                // instead of surfacing it. RESOURCE_EXHAUSTED is the exception: it is the
+                // reset-aware failover signal, so it advances once the sibling accounts have all
+                // refused.
+                advance_step: reason != select::CooldownReason::RateLimited || resource_exhausted,
             }
         }
         Err(e) => {
@@ -4480,6 +4602,7 @@ async fn attempt_step(
                 response: None,
                 account: Some(account.id.clone()),
                 sticky_cleared,
+                resource_exhausted: false,
                 retry_accounts: true,
                 advance_step: true,
             }
@@ -5233,6 +5356,18 @@ fn names_an_unavailable_model(body: &[u8]) -> bool {
         .and_then(|error| error.get("type"))
         .and_then(serde_json::Value::as_str)
         == Some("model_unavailable")
+}
+
+/// Whether a refusal body is Google/Vertex-style `RESOURCE_EXHAUSTED`.
+///
+/// This is the reset-aware failover signal: the account has exhausted its *current* window, which
+/// resets on its own schedule while the sibling accounts keep their own windows. The request must
+/// fail over to the next account immediately — and when every account of the provider is exhausted,
+/// advance to the next combo step rather than parking the request on a throttle that no amount of
+/// waiting on *this* provider will resolve.
+fn refusal_is_resource_exhausted(body: &[u8]) -> bool {
+    let lower = String::from_utf8_lossy(body).to_ascii_lowercase();
+    lower.contains("resource_exhausted")
 }
 
 /// What a refusal body says about the account, beyond the status code.
@@ -12023,7 +12158,8 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 max_wait_ms: 1_500,
                 max_stated_wait_ms: 1_200,
                 poll_interval_ms: 300,
-            },
+                max_total_hold_ms: 60_000,
+                },
             ..Default::default()
         };
         let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
@@ -12108,6 +12244,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 max_wait_ms: 800,
                 max_stated_wait_ms: 1_200,
                 poll_interval_ms: 200,
+                max_total_hold_ms: 60_000,
             },
             ..Default::default()
         };
@@ -12251,7 +12388,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     /// Google/Vertex-style `429 RESOURCE_EXHAUSTED` is a throttle in a quota costume: it must be
     /// absorbed like any other 429 instead of surfacing to the client.
     #[tokio::test]
-    async fn a_resource_exhausted_429_is_absorbed_and_retried_within_the_budget() {
+    async fn a_resource_exhausted_429_fails_over_instead_of_being_held() {
         let (url, seen) = mock_upstream_custom(|attempt, _body| {
             if attempt < 2 {
                 (
@@ -12276,7 +12413,8 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 max_wait_ms: 1_500,
                 max_stated_wait_ms: 1_200,
                 poll_interval_ms: 300,
-            },
+                max_total_hold_ms: 60_000,
+                },
             ..Default::default()
         };
         let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
@@ -12316,21 +12454,22 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         .await;
         assert_eq!(
             resp.status(),
-            StatusCode::OK,
-            "the absorbed RESOURCE_EXHAUSTED 429s must not surface"
+            StatusCode::TOO_MANY_REQUESTS,
+            "RESOURCE_EXHAUSTED fails over; with a single account the refusal surfaces"
         );
         assert_eq!(
             seen.lock().unwrap().len(),
-            3,
-            "two RESOURCE_EXHAUSTED 429s were absorbed, the third attempt served"
+            1,
+            "no silent holding on RESOURCE_EXHAUSTED — one try, then failover"
         );
     }
 
-    /// A persistent `429 RESOURCE_EXHAUSTED` stays on its provider and remains invisible while the
-    /// cooldown is active. When it recovers, the same request succeeds; the next combo step is never
-    /// used for a cooldown that may recover.
+    /// A persistent `429 RESOURCE_EXHAUSTED` fails over: each account's window resets on its own
+    /// schedule (reset-aware priority), so once the provider's accounts have all refused, the
+    /// request moves to the next combo step instead of parking on a throttle that no amount of
+    /// waiting on this provider will resolve.
     #[tokio::test]
-    async fn a_persistent_resource_exhausted_429_is_held_silently_until_recovery() {
+    async fn a_persistent_resource_exhausted_429_fails_over_to_the_next_step() {
         let (first_url, first_seen) = mock_upstream_custom(|attempt, _body| {
             if attempt < 4 {
                 (
@@ -12371,6 +12510,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 max_wait_ms: 800,
                 max_stated_wait_ms: 1_200,
                 poll_interval_ms: 200,
+                max_total_hold_ms: 60_000,
             },
             ..Default::default()
         };
@@ -12413,17 +12553,17 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "the upstream's transient RESOURCE_EXHAUSTED 429s are hidden until recovery"
+            "the second provider serves after the first's RESOURCE_EXHAUSTED"
         );
         assert_eq!(
             first_seen.lock().unwrap().len(),
-            5,
-            "the same provider was retried until it recovered"
+            1,
+            "the exhausted provider is tried once, then failed over"
         );
         assert_eq!(
             second_seen.lock().unwrap().len(),
-            0,
-            "a temporary account cooldown must not advance to another provider"
+            1,
+            "RESOURCE_EXHAUSTED advances to the next combo step"
         );
     }
 
@@ -12481,6 +12621,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 max_wait_ms: 800,
                 max_stated_wait_ms: 1_200,
                 poll_interval_ms: 200,
+                max_total_hold_ms: 60_000,
             },
             ..Default::default()
         };
@@ -15327,19 +15468,25 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     }
 
     #[tokio::test]
-    async fn a_plain_model_request_is_not_combo_activity() {
+    async fn a_plain_model_request_is_combo_free_but_visible_as_direct_activity() {
         let (state, seen) = combo_state().await;
         let activity = Arc::clone(&state.activity);
 
         let response = chat(state, "openai-codex/gpt-6-luna").await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(seen.lock().unwrap().len(), 1);
+
+        let open = activity.snapshot();
+        assert_eq!(open.len(), 1, "a direct request is still recorded");
+        assert_eq!(open[0].combo, "direct");
+        assert_eq!(open[0].requested, "openai-codex/gpt-6-luna");
+        assert!(open[0].finished_at.is_none(), "in flight while streaming");
+        assert!(open[0].outcome.is_none());
+
         drop(response);
 
-        assert!(
-            activity.snapshot().is_empty(),
-            "a direct model is not a combo decision"
-        );
+        let closed = activity.snapshot();
+        assert_eq!(closed[0].outcome, Some(Outcome::Ok));
     }
 
     #[tokio::test]

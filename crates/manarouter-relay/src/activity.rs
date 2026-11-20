@@ -223,6 +223,17 @@ pub struct ActivityGuard {
     id: u64,
 }
 
+impl ActivityGuard {
+    /// Mark this decision failed immediately, without waiting for the body.
+    ///
+    /// Used when the request ended without an answer (a routed error, a refusal after the hold
+    /// ceiling, a fatal transport failure). The drop handler is a no-op afterwards: `finish`
+    /// only writes an outcome once, so a later `Ok` cannot overwrite the failure.
+    pub(crate) fn finish_failed(self) {
+        self.log.finish(self.id, Outcome::Failed);
+    }
+}
+
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
         self.log.finish(self.id, Outcome::Ok);

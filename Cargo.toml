@@ -24,6 +24,10 @@ socket2 = { version = "0.6", features = ["all"] }
 mr-core = { path = "crates/mr-core" }
 mr-dialects = { path = "crates/mr-dialects" }
 
+# --- browser-impersonating http client (TLS fingerprint egress for Cloudflare-guarded surfaces) ---
+rquest = { path = "crates/vendor/rquest-5.2.0", features = ["stream"] }
+rquest-util = { path = "crates/vendor/rquest-util-2.2.1", default-features = false, features = ["emulation"] }
+
 # --- async runtime / http ---
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal", "fs", "io-util"] }
 tokio-util = { version = "0.7", features = ["io", "rt"] }

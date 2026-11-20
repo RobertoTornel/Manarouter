@@ -292,11 +292,13 @@ export async function renderOverview(mount, ctx) {
       const tr = h('tr', {},
         h('td', { class: 'mono cell-dim' }, formatAge(item.started_at, now)),
         h('td', {},
-          h('a', {
-            href: `#/combos/${encodeURIComponent(item.combo)}`,
-            class: 'overview-table-combo mono',
-            title: `View combo ${item.combo}`,
-          }, item.combo)),
+          item.combo === 'direct'
+            ? h('span', { class: 'overview-table-combo mono' }, item.combo)
+            : h('a', {
+                href: `#/combos/${encodeURIComponent(item.combo)}`,
+                class: 'overview-table-combo mono',
+                title: `View combo ${item.combo}`,
+              }, item.combo)),
         h('td', { class: 'mono' }, item.requested || '—'),
         h('td', { class: 'mono cell-highlight', title: item.step }, item.step || '—'),
         h('td', { class: 'num mono' }, durationStr),

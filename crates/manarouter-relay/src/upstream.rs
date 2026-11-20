@@ -72,6 +72,16 @@ pub struct UpstreamRequest {
     /// How long the whole request may take. `None` disables the limit, which is correct for a long
     /// streamed generation and wrong for anything else.
     pub total_timeout: Option<Duration>,
+    /// Send this request through a browser-emulating client (Chrome TLS/HTTP-2 fingerprint)
+    /// rather than the pooled rustls client.
+    ///
+    /// Mistral Vibe's consumer gateway fronts `chat.mistral.ai` with a Cloudflare
+    /// fingerprint check: a plain rustls ClientHello is answered with a `403` "Just a moment"
+    /// challenge, where the desktop app's Chromium fingerprint goes through. Only a dialect
+    /// that needs the app's exact client shape sets this; every other provider keeps the fast
+    /// pooled path. An emulated request that also carries a proxy is refused outright (the same
+    /// refusal the Cursor transport makes), because the browser client has no tunnel path.
+    pub emulate: bool,
 }
 
 /// A response whose body has **not** been read.
@@ -378,6 +388,14 @@ struct UpstreamInner {
         hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
         http_body_util::Full<Bytes>,
     >,
+    /// The browser-impersonating client for Cloudflare-guarded surfaces (Mistral Vibe).
+    ///
+    /// Built once with the same Chrome profile the desktop app itself presents (`Emulation::Chrome124`):
+    /// its TLS ClientHello and HTTP/2 settings are what `chat.mistral.ai`'s Cloudflare fingerprint
+    /// check accepts, where the rustls pool above is answered with a "Just a moment" challenge.
+    /// `None` only when the client could not be constructed at startup, in which case an emulated
+    /// request fails fast with a clear error rather than silently falling back to the plain pool.
+    chrome: Option<rquest::Client>,
     /// One client per proxy, each with its own pool.
     ///
     /// The pools are separate on purpose. A pool is keyed by origin, so a single pool holding both
@@ -529,11 +547,21 @@ impl Upstream {
                 .http2_only(false)
                 .build(https);
 
+        // The Chrome-124 browser client for Cloudflare-guarded surfaces. Same fingerprint the
+        // Vibe desktop app presents; built once, alongside the pooled client it stands in for
+        // on those requests.
+        let chrome = rquest::Client::builder()
+            .emulation(rquest_util::Emulation::Chrome124)
+            .connect_timeout(Duration::from_secs(30))
+            .build()
+            .ok();
+
         Ok(Self {
             inner: std::sync::Arc::new(UpstreamInner {
                 pool_idle,
                 pool_max_idle_per_host,
                 client,
+                chrome,
                 proxied: std::sync::Mutex::new(std::collections::HashMap::new()),
                 origin_tls: origin_tls.clone(),
                 proxy_tls: Some(proxy_tls),
@@ -585,6 +613,9 @@ impl Upstream {
         }
         if uri.authority().is_none() {
             return Err(UpstreamError::BadUrl(request.url.clone()));
+        }
+        if request.emulate {
+            return self.send_impersonated(request).await;
         }
 
         // Version selection. Over TLS the ALPN offer in `new` decides what is actually spoken;
@@ -739,6 +770,7 @@ impl Upstream {
             connect_timeout: Duration::from_secs(10),
             ttfb_timeout: Duration::from_secs(10),
             total_timeout: Some(Duration::from_secs(15)),
+            emulate: false,
         };
         match self.send(request).await {
             Ok(_) => tracing::debug!(base_url, "prewarm connection established"),
@@ -785,6 +817,100 @@ where
     };
     let headers_at = started.elapsed();
     resp.map_err(|e| classify(&e, request, headers_at, proxied))
+}
+
+impl Upstream {
+    /// Send a request through the Chrome-124 browser client, for Cloudflare-guarded surfaces
+    /// (Mistral Vibe).
+    ///
+    /// The rustls pool gets a TLS-fingerprint challenge (`403` "Just a moment") from a gateway
+    /// that only the desktop app's Chromium passes. This path keeps the same outer contract —
+    /// a status, headers and an unread streaming body — by pumping the emulated client's byte
+    /// stream through a channel, exactly as the Cursor transport does.
+    ///
+    /// - A proxied request is refused: the browser client has no tunnel path, and silently
+    ///   sending it direct would violate the operator's egress policy (the same reason the
+    ///   Cursor transport refuses proxies).
+    /// - The emulated client is built once in [`Upstream::new`]; when that build failed, this
+    ///   reports it plainly rather than falling back to the plain pool (which the gateway
+    ///   would challenge and the caller would misread as a provider error).
+    async fn send_impersonated(&self, request: UpstreamRequest) -> Result<UpstreamResponse> {
+        tracing::info!(
+            url = %request.url,
+            "browser-emulated upstream request (Vibe path)"
+        );
+        if request.proxy.is_some() {
+            return Err(UpstreamError::Connect(
+                "a browser-emulated request cannot be proxied".to_owned(),
+            ));
+        }
+        let client = self.inner.chrome.clone().ok_or_else(|| {
+            UpstreamError::Connect("browser client unavailable".to_owned())
+        })?;
+
+        let started = Instant::now();
+        let mut builder = client.request(request.method.clone(), request.url.clone());
+        builder = builder.headers(request.headers.clone());
+        if let Some(total) = request.total_timeout {
+            builder = builder.timeout(total);
+        }
+        builder = builder.body(request.body.clone());
+
+        let (deadline, from_ttfb) = match request.total_timeout {
+            Some(total) if total < request.ttfb_timeout => (total, false),
+            _ => (request.ttfb_timeout, true),
+        };
+        let resp = match tokio::time::timeout(deadline, builder.send()).await {
+            Ok(r) => r.map_err(|e| UpstreamError::Connect(e.to_string()))?,
+            Err(_) if from_ttfb => return Err(UpstreamError::TtfbTimeout(deadline)),
+            Err(_) => return Err(UpstreamError::TotalTimeout(deadline)),
+        };
+        let ttfb = started.elapsed();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+
+        // Diagnostic hook: a path in MANAROUTER_UPSTREAM_DUMP tees the raw upstream bytes
+        // (the untranslated provider wire format) into that file. Off unless the variable is
+        // set, so a production relay costs nothing for it.
+        let dump_path = std::env::var("MANAROUTER_UPSTREAM_DUMP").ok();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+        tokio::spawn(async move {
+            use futures_util::StreamExt as _;
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        if let Some(path) = &dump_path {
+                            use std::io::Write as _;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(path)
+                            {
+                                let _ = f.write_all(&bytes);
+                            }
+                        }
+                        if tx.send(bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "browser-emulated stream broke mid-body");
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(UpstreamResponse {
+            status,
+            headers,
+            body: Body::Channel(ChannelBody::new(rx)),
+            ttfb,
+            reused_connection: false,
+        })
+    }
 }
 
 /// Map a transport error onto the variant that tells the caller what to do about it.
@@ -1270,6 +1396,7 @@ mod tests {
                 connect_timeout: Duration::from_secs(1),
                 ttfb_timeout: Duration::from_secs(2),
                 total_timeout: Some(Duration::from_secs(5)),
+                emulate: false,
             })
             .await
             .expect("a dead tunnel must fall back to a direct connection");
@@ -1307,6 +1434,7 @@ mod tests {
                 connect_timeout: Duration::from_secs(1),
                 ttfb_timeout: Duration::from_millis(250),
                 total_timeout: None,
+                emulate: false,
             })
             .await
             .expect_err("a silent provider must fail");

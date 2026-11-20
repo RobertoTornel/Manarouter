@@ -408,6 +408,10 @@ pub struct RelayState {
     /// Swapped whole on reload for the same reason as `quota_config`: a hand edit must take
     /// effect without a restart.
     rate_limit_retry: ArcSwap<mr_core::config::RateLimitRetryConfig>,
+    /// Debug logging of admitted request payloads (`debugLogMessages`).
+    ///
+    /// Swapped whole on reload so a hand edit applies without a restart.
+    debug_log_messages: ArcSwap<bool>,
 }
 
 impl RelayState {
@@ -423,6 +427,7 @@ impl RelayState {
             proxy_selection: ProxySelectionState::new(&config.proxies),
             quota_config: ArcSwap::from_pointee(config.quota.clone()),
             rate_limit_retry: ArcSwap::from_pointee(config.rate_limit_retry.clone()),
+            debug_log_messages: ArcSwap::from_pointee(config.debug_log_messages),
         }
     }
 
@@ -439,6 +444,11 @@ impl RelayState {
     /// Read once per request so one request does not observe two different settings.
     pub fn rate_limit_retry_config(&self) -> std::sync::Arc<mr_core::config::RateLimitRetryConfig> {
         self.rate_limit_retry.load_full()
+    }
+
+    /// Whether debug logging of admitted request payloads is enabled (`debugLogMessages`).
+    pub fn debug_log_messages(&self) -> bool {
+        *self.debug_log_messages.load_full()
     }
 
     /// Load the snapshot and configuration from disk.
@@ -749,6 +759,7 @@ mod tests {
             rate_limit_retry: ArcSwap::from_pointee(
                 mr_core::config::RateLimitRetryConfig::default(),
             ),
+            debug_log_messages: ArcSwap::from_pointee(false),
         }
     }
 
