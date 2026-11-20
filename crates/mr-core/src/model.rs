@@ -1115,7 +1115,7 @@ impl Provider {
         match self.dialect {
             // OpenAI is the reference surface: every capability in this build, Search included, is
             // one of its routes, so there is nothing it can claim that it cannot serve.
-            Dialect::OpenAi | Dialect::MistralVibe => {}
+            Dialect::OpenAi | Dialect::MistralVibe | Dialect::MistralVibeApi => {}
             // ZCode's plan surface is the same Messages endpoint and nothing else, so the same
             // complaints apply. Its count-tokens route is answered locally rather than proxied, so
             // `messages` covers a client that counts through it.
@@ -2411,6 +2411,7 @@ mod tests {
         let rejected: Vec<(Dialect, Vec<Capability>)> = vec![
             (Dialect::OpenAi, Vec::new()),
             (Dialect::MistralVibe, Vec::new()),
+            (Dialect::MistralVibeApi, Vec::new()),
             (Dialect::Anthropic, with_new(&text_and_audio_free)),
             (Dialect::Zcode, with_new(&text_and_audio_free)),
             (Dialect::ClaudeCli, with_new(&text_and_audio_free)),

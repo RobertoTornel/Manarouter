@@ -7,13 +7,15 @@
 //! - `Authorization: Bearer <ory id_token>` — the JWT Ory mints beside the opaque access token,
 //!   and the only credential the consumer gateway accepts;
 //! - a JSON body in one of four `mode` shapes (`create`, `append`, `edit`, `retry` …);
-//! - a `text/event-stream` answer whose frames are **length-prefixed JSONL**: each line is
-//!   `N:{json}` (or `null`), e.g. `15:{"json":{"type":"bootstrap",...}}`. There is no `data:`
-//!   field.
+//! - a `text/event-stream` answer whose frames are AI-SDK stream-part codes: the leading number
+//!   is the part code (`15` = state update, `8` = done), followed by `:{json}` (or `null`), e.g.
+//!   `15:{"json":{"type":"bootstrap",...}}`. There is no `data:` field.
 //!
 //! The relay maps an OpenAI Chat Completions request onto `mode: "create"` (a fresh chat per
 //! request — stateless, and the simplest faithful mapping; conversation context is not carried
 //! between turns yet, which is acceptable for a first-class provider integration).
+
+use std::sync::OnceLock;
 
 use bytes::Bytes;
 use mr_core::RouteKind;
@@ -31,6 +33,20 @@ pub const VIBE_USER_AGENT: &str = concat!(
     "LeChat-Desktop/1.2.0 (win32; production; x86_64)"
 );
 
+/// The task callbacks the desktop app declares on every create (`webSupportedTaskCallbacks` in the
+/// app bundle). The backend uses the list to know which interactive callbacks a caller can handle.
+const WORK_TASK_CALLBACKS: &[&str] = &[
+    "ask_user_question",
+    "ask_user_confirmation",
+    "ask_enable_skill",
+    "enable_connector",
+    "reconnect_connector",
+    "ask_retry_or_continue_rate_limit",
+    "collect_workflow_input",
+    "delegate_workflow_execution",
+    "await_desktop_approval",
+];
+
 /// Build the `create` envelope for a fresh chat.
 /// The Vibe work-model selection fields the desktop app sends on every create.
 ///
@@ -38,29 +54,37 @@ pub const VIBE_USER_AGENT: &str = concat!(
 /// surface choose a default that answered test prompts with a one-token fragment. The alias is
 /// the model the relay resolved, and the effort is the client's requested reasoning level mapped
 /// onto Vibe's spelling (the app's own work-model list uses `none|low|medium|high|xhigh`).
-fn create_envelope(prompt: &str, model_alias: &str, effort: &str) -> Value {
-    let now = today_utc();
+fn create_envelope(prompt: &str, model_alias: &str, effort: &str, temperature: Option<f64>) -> Value {
+    let (date, timezone) = client_prompt_data();
+    let mut model_config = json!({
+        "model_alias": model_alias,
+        "reasoning_effort": effort,
+    });
+    if let Some(t) = temperature {
+        model_config["temperature"] = json!(t);
+    }
+    // Work-mode features derive from the effort, exactly like the app: `none` is fast mode
+    // (`agentic-fast`), every other effort is think mode (no `agentic-fast`).
+    let features: Vec<&str> = if effort == "none" {
+        vec!["agentic-fast"]
+    } else {
+        Vec::new()
+    };
     json!({
         "mode": "create",
         "productType": "work",
         "clientPromptData": {
-            "currentDate": now,
-            "userTimezone": "UTC",
+            "currentDate": date,
+            "userTimezone": timezone,
         },
-        "modelConfig": {
-            "model_alias": model_alias,
-            "reasoning_effort": effort,
-        },
-        "stableAnonymousIdentifier": format!(
-            "00000000-0000-0000-0000-{:012}",
-            crate::vibe::pseudo_uuid_suffix()
-        ),
+        "modelConfig": model_config,
+        "stableAnonymousIdentifier": stable_anonymous_id(),
         "appProvidedToolsCatalog": { "groups": [] },
-        "supportedTaskCallbacks": [],
+        "supportedTaskCallbacks": WORK_TASK_CALLBACKS,
         "disabledFeatures": [],
         "content": [{ "type": "text", "text": prompt }],
         "files": [],
-        "features": [],
+        "features": features,
         "integrations": [],
         "libraries": [],
     })
@@ -68,32 +92,108 @@ fn create_envelope(prompt: &str, model_alias: &str, effort: &str) -> Value {
 
 /// Map the client's reasoning-effort request onto Vibe's spelling.
 ///
-/// A higher effort is a longer-thinking generation; the app's own selection uses the same names
-/// (`none`, `low`, `medium`, `high`, `xhigh`), so the request's `reasoning_effort` is passed
-/// through when present. Without one, `medium` is used — the setting that reproduced complete
+/// The app's composer surface spells the levels `off|low|medium|high|xhigh|max` while the work
+/// surface uses `none|low|medium|high|xhigh`. `off` and `max` are accepted and mapped onto the
+/// nearest work spelling; without one, `medium` is used — the setting that reproduced complete
 /// answers, where the backend's own default returned fragments.
 fn reasoning_effort(value: &Value) -> String {
     match value.get("reasoning_effort").and_then(Value::as_str) {
+        Some("off") => "none".to_owned(),
+        Some("max") => "xhigh".to_owned(),
         Some(effort @ ("none" | "low" | "medium" | "high" | "xhigh")) => effort.to_owned(),
         _ => "medium".to_owned(),
     }
 }
 
-/// A tiny, dependency-free stand-in for a random UUID suffix.
-fn pseudo_uuid_suffix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64 % 1_000_000_000_000)
-        .unwrap_or(0)
+/// A stable anonymous identifier for this relay process.
+///
+/// The desktop app persists one device fingerprint and reuses it on every request, so the backend
+/// sees one anonymous user. The relay regenerates per request, which makes the backend treat each
+/// call as a new anonymous user. This process-wide stable value (generated once) is the closest
+/// stateless equivalent; it is not persisted across relay restarts.
+fn stable_anonymous_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let suffix = {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            nanos % 1_000_000_000_000
+        };
+        format!("00000000-0000-0000-0000-{suffix:012}")
+    })
 }
 
-/// Today's date in UTC, `YYYY-MM-DD`, without pulling in a date crate.
-fn today_utc() -> String {
+/// The local timezone offset in seconds east of UTC, and its IANA name, resolved once.
+///
+/// The app sends `T+01:00 (Europe/Madrid)`; the relay used to hardcode `UTC`. The offset is read
+/// once from the system (`date +%z`), and the zone name from `TZ` or `/etc/timezone`, so the
+/// envelope matches the app's shape without a date crate.
+fn local_timezone() -> (i64, String) {
+    static TZ: OnceLock<(i64, String)> = OnceLock::new();
+    TZ.get_or_init(|| {
+        let zone = std::env::var("TZ")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::fs::read_to_string("/etc/timezone")
+                    .ok()
+                    .map(|s| s.trim().to_owned())
+            })
+            .unwrap_or_else(|| "UTC".to_owned());
+        let offset_secs = std::process::Command::new("date")
+            .arg("+%z")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| parse_zone_offset(s.trim()))
+            .unwrap_or(0);
+        (offset_secs, zone)
+    })
+    .clone()
+}
+
+/// Parse `+0100` / `-0330` into seconds east of UTC.
+fn parse_zone_offset(s: &str) -> Option<i64> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 5 {
+        return None;
+    }
+    let sign = match bytes[0] {
+        b'+' => 1i64,
+        b'-' => -1i64,
+        _ => return None,
+    };
+    let h: i64 = s[1..3].parse().ok()?;
+    let m: i64 = s[3..5].parse().ok()?;
+    (h < 24 && m < 60).then_some(sign * (h * 3600 + m * 60))
+}
+
+/// The `currentDate` and `userTimezone` fields for `clientPromptData`, in the app's shape.
+fn client_prompt_data() -> (String, String) {
+    let (offset_secs, zone) = local_timezone();
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = (secs / 86400) as i64;
+        .unwrap_or(0) as i64
+        + offset_secs;
+    let date = civil_date_from_secs(secs);
+    // `formatTimeZoneOffset` in the app emits `T+01:00 (Europe/Madrid)`.
+    let sign = if offset_secs < 0 { '-' } else { '+' };
+    let abs = offset_secs.abs();
+    let timezone = format!(
+        "T{sign}{:02}:{:02} ({zone})",
+        abs / 3600,
+        (abs % 3600) / 60
+    );
+    (date, timezone)
+}
+
+/// Civil date `YYYY-MM-DD` for a (possibly offset-shifted) epoch second.
+fn civil_date_from_secs(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
     // Civil-from-days (Howard Hinnant's algorithm).
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -108,29 +208,34 @@ fn today_utc() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// Rewrite an OpenAI chat-completions request into the Vibe `create` envelope.
-pub fn from_pivot_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<TranslatedRequest> {
-    if ctx.route != RouteKind::ChatCompletions {
-        return Err(TranslateError::Unsupported {
-            from: ctx.client_dialect.as_str(),
-            to: ctx.upstream_dialect.as_str(),
-            route: ctx.route.as_str(),
-        });
-    }
-    let value: Value =
-        serde_json::from_slice(body).map_err(|e| TranslateError::MalformedRequest {
+/// What an OpenAI chat-completions request asks a Vibe surface to do, independent of the transport
+/// (the website API or the CLI).
+pub struct CliInvocation {
+    /// The last user text, which is the only content a fresh session carries.
+    pub prompt: String,
+    /// The reasoning effort mapped onto Vibe's work spelling (`none|low|medium|high|xhigh`).
+    pub effort: String,
+    /// An optional client temperature (0.0..=1.0).
+    pub temperature: Option<f64>,
+}
+
+/// Read the meaningful fields out of an OpenAI chat-completions body.
+///
+/// The create envelope is a fresh chat, so only the final user text is meaningful; system context
+/// is dropped (the work surface applies its own system prompt).
+pub fn cli_invocation(body: &[u8]) -> Result<CliInvocation> {
+    let value: Value = serde_json::from_slice(body).map_err(|e| {
+        TranslateError::MalformedRequest {
             dialect: "openai",
             detail: format!("{e}"),
-        })?;
-    let messages = value
-        .get("messages")
-        .and_then(Value::as_array)
-        .ok_or_else(|| TranslateError::MalformedRequest {
+        }
+    })?;
+    let messages = value.get("messages").and_then(Value::as_array).ok_or_else(
+        || TranslateError::MalformedRequest {
             dialect: "openai",
             detail: "missing `messages` array".to_string(),
-        })?;
-    // Take the last user text. The create envelope is a fresh chat, so only the final prompt is
-    // meaningful; system context is dropped (the work surface applies its own system prompt).
+        },
+    )?;
     let prompt = messages
         .iter()
         .rev()
@@ -141,8 +246,37 @@ pub fn from_pivot_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Transla
             detail: "no user text message found".to_string(),
         })?;
     let effort = reasoning_effort(&value);
+    let temperature = value
+        .get("temperature")
+        .and_then(Value::as_f64)
+        .filter(|t| (0.0..=1.0).contains(t));
+    Ok(CliInvocation {
+        prompt,
+        effort,
+        temperature,
+    })
+}
+
+/// Rewrite an OpenAI chat-completions request into the Vibe `create` envelope.
+pub fn from_pivot_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<TranslatedRequest> {
+    if ctx.route != RouteKind::ChatCompletions {
+        return Err(TranslateError::Unsupported {
+            from: ctx.client_dialect.as_str(),
+            to: ctx.upstream_dialect.as_str(),
+            route: ctx.route.as_str(),
+        });
+    }
+    let invocation = cli_invocation(body)?;
     Ok(TranslatedRequest {
-        body: Bytes::from(create_envelope(&prompt, ctx.upstream_model, &effort).to_string()),
+        body: Bytes::from(
+            create_envelope(
+                &invocation.prompt,
+                ctx.upstream_model,
+                &invocation.effort,
+                invocation.temperature,
+            )
+            .to_string(),
+        ),
         content_type: "application/json",
         force_stream: true,
         path_override: Some(CHAT_API_PATH.to_string()),
@@ -315,11 +449,7 @@ impl Translator {
 
     /// Emit only the suffix that has not been sent to the client yet.
     fn emit_content_delta(&mut self, model: &str) -> Vec<String> {
-        let full: String = self
-            .content_chunks
-            .iter()
-            .filter_map(|chunk| chunk.get("text").and_then(Value::as_str))
-            .collect();
+        let full = chunks_text(&self.content_chunks);
         let len = full.chars().count();
         if len <= self.emitted_len {
             return Vec::new();
@@ -359,6 +489,96 @@ impl Translator {
         out.push(crate::SSE_DONE.to_string());
         out
     }
+}
+
+/// Whether a content chunk is hidden reasoning (`_context.type == "reasoning"`), which the app
+/// renders as nothing and which must not leak into the assistant's visible text.
+fn is_reasoning_chunk(chunk: &Value) -> bool {
+    chunk
+        .get("_context")
+        .and_then(|c| c.get("type"))
+        .and_then(Value::as_str)
+        == Some("reasoning")
+}
+
+/// Fold `contentChunks` into visible text exactly like the desktop app's `getTextContent`:
+/// reasoning chunks are skipped, `inline_tag` labels get app-side spacing against adjacent text
+/// chunks, and `canva`/`custom_element` blocks render as their titled content (or nothing when the
+/// canvas data is absent, which a stateless relay does not have).
+fn chunks_text(chunks: &[Value]) -> String {
+    let mut out = String::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        if is_reasoning_chunk(chunk) {
+            continue;
+        }
+        match chunk.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = chunk.get("text").and_then(Value::as_str) {
+                    out.push_str(text);
+                }
+            }
+            Some("inline_tag") => {
+                let Some(label) = chunk.get("label").and_then(Value::as_str) else {
+                    continue;
+                };
+                let prev = chunks[..i]
+                    .iter()
+                    .rev()
+                    .find(|c| !is_reasoning_chunk(c));
+                let next = chunks[i + 1..]
+                    .iter()
+                    .find(|c| !is_reasoning_chunk(c));
+                let prefix = match prev {
+                    Some(p)
+                        if p.get("type").and_then(Value::as_str) == Some("text")
+                            && p.get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|t| !t.ends_with(' ')) =>
+                    {
+                        " "
+                    }
+                    _ => "",
+                };
+                let suffix = match next {
+                    Some(n)
+                        if n.get("type").and_then(Value::as_str) == Some("text")
+                            && n.get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|t| !t.starts_with(' ')) =>
+                    {
+                        " "
+                    }
+                    _ => "",
+                };
+                out.push_str(prefix);
+                out.push_str(label);
+                out.push_str(suffix);
+            }
+            Some("custom_element") => {
+                let is_table = chunk
+                    .get("element")
+                    .and_then(|e| e.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("table-metadata");
+                if is_table {
+                    if let Some(title) = chunk
+                        .get("element")
+                        .and_then(|e| e.get("attributes"))
+                        .and_then(|a| a.get("title"))
+                        .and_then(Value::as_str)
+                    {
+                        out.push('\n');
+                        out.push_str(title);
+                        out.push('\n');
+                    }
+                }
+            }
+            // `canva` chunks need the canvas payload, which a stateless relay does not carry; the
+            // app itself renders nothing when the canvas is missing, so skipping matches it.
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Parse a JSON Pointer to a contentChunks item text field.
@@ -439,10 +659,7 @@ pub fn to_pivot_response(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Bytes> {
             }
         }
     }
-    let full: String = chunks
-        .iter()
-        .filter_map(|chunk| chunk.get("text").and_then(Value::as_str))
-        .collect();
+    let full = chunks_text(&chunks);
     let completion = estimate_tokens(full.chars().count());
     let doc = json!({
         "id": "vibe-0",
@@ -625,5 +842,75 @@ mod tests {
         assert_eq!(v["object"], "chat.completion");
         assert_eq!(v["choices"][0]["message"]["content"], "OK");
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn chunks_text_skips_reasoning_chunks_and_spaces_inline_tags() {
+        let chunks = json!([
+            { "type": "text", "text": "Answer: " },
+            { "type": "text", "text": "hidden chain", "_context": { "type": "reasoning" } },
+            { "type": "inline_tag", "label": "@file" },
+            { "type": "text", "text": "is here." },
+            { "type": "text", "text": " (also hidden)", "_context": { "type": "reasoning" } },
+        ]);
+        // The reasoning chunk between the tag and the trailing text must be invisible to the
+        // adjacency scan: the tag still gets a space because the *next visible* chunk is text.
+        assert_eq!(chunks_text(chunks.as_array().unwrap()), "Answer: @file is here.");
+    }
+
+    #[test]
+    fn chunks_text_renders_table_metadata_custom_elements() {
+        let chunks = json!([
+            { "type": "text", "text": "Here:" },
+            { "type": "custom_element", "element": { "type": "table-metadata", "attributes": { "title": "The Table" } } },
+            { "type": "text", "text": "Done" },
+        ]);
+        assert_eq!(
+            chunks_text(chunks.as_array().unwrap()),
+            "Here:\nThe Table\nDone"
+        );
+    }
+
+    #[test]
+    fn envelope_matches_app_shape_for_callbacks_features_effort_and_temperature() {
+        let body = br#"{"model":"m","reasoning_effort":"off","temperature":0.4,"messages":[{"role":"user","content":"hi"}]}"#;
+        let translated = from_pivot_request(&ctx("glm-5-latest-short"), body).unwrap();
+        let v: Value = serde_json::from_slice(&translated.body).unwrap();
+
+        // `off` is the composer spelling of work-mode `none`, which selects fast mode (agentic-fast).
+        assert_eq!(v["modelConfig"]["reasoning_effort"], "none");
+        assert_eq!(v["features"], json!(["agentic-fast"]));
+        assert_eq!(v["modelConfig"]["temperature"], json!(0.4));
+
+        // The callback list matches the desktop app's `webSupportedTaskCallbacks`.
+        assert_eq!(
+            v["supportedTaskCallbacks"],
+            json!(["ask_user_question","ask_user_confirmation","ask_enable_skill","enable_connector","reconnect_connector","ask_retry_or_continue_rate_limit","collect_workflow_input","delegate_workflow_execution","await_desktop_approval"])
+        );
+
+        // `max` maps to work spelling `xhigh`; think-mode efforts get no fast feature.
+        let body = br#"{"model":"m","reasoning_effort":"max","messages":[{"role":"user","content":"hi"}]}"#;
+        let translated = from_pivot_request(&ctx("glm-5-latest-short"), body).unwrap();
+        let v: Value = serde_json::from_slice(&translated.body).unwrap();
+        assert_eq!(v["modelConfig"]["reasoning_effort"], "xhigh");
+        assert_eq!(v["features"], json!([]));
+
+        // `clientPromptData` carries the app's `T+hh:mm (Zone)` shape and a local date.
+        let tz = v["clientPromptData"]["userTimezone"].as_str().unwrap();
+        assert!(tz.starts_with('T'), "bad timezone shape: {tz}");
+        assert!(tz.contains('(') && tz.contains(')'), "missing zone name: {tz}");
+        let date = v["clientPromptData"]["currentDate"].as_str().unwrap();
+        let mut parts = date.split('-');
+        assert_eq!(parts.next().unwrap().len(), 4, "bad date: {date}");
+        assert_eq!(parts.next().unwrap().len(), 2);
+        assert_eq!(parts.next().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn frame_codes_parse_and_done_null_is_tolerated() {
+        assert!(parse_frame("15:{\"json\":{\"type\":\"message\"}}").unwrap().is_some());
+        // `8:null` is the done part; it parses as a JSON null value and drives no output.
+        assert!(parse_frame("8:null").unwrap().is_some());
+        assert!(parse_frame("null").unwrap().is_none());
     }
 }

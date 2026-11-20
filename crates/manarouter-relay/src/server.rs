@@ -2571,14 +2571,36 @@ async fn dispatch_routed(
 
     // Set when a step was refused with a rate limit and the silent-retry budget ran out: the
     // combo must stop here. A rate limit is not a reason to spend the next provider on the same
-    // throttle, so the request ends with the 429 instead of advancing.
+    // throttle, so the request ends with the 429 instead of advancing — **unless** a later combo
+    // step can serve it right now. A combo exists to survive a provider that is throttled:
+    // parking the request on a 429 while a sibling provider stands ready hides that survival, so
+    // when a later step has a usable account the request fails over to it instead. The hold only
+    // applies when this step is the request's only option.
     let mut stop_advancing = false;
 
-    for step in &steps {
+    for (step_index, step) in steps.iter().enumerate() {
         // A step that was in the race has already been tried.
         if raced.iter().any(|tried| std::ptr::eq(*tried, *step)) {
             continue;
         }
+        // Whether any *later* combo step can serve this request right now, judged against the
+        // same health view the attempts use. When true, a rate-limited or parked step must not
+        // end the request or hold it: the loop continues to the step that can answer.
+        let later_available = {
+            let health = app.health.view();
+            steps
+                .iter()
+                .skip(step_index + 1)
+                .any(|next| {
+                    table
+                        .snapshot
+                        .providers()
+                        .get(next.provider_index as usize)
+                        .is_some_and(|provider| {
+                            select::step_has_usable_account(provider, &health, now_ms, next)
+                        })
+                })
+        };
         let is_sticky = sticky_step_is(combo, sticky_index, step);
         if activity.is_some() {
             attempted = Some(participant_id(step));
@@ -2611,6 +2633,17 @@ async fn dispatch_routed(
             // budget would defeat silent handling.
             let mut wait_horizon_ms = rate_limit_retry.max_wait_ms;
             'patience: loop {
+                // A later combo step can serve this request right now: do not park it on this
+                // provider's throttle. Break out so the outer loop fails over to the available
+                // step; the throttled step will be retried by later requests once it recovers.
+                if later_available {
+                    tracing::info!(
+                        provider = %step.provider_id,
+                        model = %step.model,
+                        "a later combo step can serve; failing over past the rate limit"
+                    );
+                    break 'patience;
+                }
                 if total_hold_started.elapsed().as_millis() as u64
                     >= rate_limit_retry.max_total_hold_ms
                 {
@@ -2755,7 +2788,14 @@ async fn dispatch_routed(
                 }
                 last_failure = response;
                 if !advance_step {
-                    stop_advancing = true;
+                    // A rate-limited step does not end the combo when a later step can serve the
+                    // request right now: the throttled provider recovers on its own schedule, and
+                    // the request should be answered by the sibling that is available instead of
+                    // failing or parking. `stop_advancing` only applies when this step is the
+                    // request's only option.
+                    if !later_available {
+                        stop_advancing = true;
+                    }
                 }
             }
             Attempt::Skip {
@@ -5952,7 +5992,7 @@ fn upstream_path<'a>(
 /// Copilot's `/chat/completions` and Command Code's `/alpha/generate`.
 fn dialect_version(dialect: Dialect) -> Option<&'static str> {
     match dialect {
-        Dialect::OpenAi => Some("v1"),
+        Dialect::OpenAi | Dialect::MistralVibeApi => Some("v1"),
         // Vibe's LeChat backend lives at the origin root (`POST /api/chat`), with no version
         // segment anywhere — like Cursor, where the RPC path is absolute. Adding one produces
         // `/v1/api/chat`, which the consumer gateway 404s.
@@ -6095,7 +6135,7 @@ fn build_url(step: &StepPlan, path: UpstreamPath<'_>) -> Option<String> {
 /// each route lives; a provider that deviates from it says so in `route_overrides`.
 fn default_path(dialect: Dialect, route: RouteKind) -> &'static str {
     match dialect {
-        Dialect::OpenAi | Dialect::MistralVibe => match route {
+        Dialect::OpenAi | Dialect::MistralVibe | Dialect::MistralVibeApi => match route {
             RouteKind::ChatCompletions => "/v1/chat/completions",
             RouteKind::Responses => "/v1/responses",
             RouteKind::Embeddings => "/v1/embeddings",
@@ -12209,10 +12249,11 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         );
     }
 
-    /// A rate limit must never advance the combo to the next provider: the throttle belongs to the
-    /// provider, not to its availability, and the next step would only re-collect the same 429.
+    /// A rate limit on the first step must fail the combo over to a later step that is available:
+    /// the throttle belongs to the provider, not to the combo, and the request should be answered
+    /// by the sibling provider instead of parking on or surfacing the 429.
     #[tokio::test]
-    async fn a_rate_limit_does_not_advance_the_combo_to_the_next_step() {
+    async fn a_rate_limit_fails_over_to_a_later_available_step() {
         let (first_url, first_seen) = refusing_upstream(
             StatusCode::TOO_MANY_REQUESTS,
             r#"{"error":{"message":"too many requests"}}"#,
@@ -12286,24 +12327,105 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         .await;
         assert_eq!(
             response.status(),
+            StatusCode::OK,
+            "the second step must serve once the first is rate limited"
+        );
+        assert!(
+            !first_seen.lock().unwrap().is_empty(),
+            "the rate-limited step was tried first"
+        );
+        assert_eq!(
+            second_seen.lock().unwrap().len(),
+            1,
+            "the rate limit fails the combo over to the available step"
+        );
+    }
+
+    /// When no later combo step is available — a single-step combo or a direct provider — a rate
+    /// limit still does not advance anywhere; the request holds silently until the hold ceiling,
+    /// then ends with the 429.
+    #[tokio::test]
+    async fn a_rate_limit_holds_when_no_later_step_is_available() {
+        let (first_url, first_seen) = refusing_upstream(
             StatusCode::TOO_MANY_REQUESTS,
-            "the 429 must surface once the silent-retry budget is spent"
+            r#"{"error":{"message":"too many requests"}}"#,
+        )
+        .await;
+
+        let combo = mr_core::model::Combo::new(
+            "failover",
+            mr_core::model::ComboStep::new("first", "shared-model"),
+        );
+
+        let config = mr_core::config::Config {
+            providers: vec![provider_serving(
+                "first",
+                &first_url,
+                "shared-model",
+                &[InputModality::Text],
+            )],
+            combos: vec![combo],
+            rate_limit_retry: mr_core::config::RateLimitRetryConfig {
+                enabled: true,
+                max_wait_ms: 200,
+                max_stated_wait_ms: 1_200,
+                poll_interval_ms: 200,
+                max_total_hold_ms: 800,
+            },
+            ..Default::default()
+        };
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(failover_body()),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "with no later step the hold ceiling ends the request with the 429"
         );
         assert!(
             !first_seen.lock().unwrap().is_empty(),
             "the rate-limited step was tried"
         );
-        assert_eq!(
-            second_seen.lock().unwrap().len(),
-            0,
-            "a rate limit must not fail the combo over to the next provider"
-        );
     }
 
-    /// With the setting off, the upstream 429 surfaces immediately — but still never advances the
-    /// combo to the next provider.
+    /// With the setting off, the upstream 429 surfaces immediately when no later step can serve —
+    /// but when a later step is available the combo still fails over to it, because a healthy
+    /// sibling provider should answer instead of surfacing a throttle it is not subject to.
     #[tokio::test]
-    async fn a_disabled_rate_limit_setting_surfaces_the_429_immediately() {
+    async fn a_disabled_rate_limit_setting_surfaces_the_429_when_no_failover_exists() {
         let (first_url, first_seen) = refusing_upstream(
             StatusCode::TOO_MANY_REQUESTS,
             r#"{"error":{"message":"too many requests"}}"#,
@@ -12374,15 +12496,11 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         .await;
         assert_eq!(
             response.status(),
-            StatusCode::TOO_MANY_REQUESTS,
-            "with the setting off the 429 surfaces right away"
+            StatusCode::OK,
+            "a later available step serves even when silent retry is off"
         );
         assert_eq!(first_seen.lock().unwrap().len(), 1, "exactly one attempt");
-        assert_eq!(
-            second_seen.lock().unwrap().len(),
-            0,
-            "even with the setting off, a rate limit must not advance the combo"
-        );
+        assert_eq!(second_seen.lock().unwrap().len(), 1, "failover happened");
     }
 
     /// Google/Vertex-style `429 RESOURCE_EXHAUSTED` is a throttle in a quota costume: it must be
@@ -13741,6 +13859,82 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             // lane that recovered the operator's real batches would be both slow and surprising.
             batch: crate::batch::BatchLane::inert(),
         }
+    }
+
+    /// The Mistral Vibe API surface is OpenAI-shaped: an OpenAI client's body is forwarded
+    /// verbatim (no Vibe envelope, no website API), the path is the standard `/v1/chat/completions`
+    /// and the answer is the upstream's own document.
+    #[tokio::test]
+    async fn a_mistral_vibe_api_provider_serves_openai_chat_verbatim() {
+        let (url, seen) = counting_upstream(
+            StatusCode::OK,
+            r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}"#,
+        )
+        .await;
+        let mut provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+        provider.dialect = Dialect::MistralVibeApi;
+        provider.capabilities = vec![Capability::Chat, Capability::Models];
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let request_body = r#"{"model":"p/m","messages":[{"role":"user","content":"hello"}],"temperature":0.7}"#;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(request_body.to_owned()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let records = seen.lock().unwrap();
+        assert_eq!(records.len(), 1, "exactly one upstream call");
+        let (path, body) = &records[0];
+        assert_eq!(path, "/v1/chat/completions", "standard API path");
+        // The only rewrite is the model-id resolution (`p/m` → `m`); the rest of the OpenAI body
+        // reaches the API surface untouched — no Vibe envelope, no website chat shapes.
+        let sent: serde_json::Value = serde_json::from_str(body).unwrap();
+        let requested: serde_json::Value = serde_json::from_str(request_body).unwrap();
+        assert_eq!(sent["model"], "m");
+        assert_eq!(sent["messages"], requested["messages"]);
+        assert_eq!(sent["temperature"], requested["temperature"]);
+        assert!(sent.get("mode").is_none(), "no Vibe create mode field");
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["choices"][0]["message"]["content"], "ok");
+        assert_eq!(doc["usage"]["total_tokens"], 4);
     }
 
     /// An Anthropic step's count goes to the upstream's own count-tokens endpoint.

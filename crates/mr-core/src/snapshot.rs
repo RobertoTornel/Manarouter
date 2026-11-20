@@ -2209,6 +2209,7 @@ fn dialect_reasoning_fragment(
         // dialects use is a truer summary of "no field on the wire" than inventing a shape.
         Dialect::OpenAi
         | Dialect::MistralVibe
+        | Dialect::MistralVibeApi
         | Dialect::Copilot
         | Dialect::CommandCodeGo
         | Dialect::Cursor => {

@@ -187,7 +187,7 @@ export function buildRedirectPaste(p, ctx, session) {
 // `open-ai`, `parse` wants `openai`. A value here that the backend rejects turns "Add provider"
 // into a save-time error, which is how the pre-rename `command-code` spelling was caught. The Rust
 // test `the_panel_offers_only_dialects_this_binary_deserialises` pins this list.
-const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm', 'cursor', 'zcode', 'claude-cli', 'mistral-vibe'];
+const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm', 'cursor', 'zcode', 'claude-cli', 'mistral-vibe', 'mistral-vibe-api'];
 // Must list exactly the capability spellings the backend *deserialises* (mr-core `dialect.rs`,
 // serde kebab-case) and in the enum's order: `panel/test/capabilities.test.mjs` pins the ids to
 // the Rust variants. A checkbox spelling the server refuses turns "Create provider" into a

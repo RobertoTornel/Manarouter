@@ -233,6 +233,18 @@ oauth_scopes = "openid email profile offline_access"
 headers = { "user-agent" = "vibe-desktop/1.2.0" }
 
 [[providers]]
+id = "mistral-vibe-api"
+label = "Mistral Vibe API"
+dialect = "mistral-vibe-api"
+base_url = "https://api.mistral.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
+key_strategy = "round-robin"
+note = "API-key surface at api.mistral.ai/v1 — the same backend the Mistral Vibe CLI talks to (MISTRAL_API_KEY). The wire is OpenAI-shaped and is forwarded byte-for-byte from an OpenAI client: no LeChat create envelope, no website /api/chat. Use this dialect to route to Mistral's platform models with a standard bearer key; mistral-vibe remains the OAuth-only LeChat consumer gateway."
+docs_url = "https://www.mistral.ai/vibe"
+headers = { }
+
+[[providers]]
 id = "claude-code"
 label = "Claude Code (Claude subscription)"
 dialect = "claude-cli"

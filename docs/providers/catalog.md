@@ -93,6 +93,7 @@ route override carries one.
 |---|---|---|---|---|---|
 | `antigravity` ⚠ | Google Antigravity / Gemini Code Assist | `antigravity` | `https://daily-cloudcode-pa.googleapis.com` | `oauth` (antigravity) | chat, models, tool-calling, reasoning, vision |
 | `mistral-vibe` | Mistral Vibe | `mistral-vibe` | `https://chat.mistral.ai` | `oauth` (mistral-vibe) | chat, models, reasoning |
+| `mistral-vibe-api` ⚠ | Mistral Vibe API | `mistral-vibe-api` | `https://api.mistral.ai/v1` | `bearer` | chat, models, tool-calling, reasoning |
 | `claude-code` | Claude Code (Claude subscription) | `claude-cli` | `https://api.anthropic.com/v1` | `oauth` (claude) | messages, models, tool-calling, reasoning, vision |
 | `cline` | Cline | `open-ai` | `https://api.cline.bot/api/v1` | `oauth` (cline) | chat, models, tool-calling, reasoning |
 | `codebuddy-cn` ⚠ | CodeBuddy CN | `open-ai` | `https://copilot.tencent.com/v2` | `oauth` (codebuddy-cn) | chat, models, tool-calling |

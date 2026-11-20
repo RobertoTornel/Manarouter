@@ -155,6 +155,15 @@ pub enum Dialect {
     /// The body is OpenAI-shaped and is forwarded byte-for-byte from an OpenAI client; the dialect
     /// exists because the credential is OAuth-only and the surface is Mistral's own.
     MistralVibe = 12,
+    /// Mistral Vibe API: Mistral's public platform surface at `api.mistral.ai/v1`, authenticated
+    /// with a standard bearer API key.
+    ///
+    /// This is the same wire dialect as Mistral Vibe's consumer gateway — OpenAI-shaped bodies,
+    /// forwarded byte-for-byte — so the only differences are the credential (an API key instead
+    /// of an OAuth token) and the endpoint (the public `/v1/*` paths). The dialect exists so a
+    /// provider can name this surface explicitly and get the standard versioned paths and bearer
+    /// auth without the Vibe login flow.
+    MistralVibeApi = 13,
 }
 
 impl Dialect {
@@ -181,6 +190,7 @@ impl Dialect {
             10 => Self::Zcode,
             11 => Self::ClaudeCli,
             12 => Self::MistralVibe,
+            13 => Self::MistralVibeApi,
             _ => return None,
         })
     }
@@ -209,6 +219,7 @@ impl Dialect {
             Self::Zcode => "zcode",
             Self::ClaudeCli => "claude-cli",
             Self::MistralVibe => "mistral-vibe",
+            Self::MistralVibeApi => "mistral-vibe-api",
         }
     }
 
@@ -258,6 +269,9 @@ impl Dialect {
             "cursor" | "cursor-agent" | "cursoragent" => Self::Cursor,
             "zcode" | "z-code" | "zcode-plan" => Self::Zcode,
             "mistral-vibe" | "vibe" | "mistralvibe" => Self::MistralVibe,
+            "mistral-vibe-api" | "vibe-api" | "mistralapi" | "mistral-api" => {
+                Self::MistralVibeApi
+            }
             _ => return None,
         })
     }
@@ -272,7 +286,9 @@ impl Dialect {
         matches!(
             (self, other),
             (Self::OpenAi, Self::OpenAi)
+                | (Self::OpenAi, Self::MistralVibeApi)
                 | (Self::MistralVibe, Self::MistralVibe)
+                | (Self::MistralVibeApi, Self::MistralVibeApi)
                 | (Self::Anthropic, Self::Anthropic)
         )
     }
@@ -293,7 +309,7 @@ impl Dialect {
     }
 
     /// Every dialect, in snapshot order. Useful for exhaustive tests.
-    pub const ALL: [Dialect; 13] = [
+    pub const ALL: [Dialect; 14] = [
         Self::OpenAi,
         Self::Anthropic,
         Self::Google,
@@ -307,6 +323,7 @@ impl Dialect {
         Self::Zcode,
         Self::ClaudeCli,
         Self::MistralVibe,
+        Self::MistralVibeApi,
     ];
 
     /// The reasoning levels this dialect can put on the wire as *themselves*, ascending.
@@ -331,6 +348,7 @@ impl Dialect {
         match self {
             Self::OpenAi
             | Self::MistralVibe
+            | Self::MistralVibeApi
             | Self::Copilot
             | Self::CommandCodeGo
             | Self::Codex
@@ -1568,8 +1586,8 @@ mod tests {
         // Unknown values must be rejected rather than silently mapping onto a dialect, because a
         // misread snapshot byte would otherwise route traffic to an unrelated provider. The value
         // after the last dialect is the one a new variant would take, so this line moves with the
-        // enum: `ClaudeCli` is 11, and 12 is still unassigned.
-        assert_eq!(Dialect::from_u8(13), None);
+        // enum: `MistralVibeApi` is 13, and 14 is still unassigned.
+        assert_eq!(Dialect::from_u8(14), None);
         assert_eq!(Dialect::from_u8(255), None);
     }
 
@@ -1580,7 +1598,9 @@ mod tests {
                 let expected = matches!(
                     (a, b),
                     (Dialect::OpenAi, Dialect::OpenAi)
+                        | (Dialect::OpenAi, Dialect::MistralVibeApi)
                         | (Dialect::MistralVibe, Dialect::MistralVibe)
+                        | (Dialect::MistralVibeApi, Dialect::MistralVibeApi)
                         | (Dialect::Anthropic, Dialect::Anthropic)
                 );
                 assert_eq!(a.is_passthrough_to(b), expected, "{a:?} -> {b:?}");
@@ -1873,6 +1893,7 @@ mod tests {
             (Dialect::Zcode, "zcode"),
             (Dialect::ClaudeCli, "claude-cli"),
             (Dialect::MistralVibe, "mistral-vibe"),
+            (Dialect::MistralVibeApi, "mistral-vibe-api"),
         ];
         assert_eq!(expected.len(), Dialect::ALL.len());
         for (dialect, id) in expected {
