@@ -17,9 +17,9 @@
 
 use bytes::Bytes;
 use mr_core::RouteKind;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::{TranslateCtx, TranslatedRequest, TranslateError, Result};
+use crate::{Result, TranslateCtx, TranslateError, TranslatedRequest};
 
 /// The consumer endpoint the app posts completions to.
 pub const CHAT_API_PATH: &str = "/api/chat";
@@ -117,27 +117,25 @@ pub fn from_pivot_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Transla
             route: ctx.route.as_str(),
         });
     }
-    let value: Value = serde_json::from_slice(body).map_err(|e| TranslateError::MalformedRequest {
-        dialect: "openai",
-        detail: format!("{e}"),
-    })?;
-    let messages = value.get("messages").and_then(Value::as_array).ok_or_else(|| {
-        TranslateError::MalformedRequest {
+    let value: Value =
+        serde_json::from_slice(body).map_err(|e| TranslateError::MalformedRequest {
+            dialect: "openai",
+            detail: format!("{e}"),
+        })?;
+    let messages = value
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| TranslateError::MalformedRequest {
             dialect: "openai",
             detail: "missing `messages` array".to_string(),
-        }
-    })?;
+        })?;
     // Take the last user text. The create envelope is a fresh chat, so only the final prompt is
     // meaningful; system context is dropped (the work surface applies its own system prompt).
     let prompt = messages
         .iter()
         .rev()
         .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-        .and_then(|m| {
-            m.get("content")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
+        .and_then(|m| m.get("content").and_then(Value::as_str).map(str::to_owned))
         .ok_or_else(|| TranslateError::MalformedRequest {
             dialect: "openai",
             detail: "no user text message found".to_string(),
@@ -180,6 +178,7 @@ fn parse_frame(line: &str) -> Result<Option<Value>> {
 pub struct Translator {
     started: bool,
     emitted_len: usize,
+    content_chunks: Vec<Value>,
     done: bool,
 }
 
@@ -195,6 +194,7 @@ impl Translator {
         Self {
             started: false,
             emitted_len: 0,
+            content_chunks: Vec::new(),
             done: false,
         }
     }
@@ -216,23 +216,8 @@ impl Translator {
             "bootstrap" => {
                 // Opening chunk: announce the assistant role.
                 self.started = true;
-                out.push(json!({
-                    "id": "vibe-0",
-                    "object": "chat.completion.chunk",
-                    "created": crate::vibe::now_secs(),
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": { "role": "assistant" },
-                        "finish_reason": null,
-                    }],
-                }).to_string());
-                out.extend(openai_chunk(model, "vibe-0", "").into_iter());
-            }
-            "message" => {
-                if !self.started {
-                    self.started = true;
-                    out.push(json!({
+                out.push(
+                    json!({
                         "id": "vibe-0",
                         "object": "chat.completion.chunk",
                         "created": crate::vibe::now_secs(),
@@ -242,49 +227,80 @@ impl Translator {
                             "delta": { "role": "assistant" },
                             "finish_reason": null,
                         }],
-                    }).to_string());
+                    })
+                    .to_string(),
+                );
+                out.extend(openai_chunk(model, "vibe-0", "").into_iter());
+            }
+            "message" => {
+                if !self.started {
+                    self.started = true;
+                    out.push(
+                        json!({
+                            "id": "vibe-0",
+                            "object": "chat.completion.chunk",
+                            "created": crate::vibe::now_secs(),
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": { "role": "assistant" },
+                                "finish_reason": null,
+                            }],
+                        })
+                        .to_string(),
+                    );
                 }
                 let patches = json.get("patches").and_then(Value::as_array);
                 if let Some(patches) = patches {
                     for patch in patches {
                         let path = patch.get("path").and_then(Value::as_str).unwrap_or("");
-                        if path.ends_with("/contentChunks") {
+                        if path == "/contentChunks" {
                             if let Some(chunks) = patch.get("value").and_then(Value::as_array) {
-                                let text: String = chunks
-                                    .iter()
-                                    .filter_map(|c| c.get("text").and_then(Value::as_str))
-                                    .collect();
-                                let full = text.as_str();
-                                let len = full.chars().count();
-                                if len > self.emitted_len {
-                                    let delta: String = full
-                                        .chars()
-                                        .skip(self.emitted_len)
-                                        .collect();
-                                    self.emitted_len = len;
-                                    out.extend(openai_chunk(model, "vibe-0", &delta).into_iter());
-                                }
+                                self.content_chunks = chunks.clone();
+                                out.extend(self.emit_content_delta(model));
+                            }
+                        } else if let Some(text_index) = content_text_patch_index(path) {
+                            if let Some(chunk) = self.content_chunks.get_mut(text_index) {
+                                let Some(old_text) = chunk.get("text").and_then(Value::as_str)
+                                else {
+                                    continue;
+                                };
+                                let old_text = old_text.to_owned();
+                                let op =
+                                    patch.get("op").and_then(Value::as_str).unwrap_or("replace");
+                                let value =
+                                    patch.get("value").and_then(Value::as_str).unwrap_or("");
+                                let new_text = match op {
+                                    "append" => format!("{old_text}{value}"),
+                                    "replace" => value.to_owned(),
+                                    _ => continue,
+                                };
+                                chunk["text"] = Value::String(new_text);
+                                out.extend(self.emit_content_delta(model));
                             }
                         } else if path.ends_with("/generationStatus") {
                             if patch.get("value").and_then(Value::as_str) == Some("success") {
                                 self.done = true;
                                 let completion = crate::vibe::estimate_tokens(self.emitted_len);
-                                out.push(json!({
-                                    "id": "vibe-0",
-                                    "object": "chat.completion.chunk",
-                                    "created": crate::vibe::now_secs(),
-                                    "model": model,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {},
-                                        "finish_reason": "stop",
-                                    }],
-                                    "usage": {
-                                        "prompt_tokens": 0,
-                                        "completion_tokens": completion,
-                                        "total_tokens": completion,
-                                    },
-                                }).to_string());
+                                out.push(
+                                    json!({
+                                        "id": "vibe-0",
+                                        "object": "chat.completion.chunk",
+                                        "created": crate::vibe::now_secs(),
+                                        "model": model,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {},
+                                            "finish_reason": "stop",
+                                        }],
+                                        "usage": {
+                                            "prompt_tokens": 0,
+                                            "completion_tokens": completion,
+                                            "total_tokens": completion,
+                                        },
+                                    })
+                                    .to_string(),
+                                );
                                 out.push(crate::SSE_DONE.to_string());
                             }
                         }
@@ -297,6 +313,22 @@ impl Translator {
         Ok(out)
     }
 
+    /// Emit only the suffix that has not been sent to the client yet.
+    fn emit_content_delta(&mut self, model: &str) -> Vec<String> {
+        let full: String = self
+            .content_chunks
+            .iter()
+            .filter_map(|chunk| chunk.get("text").and_then(Value::as_str))
+            .collect();
+        let len = full.chars().count();
+        if len <= self.emitted_len {
+            return Vec::new();
+        }
+        let delta: String = full.chars().skip(self.emitted_len).collect();
+        self.emitted_len = len;
+        openai_chunk(model, "vibe-0", &delta)
+    }
+
     /// Close the stream honestly when the upstream ended without a `success` status.
     pub fn finish(&mut self, ctx: &TranslateCtx<'_>) -> Vec<String> {
         if self.done {
@@ -305,40 +337,53 @@ impl Translator {
         self.done = true;
         let model = ctx.upstream_model;
         let completion = crate::vibe::estimate_tokens(self.emitted_len);
-        let mut out = vec![json!({
-            "id": "vibe-0",
-            "object": "chat.completion.chunk",
-            "created": crate::vibe::now_secs(),
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop",
-            }],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": completion,
-                "total_tokens": completion,
-            },
-        }).to_string()];
+        let mut out = vec![
+            json!({
+                "id": "vibe-0",
+                "object": "chat.completion.chunk",
+                "created": crate::vibe::now_secs(),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": completion,
+                    "total_tokens": completion,
+                },
+            })
+            .to_string(),
+        ];
         out.push(crate::SSE_DONE.to_string());
         out
     }
 }
 
+/// Parse a JSON Pointer to a contentChunks item text field.
+fn content_text_patch_index(path: &str) -> Option<usize> {
+    let mut parts = path.strip_prefix("/contentChunks/")?.split('/');
+    let index = parts.next()?.parse().ok()?;
+    (parts.next()? == "text" && parts.next().is_none()).then_some(index)
+}
+
 /// An OpenAI streaming chunk with a text delta.
 fn openai_chunk(model: &str, id: &str, delta: &str) -> Vec<String> {
-    vec![json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": crate::vibe::now_secs(),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": { "content": delta },
-            "finish_reason": null,
-        }],
-    }).to_string()]
+    vec![
+        json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": crate::vibe::now_secs(),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": { "content": delta },
+                "finish_reason": null,
+            }],
+        })
+        .to_string(),
+    ]
 }
 
 fn now_secs() -> u64 {
@@ -363,24 +408,30 @@ pub fn to_pivot_response(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Bytes> {
         dialect: "mistral-vibe",
         detail: format!("not utf-8: {e}"),
     })?;
-    let mut full = String::new();
+    let mut chunks: Vec<Value> = Vec::new();
     for line in text.lines() {
         if let Some(payload) = parse_frame(line)? {
             let json = payload.get("json").cloned().unwrap_or(payload);
             if json.get("type").and_then(Value::as_str) == Some("message") {
                 if let Some(patches) = json.get("patches").and_then(Value::as_array) {
                     for patch in patches {
-                        if patch
-                            .get("path")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .ends_with("/contentChunks")
-                        {
-                            if let Some(chunks) = patch.get("value").and_then(Value::as_array) {
-                                full = chunks
-                                    .iter()
-                                    .filter_map(|c| c.get("text").and_then(Value::as_str))
-                                    .collect();
+                        let path = patch.get("path").and_then(Value::as_str).unwrap_or("");
+                        if path == "/contentChunks" {
+                            if let Some(value) = patch.get("value").and_then(Value::as_array) {
+                                chunks = value.clone();
+                            }
+                        } else if let Some(index) = content_text_patch_index(path) {
+                            if let (Some(chunk), Some(value)) = (
+                                chunks.get_mut(index),
+                                patch.get("value").and_then(Value::as_str),
+                            ) {
+                                let old = chunk.get("text").and_then(Value::as_str).unwrap_or("");
+                                let next = match patch.get("op").and_then(Value::as_str) {
+                                    Some("append") => format!("{old}{value}"),
+                                    Some("replace") => value.to_owned(),
+                                    _ => continue,
+                                };
+                                chunk["text"] = Value::String(next);
                             }
                         }
                     }
@@ -388,6 +439,10 @@ pub fn to_pivot_response(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Bytes> {
             }
         }
     }
+    let full: String = chunks
+        .iter()
+        .filter_map(|chunk| chunk.get("text").and_then(Value::as_str))
+        .collect();
     let completion = estimate_tokens(full.chars().count());
     let doc = json!({
         "id": "vibe-0",
@@ -441,9 +496,18 @@ mod tests {
         }
         frames.extend(t.finish(&ctx("glm-5-latest-short")));
         let joined = frames.join("\n");
-        assert!(joined.contains("\"role\":\"assistant\""), "missing role chunk: {joined}");
-        assert!(joined.contains("\"content\":\"OK\""), "missing OK delta: {joined}");
-        assert!(joined.contains("\"finish_reason\":\"stop\""), "missing finish chunk: {joined}");
+        assert!(
+            joined.contains("\"role\":\"assistant\""),
+            "missing role chunk: {joined}"
+        );
+        assert!(
+            joined.contains("\"content\":\"OK\""),
+            "missing OK delta: {joined}"
+        );
+        assert!(
+            joined.contains("\"finish_reason\":\"stop\""),
+            "missing finish chunk: {joined}"
+        );
         assert!(joined.contains("[DONE]"), "missing DONE: {joined}");
         // No duplicate text: one delta carrying the full answer since we start empty.
         assert!(joined.matches("\"content\":\"OK\"").count() >= 1);
@@ -470,9 +534,56 @@ mod tests {
             .unwrap(),
         );
         let joined = frames.join("\n");
-        assert!(joined.contains("\"content\":\"Hel\""), "missing first delta: {joined}");
-        assert!(joined.contains("\"content\":\"lo\""), "missing tail delta: {joined}");
-        assert!(!joined.contains("\"content\":\"Hello\""), "full text re-emitted: {joined}");
+        assert!(
+            joined.contains("\"content\":\"Hel\""),
+            "missing first delta: {joined}"
+        );
+        assert!(
+            joined.contains("\"content\":\"lo\""),
+            "missing tail delta: {joined}"
+        );
+        assert!(
+            !joined.contains("\"content\":\"Hello\""),
+            "full text re-emitted: {joined}"
+        );
+    }
+
+    #[test]
+    fn vibe_stream_applies_nested_text_append_and_emits_the_full_answer() {
+        let mut t = Translator::new();
+        let ctx = ctx("glm-5-latest-short");
+        let mut frames = Vec::new();
+        frames.extend(t.translate(&ctx, "15:{\"json\":{\"type\":\"message\",\"patches\":[{\"op\":\"replace\",\"path\":\"/contentChunks\",\"value\":[{\"type\":\"text\",\"text\":\"2\"}]}]}}").unwrap());
+        frames.extend(t.translate(&ctx, "15:{\"json\":{\"type\":\"message\",\"patches\":[{\"op\":\"append\",\"path\":\"/contentChunks/0/text\",\"value\":\" + 2 equals 4.\"}]}}")
+            .unwrap());
+        frames.extend(t.translate(&ctx, "15:{\"json\":{\"type\":\"message\",\"patches\":[{\"op\":\"replace\",\"path\":\"/generationStatus\",\"value\":\"success\"}]}}")
+            .unwrap());
+        let joined = frames.join("\n");
+        assert!(
+            joined.contains("\"content\":\"2\""),
+            "missing first delta: {joined}"
+        );
+        assert!(
+            joined.contains("\"content\":\" + 2 equals 4.\""),
+            "missing appended tail: {joined}"
+        );
+        assert!(
+            !joined.contains("\"content\":\"2 + 2 equals 4.\""),
+            "full answer re-emitted: {joined}"
+        );
+        assert!(joined.contains("[DONE]"), "missing done marker: {joined}");
+    }
+
+    #[test]
+    fn non_streaming_response_applies_nested_text_append() {
+        let stream = concat!(
+            "15:{\"json\":{\"type\":\"message\",\"patches\":[{\"op\":\"replace\",\"path\":\"/contentChunks\",\"value\":[{\"type\":\"text\",\"text\":\"2\"}]}]}}\n",
+            "15:{\"json\":{\"type\":\"message\",\"patches\":[{\"op\":\"append\",\"path\":\"/contentChunks/0/text\",\"value\":\" + 2 equals 4.\"}]}}\n",
+            "15:{\"json\":{\"type\":\"message\",\"patches\":[{\"op\":\"replace\",\"path\":\"/generationStatus\",\"value\":\"success\"}]}}"
+        );
+        let out = to_pivot_response(&ctx("glm-5-latest-short"), stream.as_bytes()).unwrap();
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["choices"][0]["message"]["content"], "2 + 2 equals 4.");
     }
 
     #[test]
