@@ -32,7 +32,13 @@ pub const VIBE_USER_AGENT: &str = concat!(
 );
 
 /// Build the `create` envelope for a fresh chat.
-fn create_envelope(prompt: &str) -> Value {
+/// The Vibe work-model selection fields the desktop app sends on every create.
+///
+/// The backend keys its generation behaviour on `modelConfig`; omitting it makes the app's own
+/// surface choose a default that answered test prompts with a one-token fragment. The alias is
+/// the model the relay resolved, and the effort is the client's requested reasoning level mapped
+/// onto Vibe's spelling (the app's own work-model list uses `none|low|medium|high|xhigh`).
+fn create_envelope(prompt: &str, model_alias: &str, effort: &str) -> Value {
     let now = today_utc();
     json!({
         "mode": "create",
@@ -40,6 +46,10 @@ fn create_envelope(prompt: &str) -> Value {
         "clientPromptData": {
             "currentDate": now,
             "userTimezone": "UTC",
+        },
+        "modelConfig": {
+            "model_alias": model_alias,
+            "reasoning_effort": effort,
         },
         "stableAnonymousIdentifier": format!(
             "00000000-0000-0000-0000-{:012}",
@@ -54,6 +64,19 @@ fn create_envelope(prompt: &str) -> Value {
         "integrations": [],
         "libraries": [],
     })
+}
+
+/// Map the client's reasoning-effort request onto Vibe's spelling.
+///
+/// A higher effort is a longer-thinking generation; the app's own selection uses the same names
+/// (`none`, `low`, `medium`, `high`, `xhigh`), so the request's `reasoning_effort` is passed
+/// through when present. Without one, `medium` is used — the setting that reproduced complete
+/// answers, where the backend's own default returned fragments.
+fn reasoning_effort(value: &Value) -> String {
+    match value.get("reasoning_effort").and_then(Value::as_str) {
+        Some(effort @ ("none" | "low" | "medium" | "high" | "xhigh")) => effort.to_owned(),
+        _ => "medium".to_owned(),
+    }
 }
 
 /// A tiny, dependency-free stand-in for a random UUID suffix.
@@ -119,8 +142,9 @@ pub fn from_pivot_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Transla
             dialect: "openai",
             detail: "no user text message found".to_string(),
         })?;
+    let effort = reasoning_effort(&value);
     Ok(TranslatedRequest {
-        body: Bytes::from(create_envelope(&prompt).to_string()),
+        body: Bytes::from(create_envelope(&prompt, ctx.upstream_model, &effort).to_string()),
         content_type: "application/json",
         force_stream: true,
         path_override: Some(CHAT_API_PATH.to_string()),
@@ -436,6 +460,14 @@ mod tests {
         assert_eq!(v["productType"], "work");
         assert_eq!(v["content"][0]["text"], "Reply OK");
         assert_eq!(v["appProvidedToolsCatalog"]["groups"], json!([]));
+        assert_eq!(v["modelConfig"]["model_alias"], "glm-5-latest-short");
+        assert_eq!(v["modelConfig"]["reasoning_effort"], "medium");
+
+        // A client-requested reasoning level is passed through, not dropped.
+        let body = br#"{"model":"m","reasoning_effort":"high","messages":[{"role":"user","content":"Reply OK"}]}"#;
+        let translated = from_pivot_request(&ctx("glm-5-latest-short"), body).unwrap();
+        let v: Value = serde_json::from_slice(&translated.body).unwrap();
+        assert_eq!(v["modelConfig"]["reasoning_effort"], "high");
     }
 
     #[test]

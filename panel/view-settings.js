@@ -12,6 +12,7 @@ export async function renderSettings(mount, ctx) {
   const portsCard = h('div', { class: 'card wide' }, h('h2', {}, 'Listen ports'));
   const latencyCard = h('div', { class: 'card' }, h('h2', {}, 'Relay connection pool'));
   const accessCard = h('div', { class: 'card' }, h('h2', {}, 'Client-key access'));
+  const diagnosticsCard = h('div', { class: 'card' }, h('h2', {}, 'Relay diagnostics'));
   const proxiesCard = h('div', { class: 'card wide' }, h('h2', {}, 'Upstream proxies'));
   const peopleCard = h('div', { class: 'card wide' }, h('h2', {}, 'People and their machines'));
   const quotaDisplayCard = h('div', { class: 'card' }, h('h2', {}, 'Quota display'));
@@ -25,10 +26,10 @@ export async function renderSettings(mount, ctx) {
   // label and reorder buttons, and pairing it with a narrow card would squeeze the paths into a
   // column.
   mount.replaceChildren(h('div', { class: 'settings-grid' },
-    portsCard, latencyCard, accessCard, proxiesCard, peopleCard, quotaDisplayCard, quotaProbeCard,
+    portsCard, latencyCard, accessCard, diagnosticsCard, proxiesCard, peopleCard, quotaDisplayCard, quotaProbeCard,
     pricingCard, passwordCard, rawCard));
 
-  await Promise.all([renderPorts(), renderPassword(), renderLatency(), renderAccess(), renderProxies(), renderPeople(), renderQuotaDisplay(), renderQuotaProbe(), renderPricing()]);
+  await Promise.all([renderPorts(), renderPassword(), renderLatency(), renderAccess(), renderDiagnostics(), renderProxies(), renderPeople(), renderQuotaDisplay(), renderQuotaProbe(), renderPricing()]);
   renderRaw(); // sequential on purpose: the textarea is heavy and it can stream in last
 
   // ------------------------------------------------------------------ ports
@@ -340,6 +341,68 @@ export async function renderSettings(mount, ctx) {
       h('h2', {}, 'Client-key access'),
       h('p', { class: 'hint' }, 'Control whether the relay accepts requests with no client key. These are relay authentication settings, not upstream provider credentials.'),
       noKey.row, allowRemote.row, warning,
+      h('div', { class: 'dialog-actions' }, save), status,
+    );
+  }
+
+  // ------------------------------------------------------------- relay diagnostics
+
+  async function renderDiagnostics() {
+    let config;
+    try {
+      config = await readConfig();
+    } catch (err) {
+      diagnosticsCard.replaceChildren(h('h2', {}, 'Relay diagnostics'), errorBlock(err));
+      return;
+    }
+
+    const debugLog = toggle('Log all messages for debugging (debugLogMessages)', {
+      checked: config.debug_log_messages === true,
+      help: 'Off by default: when enabled, every admitted request payload is written to the relay journal with a timestamp, truncated to 4 KiB. Request bodies may contain private user content — enable only while debugging.',
+    });
+    const rlr = config.rateLimitRetry && typeof config.rateLimitRetry === 'object' && !Array.isArray(config.rateLimitRetry)
+      ? config.rateLimitRetry : {};
+    const holdMs = h('input', {
+      class: 'input mono', type: 'number', min: '0', max: '86400000', step: '1000',
+      value: String(Number.isInteger(rlr.max_total_hold_ms) && rlr.max_total_hold_ms >= 0 ? rlr.max_total_hold_ms : 120000),
+      'aria-label': 'Silent rate-limit hold ceiling in milliseconds',
+    });
+    const status = h('div');
+    const save = h('button', { class: 'btn btn-primary', type: 'button' }, 'Save diagnostics settings');
+
+    save.addEventListener('click', async () => {
+      clearFieldErrors(diagnosticsCard);
+      status.replaceChildren();
+      let holdValue = Number(holdMs.value);
+      if (!Number.isInteger(holdValue) || holdValue < 0 || holdValue > 86400000) {
+        applyFieldErrors(diagnosticsCard, { message: 'Hold ceiling must be an integer from 0 to 86400000 milliseconds.', details: [] });
+        return;
+      }
+      save.disabled = true;
+      try {
+        const latest = await readConfig();
+        const latestRlr = latest.rateLimitRetry && typeof latest.rateLimitRetry === 'object' && !Array.isArray(latest.rateLimitRetry)
+          ? latest.rateLimitRetry : {};
+        latest.debug_log_messages = debugLog.input.checked;
+        latest.rateLimitRetry = { ...latestRlr, max_total_hold_ms: holdValue };
+        await api.putRaw('/api/config/raw', JSON.stringify(latest, null, 2));
+        status.replaceChildren(chip('Saved', 'ok'));
+        ctx.toast.success('Relay diagnostics settings saved.');
+      } catch (err) {
+        applyFieldErrors(diagnosticsCard, err);
+        if (!err.details?.length) status.replaceChildren(errorBlock(err));
+      }
+      save.disabled = false;
+    });
+
+    diagnosticsCard.replaceChildren(
+      h('h2', {}, 'Relay diagnostics'),
+      h('p', { class: 'hint' },
+        'Debug logging and the rate-limit hold ceiling. RESOURCE_EXHAUSTED refusals always fail over to the next account and then the next combo step (reset-aware priority); this ceiling only bounds how long a plain throttle may be held silently before it is surfaced.'),
+      debugLog.row,
+      field('Silent rate-limit hold ceiling (ms)', holdMs, {
+        hint: '0–86400000. The request stops waiting and fails over (or returns the refusal) after this long parked on a persistent 429.',
+      }),
       h('div', { class: 'dialog-actions' }, save), status,
     );
   }
