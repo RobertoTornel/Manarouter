@@ -268,6 +268,7 @@ impl Translator {
                         } else if path.ends_with("/generationStatus") {
                             if patch.get("value").and_then(Value::as_str) == Some("success") {
                                 self.done = true;
+                                let completion = crate::vibe::estimate_tokens(self.emitted_len);
                                 out.push(json!({
                                     "id": "vibe-0",
                                     "object": "chat.completion.chunk",
@@ -278,6 +279,11 @@ impl Translator {
                                         "delta": {},
                                         "finish_reason": "stop",
                                     }],
+                                    "usage": {
+                                        "prompt_tokens": 0,
+                                        "completion_tokens": completion,
+                                        "total_tokens": completion,
+                                    },
                                 }).to_string());
                                 out.push(crate::SSE_DONE.to_string());
                             }
@@ -298,6 +304,7 @@ impl Translator {
         }
         self.done = true;
         let model = ctx.upstream_model;
+        let completion = crate::vibe::estimate_tokens(self.emitted_len);
         let mut out = vec![json!({
             "id": "vibe-0",
             "object": "chat.completion.chunk",
@@ -308,6 +315,11 @@ impl Translator {
                 "delta": {},
                 "finish_reason": "stop",
             }],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": completion,
+                "total_tokens": completion,
+            },
         }).to_string()];
         out.push(crate::SSE_DONE.to_string());
         out
@@ -334,6 +346,15 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// A 4-chars-per-token estimate, so a client always sees a non-zero usage line.
+///
+/// The Vibe surface reports no token counts in its frames; the relay synthesises an estimate so
+/// callers that key on `usage` (the panel's token readout, spend bookkeeping) get a sane number.
+/// Prompt tokens are not observable from the response side and are reported as zero.
+fn estimate_tokens(chars: usize) -> u64 {
+    (chars + 3) as u64 / 4
 }
 
 /// Fold a complete (non-streaming) answer into one OpenAI chat-completions document.
@@ -367,6 +388,7 @@ pub fn to_pivot_response(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Bytes> {
             }
         }
     }
+    let completion = estimate_tokens(full.chars().count());
     let doc = json!({
         "id": "vibe-0",
         "object": "chat.completion",
@@ -377,7 +399,11 @@ pub fn to_pivot_response(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Bytes> {
             "message": { "role": "assistant", "content": full },
             "finish_reason": "stop",
         }],
-        "usage": null,
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": completion,
+            "total_tokens": completion,
+        },
     });
     Ok(Bytes::from(doc.to_string()))
 }
