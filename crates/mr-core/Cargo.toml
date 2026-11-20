@@ -11,6 +11,11 @@ authors.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Browser-impersonated TLS for the Mistral Vibe token calls: auth.mistral.ai is fronted by
+# Cloudflare, which challenges the plain rustls client (HTTP 403 error 1010). The desktop app's
+# Chrome fingerprint passes; refresh/exchange for this platform use it.
+rquest = { path = "../vendor/rquest-5.2.0", features = ["stream"] }
+rquest-util = { path = "../vendor/rquest-util-2.2.1", default-features = false, features = ["emulation"] }
 toml = { workspace = true }
 bytes = { workspace = true }
 smallvec = { workspace = true }

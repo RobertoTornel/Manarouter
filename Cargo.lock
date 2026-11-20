@@ -1983,6 +1983,8 @@ dependencies = [
  "memchr",
  "password-hash",
  "rand 0.8.8",
+ "rquest",
+ "rquest-util",
  "rusqlite",
  "rustls",
  "rustls-pemfile",

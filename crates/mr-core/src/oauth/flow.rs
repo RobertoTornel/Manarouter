@@ -345,6 +345,104 @@ impl Http {
     }
 }
 
+/// A browser-impersonated HTTPS client for token calls on Cloudflare-guarded platforms.
+///
+/// Mistral Vibe's Ory endpoint (`auth.mistral.ai`) is fronted by Cloudflare: the plain rustls
+/// client above is answered with `403 error 1010` (browser integrity challenge), while the
+/// desktop app's Chrome fingerprint is accepted. This client presents the same Chrome 124 TLS
+/// and HTTP/2 fingerprint the relay's browser-emulated upstream transport uses, and implements
+/// [`OAuthHttp`] so the Vibe token exchange and refresh can use it.
+#[derive(Clone)]
+pub struct ImpersonatingHttp {
+    client: rquest::Client,
+}
+
+impl ImpersonatingHttp {
+    /// Build the Chrome-impersonated client. Fails only if the emulated client cannot be built.
+    pub fn new() -> Result<Self> {
+        let client = rquest::Client::builder()
+            .emulation(rquest_util::Emulation::Chrome124)
+            .connect_timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| oauth_error(format!("building the impersonating OAuth client: {e}")))?;
+        Ok(Self { client })
+    }
+
+    async fn send(
+        &self,
+        method: Method,
+        url: &str,
+        content_type: Option<&str>,
+        body: Option<String>,
+        headers: &[(&str, &str)],
+    ) -> Result<HttpReply> {
+        let host = url
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or("<no host>")
+            .to_string();
+        let mut builder = self.client.request(method.clone(), url);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        if let Some(content_type) = content_type {
+            builder = builder.header(CONTENT_TYPE, content_type);
+        }
+        builder = builder.body(body.unwrap_or_default());
+        let response = tokio::time::timeout(REQUEST_TIMEOUT, builder.send())
+            .await
+            .map_err(|_| oauth_error(format!("timed out contacting {host}")))?
+            .map_err(|e| Error::Io(io::Error::other(format!("OAuth request to {host}: {e}"))))?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        const MAX_REPLY: usize = 1024 * 1024;
+        let body = tokio::time::timeout(REQUEST_TIMEOUT, response.text())
+            .await
+            .map_err(|_| oauth_error(format!("timed out reading the reply from {host}")))?
+            .map_err(|e| Error::Io(io::Error::other(format!("OAuth reply from {host}: {e}"))))?;
+        Ok(HttpReply {
+            status,
+            body: body.chars().take(MAX_REPLY).collect(),
+            content_type,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl OAuthHttp for ImpersonatingHttp {
+    async fn post_form(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        pairs: &[(&str, &str)],
+    ) -> Result<HttpReply> {
+        self.send(
+            Method::POST,
+            url,
+            Some("application/x-www-form-urlencoded"),
+            Some(form_body(pairs)),
+            headers,
+        )
+        .await
+    }
+    async fn post_json(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: String,
+    ) -> Result<HttpReply> {
+        self.send(Method::POST, url, Some("application/json"), Some(body), headers).await
+    }
+    async fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpReply> {
+        self.send(Method::GET, url, None, None, headers).await
+    }
+}
+
 /// One delivered browser callback, after `state` verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Callback {

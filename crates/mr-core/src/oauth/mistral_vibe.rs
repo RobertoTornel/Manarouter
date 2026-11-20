@@ -20,7 +20,7 @@ use http::{HeaderName, HeaderValue};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use super::flow::{self, Http};
+use super::flow::{self, ImpersonatingHttp, OAuthHttp};
 use super::refresh::{oauth_failure, FailureClass};
 use super::{
     expires_at_from_secs, header, oauth_error, AccountIdentity, OAuthPlatform, Pkce, RedirectPorts,
@@ -149,7 +149,7 @@ impl OAuthPlatform for MistralVibe {
     }
 
     async fn exchange_code(&self, code: &str, pkce: Option<&Pkce>, port: u16) -> Result<TokenSet> {
-        let http = Http::shared()?;
+        let http = ImpersonatingHttp::new()?;
         let redirect_uri = format!(
             "http://127.0.0.1:{port}{}",
             mistral_vibe::LOOPBACK_CALLBACK_PATH
@@ -178,7 +178,7 @@ impl OAuthPlatform for MistralVibe {
     }
 
     async fn refresh(&self, refresh_token: &str) -> Result<TokenSet> {
-        let http = Http::shared()?;
+        let http = ImpersonatingHttp::new()?;
         let pairs: Vec<(&str, &str)> = vec![
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
@@ -203,7 +203,7 @@ impl OAuthPlatform for MistralVibe {
     }
 
     async fn account_identity(&self, tokens: &TokenSet) -> Result<AccountIdentity> {
-        let http = Http::shared()?;
+        let http = ImpersonatingHttp::new()?;
         let reply = http
             .get(
                 mistral_vibe::USERINFO,

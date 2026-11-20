@@ -100,7 +100,7 @@ route override carries one.
 | `github-copilot` | GitHub Copilot | `copilot` | `https://api.githubcopilot.com` | `oauth` (github-copilot) | chat, responses, messages, embeddings, models, tool-calling, reasoning, vision |
 | `grok-cli` ⚠ | Grok Build | `open-ai` | `https://cli-chat-proxy.grok.com/v1` | `oauth` (grok-cli) | chat, models, tool-calling |
 | `kilocode` ⚠ | Kilo Code | `open-ai` | `https://api.kilo.ai/api/openrouter` | `oauth` (kilocode) | chat, models, tool-calling |
-| `openai-codex` ⚠ | OpenAI Codex (ChatGPT subscription) | `codex` | `https://chatgpt.com/backend-api/codex` | `oauth` (openai-codex) | responses, tool-calling, reasoning, vision |
+| `openai-codex` ⚠ | OpenAI Codex (ChatGPT subscription) | `codex` | `https://chatgpt.com/backend-api/codex` | `oauth` (openai-codex) | chat, responses, tool-calling, reasoning, vision |
 | `openference` ⚠ | Openference | `open-ai` | `https://api.openference.com/v1` | `oauth` (openference) | chat, models, tool-calling |
 | `qoder` ⚠ | Qoder | `open-ai` | `https://api.qoder.com/v1` | `oauth` (qoder) | chat, models, tool-calling |
 | `trae` ⚠ | Trae | `open-ai` | `https://core-normal.trae.ai/api/remote/v1` | `oauth` (trae) | chat, models, tool-calling |
