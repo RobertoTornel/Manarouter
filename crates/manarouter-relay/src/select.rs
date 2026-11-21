@@ -434,6 +434,25 @@ pub fn step_has_usable_account(
     now_ms: u64,
     step: &StepPlan,
 ) -> bool {
+    step_has_usable_account_if(provider, health, now_ms, step, |_| true)
+}
+
+/// Like [`step_has_usable_account`], but every candidate account must also pass `spend_ok` — the
+/// caller's view of the declared-quota ledger.
+///
+/// The relay's attempt path filters ledger-spent accounts out of the candidate list before it
+/// dials anything, so a step whose every account is ledger-spent is **not** actually usable even
+/// though no cooldown says so. Ordering, sticky preference and the sibling-account probe that read
+/// only the cooldown map disagree with what an attempt will accept: they order and pin a step whose
+/// every candidate is spent, and the request pays a failed attempt before falling through. Passing
+/// the ledger's verdict as `spend_ok` makes the predicates agree with what an attempt will accept.
+pub fn step_has_usable_account_if(
+    provider: &ProviderPlan,
+    health: &HashMap<String, Cooldown>,
+    now_ms: u64,
+    step: &StepPlan,
+    spend_ok: impl Fn(&AccountPlan) -> bool,
+) -> bool {
     provider.accounts.iter().any(|a| {
         step_allows_account(step, a)
             && account_allows_model(a, &step.model)
@@ -444,6 +463,7 @@ pub fn step_has_usable_account(
                 health,
                 now_ms,
             )
+            && spend_ok(a)
     })
 }
 

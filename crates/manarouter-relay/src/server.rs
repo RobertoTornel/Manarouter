@@ -2392,15 +2392,7 @@ async fn dispatch_routed(
                 sticky_index = app.sticky_success.preferred_index(
                     &combo.id,
                     &combo.steps,
-                    |step| {
-                        table
-                            .snapshot
-                            .providers()
-                            .get(step.provider_index as usize)
-                            .is_some_and(|provider| {
-                                select::step_has_usable_account(provider, &health, now_ms, step)
-                            })
-                    },
+                    |step| step_can_serve(&app, &table, step, now_ms),
                     std::time::Instant::now(),
                 );
             }
@@ -2584,23 +2576,13 @@ async fn dispatch_routed(
             continue;
         }
         // Whether any *later* combo step can serve this request right now, judged against the
-        // same health view the attempts use. When true, a rate-limited or parked step must not
-        // end the request or hold it: the loop continues to the step that can answer.
-        let later_available = {
-            let health = app.health.view();
-            steps
-                .iter()
-                .skip(step_index + 1)
-                .any(|next| {
-                    table
-                        .snapshot
-                        .providers()
-                        .get(next.provider_index as usize)
-                        .is_some_and(|provider| {
-                            select::step_has_usable_account(provider, &health, now_ms, next)
-                        })
-                })
-        };
+        // same view the attempts use — cooldowns and the declared-quota ledger. When true, a
+        // rate-limited or parked step must not end the request or hold it: the loop continues to
+        // the step that can answer.
+        let later_available = steps
+            .iter()
+            .skip(step_index + 1)
+            .any(|next| step_can_serve(&app, &table, next, now_ms));
         let is_sticky = sticky_step_is(combo, sticky_index, step);
         if activity.is_some() {
             attempted = Some(participant_id(step));
@@ -5175,10 +5157,18 @@ fn last_resort_step<'a>(
                 .snapshot
                 .providers()
                 .get(step.provider_index as usize)?;
+            // The ledger counts too: an account whose declared windows are full has no reset the
+            // cooldown map knows about, and waking it as a last resort would make the sweep the
+            // request that is refused again. Its own declared windows say when it frees.
             let soonest = provider
                 .accounts
                 .iter()
                 .filter(|account| select::account_allows_model(account, &step.model))
+                .filter(|account| {
+                    select::step_allows_account(step, account)
+                        && crate::account_spend::exhaustion_for(&app.quota_store, account, now_ms)
+                            .is_none()
+                })
                 .map(|account| {
                     select::route_reset_instant(
                         provider.id.as_str(),
@@ -6927,12 +6917,26 @@ fn step_has_a_live_account(
     step: &StepPlan,
     now_ms: u64,
 ) -> bool {
+    step_can_serve(app, table, step, now_ms)
+}
+
+/// Whether a step can accept a request right now, by every test an attempt would apply.
+///
+/// This is the predicate the ordering, sticky-preference, sibling-probe and failover decisions all
+/// read, and it deliberately matches what [`attempt_step`] accepts: the provider exists and
+/// declares the step's needs-attempt qualities, some account passes the step's selection, allows
+/// the model, is not cooled down, **and** is not full per the declared-quota ledger. The cooldown
+/// map alone said "available" for steps whose every account was spent in the ledger, so the
+/// ordering pinned them first and the request paid a failed attempt before falling through — the
+/// disagreement between "available" here and "usable" in an attempt is what this closes.
+fn step_can_serve(app: &AppState, table: &RouteTable, step: &StepPlan, now_ms: u64) -> bool {
     let health = app.health.view();
-    table
-        .snapshot
-        .providers()
-        .get(step.provider_index as usize)
-        .is_some_and(|provider| select::step_has_usable_account(provider, &health, now_ms, step))
+    let Some(provider) = table.snapshot.providers().get(step.provider_index as usize) else {
+        return false;
+    };
+    select::step_has_usable_account_if(provider, &health, now_ms, step, |account| {
+        crate::account_spend::exhaustion_for(&app.quota_store, account, now_ms).is_none()
+    })
 }
 
 fn build_response(
