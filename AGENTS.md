@@ -41,8 +41,8 @@ Useful CLI commands (use `mr <command> --help` for exact options):
 
 `mr serve` now runs both processes together for a foreground session, and is the quickest way to
 start everything; the README still documents the two-process launch and the systemd units, which are
-the supported way to run it unattended. `mr config` (show/validate/edit) and `mr vault` (inspect/rekey)
-are implemented, as is `mr doctor` for installation checks. Likewise,
+the supported way to run it unattended. `mr config` (show/validate/edit) is implemented, as is
+`mr doctor` for installation checks; `mr vault` is planned but not implemented yet. Likewise,
 consult `docs/23-implementation-status.md` before claiming a feature is implemented; command names may
 exist before all behavior does.
 
@@ -68,6 +68,22 @@ URL); check provider and API documentation for request details. `GET /v1/models`
 check. If the response is 401, check that the *client* key was created and is being sent. If it is a
 404, verify the path/base URL and model or route name. For upstream errors, inspect the provider,
 account, model, and upstream credential without asking the user to reveal the credential.
+
+## What the relay adapts automatically
+
+- **Role compatibility.** The OpenAI surface accepts both `system` and the newer `developer`
+  role. On the way to an OpenAI-wire upstream that predates `developer` (for example Mistral's
+  platform), `developer` messages are rewritten to `system`; a real OpenAI upstream is passed
+  through untouched. Clients using either spelling work against any provider.
+- **Rate limits and failover.** A rate-limited account is retried silently (honoring
+  `Retry-After`, bounded by the `rateLimitRetry` settings) while sibling accounts and later
+  combo steps are used; a combo step is only allowed to fail the request when no later step can
+  serve it. Reset windows stated by the provider (including nested ones, in seconds or
+  milliseconds) decide when an exhausted account returns to rotation.
+- **Debugging.** The panel's Diagnostics tab has `Log all messages for debugging`
+  (`debugLogMessages`, default off): when enabled, every admitted request payload is written to
+  the relay journal with a timestamp, truncated to 4 KiB. Request bodies may contain private
+  user content — enable only while debugging.
 
 ## Secrets, safety, and consent
 

@@ -357,7 +357,11 @@ export async function renderSettings(mount, ctx) {
     }
 
     const debugLog = toggle('Log all messages for debugging (debugLogMessages)', {
-      checked: config.debug_log_messages === true,
+      // The API serializes the camelCase serde name (`debugLogMessages`); the snake_case
+      // spelling is only an input alias, so reading it here always read `undefined` and the
+      // toggle rendered off even when debug logging was on — and the save path below then
+      // wrote that stale state back, silently disabling an enabled debug log.
+      checked: config.debugLogMessages === true,
       help: 'Off by default: when enabled, every admitted request payload is written to the relay journal with a timestamp, truncated to 4 KiB. Request bodies may contain private user content — enable only while debugging.',
     });
     const rlr = config.rateLimitRetry && typeof config.rateLimitRetry === 'object' && !Array.isArray(config.rateLimitRetry)
@@ -383,7 +387,7 @@ export async function renderSettings(mount, ctx) {
         const latest = await readConfig();
         const latestRlr = latest.rateLimitRetry && typeof latest.rateLimitRetry === 'object' && !Array.isArray(latest.rateLimitRetry)
           ? latest.rateLimitRetry : {};
-        latest.debug_log_messages = debugLog.input.checked;
+        latest.debugLogMessages = debugLog.input.checked;
         latest.rateLimitRetry = { ...latestRlr, max_total_hold_ms: holdValue };
         await api.putRaw('/api/config/raw', JSON.stringify(latest, null, 2));
         status.replaceChildren(chip('Saved', 'ok'));

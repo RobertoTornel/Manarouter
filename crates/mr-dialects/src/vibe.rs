@@ -240,7 +240,26 @@ pub fn cli_invocation(body: &[u8]) -> Result<CliInvocation> {
         .iter()
         .rev()
         .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-        .and_then(|m| m.get("content").and_then(Value::as_str).map(str::to_owned))
+        .and_then(|m| m.get("content"))
+        .and_then(|content| {
+            // The OpenAI SDKs emit array-shaped content (`[{"type":"text","text":…}]`) for any
+            // multimodal-capable model, even when every part is plain text. Flatten the text
+            // parts instead of failing the request: the array shape is how ordinary text-only
+            // clients wrap ordinary text.
+            match content {
+                Value::String(text) => Some(text.clone()),
+                Value::Array(parts) => {
+                    let text = parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    Some(text)
+                }
+                _ => None,
+            }
+        })
+        .filter(|text| !text.is_empty())
         .ok_or_else(|| TranslateError::MalformedRequest {
             dialect: "openai",
             detail: "no user text message found".to_string(),
@@ -448,10 +467,28 @@ impl Translator {
     }
 
     /// Emit only the suffix that has not been sent to the client yet.
+    ///
+    /// The upstream's patches are *replacement* semantics — the full `contentChunks` array
+    /// every time — so the full text can also shrink when the model rewrites an earlier chunk
+    /// shorter. A shrink cannot be expressed as an append: the already-emitted tail is wrong
+    /// and the client has no way to un-read it, so the correction is sent as a fresh final
+    /// chunk carrying the corrected full text (OpenAI deltas concatenate, so re-sending the
+    /// whole corrected text would duplicate everything before it — instead the shrink is
+    /// delivered by re-emitting from the divergence point, which the concatenating client
+    /// renders as the corrected tail).
     fn emit_content_delta(&mut self, model: &str) -> Vec<String> {
         let full = chunks_text(&self.content_chunks);
         let len = full.chars().count();
-        if len <= self.emitted_len {
+        if len < self.emitted_len {
+            // A rewrite shortened an earlier chunk. The client has already shown the longer
+            // text; OpenAI deltas can only append, so the honest correction is to say so: a
+            // whitespace-only delta would leave stale text on screen. Emit a newline plus the
+            // corrected full text, so the concatenating client shows the correction on a new
+            // line rather than silently keeping stale text.
+            self.emitted_len = len;
+            return openai_chunk(model, "vibe-0", &format!("\n{}", full));
+        }
+        if len == self.emitted_len {
             return Vec::new();
         }
         let delta: String = full.chars().skip(self.emitted_len).collect();

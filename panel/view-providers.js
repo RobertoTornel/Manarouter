@@ -374,13 +374,13 @@ const PROVIDER_PRESETS = {
   // visually separated from the standard APIs above.
   platforms: [
     { name: 'NVIDIA NIM', dialect: 'open-ai', baseUrl: 'https://integrate.api.nvidia.com/v1', auth: 'bearer', capabilities: ['chat', 'embeddings', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'NVIDIA NIM inference endpoints. Add your NVIDIA API key as an account secret after saving.' },
-    { name: 'Codex', dialect: 'codex', baseUrl: 'https://chatgpt.com/backend-api/codex', auth: 'oauth', platform: 'openai-codex', capabilities: ['responses', 'tool-calling', 'reasoning', 'vision'], hint: 'OpenAI Codex — OAuth sign-in from the panel.' },
+    { name: 'Codex', dialect: 'codex', baseUrl: 'https://chatgpt.com/backend-api/codex', auth: 'oauth', platform: 'openai-codex', capabilities: ['chat', 'responses', 'tool-calling', 'reasoning', 'vision'], hint: 'OpenAI Codex — OAuth sign-in from the panel.' },
     { name: 'Copilot', dialect: 'copilot', baseUrl: 'https://api.githubcopilot.com', auth: 'oauth', platform: 'github-copilot', capabilities: ['chat', 'responses', 'messages', 'embeddings', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'GitHub Copilot — OAuth sign-in from the panel.' },
-    { name: 'Antigravity', dialect: 'antigravity', baseUrl: 'https://cloudcode-pa.googleapis.com', auth: 'oauth', platform: 'antigravity', capabilities: ['chat', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'Google Antigravity / Cloud Code — OAuth sign-in from the panel.' },
+    { name: 'Antigravity', dialect: 'antigravity', baseUrl: 'https://daily-cloudcode-pa.googleapis.com', auth: 'oauth', platform: 'antigravity', capabilities: ['chat', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'Google Antigravity / Cloud Code — OAuth sign-in from the panel.' },
     { name: 'Cursor', dialect: 'cursor', baseUrl: 'https://api2.cursor.sh', auth: 'oauth', platform: 'cursor', capabilities: ['chat'], hint: 'Cursor — OAuth sign-in from the panel. The sign-in finishes in Cursor’s own tab and the panel learns of it by polling, so nothing is ever pasted back here.' },
     { name: 'Z Code', dialect: 'zcode', baseUrl: 'https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1', auth: 'oauth', platform: 'zcode', capabilities: ['messages', 'tool-calling', 'reasoning'], hint: 'Z.ai coding plan — sign in with the ZCode desktop app’s own login flow; the link opens at zcode.z.ai and the panel waits for the browser.' },
     { name: 'Claude Code', dialect: 'claude-cli', baseUrl: 'https://api.anthropic.com/v1', auth: 'oauth', platform: 'claude', capabilities: ['messages', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'Claude Code with a Claude subscription (Pro/Max) — sign-in happens on claude.ai and Anthropic shows a one-time code; the panel asks you to paste it. Do not add an API key: the subscription token is the credential, and an sk-ant-api… key is refused on this surface.' },
-    { name: 'Mistral Vibe', dialect: 'mistral-vibe', baseUrl: 'https://api.mistral.ai/v1', auth: 'oauth', platform: 'mistral-vibe', capabilities: ['chat', 'responses', 'models', 'tool-calling', 'reasoning'], hint: 'Mistral Vibe — OAuth sign-in from the panel (loopback PKCE at auth.mistral.ai). No API key: the Vibe bearer is the credential.' },
+    { name: 'Mistral Vibe', dialect: 'mistral-vibe', baseUrl: 'https://chat.mistral.ai', auth: 'oauth', platform: 'mistral-vibe', capabilities: ['chat', 'models', 'reasoning'], hint: 'Mistral Vibe — OAuth sign-in from the panel (loopback PKCE at auth.mistral.ai). No API key: the Vibe bearer is the credential.' },
     { name: 'Command Code', dialect: 'command-code-go', baseUrl: 'https://api.commandcode.ai', auth: 'bearer', capabilities: ['chat', 'models', 'tool-calling', 'reasoning'], hint: 'Command Code — bearer auth.' },
     { name: 'Modal vLLM', dialect: 'modal-vllm', baseUrl: '', auth: 'modal', hint: 'Enter your Modal app’s HTTPS public URL (for example https://your-app--serve.modal.run). Add the Modal Token ID.Token Secret as the account secret after saving; the panel sends it as Modal-Key and Modal-Secret headers.' },
     { name: 'OpenCode Zen', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/v1', auth: 'bearer', capabilities: ['chat', 'responses', 'models', 'tool-calling', 'reasoning'], hint: 'OpenCode Console, pay-as-you-go. Needs a funded key: the free models are refused outside the OpenCode client, so they cannot be routed from here.' },
@@ -393,12 +393,12 @@ const DIALECT_BASE_URLS = {
   'google-ai-studio': 'https://generativelanguage.googleapis.com/v1beta',
   google: 'https://generativelanguage.googleapis.com/v1beta',
   codex: 'https://chatgpt.com/backend-api/codex',
-  antigravity: 'https://cloudcode-pa.googleapis.com',
+  antigravity: 'https://daily-cloudcode-pa.googleapis.com',
   'command-code-go': 'https://api.commandcode.ai',
   copilot: 'https://api.githubcopilot.com',
   cursor: 'https://api2.cursor.sh',
   'claude-cli': 'https://api.anthropic.com/v1',
-  'mistral-vibe': 'https://api.mistral.ai/v1',
+  'mistral-vibe': 'https://chat.mistral.ai',
 };
 // The dialects that have no API-key path: their request builders expect the header an OAuth
 // login produces, and the Cursor transport refuses a turn before opening a socket when no such

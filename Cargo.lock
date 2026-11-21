@@ -1967,7 +1967,6 @@ name = "mr-core"
 version = "0.2.4"
 dependencies = [
  "aes-gcm",
- "anyhow",
  "arc-swap",
  "argon2",
  "async-trait",
@@ -1980,7 +1979,6 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "indexmap",
- "memchr",
  "password-hash",
  "rand 0.8.8",
  "rquest",
@@ -1992,8 +1990,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "smallvec",
- "socket2 0.6.5",
  "tempfile",
  "thiserror 2.0.21",
  "time",
@@ -2009,19 +2005,14 @@ dependencies = [
 name = "mr-dialects"
 version = "0.2.4"
 dependencies = [
- "async-trait",
  "bytes",
  "flate2",
- "futures-util",
- "http",
  "memchr",
  "mr-core",
  "serde",
  "serde_json",
  "sha2",
- "smallvec",
  "thiserror 2.0.21",
- "tracing",
 ]
 
 [[package]]

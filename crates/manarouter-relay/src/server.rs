@@ -56,7 +56,6 @@ use crate::model_scan::{multipart_boundary, scan_multipart_model, scan_request_h
 use crate::proxy::{self, ProxyEndpoint};
 use crate::recovery::RerunFactory;
 use crate::select::{self, Health};
-use crate::activity::Outcome;
 use crate::state::{AuthOutcome, ProxyLease, RelayState, RouteTable};
 use crate::upstream::{UpstreamError, UpstreamRequest};
 
@@ -1779,6 +1778,7 @@ fn apply_reasoning_level(
         .map_err(|_| "the rewritten request body could not be encoded".to_string())
 }
 
+
 /// The output cap a request states, in whichever spelling and nesting its dialect uses.
 ///
 /// Only the two placements a real body uses are read: the top level (`max_tokens` for the Anthropic
@@ -1872,6 +1872,50 @@ fn with_stream_usage(body: Bytes) -> Bytes {
     match serde_json::to_vec(&value) {
         Ok(encoded) => Bytes::from(encoded),
         Err(_) => body,
+    }
+}
+
+/// OpenAI's `developer` role, written as `system` for wire-compatible upstreams that predate
+/// the rename.
+///
+/// The relay's OpenAI surface accepts the `developer` role — the newer OpenAI name for the same
+/// kind of message — and a passthrough body forwards the name verbatim. OpenAI-wire servers
+/// that predate the rename (Mistral's platform among them) answer
+/// `422: Input tag 'developer' found using 'role' does not match any of the expected tags` and
+/// never see the request at all, so the alias is rewritten before the body leaves. The two
+/// names name the same kind of message — instructions that are not part of the conversation —
+/// so the rewrite is meaning-preserving. A real OpenAI upstream (`api.openai.com`) understands
+/// the newer name and is left untouched.
+///
+/// Returns whether anything changed: `outgoing` is rewritten only when a role actually
+/// changed, so a body without the alias is passed through without a re-encode.
+fn normalize_developer_role(outgoing: &mut Vec<u8>) -> bool {
+    let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(outgoing) else {
+        return false;
+    };
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return false;
+    };
+    let mut changed = false;
+    for message in messages {
+        let is_developer =
+            message.get("role").and_then(serde_json::Value::as_str) == Some("developer");
+        if is_developer {
+            if let Some(message) = message.as_object_mut() {
+                message.insert("role".into(), serde_json::Value::String("system".into()));
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return false;
+    }
+    match serde_json::to_vec(&body) {
+        Ok(encoded) => {
+            *outgoing = encoded;
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -2628,15 +2672,56 @@ async fn dispatch_routed(
             // budget would defeat silent handling.
             let mut wait_horizon_ms = rate_limit_retry.max_wait_ms;
             'patience: loop {
+                // Only a refusal the hold could absorb sits here: a success — or any other
+                // state — leaves immediately, so the failover log below never fires for a
+                // request that was answered.
+                let absorbable = matches!(
+                    &attempt,
+                    Attempt::Failed { .. }
+                        | Attempt::Skip {
+                            cause: SkipCause::NoUsableAccount,
+                            ..
+                        }
+                );
+                if !absorbable {
+                    break 'patience;
+                }
                 // A later combo step can serve this request right now: do not park it on this
-                // provider's throttle. Break out so the outer loop fails over to the available
-                // step; the throttled step will be retried by later requests once it recovers.
+                // provider's refusal. Break out so the outer loop fails over to the available
+                // step; this step will be retried by later requests once it recovers. The
+                // reason is named honestly — a rate limit reads differently from a request
+                // the upstream refused to parse.
                 if later_available {
-                    tracing::info!(
-                        provider = %step.provider_id,
-                        model = %step.model,
-                        "a later combo step can serve; failing over past the rate limit"
-                    );
+                    match &attempt {
+                        Attempt::Failed {
+                            resource_exhausted: true,
+                            ..
+                        } => {
+                            tracing::info!(
+                                provider = %step.provider_id,
+                                model = %step.model,
+                                "resource-exhausted refusal; failing over to a later combo step"
+                            );
+                        }
+                        Attempt::Failed {
+                            response: Some(resp),
+                            ..
+                        } => {
+                            tracing::info!(
+                                provider = %step.provider_id,
+                                model = %step.model,
+                                upstream_status = %resp.status(),
+                                "a later combo step can serve this refusal; failing over to it"
+                            );
+                        }
+                        _ => {
+                            tracing::info!(
+                                provider = %step.provider_id,
+                                model = %step.model,
+                                "every account of this step is cooling down; failing over to a later combo step"
+                            );
+                        }
+                    }
                     break 'patience;
                 }
                 if total_hold_started.elapsed().as_millis() as u64
@@ -3854,6 +3939,27 @@ async fn attempt_step(
     // already streaming is touched.
     if inspect_json && matches!(step.dialect, Dialect::OpenAi | Dialect::Copilot) {
         outgoing = with_stream_usage(outgoing);
+    }
+    // OpenAI's `developer` role, written as `system` for wire-compatible upstreams that predate
+    // the rename (Mistral's platform answers `422: Input tag 'developer' … does not match any of
+    // the expected tags` and never sees the request at all). Only a passthrough body is touched —
+    // a translated body's dialect already mapped the role on the way in — and only a real OpenAI
+    // upstream is spared, because there the role is meaningful and accepted as sent. The rewrite
+    // happens only when a role actually changes, so a body without the alias is passed through
+    // without a re-encode.
+    if inspect_json
+        && !translated_body
+        && !provider.base_url.as_str().contains("api.openai.com")
+    {
+        let mut normalized = (*outgoing).to_vec();
+        if normalize_developer_role(&mut normalized) {
+            outgoing = normalized.into();
+            tracing::debug!(
+                provider = %step.provider_id,
+                model = %step.model,
+                "the developer role was normalized to system for this upstream"
+            );
+        }
     }
     if step.dialect == Dialect::Antigravity && inspect_json {
         match inject_antigravity_project(&outgoing, oauth_tokens.as_ref()) {
@@ -6459,10 +6565,14 @@ fn upstream_headers(
     // shape). The bearer is `apply_auth`'s business and already attached.
     if step.dialect == Dialect::MistralVibe {
         map.insert("accept", HeaderValue::from_static("*/*"));
-        map.entry("user-agent").or_insert_with(|| {
+        // Forced rather than defaulted: the gateway recognizes the desktop app's fingerprint,
+        // and a client's own User-Agent (curl, an SDK default) would undercut it. Every client
+        // presents as the same app, which is the point of the dialect.
+        map.insert(
+            "user-agent",
             HeaderValue::from_str(mr_dialects::vibe::VIBE_USER_AGENT)
-                .unwrap_or_else(|_| HeaderValue::from_static("vibe-desktop/1.2.0"))
-        });
+                .unwrap_or_else(|_| HeaderValue::from_static("vibe-desktop/1.2.0")),
+        );
     }
 
     map
@@ -7505,6 +7615,9 @@ pub(crate) fn authorize_batch_request(app: &AppState, headers: &HeaderMap) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The activity tests name `Outcome` directly; the module-level import stays
+    // file-scoped so the production code does not carry an import only tests use.
+    use crate::activity::Outcome;
 
     #[test]
     fn streamed_requests_request_usage_and_leave_everything_else_alone() {
@@ -14146,6 +14259,152 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(doc["usage"]["total_tokens"], 4);
     }
 
+    /// OpenAI's `developer` role reaches a pre-rename upstream as `system`.
+    ///
+    /// Mistral's platform rejects the newer name outright, so the passthrough rewrites the
+    /// alias in every message while leaving everything else — a real `system` message, the
+    /// field order, provider-specific fields — untouched.
+    #[tokio::test]
+    async fn a_developer_role_reaches_a_prerename_upstream_as_system() {
+        let (url, seen) = counting_upstream(
+            StatusCode::OK,
+            r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+        )
+        .await;
+        let mut provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+        provider.dialect = Dialect::MistralVibeApi;
+        provider.capabilities = vec![Capability::Chat, Capability::Models];
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let request_body = r#"{"model":"p/m","messages":[{"role":"developer","content":"You are terse."},{"role":"user","content":"hello"}]}"#;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(request_body.to_owned()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let records = seen.lock().unwrap();
+        assert_eq!(records.len(), 1, "exactly one upstream call");
+        let sent: serde_json::Value = serde_json::from_str(&records[0].1).unwrap();
+        assert_eq!(sent["messages"][0]["role"], "system", "developer became system");
+        assert_eq!(sent["messages"][0]["content"], "You are terse.");
+        assert_eq!(sent["messages"][1]["role"], "user", "the user message is untouched");
+    }
+
+    /// A body without a `developer` message is not re-encoded at all: the passthrough stays
+    /// byte-for-byte, so provider-specific fields a re-encode would drop survive.
+    #[tokio::test]
+    async fn a_body_without_a_developer_role_is_not_reencoded() {
+        let (url, seen) = counting_upstream(
+            StatusCode::OK,
+            r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+        )
+        .await;
+        let mut provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+        provider.dialect = Dialect::MistralVibeApi;
+        provider.capabilities = vec![Capability::Chat, Capability::Models];
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        // `mistral_property` names a field no re-encode would invent; its presence in the
+        // upstream body proves the passthrough did not re-encode.
+        let request_body = r#"{"model":"p/m","messages":[{"role":"user","content":"hello"}],"mistral_property":true}"#;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(request_body.to_owned()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let records = seen.lock().unwrap();
+        assert_eq!(records.len(), 1, "exactly one upstream call");
+        let sent: serde_json::Value = serde_json::from_str(&records[0].1).unwrap();
+        assert_eq!(
+            sent["mistral_property"],
+            serde_json::Value::Bool(true),
+            "a provider-specific field survives the passthrough untouched"
+        );
+    }
+
+    /// A body without a `developer` message is not re-encoded at all: the passthrough stays
+    /// byte-for-byte, so provider-specific fields a re-encode would drop survive.
+    /// OpenAI's `developer` role reaches a pre-rename upstream as `system`.
+    ///
+    /// Mistral's platform rejects the newer name outright, so the passthrough rewrites the
+    /// alias in every message while leaving everything else — a real `system` message, the
+    /// field order, provider-specific fields — untouched.
+    /// OpenAI's `developer` role reaches a pre-rename upstream as `system`.
+    ///
+    /// Mistral's platform rejects the newer name outright (`422: Input tag 'developer' …`),
+    /// so the passthrough rewrites the alias in every message. Everything else in the body —
+    /// including a real `system` message and the field order — is untouched, and without a
+    /// `developer` message the body is byte-for-byte.
+    /// A body without a `developer` message is not re-encoded at all: the passthrough stays
+    /// byte-for-byte, so provider-specific fields a re-encode would drop survive.
     /// An Anthropic step's count goes to the upstream's own count-tokens endpoint.
     ///
     /// The path comes from the dialect, because the route is the one that names it: a count asked

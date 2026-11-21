@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 use super::flow::{self, ImpersonatingHttp, OAuthHttp};
-use super::refresh::{oauth_failure, FailureClass};
+use super::refresh::oauth_failure;
 use super::{
     expires_at_from_secs, header, oauth_error, AccountIdentity, OAuthPlatform, Pkce, RedirectPorts,
     TokenSet,
@@ -167,12 +167,12 @@ impl OAuthPlatform for MistralVibe {
             .post_form(mistral_vibe::TOKEN, &[], &pairs)
             .await
             .map_err(|e| oauth_error(format!("Mistral Vibe token request failed: {e}")))?;
-        if reply.status != 200 {
-            return Err(oauth_failure(
-                super::refresh::FailureClass::Transient,
-                "Mistral Vibe token",
-                format!("HTTP {}: {}", reply.status, reply.body),
-            ));
+        // Classified through the shared token-endpoint filter, exactly as every other platform
+        // does: a revoked or expired grant is permanent (the panel says "log in again"), and a
+        // transport hiccup stays transient. Hardcoding `Transient` here used to make a dead
+        // login retry forever without ever surfacing "log in again".
+        if let Some(failure) = super::refresh::endpoint_failure(reply.status, &reply.body) {
+            return Err(oauth_failure(failure.0, "mistral-vibe", failure.1));
         }
         token_set_from(&reply.body, None)
     }
@@ -188,12 +188,8 @@ impl OAuthPlatform for MistralVibe {
             .post_form(mistral_vibe::TOKEN, &[], &pairs)
             .await
             .map_err(|e| oauth_error(format!("Mistral Vibe refresh request failed: {e}")))?;
-        if reply.status != 200 {
-            return Err(oauth_failure(
-                super::refresh::FailureClass::Transient,
-                "Mistral Vibe refresh",
-                format!("HTTP {}: {}", reply.status, reply.body),
-            ));
+        if let Some(failure) = super::refresh::endpoint_failure(reply.status, &reply.body) {
+            return Err(oauth_failure(failure.0, "mistral-vibe", failure.1));
         }
         token_set_from(&reply.body, Some(refresh_token))
     }
@@ -211,12 +207,8 @@ impl OAuthPlatform for MistralVibe {
             )
             .await
             .map_err(|e| oauth_error(format!("Mistral Vibe userinfo request failed: {e}")))?;
-        if reply.status != 200 {
-            return Err(oauth_failure(
-                FailureClass::Transient,
-                "Mistral Vibe userinfo",
-                format!("HTTP {}: {}", reply.status, reply.body),
-            ));
+        if let Some(failure) = super::refresh::endpoint_failure(reply.status, &reply.body) {
+            return Err(oauth_failure(failure.0, "mistral-vibe", failure.1));
         }
         let value: Value = serde_json::from_str(&reply.body)
             .map_err(|e| oauth_error(format!("Mistral Vibe userinfo is not JSON: {e}")))?;
@@ -274,8 +266,16 @@ impl OAuthPlatform for MistralVibe {
             "email": previous.extra.get("email").cloned().unwrap_or(Value::Null),
         });
         tokens.extra.insert("account".into(), prev);
-        // A fresh id token was minted by the refresh grant; the previous one is dead the moment
-        // it expires, so carry no stale copy forward. TokenSet carries its own extra already.
+        // A refresh grant usually mints a fresh id token, but Ory is not obliged to: when the
+        // response omits one, the previous id token is carried forward rather than lost. It
+        // outlives the opaque access token, and the LeChat gateway rejects the opaque token —
+        // falling back to it (as `apply_credential` would) would 401 every request after the
+        // first refresh with a freshly-minted, technically-valid token.
+        if !tokens.extra.contains_key("id_token") {
+            if let Some(previous_id) = previous.extra.get("id_token") {
+                tokens.extra.insert("id_token".into(), previous_id.clone());
+            }
+        }
         Ok(tokens)
     }
 }

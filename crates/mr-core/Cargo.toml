@@ -18,13 +18,11 @@ rquest = { path = "../vendor/rquest-5.2.0", features = ["stream"] }
 rquest-util = { path = "../vendor/rquest-util-2.2.1", default-features = false, features = ["emulation"] }
 toml = { workspace = true }
 bytes = { workspace = true }
-smallvec = { workspace = true }
 arc-swap = { workspace = true }
 indexmap = { workspace = true }
 uuid = { workspace = true }
 time = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 rusqlite = { workspace = true }
 tempfile = { workspace = true }
 sha2 = { workspace = true }
@@ -39,9 +37,7 @@ scrypt = { workspace = true }
 argon2 = { workspace = true }
 password-hash = { workspace = true }
 tracing = { workspace = true }
-memchr = { workspace = true }
 http = { workspace = true }
-socket2 = { workspace = true }
 httpdate = { workspace = true }
 # OAuth (crates/mr-core/src/oauth) and quota probing (crates/mr-core/src/quota/http.rs) are the
 # only parts of this crate that reach the network: the authorization-code exchange, refresh,
@@ -58,4 +54,3 @@ webpki-roots = { workspace = true }
 http-body-util = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }

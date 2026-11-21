@@ -13,13 +13,8 @@ mr-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
-smallvec = { workspace = true }
 thiserror = { workspace = true }
 memchr = { workspace = true }
-http = { workspace = true }
-futures-util = { workspace = true }
-async-trait = { workspace = true }
-tracing = { workspace = true }
 # Cursor's prompt digest is a sha256; the codec computes it, not mr-core.
 sha2 = { workspace = true }
 flate2 = { workspace = true }
