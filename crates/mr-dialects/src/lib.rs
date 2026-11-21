@@ -31,6 +31,7 @@
 
 use bytes::Bytes;
 use mr_core::{Dialect, RouteKind};
+use serde_json::Value;
 
 pub mod anthropic;
 pub mod claudecli;
@@ -332,6 +333,13 @@ pub fn translate_response_body(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<By
             responses::to_pivot_response(ctx, body)
         }
         (Dialect::OpenAi, Dialect::MistralVibe) => vibe::to_pivot_response(ctx, body),
+        // The OpenAI-wire passthroughs: Mistral's platform answers `content` as an array of
+        // typed parts, which a string-reading client sees as no text at all. Array content is
+        // nonstandard on every OpenAI-wire upstream, so normalizing it is meaning-preserving.
+        (Dialect::OpenAi, Dialect::OpenAi)
+        | (Dialect::OpenAi, Dialect::MistralVibeApi) => {
+            Ok(normalize_openai_content(body).unwrap_or_else(|| Bytes::copy_from_slice(body)))
+        }
         _ if ctx.is_passthrough() => Ok(Bytes::copy_from_slice(body)),
         (from, to) => Err(TranslateError::Unsupported {
             from: from.as_str(),
@@ -339,6 +347,72 @@ pub fn translate_response_body(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<By
             route: ctx.route.as_str(),
         }),
     }
+}
+
+
+/// Join the text parts of Mistral's array `content` and park the thinking parts.
+///
+/// Mistral's platform returns `message.content` and `delta.content` as an **array** of typed
+/// parts — `{"type":"text","text":…}` for text, `{"type":"thinking","thinking":[…]}` for
+/// reasoning. The OpenAI contract says `content` is a string, so a client reading it as one
+/// sees nothing at all: the request "answered with no text". The text parts are therefore
+/// joined into the string the OpenAI contract promises, and any thinking parts move to
+/// `reasoning_content` (the OpenRouter/DeepSeek spelling) so the reasoning survives instead of
+/// disappearing. Array content is nonstandard on every OpenAI-wire upstream — OpenAI itself
+/// never emits it on chat completions — so normalizing is meaning-preserving for all of them.
+///
+/// Returns the re-encoded body when anything changed, else `None`.
+pub fn normalize_openai_content(body: &[u8]) -> Option<Bytes> {
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let mut changed = false;
+    {
+        let choices = value.get_mut("choices")?.as_array_mut()?;
+        for choice in choices {
+            for target in ["message", "delta"] {
+                let Some(entry) = choice.get_mut(target).and_then(|v| v.as_object_mut()) else {
+                    continue;
+                };
+                let Some(parts) = entry.get("content").and_then(|c| c.as_array()) else {
+                    continue;
+                };
+                let mut text = String::new();
+                let mut reasoning = String::new();
+                for part in parts {
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(piece) = part.get("text").and_then(Value::as_str) {
+                                text.push_str(piece);
+                            }
+                        }
+                        Some("thinking") => {
+                            // {"type":"thinking","thinking":[{"type":"text","text":…}]}
+                            if let Some(pieces) = part.get("thinking").and_then(|t| t.as_array()) {
+                                for piece in pieces {
+                                    if let Some(piece) = piece.get("text").and_then(Value::as_str) {
+                                        reasoning.push_str(piece);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let content = serde_json::Value::String(text);
+                if entry.get("content") != Some(&content) {
+                    entry.insert("content".into(), content);
+                    changed = true;
+                }
+                if !reasoning.is_empty() && !entry.contains_key("reasoning_content") {
+                    entry.insert("reasoning_content".into(), Value::String(reasoning));
+                    changed = true;
+                }
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    serde_json::to_vec(&value).ok().map(Bytes::from)
 }
 
 /// Translate one upstream SSE frame into zero or more client-dialect frames.
@@ -388,6 +462,14 @@ pub fn translate_sse_data(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<Stri
         | (Dialect::Anthropic, Dialect::GoogleAiStudio) => google::sse_to_pivot(ctx, data),
         (Dialect::OpenAi, Dialect::Codex) | (Dialect::Anthropic, Dialect::Codex) => {
             responses::sse_to_pivot(ctx, data)
+        }
+        // The OpenAI-wire passthroughs: Mistral's platform streams `delta.content` as an array
+        // of typed parts, which a string-reading client sees as no text at all. Normalize each
+        // frame to the string shape; frames of any other shape ride through untouched.
+        (Dialect::OpenAi, Dialect::OpenAi) | (Dialect::OpenAi, Dialect::MistralVibeApi) => {
+            Ok(vec![normalize_openai_content(data.as_bytes())
+                .and_then(|normalized| String::from_utf8(normalized.to_vec()).ok())
+                .unwrap_or_else(|| data.to_owned())])
         }
         // Mistral Vibe's frames are length-prefixed JSONL and are driven through
         // `vibe::Translator` directly by the relay (see server.rs), not through this generic SSE
@@ -767,5 +849,33 @@ mod tests {
         .expect("an Anthropic client's ZCode stream is Anthropic SSE");
         assert_eq!(frames.len(), 1);
         assert!(frames[0].contains("content_block_delta"));
+    }
+
+    /// Mistral's array `content` reaches an OpenAI client as the string the contract promises.
+    ///
+    /// The thinking parts are preserved as `reasoning_content` (they are reasoning, not text),
+    /// the text parts are joined into `content`, and a body without `choices` rides through.
+    #[test]
+    fn a_mistral_content_array_becomes_the_contract_string() {
+        let body = r#"{"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":[{"type":"thinking","thinking":[{"type":"text","text":"thinking hard"}],"closed":true},{"type":"text","text":"4"}]}}]}"#;
+        let normalized = normalize_openai_content(body.as_bytes()).expect("array content normalized");
+        let value: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
+        let message = &value["choices"][0]["message"];
+        assert_eq!(message["content"], "4", "text parts joined into the contract string");
+        assert_eq!(
+            message["reasoning_content"], "thinking hard",
+            "thinking parts survive as reasoning_content"
+        );
+
+        // A delta-shaped body normalizes the same way.
+        let frame = r#"{"choices":[{"index":0,"delta":{"content":[{"type":"text","text":"4"}]}}]}"#;
+        let normalized = normalize_openai_content(frame.as_bytes()).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
+        assert_eq!(value["choices"][0]["delta"]["content"], "4");
+
+        // A body without `choices` rides through untouched.
+        assert_eq!(normalize_openai_content(br#"{"error":{"message":"no"}}"#), None);
+        // A string-content body needs no normalization.
+        assert_eq!(normalize_openai_content(br#"{"choices":[{"message":{"content":"4"}}]}"#), None);
     }
 }
