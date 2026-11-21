@@ -878,4 +878,26 @@ mod tests {
         // A string-content body needs no normalization.
         assert_eq!(normalize_openai_content(br#"{"choices":[{"message":{"content":"4"}}]}"#), None);
     }
+
+    /// The streaming passthrough arm normalizes Mistral's array deltas too: a string-reading
+    /// client must never see an array where the OpenAI contract promises a string.
+    #[test]
+    fn the_sse_passthrough_arm_normalizes_array_deltas() {
+        let ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::MistralVibeApi, "m");
+        let frame = r#"{"choices":[{"index":0,"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"We"}],"closed":true}]}}]}"#;
+        let out = translate_sse_data(&ctx, frame).unwrap();
+        assert_eq!(out.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(out[0].trim_start_matches("data: ")).unwrap();
+        let delta = &value["choices"][0]["delta"];
+        assert_eq!(delta["content"], "", "the thinking chunk contributes no client text");
+        assert_eq!(delta["reasoning_content"], "We", "the thinking survives as reasoning_content");
+
+        let text_frame = r#"{"choices":[{"index":0,"delta":{"content":[{"type":"text","text":"4"}]}}]}"#;
+        let out = translate_sse_data(&ctx, text_frame).unwrap();
+        let value: serde_json::Value = serde_json::from_str(out[0].trim_start_matches("data: ")).unwrap();
+        assert_eq!(value["choices"][0]["delta"]["content"], "4");
+
+        // Keep-alives and non-chunk payloads ride through untouched.
+        assert_eq!(translate_sse_data(&ctx, "[DONE]").unwrap(), vec!["[DONE]"]);
+    }
 }

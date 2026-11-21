@@ -6735,6 +6735,22 @@ async fn build_client_response(
     spend_ticket: Option<std::sync::Arc<crate::account_spend::AccountSpendTicket>>,
 ) -> Response {
     if !translated {
+        // The purely-shaped passthrough pairs still owe the client one normalization: an
+        // OpenAI-wire upstream that answers `content` as an array of typed parts (Mistral's
+        // platform) hands a string-reading client an answer it cannot read — "answered with no
+        // text". Everything else keeps the byte-honest fast path.
+        if matches!(ctx.client_dialect, Dialect::OpenAi)
+            && matches!(ctx.upstream_dialect, Dialect::OpenAi | Dialect::MistralVibeApi)
+            && ctx.route == RouteKind::ChatCompletions
+        {
+            return build_response_with_content_normalization(
+                ctx,
+                upstream,
+                ticket,
+                spend_ticket,
+            )
+            .await;
+        }
         return build_response_with_spend(upstream, ticket, spend_ticket);
     }
 
@@ -7156,6 +7172,134 @@ fn build_response(
     ticket: Option<std::sync::Arc<crate::quota::QuotaTicket>>,
 ) -> Response {
     build_response_with_spend(upstream, ticket, None)
+}
+
+/// A passthrough response body that still gets its `content` arrays normalized.
+///
+/// Mistral's platform answers chat completions with `content` as an **array** of typed parts —
+/// `{"type":"text","text":…}` for text, `{"type":"thinking",…}` for reasoning — where the OpenAI
+/// contract promises a string. A client reading `delta.content` as a string sees an answer with
+/// no text at all. `mr_dialects::normalize_openai_content` is the fix as a function; this wraps a
+/// passthrough body so it is applied frame by frame without disturbing anything else the upstream
+/// chose: non-JSON lines, `[DONE]`, keep-alive comments, blank-line framing, and every field but
+/// the content arrays ride through byte-for-byte. The usage taps stay between the upstream and
+/// the client, so what is spent is measured exactly as before.
+async fn build_response_with_content_normalization(
+    ctx: TranslateCtx<'_>,
+    upstream: crate::upstream::UpstreamResponse,
+    ticket: Option<std::sync::Arc<crate::quota::QuotaTicket>>,
+    spend_ticket: Option<std::sync::Arc<crate::account_spend::AccountSpendTicket>>,
+) -> Response {
+    let status = upstream.status;
+    let tapped = match (&ticket, &spend_ticket) {
+        (Some(ticket), Some(spend)) => http_body_util::combinators::UnsyncBoxBody::new(
+            crate::account_spend::SpendBody::new(
+                crate::quota::TapBody::new(upstream.body, std::sync::Arc::clone(ticket)),
+                std::sync::Arc::clone(spend),
+            ),
+        ),
+        (Some(ticket), None) => http_body_util::combinators::UnsyncBoxBody::new(
+            crate::quota::TapBody::new(upstream.body, std::sync::Arc::clone(ticket)),
+        ),
+        (None, Some(spend)) => http_body_util::combinators::UnsyncBoxBody::new(
+            crate::account_spend::SpendBody::new(upstream.body, std::sync::Arc::clone(spend)),
+        ),
+        (None, None) => http_body_util::combinators::UnsyncBoxBody::new(upstream.body),
+    };
+
+    let body = if !ctx.client_streaming {
+        // One JSON document: normalize its content arrays, or forward the body untouched when
+        // there is nothing of the shape to fix.
+        match http_body_util::BodyExt::collect(tapped).await {
+            Ok(collected) => {
+                let raw = collected.to_bytes();
+                AxumBody::from(mr_dialects::normalize_openai_content(&raw).unwrap_or(raw))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the upstream body did not finish");
+                AxumBody::empty()
+            }
+        }
+    } else {
+        // Streaming: buffer to line boundaries (a `data:` line may arrive in pieces), normalize
+        // each complete frame's payload, and forward it with its newline. An upstream **error**
+        // frame must reach the client as an error — the recovery layer sits downstream of this
+        // body and needs to see a death as a death, not as a clean end-of-stream, or it will
+        // never splice the replacement in. `futures`' scan ends the stream when the callback's
+        // future resolves to `None`; the callback never does, because only the upstream's own end
+        // may end this stream — a line that never got its newline is not a frame and never can
+        // be, and the half-line is dropped when the stream state drops.
+        let frames = BodyStream::new(tapped);
+        let stream = frames
+            .scan(
+                Vec::<u8>::new(),
+                |pending, frame: Result<http_body::Frame<Bytes>, hyper::Error>| {
+                    let out: Option<Vec<Result<Bytes, hyper::Error>>> = Some(match frame {
+                        Ok(frame) => match frame.into_data() {
+                            Ok(data) => normalize_stream_chunk(pending, &data)
+                                .into_iter()
+                                .map(Ok)
+                                .collect(),
+                            // A trailers-only frame carries no payload lines and keeps the
+                            // stream alive.
+                            Err(_) => Vec::new(),
+                        },
+                        Err(err) => vec![Err(err)],
+                    });
+                    async move { out }
+                },
+            );
+        let stream = stream.flat_map(|chunks| {
+            futures_util::stream::iter(chunks.into_iter().map(|c| c.map(http_body::Frame::data)))
+        });
+        AxumBody::new(StreamBody::new(stream))
+    };
+
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    let content_type = if ctx.client_streaming {
+        "text/event-stream; charset=utf-8"
+    } else {
+        "application/json; charset=utf-8"
+    };
+    for (name, value) in upstream.headers.iter() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if HOP_BY_HOP.contains(&lower.as_str()) {
+            continue;
+        }
+        response.headers_mut().append(name.clone(), value.clone());
+    }
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        response.headers_mut().insert("content-type", value);
+    }
+    response
+}
+
+/// Normalize one stream chunk's complete lines, in order, preserving framing.
+///
+/// A chunk may end mid-line; the partial tail stays in `pending` until the next chunk or the
+/// stream's end completes it. A `data: ` line whose payload carries array `content` is
+/// re-emitted with the normalized payload; a payload of any other shape (including `[DONE]` and
+/// frames with no choices) is re-emitted exactly as it arrived, newline included.
+fn normalize_stream_chunk(pending: &mut Vec<u8>, chunk: &[u8]) -> Vec<Bytes> {
+    let mut out = Vec::new();
+    pending.extend_from_slice(chunk);
+    while let Some(idx) = pending.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = pending.drain(..=idx).collect();
+        let text = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]).into_owned();
+        let trimmed = text.trim_end_matches('\r');
+        let payload = trimmed
+            .strip_prefix("data: ")
+            .or_else(|| trimmed.strip_prefix("data:"));
+        let changed = payload
+            .and_then(|payload| mr_dialects::normalize_openai_content(payload.as_bytes()))
+            .and_then(|normalized| String::from_utf8(normalized.to_vec()).ok());
+        match changed {
+            Some(normalized) => out.push(Bytes::from(format!("data: {normalized}\n"))),
+            None => out.push(Bytes::from(line)),
+        }
+    }
+    out
 }
 
 fn build_response_with_spend(
@@ -14407,6 +14551,111 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(sent["temperature"], 0.5, "fields every provider reads stay");
         assert_eq!(sent["messages"][0]["content"], "hello");
     }
+
+    /// A streaming passthrough answer whose deltas carry Mistral's array `content` reaches an
+    /// OpenAI client as the string shape the contract promises — the streaming twin of the
+    /// non-streaming fix, exercised on the live `!translated` fast path.
+    #[tokio::test]
+    async fn a_streaming_passthrough_answer_normalizes_array_deltas() {
+        // An upstream in the Mistral shape: thinking deltas as arrays, then the text part.
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(move |body: Bytes| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&body).to_string());
+                let frames = vec![
+                    Ok::<Bytes, std::io::Error>(Bytes::from(concat!(
+                        r#"data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}"#,
+                        "\n\n",
+                    ))),
+                    Ok(Bytes::from(concat!(
+                        r#"data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"adding"}],"closed":true}]}}]}"#,
+                        "\n\n",
+                    ))),
+                    Ok(Bytes::from(concat!(
+                        r#"data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":[{"type":"text","text":"4"}]}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+                        "\n\n",
+                    ))),
+                    Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                ];
+                (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    AxumBody::from_stream(futures_util::stream::iter(frames)),
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}");
+
+        let mut provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+        provider.dialect = Dialect::MistralVibeApi;
+        provider.capabilities = vec![Capability::Chat, Capability::Models];
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let toystore = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&toystore))),
+            oauth_store: Arc::clone(&toystore),
+            quota_store: Arc::clone(&toystore),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let request_body = r#"{"model":"p/m","stream":true,"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(request_body.to_owned()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (text, error) = drain(response).await;
+        assert_eq!(error, None, "the stream ended in an error: {text}");
+
+        // Not one frame may carry array content; the thinking lands as reasoning_content and
+        // the answer's text is the string the contract promises.
+        assert!(!text.contains("[{\"type\""), "an array delta reached the client: {text}");
+        assert!(text.contains("\"reasoning_content\":\"adding\""), "thinking was lost: {text}");
+        let text_delta = text
+            .lines()
+            .find(|l| l.contains("\"content\":\"4\"") || l.contains("\"content\": \"4\""))
+            .expect("the text answer never reached the client");
+        let payload: serde_json::Value =
+            serde_json::from_str(text_delta.trim_start_matches("data: ")).unwrap();
+        assert_eq!(payload["choices"][0]["delta"]["content"], "4");
+        assert_eq!(payload["usage"]["total_tokens"], 2, "usage rides through untouched");
+    }
+
 
     /// A body without a `developer` message is not re-encoded at all: the passthrough stays
     /// byte-for-byte, so provider-specific fields a re-encode would drop survive.
