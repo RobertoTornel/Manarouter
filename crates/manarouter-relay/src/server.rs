@@ -1876,7 +1876,7 @@ fn with_stream_usage(body: Bytes) -> Bytes {
 }
 
 /// OpenAI's `developer` role, written as `system` for wire-compatible upstreams that predate
-/// the rename.
+/// the rename; OpenAI-only extras dropped alongside it.
 ///
 /// The relay's OpenAI surface accepts the `developer` role — the newer OpenAI name for the same
 /// kind of message — and a passthrough body forwards the name verbatim. OpenAI-wire servers
@@ -1915,6 +1915,16 @@ fn normalize_developer_role(outgoing: &mut Vec<u8>) -> bool {
         return changed;
     };
     for message in messages {
+        // Reasoning reproduced on the request: the assistant messages a client echoes back from
+        // an earlier answer carry `reasoning_content` (which this relay itself adds to responses
+        // so thinking stays visible), and a strict upstream refuses the field on the way in —
+        // `422: extra_forbidden … messages[82].assistant.reasoning_content`. The reasoning is
+        // not a request field; it is dropped wherever a client round-trips it.
+        if let Some(message) = message.as_object_mut() {
+            if message.remove("reasoning_content").is_some() {
+                changed = true;
+            }
+        }
         let is_developer =
             message.get("role").and_then(serde_json::Value::as_str) == Some("developer");
         if is_developer {
@@ -14529,7 +14539,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             batch: crate::batch::BatchLane::inert(),
         };
 
-        let request_body = r#"{"model":"p/m","store":false,"metadata":{"a":"b"},"prompt_cache_key":"k","service_tier":"auto","messages":[{"role":"user","content":"hello"}],"temperature":0.5}"#;
+        let request_body = r#"{"model":"p/m","store":false,"metadata":{"a":"b"},"prompt_cache_key":"k","service_tier":"auto","messages":[{"role":"developer","content":"be terse"},{"role":"assistant","reasoning_content":"I was thinking","content":"an earlier answer"},{"role":"user","content":"hello"}],"temperature":0.5}"#;
         let response = dispatch(
             state,
             Dialect::OpenAi,
@@ -14548,8 +14558,13 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert!(sent.get("metadata").is_none(), "metadata was dropped");
         assert!(sent.get("prompt_cache_key").is_none(), "prompt_cache_key was dropped");
         assert!(sent.get("service_tier").is_none(), "service_tier was dropped");
+        assert!(
+            sent["messages"][1].get("reasoning_content").is_none(),
+            "an echoed reasoning_content was dropped from the assistant message"
+        );
+        assert_eq!(sent["messages"][1]["content"], "an earlier answer");
+        assert_eq!(sent["messages"][2]["content"], "hello", "the user message is untouched");
         assert_eq!(sent["temperature"], 0.5, "fields every provider reads stay");
-        assert_eq!(sent["messages"][0]["content"], "hello");
     }
 
     /// A streaming passthrough answer whose deltas carry Mistral's array `content` reaches an
