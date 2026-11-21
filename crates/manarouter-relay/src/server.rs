@@ -1893,10 +1893,27 @@ fn normalize_developer_role(outgoing: &mut Vec<u8>) -> bool {
     let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(outgoing) else {
         return false;
     };
-    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
-        return false;
-    };
     let mut changed = false;
+    // OpenAI-only extras: strict OpenAI-wire servers answer `422: extra_forbidden` on them, and
+    // no other provider reads them. Dropped before the role pass so both land in one re-encode.
+    if let Some(object) = body.as_object_mut() {
+        for field in [
+            "store",
+            "metadata",
+            "prompt_cache_key",
+            "safety_identifier",
+            "service_tier",
+            "verbosity",
+            "web_search_options",
+        ] {
+            if object.remove(field).is_some() {
+                changed = true;
+            }
+        }
+    }
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return changed;
+    };
     for message in messages {
         let is_developer =
             message.get("role").and_then(serde_json::Value::as_str) == Some("developer");
@@ -14322,6 +14339,73 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(sent["messages"][0]["role"], "system", "developer became system");
         assert_eq!(sent["messages"][0]["content"], "You are terse.");
         assert_eq!(sent["messages"][1]["role"], "user", "the user message is untouched");
+    }
+
+    /// OpenAI-only extras are dropped for a strict upstream: Mistral's platform answers
+    /// `422: extra_forbidden` on `store` (seen live 2026-11-21), and `metadata`,
+    /// `prompt_cache_key` and friends carry no meaning to any other provider. The relay's
+    /// own OpenAI-compat additions a client relies on (`stream_options`) stay.
+    #[tokio::test]
+    async fn openai_only_extras_are_dropped_for_a_strict_upstream() {
+        let (url, seen) = counting_upstream(
+            StatusCode::OK,
+            r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+        )
+        .await;
+        let mut provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+        provider.dialect = Dialect::MistralVibeApi;
+        provider.capabilities = vec![Capability::Chat, Capability::Models];
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let request_body = r#"{"model":"p/m","store":false,"metadata":{"a":"b"},"prompt_cache_key":"k","service_tier":"auto","messages":[{"role":"user","content":"hello"}],"temperature":0.5}"#;
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(request_body.to_owned()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let records = seen.lock().unwrap();
+        assert_eq!(records.len(), 1, "exactly one upstream call");
+        let sent: serde_json::Value = serde_json::from_str(&records[0].1).unwrap();
+        assert!(sent.get("store").is_none(), "store was dropped");
+        assert!(sent.get("metadata").is_none(), "metadata was dropped");
+        assert!(sent.get("prompt_cache_key").is_none(), "prompt_cache_key was dropped");
+        assert!(sent.get("service_tier").is_none(), "service_tier was dropped");
+        assert_eq!(sent["temperature"], 0.5, "fields every provider reads stay");
+        assert_eq!(sent["messages"][0]["content"], "hello");
     }
 
     /// A body without a `developer` message is not re-encoded at all: the passthrough stays
