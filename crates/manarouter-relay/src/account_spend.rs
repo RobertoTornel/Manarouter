@@ -417,3 +417,41 @@ mod tests {
         assert!(view.contains_key("a"));
     }
 }
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use mr_core::ids::{AccountId, Millis};
+
+    #[test]
+    fn probe_record_then_exhaust() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let prior = mr_core::store::AccountSpendRecord::new(
+            "first",
+            AccountId::from_raw("spent".to_owned()),
+            Millis::now(),
+        );
+        store.record_account_spend(&prior).unwrap();
+        let account = AccountPlan {
+            id: AccountId::from_raw("spent".to_owned()),
+            label: None,
+            secret_ref: None,
+            oauth_ref: None,
+            priority: 0,
+            weight: 0,
+            max_concurrent: 0,
+            models_allow: Vec::new(),
+            models_deny: Vec::new(),
+            proxy: None,
+            placeholders: Default::default(),
+            credit_cents: None,
+            quota: vec![mr_core::model::QuotaWindow::requests_per(3600, 1)],
+        };
+        let now = Millis::now().as_millis() as u64;
+        println!("exhaustion: {:?}", exhaustion_for(&store, &account, now));
+        assert!(
+            exhaustion_for(&store, &account, now).is_some(),
+            "one dial must fill a 1-request window"
+        );
+    }
+}

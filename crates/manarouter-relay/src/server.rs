@@ -2385,8 +2385,21 @@ async fn dispatch_routed(
         (_, Some(step)) => vec![step],
         (Some(combo), None) => {
             let counter = table.advance_combo_rr(&combo.id);
-            let order =
-                select::order_steps(combo, table.snapshot.providers(), &health, counter, now_ms);
+            // Ordering uses the same availability an attempt will accept — cooldowns, the step's
+            // account selection, the model allowlist and the declared-quota ledger — so a step
+            // whose usable accounts are all spent is ordered into the unavailable group instead of
+            // being attempted first and skipped on every request.
+            let order = select::order_steps_with(
+                combo,
+                table.snapshot.providers(),
+                &health,
+                counter,
+                now_ms,
+                &|account| {
+                    crate::account_spend::exhaustion_for(&app.quota_store, account, now_ms)
+                        .is_none()
+                },
+            );
             let sticky_enabled = sticky_applies(combo);
             if sticky_enabled {
                 sticky_index = app.sticky_success.preferred_index(
@@ -5473,22 +5486,16 @@ fn exhausted_by_body(body: &[u8]) -> Option<BodyRefusal> {
         kind_lower.as_str(),
         "usage_limit_reached" | "rate_limit_reached" | "insufficient_quota"
     ) || resource_exhausted;
-    let seconds = error
-        .get("resets_in_seconds")
-        .and_then(serde_json::Value::as_u64)
-        .or_else(|| {
-            // Some upstreams name an absolute instant in seconds instead of a delay.
-            error
-                .get("resets_at")
-                .and_then(serde_json::Value::as_u64)
-                .map(|at| {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    at.saturating_sub(now)
-                })
-        });
+    let seconds: Option<u64> = {
+        // A codex-shaped `usage_limit_reached` refusal reports its buckets nested
+        // (`rate_limits.primary.resets_in_seconds` / `secondary`), and the top-level fields —
+        // when present at all — name the *longest* window. Parking the account on the long one
+        // while the short bucket clears in minutes is what made every codex account vanish from
+        // its combo for a day. The soonest stated recovery is the reset-aware reading.
+        let mut candidates: Vec<u64> = Vec::new();
+        collect_reset_candidates(&error, 0, &mut candidates);
+        candidates.iter().copied().min()
+    };
     // A structured reset is the strongest statement, but it is not the only one. A body that says
     // when the account recovers, in words, is exactly as actionable, and stopping at the field
     // shape parks a spent account for the configured minute so it can be refused again on the next
@@ -5888,6 +5895,84 @@ pub(crate) fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {
     let secs: u64 = raw.parse().ok()?;
     // Capped, so a provider sending a bogus large value cannot park an account indefinitely.
     Some(secs.min(86_400).saturating_mul(1000))
+}
+
+/// A stated reset delay, in seconds, with the millisecond misread corrected.
+///
+/// A real quota-window delay is minutes to a month — at most ~2.6 million seconds. A `resets_in_seconds`-style
+/// field carrying anything from ~3 years upward is a millisecond count of the same statement
+/// (observed in the wild: `resets_in_seconds: 252` beside a cooldown computed as exactly
+/// 86_400_000 ms). Reading the millisecond form as seconds parks a healthy account for a day,
+/// which is how a provider with remaining quota ends up skipped — the unit, not the quota.
+pub(crate) fn stated_reset_delay_secs(raw: u64) -> u64 {
+    const DELAY_MS_FLOOR: u64 = 100_000_000; // 100e6 s ≈ 3.2 years: no reset delay is this long
+    let secs = if raw >= DELAY_MS_FLOOR { raw / 1000 } else { raw };
+    secs.min(86_400)
+}
+
+/// A stated reset instant, in epoch seconds, with the millisecond misread corrected.
+///
+/// The same hazard as [`stated_reset_delay_secs`] for `resets_at`-style fields: epoch
+/// **milliseconds** (≈1.8×10¹² today) read as epoch seconds would put the recovery in year 58,000
+/// and clamp the park to the 24-hour ceiling.
+pub(crate) fn stated_reset_instant_secs(raw: u64) -> u64 {
+    const INSTANT_MS_FLOOR: u64 = 100_000_000_000; // 1e11 s ≈ year 5138: not a real epoch second
+    if raw >= INSTANT_MS_FLOOR {
+        raw / 1000
+    } else {
+        raw
+    }
+}
+
+/// Collect every stated reset a refusal body carries, as second-denominated delays, soonest last.
+///
+/// Walks the refusal's objects to a bounded depth, reading the field names providers actually use
+/// for a recovery: a delay (`resets_in_seconds`, `reset_after_seconds`, `retry_after_seconds`) and
+/// an absolute instant (`resets_at`, `resets_at_epoch`). A delay that cannot be a real count of
+/// seconds is read as its millisecond spelling; an instant is converted against the wall clock.
+///
+/// Callers take the **minimum**: when a refusal reports several buckets (codex's five-hour session
+/// beside its weekly window), the soonest recovery is the reset-aware one — parking the account on
+/// the longest bucket is how an account with a fresh short window ends up skipped for a day.
+pub(crate) fn collect_reset_candidates(value: &serde_json::Value, depth: u8, out: &mut Vec<u64>) {
+    const MAX_DEPTH: u8 = 4;
+    if depth > MAX_DEPTH {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, inner) in map {
+                let lower = key.to_ascii_lowercase();
+                let now = || {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                };
+                match inner.as_u64() {
+                    Some(raw) if lower.contains("resets_in_seconds")
+                        || lower.contains("reset_after_seconds")
+                        || lower.contains("retry_after_seconds") =>
+                    {
+                        let _ = now();
+                        out.push(stated_reset_delay_secs(raw));
+                    }
+                    Some(raw) if lower.contains("resets_at") => {
+                        if let Some(delay) = stated_reset_instant_secs(raw).checked_sub(now()) {
+                            out.push(delay.min(86_400));
+                        }
+                    }
+                    _ => collect_reset_candidates(inner, depth + 1, out),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_reset_candidates(item, depth + 1, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The provider's own path for the client's route, if it has one.
@@ -10102,6 +10187,35 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     }
 
     #[test]
+    fn a_reset_stated_in_milliseconds_is_not_read_as_seconds() {
+        // `86400000000` ms is a real one-day window; read as seconds it is a thousand days, and the
+        // day cap would silently make the ms form and a bogus value indistinguishable. The
+        // normalization keeps the day cap meaningful for both.
+        let body =
+            br#"{"error":{"type":"usage_limit_reached","resets_in_seconds":86400000000}}"#;
+        let refusal = exhausted_by_body(body).expect("a spent window");
+        let wait = refusal.wait_ms.expect("a wait");
+        assert!(
+            (80_000_000..=86_400_000).contains(&wait),
+            "a one-day window in ms must read as a day, got {wait} ms"
+        );
+    }
+
+    #[test]
+    fn a_codex_refusal_parks_on_the_soonest_bucket_not_the_longest() {
+        // Codex reports its five-hour session window beside the weekly one. The park must be the
+        // soonest recovery: parking on the weekly bucket is exactly how an account whose short
+        // window clears in four minutes ends up skipped by its combo for a day.
+        let body = br#"{"error":{"type":"usage_limit_reached","message":"Usage limit reached","rate_limits":{"primary":{"resets_in_seconds":252},"secondary":{"resets_in_seconds":604800}}}}"#;
+        let refusal = exhausted_by_body(body).expect("a spent window");
+        let wait = refusal.wait_ms.expect("a wait");
+        assert!(
+            (200_000..=280_000).contains(&wait),
+            "the primary (252 s) bucket governs, got {wait} ms"
+        );
+    }
+
+    #[test]
     fn a_reset_stated_in_words_is_as_good_as_a_field() {
         // The exact body a provider returned for a spent daily window, captured live. There is no
         // `resets_in_seconds` and no `type`/`code` on the error object, so it used to be read as an
@@ -11684,6 +11798,97 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             "messages": [{"role": "user", "content": "hello"}],
         })
         .to_string()
+    }
+
+    /// A step whose accounts are spent in the declared-quota ledger — with no cooldown yet — must
+    /// be ordered *behind* a step that still has quota, and the request must be served by the
+    /// provider with quota remaining. This is the "combo skips providers with remaining quota"
+    /// report: the ordering saw "no cooldown, therefore available", attempted the spent step
+    /// first, and the skip it collected back wasted a dial on every request.
+    #[tokio::test]
+    async fn a_ledger_spent_step_is_ordered_behind_a_step_with_remaining_quota() {
+        let (first_url, first_seen) = fake_upstream().await;
+        let (second_url, second_seen) = fake_upstream().await;
+
+        // Both steps serve; the first's *account* has exhausted its declared window in the ledger.
+        let mut first = provider_serving("first", &first_url, "shared-model", &[InputModality::Text]);
+        let mut spent = mr_core::model::Account::new("spent");
+        // The ledger is keyed by the account id, and `Account::new` only names the label: pin the
+        // id so the spend row below matches what the snapshot compiles.
+        spent.id = mr_core::ids::AccountId::from_raw("spent".to_owned());
+        spent.secret_ref = Some("test-credential".to_owned());
+        spent.quota = vec![mr_core::model::QuotaWindow::requests_per(3600, 1)];
+        first.accounts = vec![spent];
+        let second = provider_serving("second", &second_url, "shared-model", &[InputModality::Text]);
+
+        let mut combo = mr_core::model::Combo::new(
+            "failover",
+            mr_core::model::ComboStep::new("first", "shared-model"),
+        );
+        combo
+            .steps
+            .push(mr_core::model::ComboStep::new("second", "shared-model"));
+
+        let config = mr_core::config::Config {
+            providers: vec![first, second],
+            combos: vec![combo],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        // The first step's account spent its one request in the declared hour.
+        let prior = mr_core::store::AccountSpendRecord::new(
+            "first",
+            mr_core::ids::AccountId::from_raw("spent".to_owned()),
+            mr_core::ids::Millis::now(),
+        );
+        store.record_account_spend(&prior).unwrap();
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(failover_body()),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the step with remaining quota must serve"
+        );
+        // The ordered-first spent step is not dialled at all: the ledger knew before the wire did.
+        let first_dials = first_seen.lock().unwrap().join(" | ");
+        assert_eq!(
+            first_seen.lock().unwrap().len(),
+            0,
+            "a ledger-spent step must not be dialled before the step with quota; saw: {first_dials}"
+        );
+        assert_eq!(second_seen.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -485,6 +485,24 @@ pub fn order_steps(
     counter: u64,
     now_ms: u64,
 ) -> Vec<usize> {
+    order_steps_with(combo, providers, health, counter, now_ms, &|_| true)
+}
+
+/// [`order_steps`] with the caller's declared-quota verdict per account.
+///
+/// Availability for *ordering* must agree with what an attempt will accept, or the operator's order
+/// degenerates into a fixed tax: a step whose every selected account is ledger-spent counts
+/// "available" on cooldowns alone, is attempted first, and is skipped — on every request — before
+/// the step that could serve is reached. Passing the spend-ledger verdict here puts such a step in
+/// the unavailable group up front, with its reset-aware position.
+pub fn order_steps_with(
+    combo: &ComboPlan,
+    providers: &[ProviderPlan],
+    health: &HashMap<String, Cooldown>,
+    counter: u64,
+    now_ms: u64,
+    spend_ok: &dyn Fn(&AccountPlan) -> bool,
+) -> Vec<usize> {
     let n = combo.steps.len();
     // Proxy eligibility belongs here: once proxy selection is available, combine it with account
     // health before applying priority/round-robin, but keep each candidate as its resolved step
@@ -493,7 +511,9 @@ pub fn order_steps(
     let available: Vec<bool> = (0..n)
         .map(
             |i| match providers.get(combo.steps[i].provider_index as usize) {
-                Some(p) => step_available(p, health, now_ms, &combo.steps[i].model),
+                Some(p) => {
+                    step_has_usable_account_if(p, health, now_ms, &combo.steps[i], spend_ok)
+                }
                 None => false,
             },
         )
