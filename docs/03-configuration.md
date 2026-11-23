@@ -644,9 +644,10 @@ neither surfaces to the client nor fails the combo over to the next provider (a 
 one refusal that never advances a combo; spent quota, bad credentials and transport errors still do).
 
 For a **priority** combo this hold is absolute: the step's quota is exhausted before any later step
-is tried, so a throttled or quota-exhausted preferred provider is waited out for the silent-retry
-budget (bounded by `max_total_hold_ms`) and only then fails the combo over. With any other strategy,
-an available later step still takes over immediately from a throttled or exhausted one.
+is tried, so a throttled or quota-exhausted preferred provider is held and retried all the way to
+`max_total_hold_ms` — not just the first short budget — and only then fails the combo over. With
+any other strategy, an available later step still takes over immediately from a throttled or
+exhausted one.
 
 ```json
 {

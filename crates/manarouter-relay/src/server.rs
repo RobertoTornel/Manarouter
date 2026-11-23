@@ -2856,32 +2856,19 @@ async fn dispatch_routed(
                 let spent = patience_started.elapsed().as_millis() as u64;
                 let remaining = wait_horizon_ms.saturating_sub(spent);
                 if remaining == 0 {
-                    // A priority combo's hold budget on this step is spent: exhaust the step's
-                    // quota windows fully before moving on — never unboundedly. Fall through so
-                    // the outer loop advances to the next combo step (or ends with the refusal
-                    // when none exists).
-                    if priority_exhausts_step {
-                        tracing::info!(
-                            provider = %step.provider_id,
-                            model = %step.model,
-                            wait_ms = wait_horizon_ms,
-                            "rate limit hold budget spent on this step; exhausting it and failing over"
-                        );
-                        break 'patience;
-                    }
-                    // A 429 is a provider cooldown, not a client-visible failure. We have already
-                    // retried every eligible sibling account; if they are still cooling, keep this
-                    // request parked and retry the same provider again rather than leaking the 429
-                    // or advancing the combo to a different provider. This is intentionally an
-                    // indefinite wait for callers who opted into silent rate-limit handling; set
-                    // `enabled: false` to return an upstream 429 immediately instead.
-                    if matches!(
-                        &attempt,
-                        Attempt::Failed {
-                            response: Some(resp),
-                            ..
-                        } if resp.status() == StatusCode::TOO_MANY_REQUESTS
-                    ) {
+                    // A priority combo exhausts the step before moving on: keep holding and
+                    // retrying past the first narrow budget, all the way to the total-hold
+                    // ceiling checked above — the next step is not spent while this one can
+                    // still recover. Every other strategy surfaces or fails over here.
+                    if priority_exhausts_step
+                        || matches!(
+                            &attempt,
+                            Attempt::Failed {
+                                response: Some(resp),
+                                ..
+                            } if resp.status() == StatusCode::TOO_MANY_REQUESTS
+                        )
+                    {
                         tracing::warn!(
                             provider = %step.provider_id,
                             model = %step.model,
@@ -12886,7 +12873,10 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 max_wait_ms: 800,
                 max_stated_wait_ms: 1_200,
                 poll_interval_ms: 200,
-                max_total_hold_ms: 60_000,
+                // A short total ceiling keeps this test fast while still proving the priority
+                // combo holds and retries the throttled step past its first budget before
+                // advancing to the sibling.
+                max_total_hold_ms: 2_000,
             },
             ..Default::default()
         };
@@ -12929,16 +12919,16 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "the second step must serve after the first's hold budget is spent"
+            "the second step must serve after the first's hold ceiling is spent"
         );
         assert!(
-            first_seen.lock().unwrap().len() >= 2,
-            "the priority combo exhausted the throttled step's budget before advancing"
+            first_seen.lock().unwrap().len() >= 4,
+            "the priority combo retried the throttled step several times before advancing"
         );
         assert_eq!(
             second_seen.lock().unwrap().len(),
             1,
-            "the throttled step exhausts its hold budget, then the combo fails over"
+            "the throttled step exhausts its hold ceiling, then the combo fails over"
         );
     }
 

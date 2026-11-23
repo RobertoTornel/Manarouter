@@ -389,12 +389,13 @@ does the refusal surface, and a 429 classified as quota exhaustion (not a plain 
 fail the combo over to the next provider. See the `rateLimitRetry` section in
 [03-configuration.md](03-configuration.md).
 
-A **priority** combo makes that exhaustion explicit: its order is absolute, so the step is held and
-retried for the whole silent-retry budget before any later step is considered — even when a later
-step could serve right now. The preferred provider's windows are spent first; the combo only advances
-once the current step's budget is exhausted. Other strategies (round-robin, reset-aware-priority)
-keep the eager failover: a throttled or exhausted step is skipped at once when a later step can
-serve.
+A **priority** combo makes that exhaustion explicit: its order is absolute, so a throttled or
+exhausted step is held and retried all the way to the total-hold ceiling
+(`rateLimitRetry.max_total_hold_ms`) before any later step is considered — even when a later step
+could serve right now. The preferred provider's windows are spent first; the combo only advances
+once the current step's hold ceiling is reached. Other strategies (round-robin,
+reset-aware-priority) keep the eager failover: a throttled or exhausted step is skipped at once when
+a later step can serve.
 
 ## The entry count caveat
 
