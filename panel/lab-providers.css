@@ -474,6 +474,22 @@ body.provider-dragging .providers-view .provider-table tr.row-draggable { cursor
   flex-wrap: wrap;
 }
 
+/* Model-access patterns are also scanned as chips; the editor may open two inputs at once. */
+.providers-view .model-access-cell { max-width: 260px; }
+.providers-view .model-access-view {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.providers-view .model-access-view .hint { margin: 0; }
+.providers-view .model-access-edit {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
 /* ---------------------------------------------------------------- empty states */
 
 .providers-view .provider-empty {

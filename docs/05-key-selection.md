@@ -284,6 +284,12 @@ model. Routing a request to an account that must not serve it is worse than fail
 per request. [Routing snapshot](04-routing-snapshot.md) §5 records why that is not a compile-time
 decision.
 
+Operators edit these lists directly from the panel (the **Models** column on a provider's account
+table, or the *Models allowed / Models blocked* fields on the add-account form) and from the CLI
+(`mr account add … --model-allow claude-* --model-deny gpt-5-mini`; `mr account list` shows the
+result). An empty allow list and an empty deny list are the same thing — the account serves any
+model.
+
 ---
 
 ## 6. Health is per account, never per provider

@@ -307,6 +307,140 @@ test('an empty field clears the tags', async () => {
   assert.deepEqual(toasts.success, ['Tags cleared.']);
 });
 
+// ------------------------------------------------------------------ model access
+
+function modelAccessProvider(accountOverrides = {}) {
+  return {
+    id: 'acme',
+    label: 'acme label',
+    dialect: 'open-ai',
+    enabled: true,
+    accounts: [{ id: 'acme-main', label: 'main', enabled: true, tags: [], ...accountOverrides }],
+    models: [{ id: 'model-a' }],
+  };
+}
+
+async function mountModelAccess(accountOverrides = {}, onRequest = null) {
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method ?? 'GET', body: init.body });
+    if (onRequest) return onRequest({ url: String(url), method: init.method ?? 'GET' });
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+
+  const { renderProviders } = await import('../view-providers.js');
+  const toasts = { success: [], error: [], warning: [] };
+  const mount = makeEl('div');
+  const ctx = {
+    loadProviders: async () => [modelAccessProvider(accountOverrides)],
+    onHealth: (cb) => { cb({ snapshot: { digest: '1111111111111111' } }); return () => {}; },
+    toast: {
+      success: (m) => toasts.success.push(m),
+      error: (m) => toasts.error.push(m),
+      warning: (m) => toasts.warning.push(m),
+    },
+    confirm: async () => true,
+  };
+
+  await renderProviders(mount, ctx);
+  await settle();
+  document.body.appendChild(mount);
+
+  const row = findOne(mount, 'TBODY')?.children
+    ?.find((tr) => tr?.getAttribute?.('data-provider-id') === 'acme');
+  assert.ok(row, 'row for acme should exist');
+  row.querySelector('.provider-open').listeners.click[0]({ stopPropagation() {} });
+  await flush();
+
+  const body = queryAll(mount, '.drawer-body')[0];
+  assert.ok(body, 'the provider detail drawer should be open');
+  return { body, calls, toasts, mount };
+}
+
+const modelEdits = (calls) => calls.filter((call) => call.method === 'PUT' && call.url.includes('/accounts/'));
+
+test('the account table carries a Models column', async () => {
+  const { body } = await mountModelAccess();
+  const heads = queryAll(body, 'th').map((th) => textOf(th).trim());
+  assert.ok(heads.includes('Models'), `expected a Models column, got ${JSON.stringify(heads)}`);
+});
+
+test('unrestricted accounts say all models; patterns render as chips', async () => {
+  const open = await mountModelAccess();
+  assert.match(textOf(open.body), /all models/);
+
+  const restricted = await mountModelAccess({ models_allow: ['claude-*'], models_deny: ['gpt-5-mini'] });
+  const text = textOf(restricted.body);
+  assert.match(text, /\+claude-\*/);
+  assert.match(text, /-gpt-5-mini/);
+});
+
+test('saving model access sends both parsed lists and the account unchanged', async () => {
+  const { body, calls, toasts } = await mountModelAccess({ models_allow: ['claude-*'], models_deny: ['gpt-5-mini'] });
+  const edit = findByAriaLabel(body, 'Edit model access for account acme-main');
+  assert.ok(edit, 'the account row should carry its model-access editor');
+
+  edit.listeners.click[0]();
+  const allowedInput = queryAll(body, 'input').find((el) => String(el.getAttribute('aria-label')).startsWith('Allowed models for account'));
+  const blockedInput = queryAll(body, 'input').find((el) => String(el.getAttribute('aria-label')).startsWith('Blocked models for account'));
+  assert.ok(allowedInput && blockedInput, 'the editor should open both fields');
+  assert.equal(allowedInput.value, 'claude-*', 'allow list starts from the account value');
+  assert.equal(blockedInput.value, 'gpt-5-mini', 'deny list starts from the account value');
+
+  allowedInput.value = '  claude-*, gpt-5 ';
+  blockedInput.value = 'gpt-5-mini, o3';
+  const save = buttonText(allowedInput.parent, 'Save');
+  save.listeners.click[0]();
+  await flush();
+
+  const put = modelEdits(calls);
+  assert.equal(put.length, 1, 'one PUT, not one per pattern');
+  assert.equal(put[0].url, '/api/providers/acme/accounts/acme-main');
+  const sent = JSON.parse(put[0].body);
+  assert.deepEqual(sent.models_allow, ['claude-*', 'gpt-5'], 'trimmed and de-duplicated');
+  assert.deepEqual(sent.models_deny, ['gpt-5-mini', 'o3']);
+  assert.equal(sent.label, 'main', 'the rest of the account is echoed back untouched');
+  assert.deepEqual(sent.tags, []);
+  assert.equal(sent.id, 'acme-main');
+  assert.deepEqual(toasts.error, []);
+  assert.deepEqual(toasts.success, ['Model access saved.']);
+});
+
+test('clearing both model-access fields sends empty lists', async () => {
+  const { body, calls, toasts } = await mountModelAccess({ models_allow: ['claude-*'], models_deny: ['gpt-5-mini'] });
+  findByAriaLabel(body, 'Edit model access for account acme-main').listeners.click[0]();
+  const allowedInput = queryAll(body, 'input').find((el) => String(el.getAttribute('aria-label')).startsWith('Allowed models for account'));
+  const blockedInput = queryAll(body, 'input').find((el) => String(el.getAttribute('aria-label')).startsWith('Blocked models for account'));
+  allowedInput.value = '   ';
+  blockedInput.value = '';
+  buttonText(allowedInput.parent, 'Save').listeners.click[0]();
+  await flush();
+
+  const put = modelEdits(calls);
+  assert.equal(put.length, 1);
+  const sent = JSON.parse(put[0].body);
+  assert.deepEqual(sent.models_allow, [], 'clearing is an empty list, not a missing key');
+  assert.deepEqual(sent.models_deny, []);
+  assert.deepEqual(toasts.success, ['Model access cleared.']);
+});
+
+test('a failed model-access save keeps the editor open and reports the server message', async () => {
+  const { body, toasts } = await mountModelAccess({}, () => ({
+    ok: false,
+    status: 400,
+    json: async () => ({ error: { code: 'config_parse', message: 'the account could not be read' } }),
+  }));
+  findByAriaLabel(body, 'Edit model access for account acme-main').listeners.click[0]();
+  const allowedInput = queryAll(body, 'input').find((el) => String(el.getAttribute('aria-label')).startsWith('Allowed models for account'));
+  allowedInput.value = 'gpt-5';
+  buttonText(allowedInput.parent, 'Save').listeners.click[0]();
+  await flush();
+
+  assert.equal(toasts.error.length, 1, 'the failure must be reported');
+  assert.match(String(toasts.error[0]), /could not save the account model access/i);
+  assert.ok(queryAll(body, 'input').some((el) => el.value === 'gpt-5'), 'the typed text is not lost');
+});
+
 test('a failed save keeps the editor open and reports the server message', async () => {
   const { body, toasts } = await mountTags(['alice'], () => ({
     ok: false,

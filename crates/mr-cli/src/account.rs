@@ -131,6 +131,14 @@ pub struct AddArgs {
     /// Tag the account, for example the person it belongs to; repeat for more than one.
     #[arg(long = "tag", value_name = "TAG")]
     pub tags: Vec<String>,
+    /// Restrict this account to these model ids or prefix patterns; repeat for more than one.
+    /// A single trailing `*` is a prefix wildcard, and blank means all models are allowed.
+    #[arg(long = "model-allow", value_name = "MODEL")]
+    pub models_allow: Vec<String>,
+    /// Block these model ids or prefix patterns for this account; repeat for more than one.
+    /// Blocked patterns always win over allowed patterns.
+    #[arg(long = "model-deny", value_name = "MODEL")]
+    pub models_deny: Vec<String>,
 }
 
 /// Run an account subcommand.
@@ -339,6 +347,23 @@ fn find_account_mut<'a>(p: &'a mut Provider, key: &str) -> Result<&'a mut Accoun
     }
 }
 
+/// Normalize repeated `--model-allow` / `--model-deny` values into stored pattern lists.
+fn parse_model_patterns(values: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in values {
+        for raw in value.split([',', '\n']) {
+            let pattern = raw.trim();
+            if pattern.is_empty() {
+                continue;
+            }
+            if !out.iter().any(|p: &String| p.eq_ignore_ascii_case(pattern)) {
+                out.push(pattern.to_owned());
+            }
+        }
+    }
+    out
+}
+
 fn add(ctx: &Ctx, args: AddArgs) -> Result<(), CliError> {
     add_with(ctx, args, std::io::stdin())
 }
@@ -395,6 +420,8 @@ fn add_with(ctx: &Ctx, args: AddArgs, stdin: impl Read) -> Result<(), CliError> 
             account.tags.push(tag.to_owned());
         }
     }
+    account.models_allow = parse_model_patterns(&args.models_allow);
+    account.models_deny = parse_model_patterns(&args.models_deny);
     if let Some(usd) = args.credit_usd {
         check_credit_usd(usd)?;
         account.credit_usd = Some(usd);
@@ -435,6 +462,18 @@ fn add_with(ctx: &Ctx, args: AddArgs, stdin: impl Read) -> Result<(), CliError> 
     ctx.finish(&out, human, doc)
 }
 
+/// One-line summary of an account's model access for the list table.
+fn access_summary(account: &Account) -> String {
+    match (account.models_allow.as_slice(), account.models_deny.as_slice()) {
+        ([], []) => String::new(),
+        (allow, []) => format!("allow: {}", allow.join(", ")),
+        ([], deny) => format!("deny: {}", deny.join(", ")),
+        (allow, deny) => {
+            format!("allow: {} | deny: {}", allow.join(", "), deny.join(", "))
+        }
+    }
+}
+
 fn list(ctx: &Ctx, provider_id: &str) -> Result<(), CliError> {
     let cfg = ctx.load()?;
     let p = require_provider(&cfg, provider_id)?;
@@ -449,6 +488,7 @@ fn list(ctx: &Ctx, provider_id: &str) -> Result<(), CliError> {
         "CREDENTIAL",
         "IDENTITY",
         "TAGS",
+        "MODELS",
     ]);
     for a in &p.accounts {
         let cred = if a.secret_ref.is_some() {
@@ -466,6 +506,7 @@ fn list(ctx: &Ctx, provider_id: &str) -> Result<(), CliError> {
             cred.to_owned(),
             a.identity.clone().unwrap_or_default(),
             a.tags.join(","),
+            access_summary(a),
         ]);
     }
     t.print();
@@ -744,6 +785,8 @@ mod tests {
             identity: None,
             credit_usd: None,
             tags: Vec::new(),
+            models_allow: Vec::new(),
+            models_deny: Vec::new(),
         }
     }
 
@@ -817,6 +860,44 @@ mod tests {
         let err = find_account(&p, "nope").unwrap_err();
         assert_eq!(err.exit, crate::output::Exit::NotFound);
         assert!(err.message.contains("nope"), "{}", err.message);
+    }
+
+    #[test]
+    fn model_patterns_normalize_and_dedupe() {
+        let ok = parse_model_patterns(&[
+            "claude-*, gpt-5".into(),
+            "Claude-*".into(),
+            "".into(),
+        ]);
+        assert_eq!(ok, ["claude-*", "gpt-5"]);
+        // Comma and newline separators both split; surrounding whitespace is trimmed.
+        let ok = parse_model_patterns(&[" gpt-5 \n o3 ".into()]);
+        assert_eq!(ok, ["gpt-5", "o3"]);
+        // Whitespace-only tokens are skipped, never stored.
+        let ok = parse_model_patterns(&["all,  ".into()]);
+        assert_eq!(ok, ["all"]);
+    }
+
+    #[test]
+    fn account_add_persists_model_access_patterns() {
+        crate::output::testutil::with_config_dir("account-models", |_| {
+            seed_account();
+            let ctx = Ctx { json: false };
+            let mut args = args();
+            args.provider = "alpha".into();
+            args.secret = Some("sk-test".into());
+            args.models_allow = vec!["claude-*".into(), "gpt-5".into()];
+            args.models_deny = vec!["gpt-5-mini".into()];
+            add_with(&ctx, args, std::io::empty()).unwrap();
+            let cfg = mr_core::config::Config::load_default().unwrap();
+            let a = &cfg.providers[0].accounts[1];
+            assert_eq!(a.models_allow, ["claude-*", "gpt-5"]);
+            assert_eq!(a.models_deny, ["gpt-5-mini"]);
+            assert!(a.allows_model("claude-opus-4-1"));
+            assert!(a.allows_model("gpt-5"));
+            assert!(!a.allows_model("gpt-4o"));
+            assert!(!a.allows_model("gpt-5-mini"));
+        });
     }
 
     #[test]

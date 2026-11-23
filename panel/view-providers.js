@@ -22,8 +22,9 @@ import {
   placeholderNamesIn, NAME_PATTERN as PLACEHOLDER_NAME, VALUE_PATTERN as PLACEHOLDER_VALUE,
 } from './placeholders.js';
 
-// Input modalities an operator can declare per model. Empty means *derive* from the bundled
-// capability table; an explicit list is how an operator corrects the seed.
+// Input modalities an operator can declare per model. Empty means every modality is on by
+// default (the request is tried and the upstream decides); an explicit list is how an operator
+// turns one off.
 const INPUT_MODALITIES = ['text', 'image', 'audio', 'video', 'pdf', 'file'];
 
 // Server- and catalogue-supplied OAuth URLs are bound to an href and to window.open. Only http(s)
@@ -187,7 +188,7 @@ export function buildRedirectPaste(p, ctx, session) {
 // `open-ai`, `parse` wants `openai`. A value here that the backend rejects turns "Add provider"
 // into a save-time error, which is how the pre-rename `command-code` spelling was caught. The Rust
 // test `the_panel_offers_only_dialects_this_binary_deserialises` pins this list.
-const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm', 'cursor', 'zcode', 'claude-cli', 'mistral-vibe', 'mistral-vibe-api'];
+const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm', 'cursor', 'zcode', 'claude-cli', 'mistral-vibe-api'];
 // Must list exactly the capability spellings the backend *deserialises* (mr-core `dialect.rs`,
 // serde kebab-case) and in the enum's order: `panel/test/capabilities.test.mjs` pins the ids to
 // the Rust variants. A checkbox spelling the server refuses turns "Create provider" into a
@@ -377,10 +378,10 @@ const PROVIDER_PRESETS = {
     { name: 'Codex', dialect: 'codex', baseUrl: 'https://chatgpt.com/backend-api/codex', auth: 'oauth', platform: 'openai-codex', capabilities: ['chat', 'responses', 'tool-calling', 'reasoning', 'vision'], hint: 'OpenAI Codex — OAuth sign-in from the panel.' },
     { name: 'Copilot', dialect: 'copilot', baseUrl: 'https://api.githubcopilot.com', auth: 'oauth', platform: 'github-copilot', capabilities: ['chat', 'responses', 'messages', 'embeddings', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'GitHub Copilot — OAuth sign-in from the panel.' },
     { name: 'Antigravity', dialect: 'antigravity', baseUrl: 'https://daily-cloudcode-pa.googleapis.com', auth: 'oauth', platform: 'antigravity', capabilities: ['chat', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'Google Antigravity / Cloud Code — OAuth sign-in from the panel.' },
-    { name: 'Cursor', dialect: 'cursor', baseUrl: 'https://api2.cursor.sh', auth: 'oauth', platform: 'cursor', capabilities: ['chat'], hint: 'Cursor — OAuth sign-in from the panel. The sign-in finishes in Cursor’s own tab and the panel learns of it by polling, so nothing is ever pasted back here.' },
+    { name: 'Cursor', dialect: 'cursor', baseUrl: 'https://api2.cursor.sh', auth: 'oauth', platform: 'cursor', capabilities: ['chat', 'tool-calling'], hint: 'Cursor — OAuth sign-in from the panel. The sign-in finishes in Cursor’s own tab and the panel learns of it by polling, so nothing is ever pasted back here.' },
     { name: 'Z Code', dialect: 'zcode', baseUrl: 'https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1', auth: 'oauth', platform: 'zcode', capabilities: ['messages', 'tool-calling', 'reasoning'], hint: 'Z.ai coding plan — sign in with the ZCode desktop app’s own login flow; the link opens at zcode.z.ai and the panel waits for the browser.' },
     { name: 'Claude Code', dialect: 'claude-cli', baseUrl: 'https://api.anthropic.com/v1', auth: 'oauth', platform: 'claude', capabilities: ['messages', 'models', 'tool-calling', 'reasoning', 'vision'], hint: 'Claude Code with a Claude subscription (Pro/Max) — sign-in happens on claude.ai and Anthropic shows a one-time code; the panel asks you to paste it. Do not add an API key: the subscription token is the credential, and an sk-ant-api… key is refused on this surface.' },
-    { name: 'Mistral Vibe', dialect: 'mistral-vibe', baseUrl: 'https://chat.mistral.ai', auth: 'oauth', platform: 'mistral-vibe', capabilities: ['chat', 'models', 'reasoning'], hint: 'Mistral Vibe — OAuth sign-in from the panel (loopback PKCE at auth.mistral.ai). No API key: the Vibe bearer is the credential.' },
+
     { name: 'Command Code', dialect: 'command-code-go', baseUrl: 'https://api.commandcode.ai', auth: 'bearer', capabilities: ['chat', 'models', 'tool-calling', 'reasoning'], hint: 'Command Code — bearer auth.' },
     { name: 'Modal vLLM', dialect: 'modal-vllm', baseUrl: '', auth: 'modal', hint: 'Enter your Modal app’s HTTPS public URL (for example https://your-app--serve.modal.run). Add the Modal Token ID.Token Secret as the account secret after saving; the panel sends it as Modal-Key and Modal-Secret headers.' },
     { name: 'OpenCode Zen', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/v1', auth: 'bearer', capabilities: ['chat', 'responses', 'models', 'tool-calling', 'reasoning'], hint: 'OpenCode Console, pay-as-you-go. Needs a funded key: the free models are refused outside the OpenCode client, so they cannot be routed from here.' },
@@ -398,7 +399,6 @@ const DIALECT_BASE_URLS = {
   copilot: 'https://api.githubcopilot.com',
   cursor: 'https://api2.cursor.sh',
   'claude-cli': 'https://api.anthropic.com/v1',
-  'mistral-vibe': 'https://chat.mistral.ai',
 };
 // The dialects that have no API-key path: their request builders expect the header an OAuth
 // login produces, and the Cursor transport refuses a turn before opening a socket when no such
@@ -1553,6 +1553,7 @@ export async function renderProviders(mount, ctx) {
           h('td', { class: 'mono' }, a.id ?? ''),
           h('td', {}, a.label ?? a.identity ?? ''),
           buildInlineAccountTags(p, a),
+          buildInlineAccountModels(p, a),
           h('td', {}, chip(s.label, s.cls, `state: ${s.key}`), quotaChip),
           buildInlineAccountNumber(p, a, 'priority', 'priority'),
           buildInlineAccountNumber(p, a, 'weight', 'weight'),
@@ -1564,6 +1565,7 @@ export async function renderProviders(mount, ctx) {
           h('thead', {}, h('tr', {},
             h('th', { scope: 'col' }, 'ID'), h('th', { scope: 'col' }, 'Label'),
             h('th', { scope: 'col', title: 'Free-text notes. A tag that names a person in Settings sends this account through that person\u2019s proxy.' }, 'Tags'),
+            h('th', { scope: 'col', title: 'Model access for this account. Allowed patterns are shown green; blocked patterns are shown red. Blocked patterns win.' }, 'Models'),
             h('th', { scope: 'col' }, 'State'), h('th', { scope: 'col' }, 'Pri'),
             h('th', { scope: 'col' }, 'Weight'),
             h('th', { scope: 'col', title: 'Known credit in US dollars; a fine-tuning job is only started on an account with more than $15' }, 'Credit'),
@@ -2439,6 +2441,94 @@ export async function renderProviders(mount, ctx) {
     return cell;
   }
 
+  /// An account's model-access patterns: which models this credential may serve.
+  ///
+  /// The configuration stores two lists (`models_allow` and `models_deny`); an empty allow list
+  /// means "all models" and a deny entry always wins. Showing both lists in one cell keeps an
+  /// account's access scope scannable without opening the whole provider configuration, and the
+  /// editor uses the same comma/newline list shape as the account-tags editor.
+  function buildInlineAccountModels(p, account) {
+    const slot = `account:${p.id}:${account.id}:models`;
+    const allowed = Array.isArray(account.models_allow) ? account.models_allow.map(String) : [];
+    const blocked = Array.isArray(account.models_deny) ? account.models_deny.map(String) : [];
+    const cell = h('td', { class: 'model-access-cell' });
+    const edit = h('button', {
+      class: 'icon-btn', type: 'button',
+      'aria-label': `Edit model access for account ${account.id ?? ''}`,
+      title: 'Model access for this account',
+    }, icon('pencil'));
+    edit.addEventListener('click', () => renderEditor(inlineDrafts.get(slot) ?? {
+      allowed: allowed.join(', '),
+      blocked: blocked.join(', '),
+    }));
+
+    function renderView() {
+      cell.replaceChildren(h('div', { class: 'model-access-view' },
+        ...(allowed.length || blocked.length
+          ? [
+              ...allowed.map((pattern) => chip(`+${pattern}`, 'chip-green', `allowed: ${pattern}`)),
+              ...blocked.map((pattern) => chip(`-${pattern}`, 'chip-red', `blocked: ${pattern}`)),
+            ]
+          : [h('span', { class: 'hint' }, 'all models')]),
+        edit));
+    }
+
+    function renderEditor(initial) {
+      const allowedInput = h('input', {
+        class: 'input mono', type: 'text', value: initial?.allowed ?? '', placeholder: 'claude-*, gpt-5',
+        'aria-label': `Allowed models for account ${account.id ?? ''}`, style: 'min-width:150px',
+      });
+      const blockedInput = h('input', {
+        class: 'input mono', type: 'text', value: initial?.blocked ?? '', placeholder: 'claude-opus-4-7',
+        'aria-label': `Blocked models for account ${account.id ?? ''}`, style: 'min-width:150px',
+      });
+      const save = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, 'Save');
+      const cancel = h('button', { class: 'btn btn-sm', type: 'button' }, 'Cancel');
+      const editor = h('div', { class: 'model-access-edit' }, allowedInput, blockedInput, save, cancel);
+      cell.replaceChildren(editor);
+      const remember = () => inlineDrafts.set(slot, {
+        allowed: allowedInput.value,
+        blocked: blockedInput.value,
+      });
+      allowedInput.addEventListener('input', remember);
+      blockedInput.addEventListener('input', remember);
+      const restore = () => { inlineDrafts.delete(slot); renderView(); };
+      const persist = async () => {
+        const nextAllowed = parseTagList(allowedInput.value);
+        const nextBlocked = parseTagList(blockedInput.value);
+        save.disabled = true;
+        save.textContent = 'Saving…';
+        try {
+          await api.put(`/api/providers/${encodeURIComponent(p.id)}/accounts/${encodeURIComponent(account.id)}`,
+            { ...account, models_allow: nextAllowed, models_deny: nextBlocked });
+          inlineDrafts.delete(slot);
+          ctx.toast.success(nextAllowed.length || nextBlocked.length ? 'Model access saved.' : 'Model access cleared.');
+          await reload(true);
+        } catch (err) {
+          save.disabled = false;
+          save.textContent = 'Save';
+          ctx.toast.error('Could not save the account model access', err);
+        }
+      };
+      save.addEventListener('click', persist);
+      cancel.addEventListener('click', restore);
+      allowedInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); persist(); }
+        if (e.key === 'Escape') { e.preventDefault(); restore(); }
+      });
+      blockedInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); persist(); }
+        if (e.key === 'Escape') { e.preventDefault(); restore(); }
+      });
+      allowedInput.focus();
+      allowedInput.select();
+    }
+
+    if (inlineDrafts.has(slot)) renderEditor(inlineDrafts.get(slot));
+    else renderView();
+    return cell;
+  }
+
   function buildInlineModelNumber(p, model, key, label) {
     const slot = `model:${p.id}:${model.id}:${key}`;
     return buildInlineNumericCell(model[key], label, slot, async (value) => {
@@ -2658,8 +2748,8 @@ export async function renderProviders(mount, ctx) {
 
   /// Inline chips for a model's `input_modalities`.
   ///
-  /// Empty means *derive* from the bundled capability table. Toggling a chip writes an explicit
-  /// per-model list.
+  /// Empty means every modality is on by default. Toggling a chip writes an explicit per-model
+  /// list (which is also how a modality gets turned off).
   function buildInlineModelModalities(p, model) {
     const key = 'input_modalities';
     const slot = `model:${p.id}:${model.id}:${key}`;
@@ -2669,7 +2759,7 @@ export async function renderProviders(mount, ctx) {
     const renderView = () => {
       const chips = model[key]?.length
         ? model[key].map((mod) => chip(String(mod), 'chip-neutral', 'input modality'))
-        : [h('span', { class: 'muted' }, 'automatic')];
+        : [h('span', { class: 'muted' }, 'all on (default)')];
       cell.replaceChildren(h('div', { style: 'display:flex;gap:4px;flex-wrap:wrap;' }, ...chips), edit);
     };
     const draft = inlineDrafts.get(slot);
@@ -2962,6 +3052,8 @@ export async function renderProviders(mount, ctx) {
     const label = h('input', { class: 'input', type: 'text', 'data-field': 'label' });
     const identity = h('input', { class: 'input mono', type: 'text', 'data-field': 'identity', placeholder: 'e.g. work@account' });
     const tags = h('input', { class: 'input mono', type: 'text', 'data-field': 'tags', placeholder: 'alice, work' });
+    const modelsAllow = h('input', { class: 'input mono', type: 'text', 'data-field': 'models_allow', placeholder: 'claude-*, gpt-5' });
+    const modelsDeny = h('input', { class: 'input mono', type: 'text', 'data-field': 'models_deny', placeholder: 'claude-opus-4-7' });
     const secret = h('input', { class: 'input mono', type: 'password', 'data-field': 'secret', autocomplete: 'new-password', ...(describedBy ? { 'aria-describedby': describedBy } : {}) });
     const revealSecret = h('button', {
       class: 'btn btn-sm', type: 'button',
@@ -3010,6 +3102,8 @@ export async function renderProviders(mount, ctx) {
         field('Label', label),
         field('Identity (optional)', identity),
         field('Tags (optional)', tags, { hint: 'Free-text notes, comma separated. A tag that names a person in Settings sends this account through that person\u2019s machine.' }),
+        field('Models allowed (optional)', modelsAllow, { hint: 'Comma-separated model ids or prefix patterns such as claude-*. Blank allows every model.' }),
+        field('Models blocked (optional)', modelsDeny, { hint: 'Comma-separated model ids or prefix patterns. A blocked model wins over an allowed pattern.' }),
         secretBox),
       keylessRow,
       add);
@@ -3038,6 +3132,8 @@ export async function renderProviders(mount, ctx) {
             label: label.value || null,
             identity: identity.value || null,
             tags: parseTagList(tags.value),
+            models_allow: parseTagList(modelsAllow.value),
+            models_deny: parseTagList(modelsDeny.value),
             secret: keyless.checked ? null : key,
           });
         // Clear the plaintext from the DOM immediately — it must not linger on screen.

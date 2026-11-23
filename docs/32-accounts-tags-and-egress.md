@@ -200,8 +200,9 @@ serves, directly.
 
 ## 5. Observing it
 
-- `mr account list <provider>` — the `TAGS` column.
-- The panel — **Providers** has a `Tags` column per account, **Settings → People** lists each
+- `mr account list <provider>` — the `TAGS` column (and the `MODELS` column for the account's
+  model-access patterns, described in [key selection §5](05-key-selection.md#5-models_allow--models_deny-and-where-they-apply)).
+- The panel — **Providers** has a `Tags` column per account and a `Models` column for model access, **Settings → People** lists each
   person with the accounts carrying their tag, and a combo's step editor shows how many of the
   provider's accounts the step may use. `node --test panel/test/account-tags.test.mjs`,
   `panel/test/settings-people.test.mjs` and `panel/test/combo-step-accounts.test.mjs` pin that
