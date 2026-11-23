@@ -458,7 +458,13 @@ async fn dispatch_anthropic(
 /// of the model's name. The reverse is also deliberate: a level the model does *not* offer is not
 /// listed, even though requesting it succeeds by rerouting to the model's highest. Advertising it
 /// would be advertising a tier that is not this model's.
-fn model_listing(snapshot: &mr_core::snapshot::RoutingSnapshot) -> Vec<serde_json::Value> {
+/// The model listing, with learned modality failures taken into account: the list must not
+/// promise a modality the model already refused upstream, and the static snapshot cannot know
+/// what failed at runtime.
+fn model_listing_with_learning(
+    snapshot: &mr_core::snapshot::RoutingSnapshot,
+    relay: Option<&RelayState>,
+) -> Vec<serde_json::Value> {
     let mut data: Vec<serde_json::Value> = Vec::new();
 
     for combo in snapshot.combos() {
@@ -511,7 +517,10 @@ fn model_listing(snapshot: &mr_core::snapshot::RoutingSnapshot) -> Vec<serde_jso
                         .iter()
                         .map(|l| l.as_str())
                         .collect::<Vec<_>>(),
-                    "input_modalities": listed_modalities(step),
+                    "input_modalities": match relay {
+                        Some(relay) => listed_modalities_live(step, relay),
+                        None => listed_modalities(step),
+                    },
                 },
             }));
             // Only levels this model genuinely offers, and never for a model whose own id already
@@ -598,6 +607,22 @@ fn listed_modalities(step: &StepPlan) -> Vec<&'static str> {
         .collect()
 }
 
+/// [`listed_modalities`], minus the modalities this model is known to have failed upstream.
+///
+/// The listing is a client's contract about what will work: a modality that was tried and
+/// refused must stop being advertised, or the client keeps sending images to a model that has
+/// already said no.
+fn listed_modalities_live(step: &StepPlan, relay: &RelayState) -> Vec<&'static str> {
+    InputModality::ALL
+        .into_iter()
+        .filter(|modality| {
+            step.accepts_modality(*modality)
+                && !relay.modality_failed(step.provider_id.as_str(), &step.model, *modality)
+        })
+        .map(|modality| modality.as_str())
+        .collect()
+}
+
 async fn list_models(State(app): State<AppState>, headers: HeaderMap) -> Response {
     let presented = presented_key(&headers);
     let auth = authenticate_request(&app.relay, app.no_key_required, presented.as_deref());
@@ -607,7 +632,7 @@ async fn list_models(State(app): State<AppState>, headers: HeaderMap) -> Respons
 
     let table = app.relay.table();
     let data = match &auth {
-        AuthOutcome::Ok(key) => model_listing(&table.snapshot)
+        AuthOutcome::Ok(key) => model_listing_with_learning(&table.snapshot, Some(&app.relay))
             .into_iter()
             .filter(|row| {
                 row.get("id")
@@ -615,7 +640,7 @@ async fn list_models(State(app): State<AppState>, headers: HeaderMap) -> Respons
                     .is_some_and(|id| key_can_see_model(&table.snapshot, key, id))
             })
             .collect::<Vec<_>>(),
-        _ => model_listing(&table.snapshot),
+        _ => model_listing_with_learning(&table.snapshot, Some(&app.relay)),
     };
 
     json_response(
@@ -710,7 +735,7 @@ async fn retrieve_model(
             &format!("the model \"{model}\" is not in this key's scope"),
         );
     }
-    match model_listing(&table.snapshot)
+    match model_listing_with_learning(&table.snapshot, Some(&app.relay))
         .into_iter()
         .find(|row| row.get("id").and_then(|id| id.as_str()) == Some(model))
     {
@@ -753,7 +778,7 @@ async fn delete_model(
     let model = model.strip_prefix('/').unwrap_or(&model);
     // An unknown name is a 404, the same as the read route: saying "this model is not a fine-tune"
     // about a model that does not exist would be a second, less useful error.
-    if !model_listing(&table.snapshot)
+    if !model_listing_with_learning(&table.snapshot, Some(&app.relay))
         .iter()
         .any(|row| row.get("id").and_then(|id| id.as_str()) == Some(model))
     {
@@ -975,7 +1000,6 @@ async fn upload_training_file(
         total_timeout: Some(Duration::from_millis(
             target.step.total_timeout_ms.max(600_000),
         )),
-        emulate: false,
     };
     let response = target
         .app
@@ -1428,7 +1452,6 @@ async fn forward_with_bytes(
                 ttfb_timeout: Duration::from_millis(step.ttfb_timeout_ms),
                 total_timeout: (step.total_timeout_ms > 0)
                     .then(|| Duration::from_millis(step.total_timeout_ms)),
-                emulate: false,
             };
             match app.relay.upstream().send(request).await {
                 Ok(response) => {
@@ -1777,7 +1800,6 @@ fn apply_reasoning_level(
         .map(Some)
         .map_err(|_| "the rewritten request body could not be encoded".to_string())
 }
-
 
 /// The output cap a request states, in whichever spelling and nesting its dialect uses.
 ///
@@ -2418,9 +2440,10 @@ async fn dispatch_routed(
     // to begin now, before the first attempt, not when an answer arrives. This guard is attached
     // to whichever response ends the request (success keeps it open for the body's lifetime;
     // every failure path finishes it as failed).
-    let mut direct_guard: Option<crate::activity::ActivityGuard> = direct
-        .as_ref()
-        .map(|step| app.activity.begin("direct", model_name, &participant_id(step), now_ms));
+    let mut direct_guard: Option<crate::activity::ActivityGuard> = direct.as_ref().map(|step| {
+        app.activity
+            .begin("direct", model_name, &participant_id(step), now_ms)
+    });
 
     // --- Debug request logging (default off). ---
     //
@@ -2652,6 +2675,14 @@ async fn dispatch_routed(
     // parking the request on a 429 while a sibling provider stands ready hides that survival, so
     // when a later step has a usable account the request fails over to it instead. The hold only
     // applies when this step is the request's only option.
+    //
+    // A **priority** combo is the exception: its order is absolute, so it exhausts the current
+    // step's quota before spending the next one. A throttled or exhausted step is held silently
+    // for its recovery budget (bounded by the configured ceilings) and only then fails the combo
+    // over — otherwise the preferred provider would be skipped the instant a backup can serve,
+    // and its remaining windows would rot while the fallback burns the wrong quota.
+    let priority_exhausts_step =
+        matches!(combo, Some(c) if c.strategy == mr_core::ComboStrategy::Priority);
     let mut stop_advancing = false;
 
     for (step_index, step) in steps.iter().enumerate() {
@@ -2717,8 +2748,10 @@ async fn dispatch_routed(
                 // provider's refusal. Break out so the outer loop fails over to the available
                 // step; this step will be retried by later requests once it recovers. The
                 // reason is named honestly — a rate limit reads differently from a request
-                // the upstream refused to parse.
-                if later_available {
+                // the upstream refused to parse. A priority combo skips this escape: it
+                // exhausts the current step's quota first and only advances after its hold
+                // budget is spent (see priority_exhausts_step).
+                if later_available && !priority_exhausts_step {
                     match &attempt {
                         Attempt::Failed {
                             resource_exhausted: true,
@@ -2775,17 +2808,23 @@ async fn dispatch_routed(
                     // RESOURCE_EXHAUSTED is not a throttle to sit on: it is the reset-aware
                     // failover signal, and the account sweep has already tried every sibling.
                     // Break out so the failure advances to the next combo step instead of
-                    // parking this request on a provider whose windows are all exhausted.
+                    // parking this request on a provider whose windows are all exhausted. A
+                    // priority combo exhausts this step first: Google/Vertex windows recover on
+                    // their own schedule, so hold and retry within the budget instead.
                     Attempt::Failed {
                         resource_exhausted: true,
                         ..
                     } => {
-                        tracing::info!(
-                            provider = %step.provider_id,
-                            model = %step.model,
-                            "resource-exhausted refusal; failing over instead of holding"
-                        );
-                        break 'patience;
+                        if priority_exhausts_step {
+                            absorbing = true;
+                        } else {
+                            tracing::info!(
+                                provider = %step.provider_id,
+                                model = %step.model,
+                                "resource-exhausted refusal; failing over instead of holding"
+                            );
+                            break 'patience;
+                        }
                     }
                     Attempt::Failed {
                         response: Some(resp),
@@ -2817,6 +2856,19 @@ async fn dispatch_routed(
                 let spent = patience_started.elapsed().as_millis() as u64;
                 let remaining = wait_horizon_ms.saturating_sub(spent);
                 if remaining == 0 {
+                    // A priority combo's hold budget on this step is spent: exhaust the step's
+                    // quota windows fully before moving on — never unboundedly. Fall through so
+                    // the outer loop advances to the next combo step (or ends with the refusal
+                    // when none exists).
+                    if priority_exhausts_step {
+                        tracing::info!(
+                            provider = %step.provider_id,
+                            model = %step.model,
+                            wait_ms = wait_horizon_ms,
+                            "rate limit hold budget spent on this step; exhausting it and failing over"
+                        );
+                        break 'patience;
+                    }
                     // A 429 is a provider cooldown, not a client-visible failure. We have already
                     // retried every eligible sibling account; if they are still cooling, keep this
                     // request parked and retry the same provider again rather than leaking the 429
@@ -3240,7 +3292,7 @@ impl SkipCause {
             }
             SkipCause::NoUsableAccount => "no account for this model is usable right now",
             SkipCause::UnsupportedModality => {
-                "the route cannot carry this input modality and has no usable default"
+                "this model does not support the requested input modality and no usable default is configured"
             }
             SkipCause::UnsupportedCapability => {
                 "the provider does not declare the capability this route requires"
@@ -3741,6 +3793,9 @@ async fn attempt_step(
     let lookup_done = actx.lookup_done;
     let mut sticky_cleared = false;
     let mut fallback_target: Option<String> = None;
+    // Modalities this request carries, captured before the rewrite pass; the refusal handler below
+    // learns them as failed for the model when an upstream rejects the request itself.
+    let mut carried_modalities: Vec<mr_core::dialect::InputModality> = Vec::new();
     let Some(provider) = table.snapshot.providers().get(step.provider_index as usize) else {
         if is_sticky_step {
             if let Some(combo) = combo {
@@ -3964,7 +4019,12 @@ async fn attempt_step(
     // the relay then records the request as costing zero tokens — which the quota layer sums as
     // zero, so every token cap silently stops binding for streamed traffic. Only a body that is
     // already streaming is touched.
-    if inspect_json && matches!(step.dialect, Dialect::OpenAi | Dialect::Copilot) {
+    if inspect_json
+        && matches!(
+            step.dialect,
+            Dialect::OpenAi | Dialect::Copilot | Dialect::MistralVibeApi | Dialect::ModalVllm
+        )
+    {
         outgoing = with_stream_usage(outgoing);
     }
     // OpenAI's `developer` role, written as `system` for wire-compatible upstreams that predate
@@ -3974,10 +4034,7 @@ async fn attempt_step(
     // upstream is spared, because there the role is meaningful and accepted as sent. The rewrite
     // happens only when a role actually changes, so a body without the alias is passed through
     // without a re-encode.
-    if inspect_json
-        && !translated_body
-        && !provider.base_url.as_str().contains("api.openai.com")
-    {
+    if inspect_json && !translated_body && !provider.base_url.as_str().contains("api.openai.com") {
         let mut normalized = (*outgoing).to_vec();
         if normalize_developer_role(&mut normalized) {
             outgoing = normalized.into();
@@ -4056,6 +4113,8 @@ async fn attempt_step(
         // Modality detection runs on the translated upstream shape, so the same helper can inspect
         // both passthrough and cross-dialect requests. Only a differing configured default changes
         // the model field; the request content is never dropped or rewritten.
+        // The modalities this request carries, remembered so an upstream refusal of it can fail
+        // the modality for this model (see the `InvalidRequest` branch below).
         let mut modality_body: serde_json::Value = match serde_json::from_slice(&outgoing) {
             Ok(body) => body,
             Err(_) => {
@@ -4069,9 +4128,18 @@ async fn attempt_step(
                 };
             }
         };
+        // Modalities carried by the body actually sent, for the learned-failure bookkeeping.
+        if let Ok(carried) = crate::upstream::detect_input_modalities(&modality_body) {
+            carried_modalities = carried;
+        }
         match crate::upstream::rewrite_model_for_modalities(
             &mut modality_body,
-            |modality| step.accepts_modality(modality),
+            |modality| {
+                step.accepts_modality(modality)
+                    && !app
+                        .relay
+                        .modality_failed(step.provider_id.as_str(), &step.model, modality)
+            },
             table.snapshot.routing_defaults(),
         ) {
             Ok(Some(target)) => {
@@ -4399,9 +4467,6 @@ async fn attempt_step(
                                 .max(provider.cold_start_ttfb_timeout_ms.unwrap_or(0)),
                         )
                     }),
-                    // The Vibe consumer gateway wants the desktop app's Chromium fingerprint;
-                    // the rustls pool gets a Cloudflare challenge instead.
-                    emulate: step.dialect == Dialect::MistralVibe,
                 };
                 app.relay.upstream().send(request).await
             }
@@ -4610,7 +4675,7 @@ async fn attempt_step(
             let resource_exhausted = response
                 .body
                 .first_frame_bytes()
-                .is_some_and(|b| refusal_is_resource_exhausted(&b));
+                .is_some_and(|b| refusal_is_resource_exhausted(b));
             // A refusal used to leave no trace at all, which made the most expensive failure in
             // a combo — the one that silently sends every request to the next step — invisible.
             // The excerpt is what names the cause: `prefill_cap_refused` reads as a rate limit in
@@ -4650,6 +4715,26 @@ async fn attempt_step(
             // answer so that a request every step refuses still reports a real cause rather than a
             // synthesized one.
             if matches!(reason, select::CooldownReason::InvalidRequest) {
+                // The upstream refused the *request*, and the request carried media: the modality
+                // is failed for this model, so later requests skip or fall back instead of being
+                // refused twice for the same input. Quotas and throttles never reach this branch
+                // (they are classified elsewhere) — only a rejection of the request itself lands
+                // here. Detection runs on the body actually sent, so translated requests count too.
+                {
+                    for modality in &carried_modalities {
+                        app.relay.learn_modality_failure(
+                            step.provider_id.as_str(),
+                            &step.model,
+                            *modality,
+                        );
+                        tracing::info!(
+                                provider = %step.provider_id,
+                                model = %step.model,
+                                modality = %modality.as_str(),
+                            "input modality failed upstream; marking it unsupported for this model"
+                        );
+                    }
+                }
                 return Attempt::Failed {
                     response: Some(build_response(rebuilt, None)),
                     account: Some(account.id.clone()),
@@ -5607,8 +5692,14 @@ fn exhausted_by_body(body: &[u8]) -> Option<BodyRefusal> {
         .unwrap_or_default();
     // Some providers spell the quota refusal in a `status` field rather than `code`/`type`
     // (Google's RESOURCE_EXHAUSTED), so both are normalized and compared.
-    let status_kind = value
+    // Google/Vertex nest the `status` field under `error.status` (Antigravity does), while
+    // some other upstreams place it at the document root. Reading only the root misreads the
+    // familiar RESOURCE_EXHAUSTED body — `code` is numeric there, so the kind stays empty and
+    // the refusal lands as `QuotaExhausted` with a long park and a hard failover instead of the
+    // short per-account throttle it actually is.
+    let status_kind = error
         .get("status")
+        .or_else(|| value.get("status"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     let kind_lower = kind.to_ascii_lowercase();
@@ -5626,7 +5717,7 @@ fn exhausted_by_body(body: &[u8]) -> Option<BodyRefusal> {
         // while the short bucket clears in minutes is what made every codex account vanish from
         // its combo for a day. The soonest stated recovery is the reset-aware reading.
         let mut candidates: Vec<u64> = Vec::new();
-        collect_reset_candidates(&error, 0, &mut candidates);
+        collect_reset_candidates(error, 0, &mut candidates);
         candidates.iter().copied().min()
     };
     // A structured reset is the strongest statement, but it is not the only one. A body that says
@@ -6010,7 +6101,7 @@ fn classify_status(status: StatusCode, modal_cold_start: bool) -> select::Cooldo
         429 => select::CooldownReason::RateLimited,
         // A client error (400, 404, 422…) is the client’s fault. Do not cool down the account
         // and do not retry: another account would reject the same malformed request.
-        400 | 404 | 405 | 413 | 415 | 422 => select::CooldownReason::InvalidRequest,
+        400 | 404 | 405 | 413 | 415 | 422 | 501 => select::CooldownReason::InvalidRequest,
         503 if modal_cold_start => select::CooldownReason::ColdStart,
         _ => select::CooldownReason::Backoff,
     }
@@ -6039,7 +6130,11 @@ pub(crate) fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {
 /// which is how a provider with remaining quota ends up skipped — the unit, not the quota.
 pub(crate) fn stated_reset_delay_secs(raw: u64) -> u64 {
     const DELAY_MS_FLOOR: u64 = 100_000_000; // 100e6 s ≈ 3.2 years: no reset delay is this long
-    let secs = if raw >= DELAY_MS_FLOOR { raw / 1000 } else { raw };
+    let secs = if raw >= DELAY_MS_FLOOR {
+        raw / 1000
+    } else {
+        raw
+    };
     secs.min(86_400)
 }
 
@@ -6083,9 +6178,10 @@ pub(crate) fn collect_reset_candidates(value: &serde_json::Value, depth: u8, out
                         .unwrap_or(0)
                 };
                 match inner.as_u64() {
-                    Some(raw) if lower.contains("resets_in_seconds")
-                        || lower.contains("reset_after_seconds")
-                        || lower.contains("retry_after_seconds") =>
+                    Some(raw)
+                        if lower.contains("resets_in_seconds")
+                            || lower.contains("reset_after_seconds")
+                            || lower.contains("retry_after_seconds") =>
                     {
                         let _ = now();
                         out.push(stated_reset_delay_secs(raw));
@@ -6201,10 +6297,7 @@ fn upstream_path<'a>(
 fn dialect_version(dialect: Dialect) -> Option<&'static str> {
     match dialect {
         Dialect::OpenAi | Dialect::MistralVibeApi => Some("v1"),
-        // Vibe's LeChat backend lives at the origin root (`POST /api/chat`), with no version
-        // segment anywhere — like Cursor, where the RPC path is absolute. Adding one produces
-        // `/v1/api/chat`, which the consumer gateway 404s.
-        Dialect::MistralVibe => None,
+
         Dialect::Anthropic => Some("v1"),
         // The plan base URL is `…/api/v1/zcode-plan/anthropic`, i.e. it already carries the `v1` of
         // the API prefix but not the one the Messages endpoint needs, so the version is added.
@@ -6343,7 +6436,7 @@ fn build_url(step: &StepPlan, path: UpstreamPath<'_>) -> Option<String> {
 /// each route lives; a provider that deviates from it says so in `route_overrides`.
 fn default_path(dialect: Dialect, route: RouteKind) -> &'static str {
     match dialect {
-        Dialect::OpenAi | Dialect::MistralVibe | Dialect::MistralVibeApi => match route {
+        Dialect::OpenAi | Dialect::MistralVibeApi => match route {
             RouteKind::ChatCompletions => "/v1/chat/completions",
             RouteKind::Responses => "/v1/responses",
             RouteKind::Embeddings => "/v1/embeddings",
@@ -6586,22 +6679,6 @@ fn upstream_headers(
         }
     }
 
-    // Mistral Vibe: the LeChat consumer gateway recognizes the desktop app's own fingerprint. The
-    // app sends `accept: */*` (the generic block above may have set `text/event-stream` because the
-    // dialect forces streaming; the gateway is permissive, but mirroring the app is the safest
-    // shape). The bearer is `apply_auth`'s business and already attached.
-    if step.dialect == Dialect::MistralVibe {
-        map.insert("accept", HeaderValue::from_static("*/*"));
-        // Forced rather than defaulted: the gateway recognizes the desktop app's fingerprint,
-        // and a client's own User-Agent (curl, an SDK default) would undercut it. Every client
-        // presents as the same app, which is the point of the dialect.
-        map.insert(
-            "user-agent",
-            HeaderValue::from_str(mr_dialects::vibe::VIBE_USER_AGENT)
-                .unwrap_or_else(|_| HeaderValue::from_static("vibe-desktop/1.2.0")),
-        );
-    }
-
     map
 }
 
@@ -6750,16 +6827,14 @@ async fn build_client_response(
         // platform) hands a string-reading client an answer it cannot read — "answered with no
         // text". Everything else keeps the byte-honest fast path.
         if matches!(ctx.client_dialect, Dialect::OpenAi)
-            && matches!(ctx.upstream_dialect, Dialect::OpenAi | Dialect::MistralVibeApi)
+            && matches!(
+                ctx.upstream_dialect,
+                Dialect::OpenAi | Dialect::MistralVibeApi
+            )
             && ctx.route == RouteKind::ChatCompletions
         {
-            return build_response_with_content_normalization(
-                ctx,
-                upstream,
-                ticket,
-                spend_ticket,
-            )
-            .await;
+            return build_response_with_content_normalization(ctx, upstream, ticket, spend_ticket)
+                .await;
         }
         return build_response_with_spend(upstream, ticket, spend_ticket);
     }
@@ -6814,9 +6889,6 @@ async fn build_client_response(
         // Codex is the other dialect whose stream state is per answer, and for the same reason: a
         // thread-local cannot tell two answers in flight on one worker apart.
         let mut responses = mr_dialects::responses::Translator::new();
-        // Mistral Vibe is the same: its frames are replacement patches, and diffing against
-        // per-thread text would let two concurrent answers bleed into each other.
-        let mut vibe = mr_dialects::vibe::Translator::new();
         // A `None` marker closes the stream: it is how the last partial line in `pending` and any
         // closing frame the translator still owes the client get written before the body ends.
         let frames = frames
@@ -6843,7 +6915,6 @@ async fn build_client_response(
                             &ctx,
                             &mut commandcode,
                             &mut responses,
-                                                        &mut vibe,
                             pending,
                             &chunk,
                         )
@@ -6856,7 +6927,6 @@ async fn build_client_response(
                         &ctx,
                         &mut commandcode,
                         &mut responses,
-                                                &mut vibe,
                         pending,
                         *failed,
                     )),
@@ -6947,7 +7017,6 @@ fn translate_stream_chunk(
     ctx: &TranslateCtx<'_>,
     commandcode: &mut mr_dialects::commandcode::Translator,
     responses: &mut mr_dialects::responses::Translator,
-    vibe: &mut mr_dialects::vibe::Translator,
     pending: &mut Vec<u8>,
     chunk: &Bytes,
 ) -> Vec<Result<Bytes, hyper::Error>> {
@@ -6991,8 +7060,6 @@ fn translate_stream_chunk(
                 mr_dialects::commandcode::translate(commandcode, ctx, data)
             } else if ctx.upstream_dialect == Dialect::Codex && !ctx.is_passthrough() {
                 responses.translate(ctx, data)
-            } else if ctx.upstream_dialect == Dialect::MistralVibe && !ctx.is_passthrough() {
-                vibe.translate(ctx, data)
             } else {
                 mr_dialects::translate_sse_data(ctx, data)
             } {
@@ -7010,22 +7077,6 @@ fn translate_stream_chunk(
             },
             // Command Code metadata JSON is intentionally suppressed.
             None if ctx.upstream_dialect == Dialect::CommandCodeGo => {}
-            // Mistral Vibe's frames are length-prefixed JSONL (`N:{json}`) with no `data:` field.
-            // Feed the whole line to the per-stream translator.
-            None if ctx.upstream_dialect == Dialect::MistralVibe && !pass_through => {
-                match vibe.translate(ctx, trimmed) {
-                    Ok(lines) => {
-                        for line in lines {
-                            if !line.is_empty() {
-                                out.push(Ok(translated_frame(&line)));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "could not translate a Vibe stream frame");
-                    }
-                }
-            }
             // A comment is a keep-alive: no payload, ignored by every SSE parser.
             None if trimmed.starts_with(':') => out.push(Ok(Bytes::from(format!("{trimmed}\n")))),
             None if pass_through => out.push(Ok(Bytes::from(format!("{trimmed}\n")))),
@@ -7050,7 +7101,6 @@ fn flush_stream_chunk(
     ctx: &TranslateCtx<'_>,
     commandcode: &mut mr_dialects::commandcode::Translator,
     responses: &mut mr_dialects::responses::Translator,
-    vibe: &mut mr_dialects::vibe::Translator,
     pending: &mut Vec<u8>,
     upstream_failed: bool,
 ) -> Vec<Result<Bytes, hyper::Error>> {
@@ -7062,20 +7112,12 @@ fn flush_stream_chunk(
             ctx,
             commandcode,
             responses,
-            vibe,
             pending,
             &Bytes::from(tail),
         ));
     }
     if ctx.upstream_dialect == Dialect::Codex && !ctx.is_passthrough() {
         for line in responses.finish(ctx) {
-            if !line.is_empty() {
-                out.push(Ok(translated_frame(&line)));
-            }
-        }
-    }
-    if ctx.upstream_dialect == Dialect::MistralVibe && !ctx.is_passthrough() {
-        for line in vibe.finish(ctx) {
             if !line.is_empty() {
                 out.push(Ok(translated_frame(&line)));
             }
@@ -7202,12 +7244,12 @@ async fn build_response_with_content_normalization(
 ) -> Response {
     let status = upstream.status;
     let tapped = match (&ticket, &spend_ticket) {
-        (Some(ticket), Some(spend)) => http_body_util::combinators::UnsyncBoxBody::new(
-            crate::account_spend::SpendBody::new(
+        (Some(ticket), Some(spend)) => {
+            http_body_util::combinators::UnsyncBoxBody::new(crate::account_spend::SpendBody::new(
                 crate::quota::TapBody::new(upstream.body, std::sync::Arc::clone(ticket)),
                 std::sync::Arc::clone(spend),
-            ),
-        ),
+            ))
+        }
         (Some(ticket), None) => http_body_util::combinators::UnsyncBoxBody::new(
             crate::quota::TapBody::new(upstream.body, std::sync::Arc::clone(ticket)),
         ),
@@ -7240,25 +7282,24 @@ async fn build_response_with_content_normalization(
         // may end this stream — a line that never got its newline is not a frame and never can
         // be, and the half-line is dropped when the stream state drops.
         let frames = BodyStream::new(tapped);
-        let stream = frames
-            .scan(
-                Vec::<u8>::new(),
-                |pending, frame: Result<http_body::Frame<Bytes>, hyper::Error>| {
-                    let out: Option<Vec<Result<Bytes, hyper::Error>>> = Some(match frame {
-                        Ok(frame) => match frame.into_data() {
-                            Ok(data) => normalize_stream_chunk(pending, &data)
-                                .into_iter()
-                                .map(Ok)
-                                .collect(),
-                            // A trailers-only frame carries no payload lines and keeps the
-                            // stream alive.
-                            Err(_) => Vec::new(),
-                        },
-                        Err(err) => vec![Err(err)],
-                    });
-                    async move { out }
-                },
-            );
+        let stream = frames.scan(
+            Vec::<u8>::new(),
+            |pending, frame: Result<http_body::Frame<Bytes>, hyper::Error>| {
+                let out: Option<Vec<Result<Bytes, hyper::Error>>> = Some(match frame {
+                    Ok(frame) => match frame.into_data() {
+                        Ok(data) => normalize_stream_chunk(pending, &data)
+                            .into_iter()
+                            .map(Ok)
+                            .collect(),
+                        // A trailers-only frame carries no payload lines and keeps the
+                        // stream alive.
+                        Err(_) => Vec::new(),
+                    },
+                    Err(err) => vec![Err(err)],
+                });
+                async move { out }
+            },
+        );
         let stream = stream.flat_map(|chunks| {
             futures_util::stream::iter(chunks.into_iter().map(|c| c.map(http_body::Frame::data)))
         });
@@ -8162,7 +8203,7 @@ mod tests {
     }
 
     fn listed_ids(snapshot: &mr_core::snapshot::RoutingSnapshot) -> Vec<String> {
-        model_listing(snapshot)
+        model_listing_with_learning(snapshot, None)
             .into_iter()
             .map(|entry| entry["id"].as_str().unwrap().to_owned())
             .collect()
@@ -8229,7 +8270,7 @@ mod tests {
             &[InputModality::Text, InputModality::Image],
             &[("c1", "coding")],
         );
-        for entry in model_listing(&snapshot) {
+        for entry in model_listing_with_learning(&snapshot, None) {
             let id = entry["id"].as_str().unwrap();
             match snapshot.resolve(id) {
                 Resolution::Direct { step, level, .. } => {
@@ -8274,7 +8315,7 @@ mod tests {
             ],
             &[],
         );
-        let entry = model_listing(&snapshot)
+        let entry = model_listing_with_learning(&snapshot, None)
             .into_iter()
             .find(|entry| entry["id"] == "p1/m1")
             .expect("the base name is listed");
@@ -8294,6 +8335,64 @@ mod tests {
     }
 
     #[test]
+    fn a_learned_failure_drops_the_modality_from_the_live_listing() {
+        // The listing is a promise: once an upstream refused an image for this model, the list
+        // must stop advertising image, or clients keep sending what already failed.
+        let snapshot = snapshot_with(
+            Dialect::OpenAi,
+            "m1",
+            &[ReasoningLevel::High],
+            &[InputModality::Text, InputModality::Image],
+            &[],
+        );
+        let config = mr_core::config::Config::default();
+        let relay = RelayState::new(
+            &config,
+            snapshot.clone(),
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        );
+
+        let listed = model_listing_with_learning(&snapshot, Some(&relay));
+        let entry = listed
+            .iter()
+            .find(|entry| entry["id"] == "p1/m1")
+            .expect("the model is listed");
+        let modalities = entry["manarouter"]["input_modalities"]
+            .as_array()
+            .expect("input_modalities is a list");
+        assert!(
+            modalities.iter().any(|m| m == "image"),
+            "image is advertised before it fails"
+        );
+
+        relay.learn_modality_failure("p1", "m1", InputModality::Image);
+
+        let listed = model_listing_with_learning(&snapshot, Some(&relay));
+        let entry = listed
+            .iter()
+            .find(|entry| entry["id"] == "p1/m1")
+            .expect("the model is listed");
+        let modalities = entry["manarouter"]["input_modalities"]
+            .as_array()
+            .expect("input_modalities is a list");
+        assert!(
+            !modalities.iter().any(|m| m == "image"),
+            "image stays advertised after it failed"
+        );
+        assert!(modalities.iter().any(|m| m == "text"));
+    }
+
+    #[test]
+    fn a_501_is_an_invalid_request_refusal_not_a_cooldown() {
+        // A gateway-style "does not support this modality" answer is a statement about the
+        // request, not the account: no cooldown, and the failure advances like any 4xx.
+        assert_eq!(
+            classify_status(StatusCode::NOT_IMPLEMENTED, false),
+            select::CooldownReason::InvalidRequest,
+        );
+    }
+
+    #[test]
     fn the_model_listing_lists_a_combo_plain_and_per_level() {
         let snapshot = snapshot_with(
             Dialect::OpenAi,
@@ -8307,7 +8406,7 @@ mod tests {
         assert!(ids.contains(&"coding-low".to_string()));
         assert!(ids.contains(&"coding-high".to_string()));
 
-        let entry = model_listing(&snapshot)
+        let entry = model_listing_with_learning(&snapshot, None)
             .into_iter()
             .find(|entry| entry["id"] == "coding-high")
             .unwrap();
@@ -8521,14 +8620,13 @@ mod tests {
             &ctx,
             &mut commandcode,
             &mut responses,
-                        &mut mr_dialects::vibe::Translator::new(),
-&mut pending,
+            &mut pending,
             &metadata
         )
         .is_empty());
         let token = Bytes::from_static(b"{\"type\":\"text-delta\",\"text\":\"OK\"}\n");
         let output =
-            translate_stream_chunk(&ctx, &mut commandcode, &mut responses, &mut mr_dialects::vibe::Translator::new(), &mut pending, &token);
+            translate_stream_chunk(&ctx, &mut commandcode, &mut responses, &mut pending, &token);
         let output = output.into_iter().map(Result::unwrap).collect::<Vec<_>>();
         assert_eq!(output.len(), 1);
         let text = std::str::from_utf8(&output[0]).unwrap();
@@ -8542,8 +8640,7 @@ mod tests {
             &ctx,
             &mut commandcode,
             &mut responses,
-                        &mut mr_dialects::vibe::Translator::new(),
-&mut pending,
+            &mut pending,
             &finish,
         );
         let text = output
@@ -8583,7 +8680,7 @@ mod tests {
 response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hi\"}\n\n",
         );
         let out =
-            translate_stream_chunk(&ctx, &mut translator, &mut responses, &mut mr_dialects::vibe::Translator::new(), &mut pending, &chunk);
+            translate_stream_chunk(&ctx, &mut translator, &mut responses, &mut pending, &chunk);
         let text = out
             .into_iter()
             .map(Result::unwrap)
@@ -8624,7 +8721,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
         );
         let out =
-            translate_stream_chunk(&ctx, &mut translator, &mut responses, &mut mr_dialects::vibe::Translator::new(), &mut pending, &chunk);
+            translate_stream_chunk(&ctx, &mut translator, &mut responses, &mut pending, &chunk);
         let text = out
             .into_iter()
             .map(Result::unwrap)
@@ -8659,8 +8756,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             &ctx,
             &mut translator,
             &mut responses,
-                        &mut mr_dialects::vibe::Translator::new(),
-&mut pending,
+            &mut pending,
             &Bytes::from_static(b"data: {\"id\":\"x\",\"choices\":[]}\n\n"),
         );
         let text = out
@@ -8689,8 +8785,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             &ctx,
             &mut translator,
             &mut responses,
-                        &mut mr_dialects::vibe::Translator::new(),
-&mut pending,
+            &mut pending,
             &Bytes::from_static(b": keep-alive\n"),
         );
         let text = out
@@ -8730,7 +8825,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                     cc: &mut mr_dialects::commandcode::Translator,
                     pending: &mut Vec<u8>,
                     frame: &'static [u8]| {
-            translate_stream_chunk(&ctx, cc, open, &mut mr_dialects::vibe::Translator::new(), pending, &Bytes::from_static(frame))
+            translate_stream_chunk(&ctx, cc, open, pending, &Bytes::from_static(frame))
                 .into_iter()
                 .map(Result::unwrap)
                 .map(|b| String::from_utf8(b.to_vec()).unwrap())
@@ -8965,13 +9060,12 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             &ctx,
             &mut cc,
             &mut open,
-                        &mut mr_dialects::vibe::Translator::new(),
             &mut pending,
             &Bytes::from_static(
                 b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}",
             ),
         );
-        let out = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut mr_dialects::vibe::Translator::new(), &mut pending, false);
+        let out = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending, false);
         let text = out
             .into_iter()
             .map(Result::unwrap)
@@ -8993,7 +9087,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         );
         assert!(pending.is_empty(), "the buffer is drained");
         // A second flush, as the body ending twice would do, says nothing again.
-        assert!(flush_stream_chunk(&ctx, &mut cc, &mut open, &mut mr_dialects::vibe::Translator::new(), &mut pending, false).is_empty());
+        assert!(flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending, false).is_empty());
     }
 
     /// A Gemini body that ends cleanly without a finish reason is still closed as an answer.
@@ -9025,13 +9119,12 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 &ctx,
                 &mut cc,
                 &mut open,
-                                &mut mr_dialects::vibe::Translator::new(),
                 &mut pending,
                 &Bytes::from_static(
                     b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"notice\"}]}}]}",
                 ),
             );
-            let text = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut mr_dialects::vibe::Translator::new(), &mut pending, false)
+            let text = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending, false)
                 .into_iter()
                 .map(Result::unwrap)
                 .map(|b| String::from_utf8(b.to_vec()).unwrap())
@@ -9050,7 +9143,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 "{upstream_dialect:?}: {text:?}"
             );
             assert!(
-                flush_stream_chunk(&ctx, &mut cc, &mut open, &mut mr_dialects::vibe::Translator::new(), &mut pending, false).is_empty(),
+                flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending, false).is_empty(),
                 "{upstream_dialect:?}: closing twice says nothing the second time"
             );
         }
@@ -9075,13 +9168,12 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             &ctx,
             &mut cc,
             &mut open,
-                        &mut mr_dialects::vibe::Translator::new(),
             &mut pending,
             &Bytes::from_static(
                 b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"half\"}]}}]}",
             ),
         );
-        let text = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut mr_dialects::vibe::Translator::new(), &mut pending, true)
+        let text = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending, true)
             .into_iter()
             .map(Result::unwrap)
             .map(|b| String::from_utf8(b.to_vec()).unwrap())
@@ -9127,7 +9219,6 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 &ctx,
                 t,
                 &mut responses,
-                                &mut mr_dialects::vibe::Translator::new(),
                 pending,
                 &Bytes::from_static(frame.as_bytes()),
             );
@@ -9241,8 +9332,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 &ctx,
                 &mut t,
                 &mut responses,
-                                &mut mr_dialects::vibe::Translator::new(),
-&mut pending,
+                &mut pending,
                 &Bytes::from_static(frame.as_bytes()),
             );
         }
@@ -10445,6 +10535,19 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     }
 
     #[test]
+    fn a_google_style_resource_exhausted_429_nested_under_error_is_still_a_throttle() {
+        // Captured live from Antigravity: the `status` field arrives under `error.status` and the
+        // `code` is numeric, so the kind alone is empty. This is the exact shape the failover
+        // storm produced — it must be read as the same per-account 10-second throttle as the
+        // root-level spelling, never a spent-quota park.
+        let body = br#"{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}"#;
+        let refusal = exhausted_by_body(body).expect("resource exhausted is a refusal");
+        assert_eq!(refusal.reason, select::CooldownReason::RateLimited);
+        assert_eq!(refusal.wait_ms, Some(10_000));
+        assert_eq!(refusal.scope, Some(mr_core::model::CooldownScope::Account));
+    }
+
+    #[test]
     fn a_reset_stated_as_an_instant_is_converted_to_a_wait() {
         // OpenAI states an instant rather than a delay on some endpoints. Reading it as a delay
         // would park the account until 1970.
@@ -10475,8 +10578,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         // `86400000000` ms is a real one-day window; read as seconds it is a thousand days, and the
         // day cap would silently make the ms form and a bogus value indistinguishable. The
         // normalization keeps the day cap meaningful for both.
-        let body =
-            br#"{"error":{"type":"usage_limit_reached","resets_in_seconds":86400000000}}"#;
+        let body = br#"{"error":{"type":"usage_limit_reached","resets_in_seconds":86400000000}}"#;
         let refusal = exhausted_by_body(body).expect("a spent window");
         let wait = refusal.wait_ms.expect("a wait");
         assert!(
@@ -12095,7 +12197,8 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         let (second_url, second_seen) = fake_upstream().await;
 
         // Both steps serve; the first's *account* has exhausted its declared window in the ledger.
-        let mut first = provider_serving("first", &first_url, "shared-model", &[InputModality::Text]);
+        let mut first =
+            provider_serving("first", &first_url, "shared-model", &[InputModality::Text]);
         let mut spent = mr_core::model::Account::new("spent");
         // The ledger is keyed by the account id, and `Account::new` only names the label: pin the
         // id so the spend row below matches what the snapshot compiles.
@@ -12103,7 +12206,12 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         spent.secret_ref = Some("test-credential".to_owned());
         spent.quota = vec![mr_core::model::QuotaWindow::requests_per(3600, 1)];
         first.accounts = vec![spent];
-        let second = provider_serving("second", &second_url, "shared-model", &[InputModality::Text]);
+        let second = provider_serving(
+            "second",
+            &second_url,
+            "shared-model",
+            &[InputModality::Text],
+        );
 
         let mut combo = mr_core::model::Combo::new(
             "failover",
@@ -12692,7 +12800,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 max_stated_wait_ms: 1_200,
                 poll_interval_ms: 300,
                 max_total_hold_ms: 60_000,
-                },
+            },
             ..Default::default()
         };
         let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
@@ -12742,9 +12850,9 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         );
     }
 
-    /// A rate limit on the first step must fail the combo over to a later step that is available:
-    /// the throttle belongs to the provider, not to the combo, and the request should be answered
-    /// by the sibling provider instead of parking on or surfacing the 429.
+    /// A priority combo exhausts the first step's throttle budget before advancing: the request
+    /// holds silently on the throttled step (retrying within its recovery budget), and only then
+    /// fails the combo over to the available sibling step.
     #[tokio::test]
     async fn a_rate_limit_fails_over_to_a_later_available_step() {
         let (first_url, first_seen) = refusing_upstream(
@@ -12821,16 +12929,16 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "the second step must serve once the first is rate limited"
+            "the second step must serve after the first's hold budget is spent"
         );
         assert!(
-            !first_seen.lock().unwrap().is_empty(),
-            "the rate-limited step was tried first"
+            first_seen.lock().unwrap().len() >= 2,
+            "the priority combo exhausted the throttled step's budget before advancing"
         );
         assert_eq!(
             second_seen.lock().unwrap().len(),
             1,
-            "the rate limit fails the combo over to the available step"
+            "the throttled step exhausts its hold budget, then the combo fails over"
         );
     }
 
@@ -13025,7 +13133,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 max_stated_wait_ms: 1_200,
                 poll_interval_ms: 300,
                 max_total_hold_ms: 60_000,
-                },
+            },
             ..Default::default()
         };
         let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
@@ -13075,10 +13183,10 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         );
     }
 
-    /// A persistent `429 RESOURCE_EXHAUSTED` fails over: each account's window resets on its own
-    /// schedule (reset-aware priority), so once the provider's accounts have all refused, the
-    /// request moves to the next combo step instead of parking on a throttle that no amount of
-    /// waiting on this provider will resolve.
+    /// A persistent `429 RESOURCE_EXHAUSTED` on a priority combo's first step is held and retried
+    /// within the silent-retry budget: the step's windows recover on their own schedule, so the
+    /// request exhausts the step before considering the next one. Here the first provider recovers
+    /// on its fourth attempt, so it serves and the sibling is never dialled.
     #[tokio::test]
     async fn a_persistent_resource_exhausted_429_fails_over_to_the_next_step() {
         let (first_url, first_seen) = mock_upstream_custom(|attempt, _body| {
@@ -13164,17 +13272,110 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "the second provider serves after the first's RESOURCE_EXHAUSTED"
+            "the first provider serves once its window recovers"
+        );
+        assert!(
+            first_seen.lock().unwrap().len() >= 4,
+            "the priority combo held and retried the exhausted step until it recovered"
+        );
+        assert_eq!(
+            second_seen.lock().unwrap().len(),
+            0,
+            "the exhausted step recovered, so the sibling was never dialled"
+        );
+    }
+
+    /// Non-priority strategies keep the eager failover: a throttled or exhausted step is skipped
+    /// at once when a later step can serve, because their order is a preference, not a promise to
+    /// burn every window first.
+    #[tokio::test]
+    async fn a_round_robin_combo_fails_over_eagerly_from_an_exhausted_step() {
+        let (first_url, first_seen) = refusing_upstream(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}"#,
+        )
+        .await;
+        let (second_url, second_seen) = fake_upstream().await;
+
+        let mut combo = mr_core::model::Combo::new(
+            "failover",
+            mr_core::model::ComboStep::new("first", "shared-model"),
+        );
+        combo.strategy = mr_core::dialect::ComboStrategy::RoundRobin;
+        combo
+            .steps
+            .push(mr_core::model::ComboStep::new("second", "shared-model"));
+
+        let config = mr_core::config::Config {
+            providers: vec![
+                provider_serving("first", &first_url, "shared-model", &[InputModality::Text]),
+                provider_serving(
+                    "second",
+                    &second_url,
+                    "shared-model",
+                    &[InputModality::Text],
+                ),
+            ],
+            combos: vec![combo],
+            rate_limit_retry: mr_core::config::RateLimitRetryConfig {
+                enabled: true,
+                max_wait_ms: 800,
+                max_stated_wait_ms: 1_200,
+                poll_interval_ms: 200,
+                max_total_hold_ms: 60_000,
+            },
+            ..Default::default()
+        };
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(failover_body()),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the second step serves the round-robin combo"
         );
         assert_eq!(
             first_seen.lock().unwrap().len(),
             1,
-            "the exhausted provider is tried once, then failed over"
+            "a non-priority combo skips the exhausted step eagerly"
         );
         assert_eq!(
             second_seen.lock().unwrap().len(),
             1,
-            "RESOURCE_EXHAUSTED advances to the next combo step"
+            "the exhausted step fails over immediately"
         );
     }
 
@@ -14397,7 +14598,8 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             batch: crate::batch::BatchLane::inert(),
         };
 
-        let request_body = r#"{"model":"p/m","messages":[{"role":"user","content":"hello"}],"temperature":0.7}"#;
+        let request_body =
+            r#"{"model":"p/m","messages":[{"role":"user","content":"hello"}],"temperature":0.7}"#;
         let response = dispatch(
             state,
             Dialect::OpenAi,
@@ -14409,13 +14611,15 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         .await;
         assert_eq!(response.status(), StatusCode::OK);
 
-        let records = seen.lock().unwrap();
-        assert_eq!(records.len(), 1, "exactly one upstream call");
-        let (path, body) = &records[0];
+        let (path, body) = {
+            let records = seen.lock().unwrap();
+            assert_eq!(records.len(), 1, "exactly one upstream call");
+            records[0].clone()
+        };
         assert_eq!(path, "/v1/chat/completions", "standard API path");
         // The only rewrite is the model-id resolution (`p/m` → `m`); the rest of the OpenAI body
         // reaches the API surface untouched — no Vibe envelope, no website chat shapes.
-        let sent: serde_json::Value = serde_json::from_str(body).unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&body).unwrap();
         let requested: serde_json::Value = serde_json::from_str(request_body).unwrap();
         assert_eq!(sent["model"], "m");
         assert_eq!(sent["messages"], requested["messages"]);
@@ -14490,9 +14694,15 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         let records = seen.lock().unwrap();
         assert_eq!(records.len(), 1, "exactly one upstream call");
         let sent: serde_json::Value = serde_json::from_str(&records[0].1).unwrap();
-        assert_eq!(sent["messages"][0]["role"], "system", "developer became system");
+        assert_eq!(
+            sent["messages"][0]["role"], "system",
+            "developer became system"
+        );
         assert_eq!(sent["messages"][0]["content"], "You are terse.");
-        assert_eq!(sent["messages"][1]["role"], "user", "the user message is untouched");
+        assert_eq!(
+            sent["messages"][1]["role"], "user",
+            "the user message is untouched"
+        );
     }
 
     /// OpenAI-only extras are dropped for a strict upstream: Mistral's platform answers
@@ -14556,14 +14766,23 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         let sent: serde_json::Value = serde_json::from_str(&records[0].1).unwrap();
         assert!(sent.get("store").is_none(), "store was dropped");
         assert!(sent.get("metadata").is_none(), "metadata was dropped");
-        assert!(sent.get("prompt_cache_key").is_none(), "prompt_cache_key was dropped");
-        assert!(sent.get("service_tier").is_none(), "service_tier was dropped");
+        assert!(
+            sent.get("prompt_cache_key").is_none(),
+            "prompt_cache_key was dropped"
+        );
+        assert!(
+            sent.get("service_tier").is_none(),
+            "service_tier was dropped"
+        );
         assert!(
             sent["messages"][1].get("reasoning_content").is_none(),
             "an echoed reasoning_content was dropped from the assistant message"
         );
         assert_eq!(sent["messages"][1]["content"], "an earlier answer");
-        assert_eq!(sent["messages"][2]["content"], "hello", "the user message is untouched");
+        assert_eq!(
+            sent["messages"][2]["content"], "hello",
+            "the user message is untouched"
+        );
         assert_eq!(sent["temperature"], 0.5, "fields every provider reads stay");
     }
 
@@ -14659,8 +14878,14 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
 
         // Not one frame may carry array content; the thinking lands as reasoning_content and
         // the answer's text is the string the contract promises.
-        assert!(!text.contains("[{\"type\""), "an array delta reached the client: {text}");
-        assert!(text.contains("\"reasoning_content\":\"adding\""), "thinking was lost: {text}");
+        assert!(
+            !text.contains("[{\"type\""),
+            "an array delta reached the client: {text}"
+        );
+        assert!(
+            text.contains("\"reasoning_content\":\"adding\""),
+            "thinking was lost: {text}"
+        );
         let text_delta = text
             .lines()
             .find(|l| l.contains("\"content\":\"4\"") || l.contains("\"content\": \"4\""))
@@ -14668,9 +14893,11 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         let payload: serde_json::Value =
             serde_json::from_str(text_delta.trim_start_matches("data: ")).unwrap();
         assert_eq!(payload["choices"][0]["delta"]["content"], "4");
-        assert_eq!(payload["usage"]["total_tokens"], 2, "usage rides through untouched");
+        assert_eq!(
+            payload["usage"]["total_tokens"], 2,
+            "usage rides through untouched"
+        );
     }
-
 
     /// A body without a `developer` message is not re-encoded at all: the passthrough stays
     /// byte-for-byte, so provider-specific fields a re-encode would drop survive.
@@ -17127,7 +17354,8 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         let provider = provider_serving("p", &url, "m", &[InputModality::Text]);
         let combo = mr_core::model::Combo::new("both", mr_core::model::ComboStep::new("p", "m"));
         let state = state_over(vec![provider], vec![combo]);
-        let listing = model_listing(&state.relay.table().snapshot);
+        let listing =
+            model_listing_with_learning(&state.relay.table().snapshot, Some(&state.relay));
 
         // A provider's model is listed as `provider/model`, and the read route answers with that
         // exact row — the same id, the same `owned_by`, the same `manarouter` metadata.
@@ -17185,9 +17413,11 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             "{body}"
         );
         // The refusal is local: the model is still in the listing.
-        assert!(model_listing(&state.relay.table().snapshot)
-            .iter()
-            .any(|row| row["id"] == "p/m"));
+        assert!(
+            model_listing_with_learning(&state.relay.table().snapshot, Some(&state.relay))
+                .iter()
+                .any(|row| row["id"] == "p/m")
+        );
 
         // An unknown name is the same 404 the read route gives, rather than a claim about what
         // kind of model it is.
@@ -17982,7 +18212,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         let state = state_over(vec![provider], Vec::new());
 
         assert!(
-            model_listing(&state.relay.table().snapshot)
+            model_listing_with_learning(&state.relay.table().snapshot, Some(&state.relay))
                 .iter()
                 .any(|row| row["id"] == id),
             "the advertised fine-tune is not in the listing"

@@ -643,6 +643,11 @@ An upstream `429` is a throttle, not a death: the provider is busy, not broken. 
 neither surfaces to the client nor fails the combo over to the next provider (a rate limit is the
 one refusal that never advances a combo; spent quota, bad credentials and transport errors still do).
 
+For a **priority** combo this hold is absolute: the step's quota is exhausted before any later step
+is tried, so a throttled or quota-exhausted preferred provider is waited out for the silent-retry
+budget (bounded by `max_total_hold_ms`) and only then fails the combo over. With any other strategy,
+an available later step still takes over immediately from a throttled or exhausted one.
+
 ```json
 {
   "rateLimitRetry": {
