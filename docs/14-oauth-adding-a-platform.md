@@ -33,10 +33,14 @@ crates/mr-core/src/oauth/
 ├── codex.rs        openai-codex (loopback, plus a device-code fallback)
 ├── antigravity.rs  antigravity (both Google tiers)
 ├── copilot.rs      github-copilot (device code)
+├── claude.rs       claude (paste-only)
+├── cursor.rs       cursor (browser-completion poll)
+├── zcode.rs        zcode (brokered CLI login)
+├── mistral_api.rs  mistral-vibe-api (the Mistral CLI's Ory loopback PKCE)
 └── (halcyon.rs)    not in the tree; the worked example below is fictional
 ```
 
-The registry is a static array of trait objects, and lookup is a linear scan by id. There are three
+The registry is a static array of trait objects, and lookup is a linear scan by id. There are seven
 shipped platforms, plus the fictional Halcyon below; a hash map would be slower to construct and no
 faster to search.
 

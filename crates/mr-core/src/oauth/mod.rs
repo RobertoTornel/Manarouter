@@ -10,6 +10,8 @@
 //! | `antigravity`      | [`antigravity::Antigravity`] | loopback authorization code (T2 experimental, T1 selectable) |
 //! | `cursor`           | [`cursor::Cursor`]   | browser-completion page + poll     |
 //! | `zcode`            | [`zcode::Zcode`]     | brokered CLI login: created, then polled until the browser finishes |
+//! | `mistral-vibe-api` | [`mistral_api::MistralApi`] | loopback PKCE (S256) against Mistral's Ory |
+//! | `claude`           | [`claude::Claude`]   | pasted-code login (redirect on Anthropic's own origin) |
 //! | `cline`            | not registered       | no verified interactive flow      |
 //! | OmniRoute additional providers | not ported | provider-specific review required |
 //!
@@ -47,7 +49,7 @@ pub mod copilot;
 pub mod cursor;
 pub mod flow;
 pub mod migrate;
-pub mod mistral_vibe;
+pub mod mistral_api;
 pub mod reference;
 pub mod refresh;
 pub mod session;
@@ -759,7 +761,7 @@ use claude::Claude;
 use codex::Codex;
 use copilot::Copilot;
 use cursor::Cursor;
-use mistral_vibe::MistralVibe;
+use mistral_api::MistralApi;
 use zcode::Zcode;
 
 static CLAUDE: Claude = Claude;
@@ -767,8 +769,8 @@ static CODEX: Codex = Codex;
 static COPILOT: Copilot = Copilot;
 static ANTIGRAVITY: Antigravity = Antigravity::ide();
 static CURSOR: Cursor = Cursor;
+static MISTRAL_API: MistralApi = MistralApi;
 static ZCODE: Zcode = Zcode;
-static MISTRAL_VIBE: MistralVibe = MistralVibe;
 
 /// Registration order for implemented platforms, matching `catalog/providers.toml`.
 static PLATFORMS: [&'static dyn OAuthPlatform; 7] = [
@@ -776,9 +778,9 @@ static PLATFORMS: [&'static dyn OAuthPlatform; 7] = [
     &COPILOT,
     &ANTIGRAVITY,
     &CURSOR,
+    &MISTRAL_API,
     &ZCODE,
     &CLAUDE,
-    &MISTRAL_VIBE,
 ];
 
 /// Every registered platform. Required to resolve every `AuthKind::OAuth` catalogue id — see

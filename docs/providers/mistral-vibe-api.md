@@ -1,47 +1,32 @@
-# Mistral Vibe API
+## Mistral Vibe API (`mistral-vibe-api`)
 
-Mistral's public platform surface at `https://api.mistral.ai/v1`, authenticated with a standard
-bearer API key (the same credential the Mistral Vibe CLI reads from `MISTRAL_API_KEY`).
+**OAuth (recommended).** The panel signs a Mistral account in through the same login the Mistral CLI
+performs: a loopback PKCE flow against Mistral's Ory deployment (`auth.mistral.ai`), minting a vibe
+token for `https://api.mistral.ai/v1`. Add an account and choose **Sign in**; a browser opens, you
+approve, and the token lands in the encrypted vault with automatic refresh. The provider needs no
+contact with Mistral's consumer website — the wire is the OpenAI-compatible platform API, forwarded
+byte-for-byte from an OpenAI client.
 
-This is the API-backed sibling of `mistral-vibe` (the LeChat consumer gateway at
-`chat.mistral.ai`). The wire format is OpenAI-shaped and is forwarded byte-for-byte from an OpenAI
-client: no Vibe create envelope, no website chat shapes. The dialect exists so the surface can be
-named explicitly in configuration, gets the standard `/v1/*` path rules, and is documented against
-the Vibe CLI's own backend (`api.mistral.ai`) rather than the app's website.
+**API key (still supported).** Existing bearer accounts keep working after the flip: an account with
+no OAuth grant falls back to its vault secret (the relay and conductor both fall through to
+`secret_ref` when `oauth_ref` is absent). A new account can still be added with an API key via
+`mr account add mistral-vibe-api --secret-stdin` (the key itself goes in through your terminal, never
+in this chat).
 
-## Configuration
+**Known unknown.** Whether `api.mistral.ai` accepts the minted Ory token is UNVERIFIED in this build:
+an earlier revision of this entry recorded the API rejecting both Ory tokens with `Invalid API Key`,
+while the operator's direction for this revision is the CLI-mimicking login that is now implemented.
+The first live login (panel **Sign in**) is the verification step. If the login completes but
+requests then fail with `401`, the first knob is the bearer in
+`crates/mr-core/src/oauth/mistral_api.rs` (`apply_credential`): it sends the audience-scoped access
+token, and the JWT `id_token` is preserved in the token set's `extra` as the documented alternative.
+No provider migration is needed either way — bearer accounts are not affected.
 
-```toml
-[[providers]]
-id = "mistral-vibe-api"
-label = "Mistral Vibe API"
-dialect = "mistral-vibe-api"
-base_url = "https://api.mistral.ai/v1"
-auth = "bearer"
-capabilities = ["chat", "models", "tool-calling", "reasoning"]
+The two surfaces use different credentials, so do not paste a platform API key into a consumer-surface
+prompt or vice versa. The relay forwards chat-completions requests on the **OpenAI wire**: `model`,
+`messages`, `stream` pass through and the response is streamed back as OpenAI SSE, preserving usage
+(and converting any Mistral streaming deltas into the same shape). `developer` messages are rewritten
+to `system` for this upstream.
 
-[[providers.models]]
-id = "mistral-large-latest"   # use the ids your key can actually serve
-input_modalities = ["text"]
-
-[[providers.accounts]]
-id = "default"
-```
-
-Attach the API key with:
-
-```bash
-mr account add mistral-vibe-api --secret-stdin
-```
-
-(all paste the key and send EOF; it is stored in the encrypted vault, never on the command line).
-
-## Behavior
-
-- Requests pass through with only the model-id resolution (`provider/model` → the step's model id)
-  applied. `reasoning_effort`, `temperature`, `max_tokens`, tool calls, vision and streaming all
-  go through as the OpenAI client wrote them; responses come back unchanged, including `usage`.
-- Streaming is the client's choice (unlike the LeChat gateway, which always streams and whose
-  frames the relay folds).
-- The same accounts, quota windows, combos, sticky success and failover machinery as every other
-  provider apply.
+The dialect id is `mistral-vibe-api`, so a configured model is selected as
+`mistral-vibe-api/<model>`.

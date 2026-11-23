@@ -184,32 +184,6 @@ pub mod openai {
     pub const DEVICE_VERIFY: &str = "https://auth.openai.com/codex/device";
 }
 
-/// The Mistral endpoints used by the Vibe desktop login and by the OpenAI-compatible API.
-///
-/// The Vibe desktop app authenticates through Ory at `auth.mistral.ai` with PKCE (S256); the
-/// values below are the Ory defaults plus the client id embedded in the desktop bundle.
-/// `// UNCERTAIN:` the Ory paths are the standard ones Ory serves; they were not verified against
-/// a live login, and the client id may be per-app. If authorize fails, compare the URL with what
-/// the desktop app opens.
-pub mod mistral_vibe {
-    /// The authorization endpoint on the Ory deployment.
-    pub const AUTHORIZE: &str = "https://auth.mistral.ai/oauth2/auth";
-    /// The token endpoint: code exchange and refresh, both form-encoded.
-    pub const TOKEN: &str = "https://auth.mistral.ai/oauth2/token";
-    /// OIDC userinfo, used for account identity.
-    pub const USERINFO: &str = "https://auth.mistral.ai/userinfo";
-    /// The OpenAI-compatible API origin.
-    pub const API: &str = "https://api.mistral.ai";
-    /// The OAuth client id embedded in the Vibe desktop app (v1.2.0).
-    pub const CLIENT_ID: &str = "88df79e3-3a98-4624-92fe-c607ecf06f1d";
-    /// API audience from the desktop app's OIDC authorization request.
-    pub const AUDIENCE: &str = "https://api.mistral.ai";
-    /// The OIDC callback path; the desktop binds an ephemeral loopback port.
-    pub const LOOPBACK_CALLBACK_PATH: &str = "/auth/oidc/callback";
-    /// The scopes the desktop login requests, in its observed order.
-    pub const SCOPES: &str = "openid email profile offline_access";
-}
-
 /// The Anthropic endpoints used by the Claude Code login and by Claude inference.
 ///
 /// Claude's login is the odd one among these platforms in a way that decides where every value
@@ -303,6 +277,39 @@ pub mod cursor {
     pub const CHAT_PATH: &str = "/aiserver.v1.ChatService/StreamUnifiedChatWithTools";
     /// The model list method, also gRPC-web.
     pub const MODELS_PATH: &str = "/aiserver.v1.AiService/AvailableModels";
+}
+
+/// The Mistral account login: the Ory deployment behind the Mistral Vibe clients.
+///
+/// The Mistral Vibe desktop app (v1.2.0, NSIS installer) signs in through an Ory deployment:
+/// the authorization, token and userinfo endpoints below, PKCE (S256), and a public client id
+/// extracted from the app's bundle. The login is what the Mistral CLI performs to mint the
+/// vibe token the `mistral-vibe-api` provider presents to `api.mistral.ai` as a bearer; the
+/// authorize request carries `audience=https://api.mistral.ai` so the minted token is scoped
+/// to the platform API, and an ephemeral loopback callback at `/auth/oidc/callback`.
+///
+/// // UNCERTAIN: the exact Ory paths (`/oauth2/auth`, `/oauth2/token`, `/userinfo`) are the
+/// defaults Ory serves, and the client id is the one embedded in the desktop app, which may be
+/// registered per-app. They are not separately verified against a live Mistral login. If a
+/// login fails at the authorization stage the panel shows the URL; compare it with the URL the
+/// app itself opens and adjust these constants.
+pub mod mistral {
+    /// The authorization endpoint on the Ory deployment.
+    pub const AUTHORIZE: &str = "https://auth.mistral.ai/oauth2/auth";
+    /// The token endpoint: code exchange and refresh, both form-encoded.
+    pub const TOKEN: &str = "https://auth.mistral.ai/oauth2/token";
+    /// OIDC userinfo, used for account identity.
+    pub const USERINFO: &str = "https://auth.mistral.ai/userinfo";
+    /// The OpenAI-compatible API origin the minted token addresses.
+    pub const API: &str = "https://api.mistral.ai";
+    /// The OAuth client id embedded in the Mistral Vibe desktop app (v1.2.0), from its shipped bundle.
+    pub const CLIENT_ID: &str = "88df79e3-3a98-4624-92fe-c607ecf06f1d";
+    /// API audience from the app's OIDC authorization request.
+    pub const AUDIENCE: &str = "https://api.mistral.ai";
+    /// The OIDC callback path; the app binds an ephemeral loopback port.
+    pub const LOOPBACK_CALLBACK_PATH: &str = "/auth/oidc/callback";
+    /// The scopes the login requests, in the app's observed order.
+    pub const SCOPES: &str = "openid email profile offline_access";
 }
 
 #[cfg(test)]

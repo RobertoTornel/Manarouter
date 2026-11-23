@@ -134,10 +134,12 @@ dialect = "cursor"
 base_url = "https://api2.cursor.sh"
 auth = { type = "oauth", platform = "cursor" }
 oauth_platform = "cursor"
-# Chat only, and deliberately: the agent stream carries no effort field, so no reasoning level
-# above `none` can be expressed, and a turn that asks this client to run a tool is refused by the
-# transport rather than half-answered. Claiming either would promise what the relay will not send.
-capabilities = ["chat"]
+# Chat and tool calling: the client's tools are declared on the agent frame and the calls the
+# server makes are surfaced as ordinary OpenAI `tool_calls`, with the caller's result carried back
+# on the next turn. No reasoning level above `none` is claimed because the agent stream carries no
+# effort field, and the transport declines the server's own tool-execution request rather than
+# running a tool the caller owns.
+capabilities = ["chat", "tool-calling"]
 key_strategy = "round-robin"
 note = "OAuth only, and not a redirect flow: the operator opens cursor.com/loginDeepControl with a PKCE challenge bound to a session id, finishes the sign-in there, and this router polls /auth/poll until the page reports it done. Chat is not REST — it is a bidirectional Connect stream of protobuf frames to agent{,.n}.api5.cursor.sh, whose host is discovered hourly from aiserver.v1.ServerConfigService/GetServerConfig. UNCERTAIN: the client version and the agent host discovery are reverse-engineered from a working CLI and may lag it; a 4xx on every request usually means the client version needs bumping. No vision capability is claimed because image parts travel through the blob store, which this build does not implement."
 docs_url = "https://cursor.com"
@@ -216,32 +218,20 @@ seconds = 18000
 reset_only = true
 
 [[providers]]
-id = "mistral-vibe"
-label = "Mistral Vibe"
-dialect = "mistral-vibe"
-base_url = "https://chat.mistral.ai"
-auth = { type = "oauth", platform = "mistral-vibe" }
-oauth_platform = "mistral-vibe"
-capabilities = ["chat", "models", "reasoning"]
+id = "mistral-vibe-api"
+label = "Mistral Vibe API"
+dialect = "mistral-vibe-api"
+base_url = "https://api.mistral.ai/v1"
+auth = { type = "oauth", platform = "mistral-vibe-api" }
+oauth_platform = "mistral-vibe-api"
+capabilities = ["chat", "models", "tool-calling", "reasoning"]
 key_strategy = "round-robin"
-note = "OAuth only: the Mistral Vibe desktop login (Ory PKCE at auth.mistral.ai) mints an opaque access token plus a JWT id_token. The LeChat consumer backend (chat.mistral.ai/api/chat) authenticates with the id_token — the public api.mistral.ai/v1 surface rejects both Ory tokens with Invalid API Key — and serves the subscription models (glm-5-latest-short etc). The relay translates OpenAI chat-completions requests into the app's create-envelope and streams the answer back as OpenAI SSE."
+note = "OAuth login (the Mistral CLI's loopback PKCE against Mistral's Ory at auth.mistral.ai) mints a vibe token for https://api.mistral.ai/v1; existing API-key accounts keep working via the vault-secret fallback for accounts with no OAuth grant. The wire is OpenAI-shaped and is forwarded byte-for-byte from an OpenAI client: no LeChat create envelope, no website /api/chat. UNCERTAIN: acceptance of Ory tokens by api.mistral.ai is unverified in this build — an earlier revision of this entry recorded the API rejecting both Ory tokens — so the first live login is the verification step and all existing key accounts stay usable regardless."
 docs_url = "https://www.mistral.ai/vibe"
 oauth_authorize_url = "https://auth.mistral.ai/oauth2/auth"
 oauth_token_url = "https://auth.mistral.ai/oauth2/token"
 oauth_client_id = "88df79e3-3a98-4624-92fe-c607ecf06f1d"
 oauth_scopes = "openid email profile offline_access"
-headers = { "user-agent" = "vibe-desktop/1.2.0" }
-
-[[providers]]
-id = "mistral-vibe-api"
-label = "Mistral Vibe API"
-dialect = "mistral-vibe-api"
-base_url = "https://api.mistral.ai/v1"
-auth = { type = "bearer" }
-capabilities = ["chat", "models", "tool-calling", "reasoning"]
-key_strategy = "round-robin"
-note = "API-key surface at api.mistral.ai/v1 — the same backend the Mistral Vibe CLI talks to (MISTRAL_API_KEY). The wire is OpenAI-shaped and is forwarded byte-for-byte from an OpenAI client: no LeChat create envelope, no website /api/chat. Use this dialect to route to Mistral's platform models with a standard bearer key; mistral-vibe remains the OAuth-only LeChat consumer gateway."
-docs_url = "https://www.mistral.ai/vibe"
 headers = { }
 
 [[providers]]
