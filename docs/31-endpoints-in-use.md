@@ -83,6 +83,11 @@ purpose.
 | GET | `/v1/batches` | List batches | none |
 | GET | `/v1/batches/{id}` | Retrieve a batch | none |
 | POST | `/v1/batches/{id}/cancel` | Cancel a batch | JSON, may be empty |
+| POST | `/v1/jobs` | Submit a GPU job | JSON |
+| GET | `/v1/jobs` | List jobs | none |
+| GET | `/v1/jobs/{id}` | Retrieve a job | none |
+| POST | `/v1/jobs/{id}/cancel` | Cancel a job | JSON, may be empty |
+| GET | `/v1/jobs/{id}/artifacts/{name}` | Download a job artifact | none |
 | POST | `/v1/vector_stores` | Create a vector store | JSON |
 | GET | `/v1/vector_stores` | List vector stores | none |
 | GET | `/v1/vector_stores/{id}` | Retrieve a vector store | none |
@@ -329,6 +334,27 @@ independently: one failing item does not fail the batch.
 
 `GET /v1/batches` lists with `limit` and `after`; `POST /v1/batches/{id}/cancel` stops new items and
 keeps the ones already paid for.
+
+## GPU jobs
+
+A job runs a container with a command on a rented GPU. `image` and `backend` are required:
+
+```bash
+curl -K /tmp/mr.curl https://example.invalid/v1/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"backend":"demo","image":"python:3.12-slim","command":["python","render.py"],"env":{"STEPS":"50"},"gpu_count":1,"max_seconds":3600}'
+```
+
+`backend` is `demo` (the local simulator: costs nothing, good for wiring a client) or `vast`
+(Vast.ai; needs `VAST_API_KEY` in the relay's environment). `gpu` names a model, `disk_gb` a disk
+size, and `max_seconds` is the wall-clock budget after which the job fails rather than billing
+forever. `env` is a string map.
+
+The answer is a job object whose `status` moves `queued` → `running` → `succeeded` (with
+`artifacts`), `failed` (with `error`), or `cancelled`. Poll with `GET /v1/jobs/{id}`; `logs` grows
+as the backend reports. `POST /v1/jobs/{id}/cancel` stops a queued or running job.
+`GET /v1/jobs` lists with `limit` and `after`. A named artifact downloads from
+`GET /v1/jobs/{id}/artifacts/{name}` (plain file names only). See `docs/27-gpu-jobs.md`.
 
 ## Vector stores
 

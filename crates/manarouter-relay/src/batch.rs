@@ -2294,6 +2294,7 @@ fn parse_input(bytes: &[u8]) -> Result<Vec<BatchItem>, Refusal> {
 ///
 /// Shared with the router's other local surfaces (uploads, vector stores, responses, fine-tuning)
 /// so that every one of them answers an error in the same envelope as the request path.
+#[derive(Debug)]
 pub(crate) struct Refusal {
     status: StatusCode,
     code: &'static str,

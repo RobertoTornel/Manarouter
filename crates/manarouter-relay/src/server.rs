@@ -155,6 +155,8 @@ pub struct AppState {
     /// goes — and the lane's executor needs the state to reach the routing snapshot and the upstream
     /// client.
     pub batch: Arc<crate::batch::BatchLane>,
+    /// The GPU-job lane: custom containerized jobs on rental or simulator backends.
+    pub jobs: Arc<crate::jobs::JobLane>,
 }
 
 /// Build the route table.
@@ -217,6 +219,16 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/batches/{id}", get(crate::batch::retrieve_batch))
         .route("/v1/batches/{id}/cancel", post(crate::batch::cancel_batch))
+        .route(
+            "/v1/jobs",
+            post(crate::jobs::create_job).get(crate::jobs::list_jobs),
+        )
+        .route("/v1/jobs/{id}", get(crate::jobs::retrieve_job))
+        .route("/v1/jobs/{id}/cancel", post(crate::jobs::cancel_job))
+        .route(
+            "/v1/jobs/{id}/artifacts/{name}",
+            get(crate::jobs::artifact_download),
+        )
         .route("/control/probe", post(control_probe))
         .route("/control/activity", get(control_activity))
         // The families that keep their own state rather than forwarding it. Each module owns its
@@ -9007,6 +9019,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         }
     }
 
@@ -11259,6 +11272,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
         (state, text_seen, vision_seen)
     }
@@ -11355,6 +11369,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
         (state, seen)
     }
@@ -11463,6 +11478,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let response = dispatch(
@@ -11637,6 +11653,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
         (state, seen)
     }
@@ -11866,6 +11883,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
         (state, upstream_seen)
     }
@@ -12207,6 +12225,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
         (state, first_seen, second_seen)
     }
@@ -12291,6 +12310,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let response = dispatch(
@@ -12364,6 +12384,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
         let response = dispatch(
             state,
@@ -12535,6 +12556,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         // Both accounts cooling; the dead one recovers soonest, so recovery order dials it first.
@@ -12646,6 +12668,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         // The account is parked for six days: far beyond the last-resort horizon.
@@ -12780,6 +12803,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let response = chat(state.clone(), "shared/shared-model").await;
@@ -12860,6 +12884,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
         let resp = dispatch(
             state,
@@ -12952,6 +12977,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let response = dispatch(
@@ -13037,6 +13063,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let response = dispatch(
@@ -13124,6 +13151,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let started = std::time::Instant::now();
@@ -13216,6 +13244,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let response = dispatch(
@@ -13291,6 +13320,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
         let resp = dispatch(
             state,
@@ -13390,6 +13420,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let response = dispatch(
@@ -13483,6 +13514,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let response = dispatch(
@@ -13592,6 +13624,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let started = std::time::Instant::now();
@@ -13712,6 +13745,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let response = dispatch(
@@ -13841,6 +13875,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
         (state, first_seen, second_seen)
     }
@@ -13990,6 +14025,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         // Two requests, each baking its own nonce into the prompt, dispatched together.
@@ -14207,6 +14243,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         // Deliberately *not* streaming: this is the path that folded the answer into nothing.
@@ -14317,6 +14354,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let response = dispatch(
@@ -14449,6 +14487,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let response = dispatch(
@@ -14684,6 +14723,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         }
     }
 
@@ -14728,6 +14768,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let request_body =
@@ -14809,6 +14850,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let request_body = r#"{"model":"p/m","messages":[{"role":"developer","content":"You are terse."},{"role":"user","content":"hello"}]}"#;
@@ -14879,6 +14921,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let request_body = r#"{"model":"p/m","store":false,"metadata":{"a":"b"},"prompt_cache_key":"k","service_tier":"auto","messages":[{"role":"developer","content":"be terse"},{"role":"assistant","reasoning_content":"I was thinking","content":"an earlier answer"},{"role":"user","content":"hello"}],"temperature":0.5}"#;
@@ -14992,6 +15035,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let request_body = r#"{"model":"p/m","stream":true,"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
@@ -15071,6 +15115,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         // `mistral_property` names a field no re-encode would invent; its presence in the
@@ -15548,6 +15593,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
         (state, winner_seen)
     }
@@ -15975,6 +16021,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
         (state, seen, dir)
     }
@@ -16293,6 +16340,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         }
     }
 
@@ -16499,6 +16547,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
         (state, seen)
     }
@@ -16627,6 +16676,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             // A lane with no disk state and no workers: these tests exercise the request path, and a
             // lane that recovered the operator's real batches would be both slow and surprising.
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
         (state, seen)
     }
@@ -16777,6 +16827,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
         let mut headers = HeaderMap::new();
@@ -16996,6 +17047,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
         (state, seen, dir)
     }
@@ -17271,6 +17323,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             account_inflight: Arc::new(crate::state::AccountInflight::default()),
             kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: Arc::new(crate::jobs::JobLane::inert()),
         }
     }
 

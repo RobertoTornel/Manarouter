@@ -56,6 +56,7 @@ pub mod count_tokens;
 pub mod cursor_transport;
 pub mod egress;
 pub mod evals;
+pub mod jobs;
 pub mod kv_budget;
 pub mod model_scan;
 pub mod proxy;

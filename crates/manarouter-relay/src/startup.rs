@@ -228,6 +228,8 @@ pub fn build_state(
         0,
     );
 
+    let jobs = Arc::new(crate::jobs::JobLane::open(mr_core::config::state_dir().join("jobs")));
+
     let state = AppState {
         relay,
         quota_store: Arc::clone(&oauth_store),
@@ -242,6 +244,7 @@ pub fn build_state(
         account_inflight: Arc::new(crate::state::AccountInflight::default()),
         kv_usage,
         batch,
+        jobs,
     };
 
     // Now that the state exists, hand the executor the pieces it needs and let the workers drain

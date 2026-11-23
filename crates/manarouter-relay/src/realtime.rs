@@ -1473,6 +1473,7 @@ mod tests {
             account_inflight: std::sync::Arc::new(crate::state::AccountInflight::default()),
             kv_usage: std::sync::Arc::new(crate::kv_budget::AdmissionPool::new()),
             batch: crate::batch::BatchLane::inert(),
+            jobs: std::sync::Arc::new(crate::jobs::JobLane::inert()),
         };
         (state, dir)
     }
