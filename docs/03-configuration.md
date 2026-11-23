@@ -643,11 +643,12 @@ An upstream `429` is a throttle, not a death: the provider is busy, not broken. 
 neither surfaces to the client nor fails the combo over to the next provider (a rate limit is the
 one refusal that never advances a combo; spent quota, bad credentials and transport errors still do).
 
-For a **priority** combo this hold is absolute: the step's quota is exhausted before any later step
-is tried, so a throttled or quota-exhausted preferred provider is held and retried all the way to
-`max_total_hold_ms` — not just the first short budget — and only then fails the combo over. With
-any other strategy, an available later step still takes over immediately from a throttled or
-exhausted one.
+For a **priority** combo this hold is absolute: a throttled preferred provider is held and retried
+all the way to `max_total_hold_ms` — not just the first short budget — before any later step is
+tried. **Quota exhaustion is not a throttle, though:** a `402`, a spent balance, an exhausted
+window, or a step whose every account is parked as `quota-exhausted` fails over immediately,
+because waiting restores neither a balance nor a window. With any other strategy, an available later
+step still takes over immediately from a throttled or exhausted one.
 
 ```json
 {

@@ -2804,6 +2804,53 @@ async fn dispatch_routed(
                     }
                     _ => None,
                 };
+                // Quota exhaustion (402, spent-balance and exhausted-window refusals) is NOT a
+                // throttle: waiting cannot restore a balance or a window, so a request must
+                // fail over to the next step rather than hold silently. Only RateLimited holds.
+                {
+                    let quota_exhausted = match &attempt {
+                        Attempt::Failed {
+                            response: Some(resp),
+                            ..
+                        } if matches!(resp.status(), StatusCode::PAYMENT_REQUIRED) => true,
+                        // Every other shape is first checked against the attempt's own
+                        // bookkeeping: a FAILED attempt whose response exists carries the
+                        // status the caller already classified when it built the failure.
+                        // The `advance_step` flag is false only for a RateLimited throttle
+                        // (which must hold), and true for everything else — spent quota, bad
+                        // credential, transport error — so it is the direct failover signal.
+                        Attempt::Failed { advance_step, .. } => *advance_step,
+                        Attempt::Skip {
+                            cause: SkipCause::NoUsableAccount,
+                            ..
+                        } => {
+                            // All accounts parked as QuotaExhausted (402 / spent balance):
+                            // waiting cannot restore a balance or a window, so fail over
+                            // rather than hold. A skip parked by a throttle still holds.
+                            app.health.view().values().any(|c| {
+                                c.reason == select::CooldownReason::QuotaExhausted
+                                    && c.until_ms > now_ms
+                            })
+                        }
+                        _ => false,
+                    };
+                    if quota_exhausted
+                        && !matches!(
+                            &attempt,
+                            Attempt::Failed {
+                                resource_exhausted: true,
+                                ..
+                            }
+                        )
+                    {
+                        tracing::info!(
+                            provider = %step.provider_id,
+                            model = %step.model,
+                            "quota exhausted; failing over instead of holding"
+                        );
+                        break 'patience;
+                    }
+                }
                 match &attempt {
                     // RESOURCE_EXHAUSTED is not a throttle to sit on: it is the reset-aware
                     // failover signal, and the account sweep has already tried every sibling.
@@ -13009,6 +13056,101 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert!(
             !first_seen.lock().unwrap().is_empty(),
             "the rate-limited step was tried"
+        );
+    }
+
+    /// A quota-exhausted step (402 / spent balance) fails over immediately: waiting cannot restore
+    /// a balance, so the request advances to the next step exactly like a non-holdable refusal,
+    /// and with no later step the request ends fast with the 402 instead of stalling on holds.
+    #[tokio::test]
+    async fn a_quota_exhausted_step_fails_over_without_holding() {
+        let (first_url, first_seen) = refusing_upstream(
+            StatusCode::PAYMENT_REQUIRED,
+            r#"{"error":{"message":"insufficient credit: top up the account"}}"#,
+        )
+        .await;
+        let (second_url, second_seen) = fake_upstream().await;
+
+        let mut combo = mr_core::model::Combo::new(
+            "failover",
+            mr_core::model::ComboStep::new("first", "shared-model"),
+        );
+        combo
+            .steps
+            .push(mr_core::model::ComboStep::new("second", "shared-model"));
+
+        let config = mr_core::config::Config {
+            providers: vec![
+                provider_serving("first", &first_url, "shared-model", &[InputModality::Text]),
+                provider_serving(
+                    "second",
+                    &second_url,
+                    "shared-model",
+                    &[InputModality::Text],
+                ),
+            ],
+            combos: vec![combo],
+            rate_limit_retry: mr_core::config::RateLimitRetryConfig {
+                enabled: true,
+                max_wait_ms: 5_000,
+                max_stated_wait_ms: 1_200,
+                poll_interval_ms: 1_000,
+                max_total_hold_ms: 5_000,
+            },
+            ..Default::default()
+        };
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            account_inflight: Arc::new(crate::state::AccountInflight::default()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let started = std::time::Instant::now();
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(failover_body()),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the quota-exhausted step must fail over to the healthy sibling immediately"
+        );
+        assert_eq!(
+            first_seen.lock().unwrap().len(),
+            1,
+            "the 402 step is tried once, never held or retried"
+        );
+        assert_eq!(second_seen.lock().unwrap().len(), 1);
+        assert!(
+            elapsed < std::time::Duration::from_millis(2_500),
+            "no silent hold happened, got {elapsed:?}"
         );
     }
 
