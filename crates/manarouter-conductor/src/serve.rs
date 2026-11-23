@@ -84,6 +84,12 @@ pub async fn serve(state: AppState) -> Result<(), String> {
         "control plane listening on {origin} (panel: {origin}/, API: {origin}/api/health)"
     );
 
+    // Automatic quota probing: sweep every keyed account once now (backfilling accounts that
+    // never got a row — e.g. ones added by the CLI after the last manual refresh), then every
+    // half hour. Spawned here, once the listener exists, so a quota-disabled config never probes
+    // against an unbound panel. Failure-isolated: a failed sweep is logged, not fatal.
+    crate::quota_api::spawn_quota_refresher(state.clone());
+
     let application = app(state.clone());
     match tls {
         Some(files) => {

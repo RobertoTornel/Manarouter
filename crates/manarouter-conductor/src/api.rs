@@ -2328,6 +2328,11 @@ async fn create_account(
         return Err(err.into());
     }
 
+    // Probe the new account's quota now, so the row exists without waiting for the automatic
+    // sweep or a manual refresh. Fire-and-forget: the 201 is already committed, and a slow or
+    // failing probe must not turn a successful write into a timeout.
+    spawn_account_quota_refresh(state.clone(), id.clone(), parsed.id.to_string());
+
     // Answer from the value just committed, never from a re-read: a concurrent mutation could have
     // removed it, and turning a successful write into a 500 invites a retry that duplicates it.
     let view = serde_json::to_value(&parsed)
@@ -2378,10 +2383,41 @@ async fn update_account(
         return Err(err.into());
     }
 
+    // An edit that re-points the credential (a new secret) is a new account as far as quota is
+    // concerned, so re-probe it rather than leaving the old row in place.
+    spawn_account_quota_refresh(state.clone(), id.clone(), account_id.clone());
+
     // Answer from the committed value; a re-read can race another mutation and 500 a success.
     Ok(Json(serde_json::to_value(&parsed).map_err(|e| {
         ApiError::internal(format!("the account could not be serialised: {e}"))
     })?))
+}
+
+/// Spawn a one-shot quota refresh for a single account (fire-and-forget).
+///
+/// Called after an account is created or its credential re-pointed, so the quota row exists
+/// immediately rather than at the next automatic sweep. Detached: the request that created the
+/// account has already committed, and a slow probe must not block it.
+fn spawn_account_quota_refresh(state: AppState, provider_id: String, account_id: String) {
+    tokio::spawn(async move {
+        let config = state.current_config().await;
+        let Some(provider) = config.providers.iter().find(|p| p.id.as_str() == provider_id) else {
+            return;
+        };
+        let Some(account) = provider.accounts.iter().find(|a| a.id.as_str() == account_id) else {
+            return;
+        };
+        if !account.enabled || !crate::quota_api::account_has_credential(account) {
+            return;
+        }
+        if !crate::quota_api::reports_quota(provider, account, &config.quota_probe) {
+            return;
+        }
+        let state = state.clone();
+        let provider = provider.clone();
+        let account = account.clone();
+        let _ = crate::quota_api::refresh_account(&state, &provider, &account).await;
+    });
 }
 
 fn replace_account(

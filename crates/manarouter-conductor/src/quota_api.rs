@@ -312,20 +312,36 @@ async fn get_quota(State(state): State<AppState>) -> ApiResult<Json<Value>> {
 }
 
 async fn refresh_all(State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let config = state.current_config().await;
-    if !config.quota.enabled {
+    if !state.current_config().await.quota.enabled {
         return Err(ApiError::bad(
             "quota_disabled",
             "quota tracking is disabled in config.quota.enabled",
         ));
     }
+    let results = refresh_all_accounts(&state).await?;
+    Ok(Json(json!({"accounts": results})))
+}
+///
+/// The non-HTTP core of `refresh_all`, shared by the manual refresh endpoint and the
+/// background refresher ([`spawn_quota_refresher`]): the same target rule, the same bounded
+/// concurrency, the same per-account isolation (one account's failure is its own row's `error`,
+/// never the whole sweep's).
+///
+/// Unlike the endpoint, this does not gate on `quota.enabled` — the caller does that, so the
+/// background task and the endpoint can differ on whether "disabled" means "do nothing" or
+/// "still report the cached rows".
+async fn refresh_all_accounts(state: &AppState) -> ApiResult<Vec<Value>> {
+    // The conductor holds the authored config in memory; the sweep must see accounts the CLI
+    // (`mr account add`) wrote to disk after startup, so re-read first. `reload_from_disk` is
+    // cheap when nothing changed and is a no-op here when it did not.
+    state.reload_from_disk().await;
+    let config = state.current_config().await;
     let targets: Vec<_> = config
         .providers
         .iter()
         .flat_map(|p| {
-            p.accounts
-                .iter()
-                .filter(|a| a.enabled && reports_quota(p, a, &config.quota_probe))
+            p.accounts.iter()
+                .filter(|a| a.enabled && account_has_credential(a) && reports_quota(p, a, &config.quota_probe))
                 .map(move |a| (p.clone(), a.clone()))
         })
         .collect();
@@ -336,7 +352,59 @@ async fn refresh_all(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     .buffer_unordered(4)
     .collect::<Vec<_>>()
     .await;
-    Ok(Json(json!({"accounts": results})))
+    Ok(results)
+}
+
+/// Whether an account carries a credential the quota probe can authenticate with.
+///
+/// A key-based account stores its secret in the vault (`secret_ref`); an OAuth account stores a
+/// grant (`oauth_ref`) from which `fetch_and_store` mints the same short-lived token the relay
+/// would. Either counts as "has an API key" for the purposes of automatic quota probing — an
+/// account with neither is skipped rather than probed unauthenticated, which would only earn a
+/// confusing 401 row.
+pub fn account_has_credential(account: &Account) -> bool {
+    account.secret_ref.is_some() || account.oauth_ref.is_some()
+}
+
+/// How long the automatic quota refresher waits between full sweeps.
+///
+/// Thirty minutes: a quota read costs one request per account against a provider the operator
+/// may rate-limit, so the sweep is deliberately not frequent. Between sweeps the panel serves
+/// the cached row and says how old it is; a manual `POST /api/quota/refresh` can still force one.
+const QUOTA_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Spawn the background quota refresher.
+///
+/// Runs one sweep immediately (so a conductor restart backfills accounts that never got a row —
+/// the case that left newly added accounts with no quota at all), then repeats every
+/// [`QUOTA_REFRESH_INTERVAL`]. Each sweep goes through `refresh_all_accounts`, which re-reads
+/// `config.json` first, so accounts added by the CLI after startup are picked up without a
+/// restart. The task is detached and failure-isolated: a sweep that errors (quota disabled, a
+/// malformed config) is logged and the next one still runs.
+///
+/// Called from `serve::serve` once the listener exists, so a quota-disabled config does not
+/// start probing against an unbound panel.
+pub fn spawn_quota_refresher(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            // The first iteration runs immediately; the interval only gates later ones, so a
+            // fresh start backfills the accounts that were never probed.
+            if state.current_config().await.quota.enabled {
+                match refresh_all_accounts(&state).await {
+                    Ok(rows) => {
+                        tracing::info!(
+                            accounts = rows.len(),
+                            "automatic quota sweep complete"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!("automatic quota sweep failed; will retry on the next interval");
+                    }
+                }
+            }
+            tokio::time::sleep(QUOTA_REFRESH_INTERVAL).await;
+        }
+    });
 }
 
 async fn refresh_one(
@@ -364,7 +432,7 @@ async fn refresh_one(
     Ok(Json(json!({"accounts": [result]})))
 }
 
-async fn refresh_account(state: &AppState, provider: &Provider, account: &Account) -> Value {
+pub async fn refresh_account(state: &AppState, provider: &Provider, account: &Account) -> Value {
     let result = fetch_and_store(state, provider, account).await;
     let cached = state
         .store
@@ -394,7 +462,7 @@ async fn refresh_account(state: &AppState, provider: &Provider, account: &Accoun
 /// The walk is asked rather than assumed: [`mr_core::quota::probe::walk_configured`] answers for the
 /// account's own declaration, so an account that switches the walk off, or empties the list, stays
 /// off this page exactly as it was before the walk existed.
-fn reports_quota(
+pub fn reports_quota(
     provider: &Provider,
     account: &Account,
     probe: &mr_core::quota::probe::QuotaProbeConfig,
