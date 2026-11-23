@@ -87,17 +87,16 @@ route override carries one.
 
 ---
 
-## OAuth-backed (11)
+## OAuth-backed (10)
 
 | id | label | dialect | base URL | auth | capabilities |
 |---|---|---|---|---|---|
 | `antigravity` ⚠ | Google Antigravity / Gemini Code Assist | `antigravity` | `https://daily-cloudcode-pa.googleapis.com` | `oauth` (antigravity) | chat, models, tool-calling, reasoning, vision |
-| `mistral-vibe` | Mistral Vibe | `mistral-vibe` | `https://chat.mistral.ai` | `oauth` (mistral-vibe) | chat, models, reasoning |
-| `mistral-vibe-api` ⚠ | Mistral Vibe API | `mistral-vibe-api` | `https://api.mistral.ai/v1` | `bearer` | chat, models, tool-calling, reasoning |
+| `mistral-vibe-api` ⚠ | Mistral Vibe API | `mistral-vibe-api` | `https://api.mistral.ai/v1` | `oauth` (mistral-vibe-api) | chat, models, tool-calling, reasoning |
 | `claude-code` | Claude Code (Claude subscription) | `claude-cli` | `https://api.anthropic.com/v1` | `oauth` (claude) | messages, models, tool-calling, reasoning, vision |
 | `cline` | Cline | `open-ai` | `https://api.cline.bot/api/v1` | `oauth` (cline) | chat, models, tool-calling, reasoning |
 | `codebuddy-cn` ⚠ | CodeBuddy CN | `open-ai` | `https://copilot.tencent.com/v2` | `oauth` (codebuddy-cn) | chat, models, tool-calling |
-| `cursor` ⚠ | Cursor | `cursor` | `https://api2.cursor.sh` | `oauth` (cursor) | chat |
+| `cursor` ⚠ | Cursor | `cursor` | `https://api2.cursor.sh` | `oauth` (cursor) | chat, tool-calling |
 | `github-copilot` | GitHub Copilot | `copilot` | `https://api.githubcopilot.com` | `oauth` (github-copilot) | chat, responses, messages, embeddings, models, tool-calling, reasoning, vision |
 | `grok-cli` ⚠ | Grok Build | `open-ai` | `https://cli-chat-proxy.grok.com/v1` | `oauth` (grok-cli) | chat, models, tool-calling |
 | `kilocode` ⚠ | Kilo Code | `open-ai` | `https://api.kilo.ai/api/openrouter` | `oauth` (kilocode) | chat, models, tool-calling |

@@ -226,13 +226,13 @@ auth = { type = "oauth", platform = "mistral-vibe-api" }
 oauth_platform = "mistral-vibe-api"
 capabilities = ["chat", "models", "tool-calling", "reasoning"]
 key_strategy = "round-robin"
-note = "OAuth login (the Mistral CLI's loopback PKCE against Mistral's Ory at auth.mistral.ai) mints a vibe token for https://api.mistral.ai/v1; existing API-key accounts keep working via the vault-secret fallback for accounts with no OAuth grant. The wire is OpenAI-shaped and is forwarded byte-for-byte from an OpenAI client: no LeChat create envelope, no website /api/chat. UNCERTAIN: acceptance of Ory tokens by api.mistral.ai is unverified in this build — an earlier revision of this entry recorded the API rejecting both Ory tokens — so the first live login is the verification step and all existing key accounts stay usable regardless."
+note = "OAuth login uses the Vibe CLI browser sign-in: the panel opens Mistral's own sign-in page (https://console.mistral.ai) and the completed sign-in is exchanged for the real platform API key used against https://api.mistral.ai/v1. Existing API-key accounts keep working via the vault-secret fallback for accounts with no OAuth grant. The wire is OpenAI-shaped and is forwarded byte-for-byte from an OpenAI client: no LeChat create envelope, no website /api/chat."
 docs_url = "https://www.mistral.ai/vibe"
 oauth_authorize_url = "https://auth.mistral.ai/oauth2/auth"
 oauth_token_url = "https://auth.mistral.ai/oauth2/token"
 oauth_client_id = "88df79e3-3a98-4624-92fe-c607ecf06f1d"
 oauth_scopes = "openid email profile offline_access"
-headers = { }
+headers = { "user-agent" = "vibe-cli" }
 
 [[providers]]
 id = "claude-code"

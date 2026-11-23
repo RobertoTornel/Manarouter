@@ -1,5 +1,19 @@
-//! Mistral Vibe API: the CLI's own login, mimicked — loopback PKCE against Mistral's Ory at
-//! auth.mistral.ai.
+//! Mistral Vibe API: the Vibe CLI browser sign-in, in the connector's own terms.
+//!
+//! api.mistral.ai does not accept Mistral's Ory access or ID tokens: the earlier
+//! loopback-PKCE implementation always minted a login that the API rejected with
+//! "Invalid API Key". The installed Vibe CLI signs in differently. Its
+//! BrowserSignInService generates an S256 PKCE verifier, creates a browser sign-in
+//! process at https://console.mistral.ai/api/vibe/sign-in, lets the human sign in
+//! on Mistral's own page, polls that process, and exchanges a single-use
+//! exchange_token plus the verifier for a real {"api_key": "..."} payload. The
+//! resulting API key is then used as the ordinary Mistral API credential. There is
+//! no Ory token to send and no refresh-token grant: a stored extracted API key is
+//! presented directly as a bearer credential, and a revoked key simply needs a new
+//! browser sign-in.
+//!
+//! The sign-in URLs are validated against the CLI's published browser/API base
+//! URLs, following its gateway. The private API key is never logged.
 
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
@@ -9,91 +23,182 @@ use std::time::Duration;
 use super::flow::{self, ImpersonatingHttp, OAuthHttp};
 use super::refresh::{endpoint_failure, oauth_failure};
 use super::{
-    expires_at_from_secs, header, oauth_error, AccountIdentity, OAuthPlatform, Pkce, RedirectPorts,
-    TokenSet,
+    header, oauth_error, AccountIdentity, DevicePoll, OAuthPlatform, Pkce, RedirectPorts,
+    ScreenLogin, TokenSet,
 };
 use crate::error::Result;
+use crate::ids::Millis;
 use crate::published::mistral;
 
-/// The Mistral Vibe API OAuth platform (the CLI login, mimicked).
+/// The Mistral Vibe API OAuth platform: browser sign-in plus API-key exchange.
 pub struct MistralApi;
 
 impl MistralApi {
-    /// Registry id, matching `oauth_platform` on the `mistral-vibe-api` catalogue entry.
+    /// Registry id, matching oauth_platform on the mistral-vibe-api catalogue entry.
     pub const ID: &'static str = "mistral-vibe-api";
+
 }
 
-/// Fallback access-token lifetime when the response omits `expires_in`, in seconds.
-const DEFAULT_TTL_SECS: i64 = 3600;
+const CREATE_PROCESS_PATH: &str = "/vibe/sign-in";
 
-/// Refresh one hour before expiry: the session token is short-lived and cheap to renew.
-const REFRESH_LEAD_SECS: u64 = 60 * 60;
+/// Relative path of Mistral's whoami endpoint on the console API base. The CLI uses
+/// the same double prefix: base "https://console.mistral.ai/api" plus this path.
+const WHOAMI_PATH: &str = "/api/vibe/whoami";
 
-/// Build the authorization URL for a loopback listener on `port`.
-fn authorization_url(state: &str, pkce: Option<&Pkce>, port: u16) -> String {
-    let challenge = pkce.map(Pkce::challenge).unwrap_or_default();
-    let redirect_uri = format!(
-        "http://127.0.0.1:{port}{}",
-        mistral::LOOPBACK_CALLBACK_PATH
-    );
-    format!(
-        "{}?client_id={}&response_type=code&redirect_uri={}&scope={}&audience={}&code_challenge={}&code_challenge_method=S256&state={}",
-        mistral::AUTHORIZE,
-        flow::url_encode(mistral::CLIENT_ID),
-        flow::url_encode(&redirect_uri),
-        flow::url_encode(mistral::SCOPES),
-        flow::url_encode(mistral::AUDIENCE),
-        flow::url_encode(challenge),
-        flow::url_encode(state),
-    )
-}
-
-/// Parse a token response into a `TokenSet`. `previous_refresh` survives a response that omits
-/// a replacement. Every non-standard field the endpoint returns (notably the JWT `id_token`) is
-/// preserved in `TokenSet::extra` so later steps can fall back to it without another round trip.
-fn token_set_from(body: &str, previous_refresh: Option<&str>) -> Result<TokenSet> {
+fn parse_json_object(body: &str, context: &str) -> Result<Value> {
     let value: Value = serde_json::from_str(body)
-        .map_err(|e| oauth_error(format!("Mistral token response is not JSON: {e}")))?;
-    let access_token = value
-        .get("access_token")
-        .and_then(Value::as_str)
-        .ok_or_else(|| oauth_error("Mistral token response has no access_token"))?;
-    let expires_in = value
-        .get("expires_in")
-        .and_then(Value::as_i64)
-        .unwrap_or(DEFAULT_TTL_SECS);
-    let mut tokens = TokenSet::new(access_token);
-    tokens.refresh_token = value
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| previous_refresh.map(str::to_owned));
-    tokens.scopes = value
-        .get("scope")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect();
-    if let Some(token_type) = value.get("token_type").and_then(Value::as_str) {
-        tokens.token_type = token_type.to_owned();
+        .map_err(|e| oauth_error(format!("Mistral {context} response is not JSON: {e}")))?;
+    if !value.is_object() {
+        return Err(oauth_error(format!("Mistral {context} response is not an object")));
     }
-    if let Some(extra) = value.as_object() {
-        const KNOWN: &[&str] = &[
-            "access_token",
-            "refresh_token",
-            "expires_in",
-            "scope",
-            "token_type",
-        ];
-        for (key, val) in extra {
-            if !KNOWN.contains(&key.as_str()) {
-                tokens.extra.insert(key.clone(), val.clone());
+    Ok(value)
+}
+
+fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str).map(str::trim)
+}
+
+/// Validate a URL returned by the sign-in start reply against the origin the CLI
+/// itself trusts. A malicious or misconfigured console answer must not be able to
+/// point the panel at an arbitrary page or exfiltrate the verifier.
+fn validated_url(raw: &str, base: &str, context: &str) -> Result<String> {
+    let value = raw.trim();
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        return Err(oauth_error(format!("Mistral browser sign-in returned an invalid {context} URL")));
+    }
+    if !value.starts_with(base) {
+        return Err(oauth_error(format!("Mistral browser sign-in returned a {context} URL outside the expected origin")));
+    }
+    Ok(value.to_owned())
+}
+
+/// Convert the exchange reply's {"api_key": "..."} payload into a stored credential.
+/// A platform API key is not an expiring OAuth token: the expiry stays at the
+/// zero sentinel (unknown), so the refresher never tries to renew it, and there is
+/// no refresh token. The key rides both in access_token and, mirrored, in
+/// extra["api_key"] for tooling that inspects the credential shape.
+fn api_key_token_set(api_key: &str) -> Result<TokenSet> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err(oauth_error("Mistral browser sign-in exchange returned no API key"));
+    }
+    let mut tokens = TokenSet::new(api_key);
+    tokens.expires_at = Millis(0);
+    tokens.token_type = "Bearer".to_owned();
+    tokens.extra.insert("api_key".into(), Value::String(api_key.into()));
+    Ok(tokens)
+}
+
+fn api_key_from_exchange_body(body: &str) -> Result<String> {
+    let value = parse_json_object(body, "exchange")?;
+    let api_key = value
+        .get("api_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| oauth_error("Mistral browser sign-in exchange returned no API key"))?;
+    Ok(api_key.to_owned())
+}
+
+/// The CLI maps a 403 with error_code 9004 to a workspace-eligibility message.
+/// Mirror that so the panel says something the operator can act on.
+fn exchange_failure_message(status: u16, body: &str) -> String {
+    if status == 403 {
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
+            if value.get("error_code").and_then(Value::as_i64) == Some(9_004) {
+                return "Your current workspace is not eligible for Mistral Vibe. Sign in again and select another workspace in the browser, or contact your administrator.".to_owned();
             }
         }
     }
-    tokens.expires_at = expires_at_from_secs(expires_in);
-    Ok(tokens)
+    "Mistral browser sign-in exchange failed.".to_owned()
+}
+
+/// Map Mistral's whoami reply to our account identity. The endpoint is plan and
+/// tenant data, not OIDC userinfo: the customer id is the stable account key and
+/// the plan name is the label. The email is not exposed by this endpoint.
+fn identity_from_whoami(body: &str) -> Result<AccountIdentity> {
+    let value = parse_json_object(body, "whoami")?;
+    let id = string_field(&value, "customer_id")
+        .or_else(|| string_field(&value, "organization_id"))
+        .or_else(|| string_field(&value, "user_id"))
+        .or_else(|| string_field(&value, "id"))
+        .ok_or_else(|| oauth_error("Mistral whoami response contains no account identifier"))?
+        .to_owned();
+    let plan = string_field(&value, "plan_name")
+        .or_else(|| string_field(&value, "plan_type"))
+        .unwrap_or("Mistral Vibe API")
+        .to_owned();
+    Ok(AccountIdentity {
+        id,
+        label: plan.clone(),
+        email: None,
+        plan: Some(plan),
+    })
+}
+
+async fn create_browser_sign_in(pkce: &Pkce) -> Result<(String, String, String)> {
+    let http = ImpersonatingHttp::new()?;
+    let body = json!({
+        "code_challenge": pkce.challenge(),
+        "code_challenge_method": "S256",
+    });
+    let reply = http
+        .post_json(
+            &format!("{}{CREATE_PROCESS_PATH}", mistral::BROWSER_AUTH_API_BASE_URL),
+            &[],
+            body.to_string(),
+        )
+        .await
+        .map_err(|e| oauth_error(format!("Mistral browser sign-in start request failed: {e}")))?;
+    if let Some(failure) = endpoint_failure(reply.status, &reply.body) {
+        return Err(oauth_failure(failure.0, "mistral-vibe-api", failure.1));
+    }
+    let value = parse_json_object(&reply.body, "browser sign-in start")?;
+    let process_id = string_field(&value, "process_id")
+        .ok_or_else(|| oauth_error("Mistral browser sign-in start returned no process id"))?
+        .to_owned();
+    let sign_in_url = validated_url(
+        string_field(&value, "sign_in_url")
+            .ok_or_else(|| oauth_error("Mistral browser sign-in start returned no sign-in URL"))?,
+        mistral::BROWSER_AUTH_BASE_URL,
+        "sign-in",
+    )?;
+    let poll_url = validated_url(
+        string_field(&value, "poll_url")
+            .ok_or_else(|| oauth_error("Mistral browser sign-in start returned no poll URL"))?,
+        mistral::BROWSER_AUTH_API_BASE_URL,
+        "poll",
+    )?;
+    Ok((process_id, sign_in_url, poll_url))
+}
+
+async fn exchange_sign_in(
+    process_id: &str,
+    exchange_token: &str,
+    code_verifier: &str,
+) -> Result<TokenSet> {
+    let http = ImpersonatingHttp::new()?;
+    let body = json!({
+        "exchange_token": exchange_token,
+        "code_verifier": code_verifier,
+    });
+    let reply = http
+        .post_json(
+            &format!("{}/vibe/sign-in/{}/exchange", mistral::BROWSER_AUTH_API_BASE_URL, flow::url_encode(process_id)),
+            &[],
+            body.to_string(),
+        )
+        .await
+        .map_err(|e| oauth_error(format!("Mistral browser sign-in exchange request failed: {e}")))?;
+    if reply.status >= 400 {
+        return Err(oauth_failure(
+            crate::oauth::refresh::FailureClass::Permanent,
+            "mistral-vibe-api",
+            exchange_failure_message(reply.status, &reply.body),
+        ));
+    }
+    let api_key = api_key_from_exchange_body(&reply.body)?;
+    api_key_token_set(&api_key)
 }
 
 #[async_trait]
@@ -107,126 +212,124 @@ impl OAuthPlatform for MistralApi {
     }
 
     fn description(&self) -> &'static str {
-        "The Mistral CLI's login (Ory PKCE at auth.mistral.ai), minting a vibe token for api.mistral.ai."
+        "Mistral Vibe CLI browser sign-in, exchanging the completed sign-in for the platform API key."
     }
 
     fn begins_with_loopback(&self) -> bool {
+        false
+    }
+
+    fn begins_with_screen_login(&self) -> bool {
         true
     }
 
     fn redirect_ports(&self) -> RedirectPorts {
-        // The app binds an ephemeral loopback port and registers the `/auth/oidc/callback` path;
-        // the redirect URI must match that path exactly. `validates_redirect_port` is false
-        // because the port is chosen at runtime, as in the installed app.
+        // Screen login never binds a local listener. An inert zero port keeps the
+        // trait requirement without advertising a callback.
         RedirectPorts {
             host: "127.0.0.1",
             primary: 0,
             fallback: None,
-            path: mistral::LOOPBACK_CALLBACK_PATH,
+            path: "/",
         }
     }
 
     fn requires_pkce(&self) -> bool {
-        true
+        false
     }
 
     fn validates_redirect_port(&self) -> bool {
         false
     }
 
-    fn authorization_url(&self, state: &str, pkce: Option<&Pkce>, port: u16) -> Result<String> {
-        Ok(authorization_url(state, pkce, port))
+    fn authorization_url(&self, _state: &str, _pkce: Option<&Pkce>, _port: u16) -> Result<String> {
+        Err(oauth_error(            "Mistral Vibe API signs in on Mistral's own page; there is no loopback redirect",
+        ))
     }
 
-    async fn exchange_code(&self, code: &str, pkce: Option<&Pkce>, port: u16) -> Result<TokenSet> {
+    async fn exchange_code(&self, _code: &str, _pkce: Option<&Pkce>, _port: u16) -> Result<TokenSet> {
+        Err(oauth_error(            "Mistral Vibe API signs in on Mistral's own page; there is no authorization code",
+        ))
+    }
+    async fn screen_login_start(&self) -> Result<ScreenLogin> {
+        let pkce = Pkce::generate();
+        let (process_id, sign_in_url, poll_url) = create_browser_sign_in(&pkce).await?;
+        // The registry stores only the halves a screen login really needs; the poll
+        // endpoint is server-minted, so it rides inside the private ticket half,
+        // split from the verifier by a control separator.
+        let ticket = format!("{}\u{1E}{poll_url}", pkce.verifier());
+        Ok(ScreenLogin::new(sign_in_url, process_id, ticket))
+    }
+
+    async fn screen_login_poll(&self, login: &ScreenLogin) -> Result<DevicePoll> {
+        let (verifier, poll_url) = login
+            .ticket()
+            .split_once('\u{1E}')
+            .ok_or_else(|| oauth_error("Mistral browser sign-in ticket is missing its poll endpoint"))?;
         let http = ImpersonatingHttp::new()?;
-        let redirect_uri = format!(
-            "http://127.0.0.1:{port}{}",
-            mistral::LOOPBACK_CALLBACK_PATH
-        );
-        let mut pairs: Vec<(&str, &str)> = vec![
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", &redirect_uri),
-            ("client_id", mistral::CLIENT_ID),
-        ];
-        if let Some(pkce) = pkce {
-            pairs.push(("code_verifier", pkce.verifier()));
-        }
         let reply = http
-            .post_form(mistral::TOKEN, &[], &pairs)
+            .get(poll_url, &[("Accept", "application/json")])
             .await
-            .map_err(|e| oauth_error(format!("Mistral token request failed: {e}")))?;
+            .map_err(|e| oauth_error(format!("Mistral browser sign-in poll request failed: {e}")))?;
+
+        if reply.status == 410 {
+            return Ok(DevicePoll::ExpiredToken);
+        }
         if let Some(failure) = endpoint_failure(reply.status, &reply.body) {
             return Err(oauth_failure(failure.0, "mistral-vibe-api", failure.1));
         }
-        token_set_from(&reply.body, None)
-    }
 
-    async fn refresh(&self, refresh_token: &str) -> Result<TokenSet> {
-        let http = ImpersonatingHttp::new()?;
-        let pairs: Vec<(&str, &str)> = vec![
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", mistral::CLIENT_ID),
-        ];
-        let reply = http
-            .post_form(mistral::TOKEN, &[], &pairs)
-            .await
-            .map_err(|e| oauth_error(format!("Mistral refresh request failed: {e}")))?;
-        if let Some(failure) = endpoint_failure(reply.status, &reply.body) {
-            return Err(oauth_failure(failure.0, "mistral-vibe-api", failure.1));
+        let value = parse_json_object(&reply.body, "browser sign-in poll")?;
+        match string_field(&value, "status") {
+            Some("pending") => Ok(DevicePoll::Pending),
+            Some("completed") => {
+                let exchange_token = string_field(&value, "exchange_token")
+                    .filter(|token| !token.is_empty())
+                    .ok_or_else(|| {
+                        oauth_error("Mistral browser sign-in completed without an exchange token")
+                    })?
+                    .to_owned();
+                let tokens = exchange_sign_in(login.session(), &exchange_token, verifier).await?;
+                Ok(DevicePoll::Success(tokens))
+            }
+            Some("expired") => Ok(DevicePoll::ExpiredToken),
+            Some("denied") => Ok(DevicePoll::AccessDenied),
+            Some("error") => Err(oauth_error(
+                string_field(&value, "message")
+                    .filter(|message| !message.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "Mistral browser sign-in failed.".to_owned()),
+            )),
+            _ => Err(oauth_error("Mistral browser sign-in returned an unknown state.")),
         }
-        token_set_from(&reply.body, Some(refresh_token))
+    }    async fn refresh(&self, _refresh_token: &str) -> Result<TokenSet> {
+        Err(oauth_failure(
+            crate::oauth::refresh::FailureClass::Permanent,
+            "mistral-vibe-api",
+            "Mistral Vibe API credentials are an extracted platform API key and cannot be refreshed; sign in again if the key is revoked",
+        ))
     }
 
     fn refresh_lead(&self) -> Duration {
-        Duration::from_secs(REFRESH_LEAD_SECS)
+        Duration::from_secs(3600)
     }
 
     async fn account_identity(&self, tokens: &TokenSet) -> Result<AccountIdentity> {
         let http = ImpersonatingHttp::new()?;
         let reply = http
             .get(
-                mistral::USERINFO,
+                &format!("{}{WHOAMI_PATH}", mistral::BROWSER_AUTH_API_BASE_URL),
                 &[("authorization", &format!("Bearer {}", tokens.access_token))],
             )
             .await
-            .map_err(|e| oauth_error(format!("Mistral userinfo request failed: {e}")))?;
+            .map_err(|e| oauth_error(format!("Mistral whoami request failed: {e}")))?;
         if let Some(failure) = endpoint_failure(reply.status, &reply.body) {
             return Err(oauth_failure(failure.0, "mistral-vibe-api", failure.1));
         }
-        let value: Value = serde_json::from_str(&reply.body)
-            .map_err(|e| oauth_error(format!("Mistral userinfo is not JSON: {e}")))?;
-        let id = value
-            .get("sub")
-            .and_then(Value::as_str)
-            .ok_or_else(|| oauth_error("Mistral userinfo has no `sub`"))?
-            .to_owned();
-        let email = value
-            .get("email")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let label = value
-            .get("name")
-            .or_else(|| value.get("preferred_username"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| id.clone());
-        Ok(AccountIdentity {
-            id,
-            label,
-            email,
-            plan: None,
-        })
+        identity_from_whoami(&reply.body)
     }
 
     fn apply_credential(&self, tokens: &TokenSet) -> Vec<(HeaderName, HeaderValue)> {
-        // The access token is issued for the `audience=https://api.mistral.ai` the authorize
-        // request carries — the standard OAuth2 bearer for the platform API resource server.
-        // The JWT id_token is preserved in `extra` as the documented alternative: if the first
-        // live login shows the API prefers the JWT (as the old consumer-surface work measured for
-        // the LeChat backend), send `tokens.extra_str("id_token")` here instead.
         vec![
             header(
                 "authorization",
@@ -237,90 +340,67 @@ impl OAuthPlatform for MistralApi {
     }
 
     fn fingerprint_headers(&self) -> &'static [(&'static str, &'static str)] {
-        &[("user-agent", "vibe-desktop/1.2.0")]
-    }
-
-    async fn refresh_with_context(
-        &self,
-        refresh_token: &str,
-        previous: &TokenSet,
-    ) -> Result<TokenSet> {
-        // Refresh returns no new account metadata on this platform; preserve the previous one.
-        let mut tokens = self.refresh(refresh_token).await?;
-        let prev = json!({
-            "id": previous.extra.get("id").cloned().unwrap_or(Value::Null),
-            "label": previous.extra.get("label").cloned().unwrap_or(Value::Null),
-            "email": previous.extra.get("email").cloned().unwrap_or(Value::Null),
-        });
-        tokens.extra.insert("account".into(), prev);
-        // A refresh grant usually mints a fresh id token, but Ory is not obliged to: when the
-        // response omits one, the previous id token is carried forward rather than lost.
-        if !tokens.extra.contains_key("id_token") {
-            if let Some(previous_id) = previous.extra.get("id_token") {
-                tokens.extra.insert("id_token".into(), previous_id.clone());
-            }
-        }
-        Ok(tokens)
+        &[("user-agent", "vibe-cli")]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    /// The authorize URL must match the registered client: the `/auth/oidc/callback` path, the
-    /// `audience` parameter and the scope order are what Ory compares.
     #[test]
-    fn the_authorize_url_matches_the_cli_registration() {
-        let pkce = Pkce::generate();
-        let url = authorization_url("state-value", Some(&pkce), 45_921);
-        assert!(url.starts_with("https://auth.mistral.ai/oauth2/auth?"));
-        assert!(url.contains("audience=https%3A%2F%2Fapi.mistral.ai"));
-        assert!(url.contains(&format!(
-            "redirect_uri=http%3A%2F%2F127.0.0.1%3A45921{}",
-            flow::url_encode(mistral::LOOPBACK_CALLBACK_PATH)
-        )));
-        assert!(url.contains("scope=openid%20email%20profile%20offline_access"));
-        assert!(url.contains("code_challenge_method=S256"));
-        assert!(url.contains("state=state-value"));
-    }
-
-    /// The Ory response carries an opaque `access_token` and a JWT `id_token`. The authorize
-    /// request is audience-scoped to `api.mistral.ai`, so the access token is the bearer; the
-    /// JWT must nevertheless survive the parse in `extra` for the documented fallback.
-    #[test]
-    fn the_token_set_keeps_the_id_token_and_the_credential_sends_the_access_token() {
-        let body = r#"{"access_token":"ory_at_opaque","id_token":"eyJhbGciOiJSUz","refresh_token":"ory_rt_x","expires_in":3599,"scope":"openid email profile offline_access","token_type":"bearer"}"#;
-        let tokens = token_set_from(body, None).unwrap();
-        assert_eq!(tokens.access_token, "ory_at_opaque");
+    fn an_api_key_maps_to_a_bearer_token_set_without_an_expiry_or_refresh_token() {
+        let tokens = api_key_token_set("mistral-api-key").unwrap();
+        assert_eq!(tokens.access_token, "mistral-api-key");
+        assert!(tokens.refresh_token.is_none());
+        assert_eq!(tokens.expires_at.as_millis(), 0);
         assert_eq!(
-            tokens.extra.get("id_token").and_then(|v| v.as_str()),
-            Some("eyJhbGciOiJSUz")
+            tokens.extra.get("api_key").and_then(Value::as_str),
+            Some("mistral-api-key"),
         );
         let headers = MistralApi.apply_credential(&tokens);
         assert_eq!(headers.len(), 1);
-        assert_eq!(
-            headers[0].1.to_str().unwrap(),
-            "Bearer ory_at_opaque",
-            "the API bearer is the audience-scoped access token"
-        );
+        assert_eq!(headers[0].1.to_str().unwrap(), "Bearer mistral-api-key");
     }
 
-    /// Without an id token (a bare Ory exchange), nothing extra is invented.
     #[test]
-    fn a_bare_token_response_has_no_id_token() {
-        let body = r#"{"access_token":"ory_at_opaque","refresh_token":"ory_rt_x","expires_in":3599,"token_type":"bearer"}"#;
-        let tokens = token_set_from(body, None).unwrap();
-        assert!(tokens.extra.get("id_token").is_none());
-        let headers = MistralApi.apply_credential(&tokens);
-        assert_eq!(headers[0].1.to_str().unwrap(), "Bearer ory_at_opaque");
+    fn an_exchange_response_extracts_the_api_key() {
+        let body = r#"{"api_key":"mistral-api-key"}"#;
+        assert_eq!(api_key_from_exchange_body(body).unwrap(), "mistral-api-key");
     }
 
-    /// A refresh that omits a replacement refresh token keeps the previous one.
     #[test]
-    fn a_missing_replacement_refresh_token_keeps_the_previous_one() {
-        let body = r#"{"access_token":"ory_at_new","expires_in":3599}"#;
-        let tokens = token_set_from(body, Some("ory_rt_old")).unwrap();
-        assert_eq!(tokens.refresh_token.as_deref(), Some("ory_rt_old"));
+    fn an_empty_exchange_response_is_an_error() {
+        assert!(api_key_from_exchange_body(r#"{"api_key":""}"#).is_err());
+        assert!(api_key_from_exchange_body(r#"{}"#).is_err());
+    }
+
+    #[test]
+    fn a_workspace_not_eligible_failure_is_surfaced_in_plain_language() {
+        let body = r#"{"error_code":9004}"#;
+        assert!(exchange_failure_message(403, body).contains("workspace"));
+    }
+
+    #[test]
+    fn whoami_fields_map_to_account_identity() {
+        let body = json!({
+            "customer_id": "cust_123",
+            "plan_name": "Pro",
+            "organization_id": "org_123",
+            "api_base": "https://api.mistral.ai/v1",
+        })
+        .to_string();
+        let identity = identity_from_whoami(&body).unwrap();
+        assert_eq!(identity.id, "cust_123");
+        assert_eq!(identity.label, "Pro");
+        assert_eq!(identity.plan.as_deref(), Some("Pro"));
+        assert!(identity.email.is_none());
+    }
+
+    #[test]
+    fn a_sign_in_url_outside_the_expected_origin_is_rejected() {
+        assert!(validated_url("https://evil.example/x", "https://console.mistral.ai", "sign-in").is_err());
+        assert!(validated_url("https://console.mistral.ai/sign-in", "https://console.mistral.ai", "sign-in").is_ok());
     }
 }

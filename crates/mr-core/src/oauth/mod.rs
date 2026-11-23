@@ -10,7 +10,7 @@
 //! | `antigravity`      | [`antigravity::Antigravity`] | loopback authorization code (T2 experimental, T1 selectable) |
 //! | `cursor`           | [`cursor::Cursor`]   | browser-completion page + poll     |
 //! | `zcode`            | [`zcode::Zcode`]     | brokered CLI login: created, then polled until the browser finishes |
-//! | `mistral-vibe-api` | [`mistral_api::MistralApi`] | loopback PKCE (S256) against Mistral's Ory |
+//! | `mistral-vibe-api` | [`mistral_api::MistralApi`] | browser sign-in on Mistral's own page, exchanged for the platform API key |
 //! | `claude`           | [`claude::Claude`]   | pasted-code login (redirect on Anthropic's own origin) |
 //! | `cline`            | not registered       | no verified interactive flow      |
 //! | OmniRoute additional providers | not ported | provider-specific review required |

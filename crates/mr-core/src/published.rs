@@ -294,6 +294,10 @@ pub mod cursor {
 /// login fails at the authorization stage the panel shows the URL; compare it with the URL the
 /// app itself opens and adjust these constants.
 pub mod mistral {
+    /// The console origin where browser sign-in processes start (the Vibe CLI's default).
+    pub const BROWSER_AUTH_BASE_URL: &str = "https://console.mistral.ai";
+    /// The console API origin that creates, polls and exchanges browser sign-in processes.
+    pub const BROWSER_AUTH_API_BASE_URL: &str = "https://console.mistral.ai/api";
     /// The authorization endpoint on the Ory deployment.
     pub const AUTHORIZE: &str = "https://auth.mistral.ai/oauth2/auth";
     /// The token endpoint: code exchange and refresh, both form-encoded.
