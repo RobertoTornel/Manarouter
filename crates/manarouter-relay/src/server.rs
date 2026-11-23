@@ -1909,8 +1909,44 @@ fn with_stream_usage(body: Bytes) -> Bytes {
     }
 }
 
+/// Drop echoed reasoning fields (`reasoning_content`, `reasoning`,
+/// `reasoning_details`) from a request value and anything nested inside it.
+///
+/// Both shapes seen in the wild are covered: flat on the message, and one level deeper
+/// under the assistant turn (`messages[N].assistant.reasoning`, the path Mistral's
+/// `422: extra_forbidden` names). Returns whether anything was dropped.
+fn drop_reasoning_fields(value: &mut serde_json::Value) -> bool {
+    let mut dropped = false;
+    if let Some(object) = value.as_object_mut() {
+        for field in ["reasoning_content", "reasoning", "reasoning_details"] {
+            if object.remove(field).is_some() {
+                dropped = true;
+            }
+        }
+        if let Some(assistant) = object.get_mut("assistant") {
+            if drop_reasoning_fields(assistant) {
+                dropped = true;
+            }
+        }
+        if let Some(content) = object.get_mut("content") {
+            if drop_reasoning_fields(content) {
+                dropped = true;
+            }
+        }
+        return dropped;
+    }
+    if let Some(array) = value.as_array_mut() {
+        for entry in array {
+            if drop_reasoning_fields(entry) {
+                dropped = true;
+            }
+        }
+        return dropped;
+    }
+    dropped
+}
+
 /// OpenAI's `developer` role, written as `system` for wire-compatible upstreams that predate
-/// the rename; OpenAI-only extras dropped alongside it.
 ///
 /// The relay's OpenAI surface accepts the `developer` role — the newer OpenAI name for the same
 /// kind of message — and a passthrough body forwards the name verbatim. OpenAI-wire servers
@@ -1949,15 +1985,18 @@ fn normalize_developer_role(outgoing: &mut Vec<u8>) -> bool {
         return changed;
     };
     for message in messages {
-        // Reasoning reproduced on the request: the assistant messages a client echoes back from
-        // an earlier answer carry `reasoning_content` (which this relay itself adds to responses
-        // so thinking stays visible), and a strict upstream refuses the field on the way in —
-        // `422: extra_forbidden … messages[82].assistant.reasoning_content`. The reasoning is
-        // not a request field; it is dropped wherever a client round-trips it.
-        if let Some(message) = message.as_object_mut() {
-            if message.remove("reasoning_content").is_some() {
-                changed = true;
-            }
+        // Reasoning echoed on the request: the assistant messages a client round-trips
+        // from earlier answers carry `reasoning_content` (which this relay itself adds to
+        // responses so thinking stays visible), `reasoning` (a rendered summary of that
+        // thinking) and `reasoning_details` (the encrypted reasoning blobs). None of the
+        // three is a request field: a strict OpenAI-wire server answers
+        // `422: extra_forbidden` for any of them, so all three are dropped wherever a
+        // client echoes them back. Two shapes carry them: flat on the message
+        // (`messages[N].reasoning`), and — from the clients that keep the assistant turn
+        // as its own object — nested one level deeper (`messages[N].assistant.reasoning`,
+        // the path Mistral's 422 names). Both are dropped; the surrounding turn is kept.
+        if drop_reasoning_fields(message) {
+            changed = true;
         }
         let is_developer =
             message.get("role").and_then(serde_json::Value::as_str) == Some("developer");
@@ -2855,11 +2894,44 @@ async fn dispatch_routed(
                             }
                         )
                     {
-                        tracing::info!(
-                            provider = %step.provider_id,
-                            model = %step.model,
-                            "quota exhausted; failing over instead of holding"
-                        );
+                        // A 402, or an account sweep parked by one, is genuine quota
+                        // exhaustion: waiting cannot restore a balance or a window. Every
+                        // other advance_step failure is a refusal of *this* step — a request
+                        // shape the upstream rejects, a credential it refuses, a broken
+                        // transport — not a balance matter: the next combo step may accept
+                        // exactly what this one refused. Log the two cases honestly; both
+                        // fail over.
+                        let quota = match &attempt {
+                            Attempt::Failed {
+                                response: Some(resp),
+                                ..
+                            } => resp.status() == StatusCode::PAYMENT_REQUIRED,
+                            Attempt::Skip {
+                                cause: SkipCause::NoUsableAccount,
+                                ..
+                            } => app
+                                .health
+                                .view()
+                                .values()
+                                .any(|c| {
+                                    c.reason == select::CooldownReason::QuotaExhausted
+                                        && c.until_ms > now_ms
+                                }),
+                            _ => false,
+                        };
+                        if quota {
+                            tracing::info!(
+                                provider = %step.provider_id,
+                                model = %step.model,
+                                "quota exhausted; failing over instead of holding"
+                            );
+                        } else {
+                            tracing::info!(
+                                provider = %step.provider_id,
+                                model = %step.model,
+                                "upstream refused the step; failing over instead of holding"
+                            );
+                        }
                         break 'patience;
                     }
                 }
@@ -14924,7 +14996,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             jobs: Arc::new(crate::jobs::JobLane::inert()),
         };
 
-        let request_body = r#"{"model":"p/m","store":false,"metadata":{"a":"b"},"prompt_cache_key":"k","service_tier":"auto","messages":[{"role":"developer","content":"be terse"},{"role":"assistant","reasoning_content":"I was thinking","content":"an earlier answer"},{"role":"user","content":"hello"}],"temperature":0.5}"#;
+        let request_body = r#"{"model":"p/m","store":false,"metadata":{"a":"b"},"prompt_cache_key":"k","service_tier":"auto","messages":[{"role":"developer","content":"be terse"},{"role":"assistant","reasoning_content":"I was thinking","reasoning":"a summary of the thinking","reasoning_details":[{"type":"reasoning.encrypted","data":"Q-PaDg"}],"content":"an earlier answer"},{"role":"assistant","assistant":{"reasoning":"thinking nested under the assistant turn","reasoning_details":[{"type":"reasoning.encrypted","data":"X"}],"content":"nested answer"}},{"role":"user","content":"hello"}],"temperature":0.5}"#;
         let response = dispatch(
             state,
             Dialect::OpenAi,
@@ -14953,9 +15025,28 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             sent["messages"][1].get("reasoning_content").is_none(),
             "an echoed reasoning_content was dropped from the assistant message"
         );
-        assert_eq!(sent["messages"][1]["content"], "an earlier answer");
+        assert!(
+            sent["messages"][1].get("reasoning").is_none(),
+            "an echoed reasoning was dropped from the assistant message"
+        );
+        assert!(
+            sent["messages"][1].get("reasoning_details").is_none(),
+            "an echoed reasoning_details was dropped from the assistant message"
+        );
+        assert!(
+            sent["messages"][2]["assistant"].get("reasoning").is_none(),
+            "an echoed reasoning nested under the assistant turn was dropped"
+        );
+        assert!(
+            sent["messages"][2]["assistant"]
+                .get("reasoning_details")
+                .is_none(),
+            "an echoed reasoning_details nested under the assistant turn was dropped"
+        );
+        assert_eq!(sent["messages"][2]["assistant"]["content"], "nested answer");
+        assert_eq!(sent["messages"][3]["content"], "hello");
         assert_eq!(
-            sent["messages"][2]["content"], "hello",
+            sent["messages"][3]["content"], "hello",
             "the user message is untouched"
         );
         assert_eq!(sent["temperature"], 0.5, "fields every provider reads stay");
