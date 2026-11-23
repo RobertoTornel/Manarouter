@@ -41,9 +41,9 @@ impl MistralApi {
 
 const CREATE_PROCESS_PATH: &str = "/vibe/sign-in";
 
-/// Relative path of Mistral's whoami endpoint on the console API base. The CLI uses
-/// the same double prefix: base "https://console.mistral.ai/api" plus this path.
-const WHOAMI_PATH: &str = "/api/vibe/whoami";
+/// Path of Mistral's whoami endpoint relative to the console API base. The CLI joins
+/// console root plus "/api/vibe/whoami" — one /api, not two: base "/api" plus this path.
+const WHOAMI_PATH: &str = "/vibe/whoami";
 
 fn parse_json_object(body: &str, context: &str) -> Result<Value> {
     let value: Value = serde_json::from_str(body)
@@ -83,7 +83,10 @@ fn api_key_token_set(api_key: &str) -> Result<TokenSet> {
         return Err(oauth_error("Mistral browser sign-in exchange returned no API key"));
     }
     let mut tokens = TokenSet::new(api_key);
-    tokens.expires_at = Millis(0);
+    // The extracted key does not expire: pin expiry far in the future so the refresher
+    // classifies it as fresh (a zero sentinel reads as always-due and would fail every
+    // request with no refresh token to renew it).
+    tokens.expires_at = Millis(i64::MAX / 4);
     tokens.token_type = "Bearer".to_owned();
     tokens.extra.insert("api_key".into(), Value::String(api_key.into()));
     Ok(tokens)
@@ -354,7 +357,8 @@ mod tests {
         let tokens = api_key_token_set("mistral-api-key").unwrap();
         assert_eq!(tokens.access_token, "mistral-api-key");
         assert!(tokens.refresh_token.is_none());
-        assert_eq!(tokens.expires_at.as_millis(), 0);
+        // No expiry: far-future pin so the refresher never treats the key as due.
+        assert!(tokens.expires_at.as_millis() > 1_000_000_000_000);
         assert_eq!(
             tokens.extra.get("api_key").and_then(Value::as_str),
             Some("mistral-api-key"),
