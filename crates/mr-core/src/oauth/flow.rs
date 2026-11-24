@@ -304,6 +304,11 @@ impl Http {
         let host = uri.host().unwrap_or("<no host>").to_string();
 
         let mut builder = hyper::Request::builder().method(method).uri(uri);
+        // GitHub's REST surfaces refuse a request with no `User-Agent` outright (HTTP 403,
+        // "Request forbidden by administrative rules"), so the client carries a default. A
+        // platform that needs to present a captured CLI identity sets its own header, which
+        // wins over this one.
+        builder = builder.header("user-agent", "manarouter-oauth/1.0");
         for (name, value) in headers {
             builder = builder.header(*name, *value);
         }

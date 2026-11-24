@@ -270,6 +270,11 @@ async fn mint(http: &Http, github_token: &str) -> Result<TokenSet> {
                 ("Authorization", authorization.as_str()),
                 ("X-GitHub-Api-Version", MINT_API_VERSION),
                 ("Accept", "application/json"),
+                // The same captured identity the quota probe presents: GitHub REST refuses
+                // UA-less requests before auth is even considered.
+                ("User-Agent", crate::quota::github::GITHUB_COPILOT_USER_AGENT),
+                ("Editor-Version", crate::quota::github::GITHUB_COPILOT_EDITOR_VERSION),
+                ("Editor-Plugin-Version", crate::quota::github::GITHUB_COPILOT_PLUGIN_VERSION),
             ],
         )
         .await?;
