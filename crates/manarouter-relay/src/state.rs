@@ -354,6 +354,24 @@ impl KeyEntry {
     ///
     /// A key with no caps pays nothing on the request path: no ledger read, no row written. That
     /// is what keeps quota enforcement free for the keys that never asked for it.
+    /// Whether this key may call `model` on `route` — the relay-side copy of
+    /// `mr_core::model::ClientKey::permits`, kept here so the enforcement path and the config model
+    /// cannot drift about *which check exists*, only about the struct it lives on.
+    pub fn permits(&self, model: &str, route: mr_core::dialect::RouteKind) -> bool {
+        let model_ok = self.allow_models.is_empty()
+            || self.allow_models.iter().any(|m| {
+                m == "*" || m == model || mr_core::model::glob_match(m, model)
+            });
+        if !model_ok {
+            return false;
+        }
+        self.allow_routes.is_empty()
+            || self
+                .allow_routes
+                .iter()
+                .any(|r| r == "*" || r == route.as_str())
+    }
+
     pub fn is_metered(&self) -> bool {
         crate::quota::QuotaManager::is_metered(&self.limits, self.limit_requests)
     }

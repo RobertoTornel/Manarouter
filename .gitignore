@@ -8,6 +8,7 @@
 
 # --- local runtime state (never commit) ---
 /.manarouter/
+/relay.pid
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm

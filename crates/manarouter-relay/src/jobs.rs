@@ -159,7 +159,10 @@ impl JobRecord {
           "backend_detail": self.backend_detail,
           "image": self.spec.image,
           "command": self.spec.command,
-          "env": self.spec.env,
+          // Env values can carry secrets (HF tokens, API keys) and this view is handed to any
+          // authenticated caller with the job id. `env` is write-only: the names are returned so
+          // a caller can see *what* it set, never the values.
+          "env": self.spec.env.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
           "gpu": self.spec.gpu,
           "gpu_count": self.spec.gpu_count,
           "max_seconds": self.spec.max_seconds,
@@ -291,6 +294,44 @@ impl JobLane {
             .collect()
     }
 
+    /// Mark every non-terminal job failed at startup: the driver task that advances a job lives
+    /// in the relay process, so after a restart the record on disk describes work nothing is
+    /// doing — a `queued` view that would otherwise sit there pretending, still referencing an
+    /// instance a restarted process no longer knows. Terminating a real rental politely belongs
+    /// to `cancel`, which reached the backend before dying; here the backend keeps billing to the
+    /// job's own `max_seconds` budget, which is why that budget exists.
+    pub fn reap_orphans(&self) -> usize {
+        let mut reaped = 0;
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return 0;
+        };
+        for entry in entries.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()) {
+            let Some(id) = entry.file_name().into_string().ok() else {
+                continue;
+            };
+            let Ok(mut rec) = self.load(&id) else {
+                continue;
+            };
+            if matches!(
+                rec.status,
+                JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
+            ) {
+                continue;
+            }
+            rec.status = JobStatus::Failed;
+            rec.error = Some(
+                "the relay restarted while this job ran; its driver is gone, so the job cannot \
+                 make progress"
+                    .to_owned(),
+            );
+            rec.finished_at_ms = Some(now_ms());
+            if self.save(&rec).is_ok() {
+                reaped += 1;
+            }
+        }
+        reaped
+    }
+
     /// Read one artifact file. Names must be plain file names; traversal is refused.
     pub fn artifact_bytes(&self, id: &str, name: &str) -> Result<(Vec<u8>, &'static str), Refusal> {
         if name.is_empty()
@@ -354,6 +395,12 @@ fn validate_submission(spec: &JobSpec) -> Result<(), Refusal> {
             format!("\"max_seconds\" must be between 1 and {MAX_MAX_SECONDS}"),
         ));
     }
+    if spec.disk_gb == Some(0) {
+        return Err(Refusal::bad_request(
+            "invalid_request_error",
+            "\"disk_gb\" must be at least 1 when given",
+        ));
+    }
     Ok(())
 }
 
@@ -401,7 +448,9 @@ async fn driver(lane: Arc<JobLane>, id: String) {
             rec.status = JobStatus::Failed;
             rec.error = Some(e);
             rec.finished_at_ms = Some(now_ms());
-            let _ = lane.save(&rec);
+            if let Err(save) = lane.save(&rec) {
+                tracing::warn!(job = %id, ?save, "could not persist the failed job record");
+            }
             return;
         }
     };
@@ -416,7 +465,9 @@ async fn driver(lane: Arc<JobLane>, id: String) {
             rec.status = JobStatus::Failed;
             rec.error = Some(e);
             rec.finished_at_ms = Some(now_ms());
-            let _ = lane.save(&rec);
+            if let Err(save) = lane.save(&rec) {
+                tracing::warn!(job = %id, ?save, "could not persist the failed job record");
+            }
             return;
         }
     }
@@ -424,7 +475,9 @@ async fn driver(lane: Arc<JobLane>, id: String) {
     let deadline = now_ms() + rec.spec.max_seconds.saturating_mul(1000);
 
     loop {
-        let _ = lane.save(&rec);
+        if let Err(save) = lane.save(&rec) {
+            tracing::warn!(job = %id, ?save, "could not persist the job record mid-run");
+        }
         match lane.load(&id) {
             Ok(current) if current.cancelled => {
                 rec = current;
@@ -460,7 +513,9 @@ async fn driver(lane: Arc<JobLane>, id: String) {
         }
     }
     if !rec.cancelled {
-        let _ = lane.save(&rec);
+        if let Err(save) = lane.save(&rec) {
+            tracing::warn!(job = %id, ?save, "could not persist the finished job record");
+        }
     }
 }
 
@@ -799,7 +854,8 @@ pub async fn create_job(
         }
     };
     match app.jobs.submit(spec).await {
-        Ok(view) => crate::server::json_response(StatusCode::OK, view),
+        // 202, not 200: the body names a job that merely got queued; nothing has run yet.
+        Ok(view) => crate::server::json_response(StatusCode::ACCEPTED, view),
         Err(refusal) => refusal.into_response(),
     }
 }

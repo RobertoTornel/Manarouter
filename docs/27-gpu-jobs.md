@@ -33,7 +33,7 @@ Auth is exactly the batch lane's: the same client key that calls a model. Bodies
 }
 ```
 
-`backend` and `image` are required. `command` empty means the image's default command. `env` is a string map passed through to the container. `gpu_count` 1–8; `max_seconds` 1–21600 (six hours) — the lane fails the job when the budget is spent, because a card bills whether the job is making progress or not.
+`backend` and `image` are required. `command` empty means the image's default command. `env` is a string map passed through to the container. `gpu_count` 1–8; `max_seconds` 1–21600 (six hours) — the lane fails the job when the budget is spent, because a card bills whether the job is making progress or not. `disk_gb` is optional (`vast` defaults it to 16 when omitted; `0` is refused), and is the one submit field the job **view does not echo back** — record it at submit time if you need it later.
 
 ### Status
 
@@ -94,7 +94,11 @@ Stated plainly, because it is easy to assume more:
 - `demo`: submit → `queued` → `running` → `succeeded`, `output.txt` produced and downloadable, traversal names refused.
 - `demo` failure: a command containing `fail` ends `failed` with a reason, not a hang.
 - cancel: a running job goes `cancelled`, and the driver stops instead of overwriting the cancellation.
-- validation: unknown backend, blank image, `gpu_count` outside 1–8, `max_seconds` outside its range.
+- validation: unknown backend, blank image, `gpu_count` outside 1–8, `max_seconds` outside its
+  range, `disk_gb` of 0.
+- a submit answers `202 Accepted` (the job is queued; nothing has run yet).
+- after a relay restart, non-terminal records found on disk are marked `failed` with an
+  "interrupted by restart" reason (`reap_orphans`), rather than sitting `queued` forever.
 - the Vast instance-list parser, against a recorded body.
 
 **Not verified:** any real `vast` rental — create, poll to `stopped`, terminate, or a live artifact fetch. The parsers and the lifecycle are tested; the HTTP contract has not been exercised.

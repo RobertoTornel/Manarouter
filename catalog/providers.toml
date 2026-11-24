@@ -87,7 +87,9 @@ copilot_token_url = "https://api.github.com/copilot_internal/v2/token"
 copilot_integration_id = "vscode-chat"
 
 [providers.headers]
-"Editor-Version" = "vscode/${vs_code_version}"
+# Pin the VS Code major the fingerprint was recorded against: a literal template here reached the
+# wire unsubstituted and read as a missing header.
+"Editor-Version" = "vscode/1.105.0"
 "Copilot-Integration-Id" = "vscode-chat"
 "editor-plugin-version" = "copilot-chat/0.26.7"
 "user-agent" = "GitHubCopilotChat/0.26.7"
@@ -232,7 +234,7 @@ oauth_authorize_url = "https://auth.mistral.ai/oauth2/auth"
 oauth_token_url = "https://auth.mistral.ai/oauth2/token"
 oauth_client_id = "88df79e3-3a98-4624-92fe-c607ecf06f1d"
 oauth_scopes = "openid email profile offline_access"
-headers = { "user-agent" = "vibe-cli" }
+headers = { "user-agent" = "mistral-client-python/Mistral-Vibe/3.1.4" }
 
 [[providers]]
 id = "claude-code"

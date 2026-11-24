@@ -677,9 +677,8 @@ pub trait OAuthPlatform: Send + Sync {
     /// tokens themselves contribute.
     fn apply_credential(&self, tokens: &TokenSet) -> Vec<(HeaderName, HeaderValue)>;
 
-    /// The exact static name/value pairs this client's upstream expects, for the golden-header
-    /// test that compares them against the catalogue. Values that only make sense as templates
-    /// (Copilot's `Editor-Version`) stay in the catalogue instead.
+    /// The exact static name/value pairs this client's upstream expects. The relay applies these
+    /// under provider headers, and the golden-header test compares them against the catalogue.
     fn fingerprint_headers(&self) -> &'static [(&'static str, &'static str)];
 
     /// How long before `expires_at` a proactive refresh should run.

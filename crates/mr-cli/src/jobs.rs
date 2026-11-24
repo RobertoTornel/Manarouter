@@ -317,3 +317,88 @@ fn report(ctx: &Ctx, view: &Value) {
     }
     say(serde_json::to_string_pretty(view).unwrap_or_else(|_| view.to_string()));
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_quoted_command_splits_like_a_shell() {
+        let body = build_body(
+            "demo",
+            "python:3.12-slim",
+            &["python render.py".to_owned()],
+            &[],
+            None,
+            1,
+            16,
+            60,
+            None,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            value["command"],
+            json!(["python", "render.py"]),
+            "one quoted flag splits on whitespace"
+        );
+    }
+
+    #[test]
+    fn repeated_flags_stay_verbatim() {
+        let body = build_body(
+            "demo",
+            "img",
+            &["python".to_owned(), "my script.py".to_owned()],
+            &["A=1".to_owned(), "B=two words".to_owned()],
+            Some("RTX4090"),
+            2,
+            32,
+            120,
+            None,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["command"], json!(["python", "my script.py"]));
+        assert_eq!(value["env"], json!({"A": "1", "B": "two words"}));
+        assert_eq!(value["gpu"], json!("RTX4090"));
+        assert_eq!(value["gpu_count"], json!(2));
+        assert_eq!(value["disk_gb"], json!(32));
+        assert_eq!(value["max_seconds"], json!(120));
+    }
+
+    #[test]
+    fn env_without_equals_is_a_usage_error() {
+        let err = build_body("demo", "img", &[], &["BROKEN".to_owned()], None, 1, 16, 60, None)
+            .expect_err("NAME=VALUE is required");
+        assert_eq!(err.exit, Exit::Usage);
+    }
+
+    #[test]
+    fn body_file_wins_and_is_passed_through_parsed_and_rejected() {
+        // A well-formed file is handed to the relay verbatim.
+        let path = std::env::temp_dir().join(format!("mr-jobs-body-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"backend":"demo","image":"i"}"#).unwrap();
+        let body = build_body("demo", "img", &[], &[], None, 1, 16, 60, Some(path.to_str().unwrap()))
+            .unwrap();
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["backend"], json!("demo"));
+        std::fs::remove_file(&path).ok();
+        // A malformed file is a usage error, not a submission.
+        let bad = std::env::temp_dir().join(format!("mr-jobs-bad-{}.json", std::process::id()));
+        std::fs::write(&bad, "not json").unwrap();
+        let err = build_body("demo", "img", &[], &[], None, 1, 16, 60, Some(bad.to_str().unwrap()))
+            .expect_err("invalid JSON refuses");
+        assert_eq!(err.exit, Exit::Usage);
+        std::fs::remove_file(&bad).ok();
+    }
+
+    #[test]
+    fn terminal_states_are_exactly_the_finished_ones() {
+        assert!(terminal("succeeded"));
+        assert!(terminal("failed"));
+        assert!(terminal("cancelled"));
+        assert!(!terminal("running"));
+        assert!(!terminal("queued"));
+        assert!(!terminal("unknown"));
+    }
+}

@@ -229,6 +229,12 @@ pub fn build_state(
     );
 
     let jobs = Arc::new(crate::jobs::JobLane::open(mr_core::config::state_dir().join("jobs")));
+    // Driver tasks died with the previous process: any non-terminal record on disk is now work
+    // nothing advances. Marking them failed is honest; their logs still explain how far they got.
+    let orphaned = jobs.reap_orphans();
+    if orphaned > 0 {
+        tracing::warn!(orphaned, "marked interrupted jobs failed after the restart");
+    }
 
     let state = AppState {
         relay,

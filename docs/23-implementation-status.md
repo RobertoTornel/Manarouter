@@ -294,7 +294,7 @@ in the conductor, presentation in the panel, and the request path in the relay.
 * `crates/mr-core/src/lane/` — one descriptor per host, with the platform's own words for what the
   host will not let you do; no HTTP, no clock, no verdicts beyond the ones quoted.
 * `crates/manarouter-conductor/src/gpu_api.rs` — **six routes**: `GET /api/gpu/catalog`,
-  `GET /api/gpu/lanes`, `POST /api/gpu/probe`, `GET /api/gpu/rentals`, `POST /api/gpu/apply` and
+  `GET /api/lanes`, `POST /api/gpu/probe`, `GET /api/gpu/rentals`, `POST /api/gpu/apply` and
   `POST /api/gpu/launch-plan`. `apply` takes one of three actions — `create-account`,
   `create-hf-token`, `create-deployment` — and is create-only: there is no update or delete route for
   an account, a token or a deployment, which is why the panel offers an already-stored account by id
@@ -306,6 +306,13 @@ in the conductor, presentation in the panel, and the request path in the relay.
   returns 2, both inside the comment recording that the lane was removed; there is no bundle button
   and no attach form left to implement, because neither route exists.
 * `crates/manarouter-relay/src/batch.rs` — the durable batch lane that mode B dispatches through.
+* `crates/manarouter-relay/src/jobs.rs` — the **custom-job lane** (`/v1/jobs`): submit an arbitrary
+  container image + command to a rental backend (`vast`, unverified against the live API) or the
+  free local `demo` simulator; lifecycle, cancel, artifact download, per-job state on disk under
+  `state_dir()/jobs/`.submit answers `202`; non-terminal records found at startup are marked failed
+  (`reap_orphans`) because the driver task died with the previous process. Agents drive it with
+  `mr jobs` (`crates/mr-cli/src/jobs.rs`); the field guide is `docs/34-agent-gpu-jobs.md`, the lane
+  record `docs/27-gpu-jobs.md`.
 
 `crates/mr-core/src/gpu/mod.rs` states the split: that tree contains **no HTTP, no filesystem access
 and no clock**, so every number is checkable in a unit test with no network and no GPU.

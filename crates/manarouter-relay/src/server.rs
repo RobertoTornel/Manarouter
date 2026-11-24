@@ -2480,6 +2480,19 @@ async fn dispatch_routed(
                 );
             }
         }
+        // Model and route scopes are enforced here, at the one gate every routed request passes.
+        // `ClientKey::permits` is the same predicate `mr key create` documents; not calling it made
+        // `--allow-models`/`--allow-routes` cosmetic against every provider lane.
+        if !key.permits(model_name, route) {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                client_dialect,
+                "key_scope_refused",
+                &format!(
+                    "this client key is not permitted to call {model_name} on this route"
+                ),
+            );
+        }
     }
 
     let health = app.health.view();
@@ -2512,7 +2525,12 @@ async fn dispatch_routed(
                 String::from_utf8_lossy(&bytes[..DEBUG_LOG_BODY_MAX]),
                 bytes.len()
             )
-        };
+        }
+        // The payload is private and may contain newlines: escaping them keeps one request to
+        // one log line (a body could otherwise forge journal entries for later readers).
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
         tracing::info!(
             ts_ms = mr_core::ids::now_millis(),
             client_dialect = client_dialect.as_str(),
@@ -6604,7 +6622,16 @@ fn default_path(dialect: Dialect, route: RouteKind) -> &'static str {
         Dialect::GoogleAiStudio => "/v1beta/models:generateContent",
         Dialect::Antigravity => "/v1internal:generateContent",
         Dialect::Codex => "/responses",
-        Dialect::Copilot => "/chat/completions",
+        // Copilot is OpenAI-shaped and its host serves the platform's other surfaces natively:
+        // `/responses`, `/embeddings` and `/models` exist beside `/chat/completions` (the provider
+        // guide documents them). Routing a /v1/responses call to the chat path returned a chat
+        // answer shape to a Responses client; each native path it advertises is now its own arm.
+        Dialect::Copilot => match route {
+            RouteKind::Responses => "/responses",
+            RouteKind::Embeddings => "/embeddings",
+            RouteKind::Models => "/models",
+            _ => "/chat/completions",
+        },
         Dialect::CommandCodeGo => "/alpha/generate",
         Dialect::ModalVllm => "/v1/chat/completions",
         // Not reachable in practice: a Cursor attempt is opened by `cursor_transport`, which builds
@@ -6696,6 +6723,24 @@ fn upstream_headers(
         map.insert(n, v);
     }
 
+    // OAuth platforms declare the static fingerprint the wire actually requires (Copilot's
+    // Editor-Version and friends). Provider headers win when present; the platform list is the
+    // floor so a provider with empty headers still identifies itself instead of getting a hard
+    // 400 from an upstream that treats the fingerprint as mandatory.
+    if let mr_core::dialect::AuthKind::OAuth { platform } = &step.auth {
+        if let Some(oauth) = oauth_platform(platform) {
+            for (name, value) in oauth.fingerprint_headers() {
+                let (Ok(n), Ok(v)) = (
+                    HeaderName::from_bytes(name.as_bytes()),
+                    HeaderValue::from_str(value),
+                ) else {
+                    continue;
+                };
+                map.entry(n).or_insert(v);
+            }
+        }
+    }
+
     apply_auth(&mut map, &step.auth, credential);
     for (name, value) in oauth_headers {
         map.insert(name.clone(), value.clone());
@@ -6744,6 +6789,17 @@ fn upstream_headers(
     // would never send is exactly what this dialect exists to avoid.
     if step.dialect == Dialect::Zcode {
         zcode_attribution_headers(&mut map, client_session_hint(client_headers));
+    }
+
+    // The Mistral platform gates on the official Vibe CLI's identity (the `user-agent` must
+    // match a request Vibe itself would send), so the dialect owns this header outright: an
+    // operator template pinning some other agent's UA would turn every account into a client
+    // Mistral has never seen. The value lives beside the flow's own constants.
+    if step.dialect == Dialect::MistralVibeApi {
+        map.insert(
+            "user-agent",
+            HeaderValue::from_static(mr_core::published::mistral::USER_AGENT),
+        );
     }
 
     // Claude Code's subscription surface. `apply_auth` has already produced `Authorization:
@@ -9886,7 +9942,6 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             (Dialect::GoogleAiStudio, "/v1beta/models:generateContent"),
             (Dialect::Antigravity, "/v1internal:generateContent"),
             (Dialect::Codex, "/responses"),
-            (Dialect::Copilot, "/chat/completions"),
             (Dialect::CommandCodeGo, "/alpha/generate"),
         ];
         for (dialect, expected) in cases {
@@ -9906,6 +9961,20 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 "{dialect:?}"
             );
         }
+        // Copilot is the exception: its host serves the platform's native /responses and
+        // /embeddings, so those routes take their own paths instead of collapsing onto chat.
+        assert_eq!(
+            default_path(Dialect::Copilot, RouteKind::ChatCompletions),
+            "/chat/completions"
+        );
+        assert_eq!(
+            default_path(Dialect::Copilot, RouteKind::Responses),
+            "/responses"
+        );
+        assert_eq!(
+            default_path(Dialect::Copilot, RouteKind::Embeddings),
+            "/embeddings"
+        );
     }
 
     #[test]
@@ -9978,6 +10047,82 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             &[],
         );
         assert_eq!(out.get("accept").unwrap(), "text/event-stream");
+    }
+
+    #[test]
+    fn mistral_vibe_api_user_agent_is_vibes_own() {
+        // The dialect's fingerprint is owned by the relay, after provider headers: even a
+        // template that pins *some other agent's* User-Agent cannot make a Mistral request look
+        // like anything but Vibe itself (the platform gates on the CLI marker).
+        let mut p = provider_plan();
+        p.headers.insert("user-agent".to_owned(), "some-other-agent/1.0".to_owned());
+        let head = scan_request_head(br#"{"model":"m"}"#);
+        let out = upstream_headers(
+            &p,
+            &step(Dialect::MistralVibeApi, "https://api.mistral.ai/v1"),
+            None,
+            &HeaderMap::new(),
+            &head,
+            false,
+            None,
+            &[],
+        );
+        assert_eq!(
+            out.get("user-agent").unwrap(),
+            "mistral-client-python/Mistral-Vibe/3.1.4"
+        );
+        // And a bare provider still gets it from the same constant, not from a template.
+        let bare = provider_plan();
+        let out = upstream_headers(
+            &bare,
+            &step(Dialect::MistralVibeApi, "https://api.mistral.ai/v1"),
+            None,
+            &HeaderMap::new(),
+            &head,
+            false,
+            None,
+            &[],
+        );
+        assert_eq!(
+            out.get("user-agent").unwrap(),
+            mr_core::published::mistral::USER_AGENT
+        );
+        // Another dialect never gains it.
+        let out = upstream_headers(
+            &bare,
+            &step(Dialect::OpenAi, "https://api.openai.com"),
+            None,
+            &HeaderMap::new(),
+            &head,
+            false,
+            None,
+            &[],
+        );
+        assert!(!out.contains_key("user-agent"));
+    }
+
+    #[test]
+    fn copilot_fingerprint_survives_empty_provider_headers() {
+        // A Copilot provider with `headers: {}` still has to identify itself (Editor-Version is a
+        // hard 400 upstream): the OAuth platform's fingerprint list is the floor.
+        let p = provider_plan();
+        let head = scan_request_head(br#"{"model":"m"}"#);
+        let mut copilot_step = step(Dialect::Copilot, "https://api.githubcopilot.com");
+        copilot_step.auth = mr_core::dialect::AuthKind::OAuth {
+            platform: "github-copilot".to_owned(),
+        };
+        let out = upstream_headers(
+            &p,
+            &copilot_step,
+            None,
+            &HeaderMap::new(),
+            &head,
+            false,
+            None,
+            &[],
+        );
+        assert_eq!(out.get("editor-version").unwrap(), "vscode/1.105.0");
+        assert_eq!(out.get("copilot-integration-id").unwrap(), "vscode-chat");
     }
 
     #[test]

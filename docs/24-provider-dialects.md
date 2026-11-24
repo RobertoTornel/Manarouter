@@ -604,6 +604,24 @@ streams an answer regardless and rejects `store: true` (`responses.rs:71-76`).
 
 ---
 
+## `mistral-vibe-api` — Mistral's public platform surface
+
+**On the wire.** `api.mistral.ai/v1`, Chat Completions with strict `extra_forbidden` validation:
+the upstream 422s on unknown or echoed fields rather than ignoring them.
+
+**Who can reach it.** Both client dialects, through the same pivots as `open-ai`.
+
+**What the relay does.** OAuth and API-key accounts both exist (`crates/mr-core/src/oauth/`, the
+`mistral_api.rs` flow). Because the upstream refuses fields other providers tolerate, the relay
+strips client-optional extras that Mistral's schema rejects — notably echoed reasoning fields,
+flat and nested (`crates/manarouter-relay/src/server.rs`) — before sending. A passthrough that
+keeps such fields fails every request with `422 extra_forbidden`; see the incident note in
+[the provider page](providers/mistral-vibe-api.md).
+
+**Read next.** [Mistral Vibe API](providers/mistral-vibe-api.md) for accounts, models and the
+reasoning-field rule.
+
+---
 ## `copilot` — GitHub Copilot's OpenAI-shaped surface
 
 **On the wire.** `api.githubcopilot.com`, with the bearer minted from a GitHub token
@@ -675,24 +693,6 @@ anything is read (`google.rs:16-19`).
 the scopes; [OAuth: Antigravity](12-oauth-antigravity.md) for the login.
 
 ---
-
-## `mistral-vibe` — the LeChat consumer surface behind the Vibe login
-
-Mistral Vibe signs in with Ory PKCE at `auth.mistral.ai` (loopback, on the client's
-pre-registered ports). Ory mints an opaque access token *and* a JWT `id_token`; the LeChat
-consumer backend (`chat.mistral.ai`) authenticates with the JWT — the public `api.mistral.ai/v1`
-surface rejects both Ory tokens with `Invalid API Key`. Inference goes to
-`POST https://chat.mistral.ai/api/chat`.
-
-The app posts a `create`/`append` envelope and receives a `text/event-stream` body whose frames
-are length-prefixed JSONL (`N:{"json":{...}}`) carrying replacement patches. The dialect is
-therefore a real translation surface: an OpenAI Chat Completions request is folded into a `create`
-envelope (`productType: "work"`) carrying the last user text, and the streamed patches are diffed
-into OpenAI chat-completion chunks so the client sees one answer (`crates/mr-dialects/src/vibe.rs`).
-The relay attaches the desktop app's own user agent, and the OAuth layer keeps the `id_token` in
-the token set's `extra` so it can be attached as the bearer. The login is documented in
-[OAuth overview](10-oauth-overview.md) and the catalogue entry in
-[providers/catalog.md](providers/catalog.md).
 
 ## `command-code-go` — the Command Code CLI envelope
 
@@ -862,11 +862,11 @@ the one case where the relay cannot fail over on a refusal; it is recorded here 
 lengthening the hold, because a longer hold would delay the first byte of every slow reasoning turn to
 buy correctness for a rare case.
 
-**What it will not do.** Client tools are refused rather than half-supported: answering a `tool_call`
-the server asks for is a protocol this transport does not implement, and the error names the field
-that would be needed. So are images and other non-text content. A provider with a proxy configured is
-refused with an actionable message instead of quietly going direct around an egress policy, since a
-proxied bidirectional stream is not implemented.
+**What it will not do.** Server-executed tools are declined with the schema's own `tool_not_found`
+answer — the declared tools belong to the calling client, and executing them here as well would run
+the caller's tool twice. Images and other non-text content are refused. A provider with a proxy
+configured is refused with an actionable message instead of quietly going direct around an egress
+policy, since a proxied bidirectional stream is not implemented.
 
 **Reasoning.** The dialect offers `ReasoningLevel::None` only, and that is not a limitation to work
 around: effort is selected by the model id. `grok-4.7-medium` answers, `grok-4.7-low` and
@@ -889,36 +889,6 @@ machine are pinned by exact-byte assertions in the dialect's tests.
 
 **Read next.** [Cursor](28-oauth-cursor.md) for the login, and
 [providers/cursor.md](providers/cursor.md) for the operator steps.
-## Not a dialect — Cursor
-
-One platform is deliberately absent from the table above, and it is worth writing down why rather
-than rediscovering it: **Cursor**.
-
-Cursor publishes no inference API — only agent-management endpoints and its CLI's own agent
-protocol. That CLI talks to `agent.v1.AgentService` over the Connect protocol, and one turn is not a
-completion:
-
-- the request is an `AgentRunRequest` carrying a *conversation state* and an *action*, not a
-  `messages[]` array;
-- the prompt is assembled server-side from `ConversationStateStructure.root_prompt_messages_json`, a
-  repeated `bytes` field whose writer is not in the shipped client, so a router cannot produce it
-  from a chat history;
-- the traffic is a bidi channel: `RunSSE` streams `AgentServerMessage` frames while client messages
-  arrive on a separate `aiserver.v1.BidiService/BidiAppend` call with their own sequence numbers;
-- the auth is a two-layer API key → JWT exchange (`/auth/exchange_user_api_key`), the same shape as
-  Copilot's minted bearer.
-
-None of that is a dialect. A dialect maps one stateless request onto another stateless request;
-Cursor is an agent loop whose memory lives on the far side. The direction that does work is Cursor
-pointed at Manarouter's OpenAI surface through its own bring-your-own-key setting, which is a client
-configuration rather than a provider entry — and that is why there is no `cursor` row in the
-catalogue.
-
-**Read next.** [Cursor](providers/cursor.md) for the working direction, and
-[the CLI protocol record](research/cursor-cli-inference.md) for the recovered wire format, with every
-claim tagged read, observed, inferred or unknown.
-
----
 
 ## Client route × upstream dialect
 
@@ -1065,11 +1035,27 @@ names is left alone — which is what keeps a client's explicit `reasoning_effor
 model, and the fallback path depends on there being one type that always works
 (`crates/mr-core/src/snapshot.rs:1807-1810`).
 
-A request whose modality the selected route cannot carry is retried against the configured default
-entry, as a complete reroute against the same pinned snapshot, with a budget of one fallback; a
-target that also lacks the modality, or names no known model, fails with HTTP `501`
-([the implementation status](23-implementation-status.md)). The modality is decided from the
-*request body*, after translation, so the check sees the shape the upstream will actually receive.
+Every modality is **on by default**. When the operator has declared no `input_modalities` for a
+model, the router enables all six and sends the request: most providers never report modalities
+at all, and deriving text-only from that silence turned a missing report into a refusal the
+upstream never issued. If the upstream rejects the input, its own failure is the answer — the
+modality is failed by the attempt, not guessed away in advance. Only an explicit operator
+declaration turns a modality off.
+
+The refusal is also **learned**: the first 4xx/501 upstream answer to a request that carried a
+modality marks that modality failed for that provider/model for the life of the relay process.
+Later requests skip or fall back to the configured default instead of re-asking a question that
+was already answered, and `GET /v1/models` stops advertising the modality for that model. When
+no step can carry it, the request fails with a message naming the model and the modality (for
+example `the request contains an image but model `X` does not accept images`) rather than a
+provider-specific blob.
+
+When a route *cannot* carry a modality because the operator restricted it, the request is retried
+against the configured default entry, as a complete reroute against the same pinned snapshot,
+with a budget of one fallback; a target that also lacks the modality, or names no known model,
+fails with HTTP `501` ([the implementation status](23-implementation-status.md)). The modality is
+decided from the *request body*, after translation, so the check sees the shape the upstream will
+actually receive.
 
 A part whose `type` names neither a routed modality nor a text, tool or reasoning block is refused with
 HTTP `400` rather than guessed at (`crates/manarouter-relay/src/upstream.rs`, `MEDIA_TYPES` and

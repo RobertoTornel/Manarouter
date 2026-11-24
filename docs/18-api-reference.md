@@ -66,7 +66,7 @@ if a documented path answers axum's empty 404, so a row in this table is a route
 | `POST` `GET` | `/v1/files` | OpenAI Files (upload, list) — the batch lane's input files and fine-tuning's training data |
 | `GET` `DELETE` | `/v1/files/{id}` | OpenAI Files (retrieve, delete) |
 | `GET` | `/v1/files/{id}/content` | The stored bytes |
-| `POST` `GET` | `/v1/uploads` | OpenAI resumable uploads (create, list) |
+| `POST` | `/v1/uploads` | OpenAI resumable uploads (create) |
 | `POST` | `/v1/uploads/{id}/parts` | One part of a resumable upload |
 | `POST` | `/v1/uploads/{id}/complete` | Assemble the parts into a file |
 | `POST` | `/v1/uploads/{id}/cancel` | Abandon the upload |
@@ -106,12 +106,27 @@ Job creation needs an account with more than $15 of known credit, and takes the 
 qualifies; the job's other routes are not gated. See
 [key selection](05-key-selection.md#the-declared-balance-and-the-one-route-ranked-by-it).
 
+**Custom GPU jobs.** The job lane rents a card (or runs the free local simulator) for a container
+image and a command the caller supplies — custom work, not model serving. Same client key; submit
+answers `202 Accepted`.
+
+| Method | Path | Shape |
+|---|---|---|
+| `POST` | `/v1/jobs` | Submit a job (backend `demo` / `vast`, image, command, `max_seconds`) |
+| `GET` | `/v1/jobs` | List jobs, newest first (`limit`, `after`) |
+| `GET` | `/v1/jobs/{id}` | One job: status, logs, artifacts |
+| `POST` | `/v1/jobs/{id}/cancel` | Cancel a queued/running job |
+| `GET` | `/v1/jobs/{id}/artifacts/{name}` | Download one artifact |
+
+See [27-gpu-jobs.md](27-gpu-jobs.md) for the lane and [34-agent-gpu-jobs.md](34-agent-gpu-jobs.md)
+for the agent's field guide.
+
 **Liveness and control.**
 
 | Method | Path | Shape |
 |---|---|---|
 | `GET` | `/healthz` | Liveness. **Never routed upstream.** |
-| `GET` | `/control/probe` | Diagnostic probe of the routing table |
+| `POST` | `/control/probe` | Diagnostic probe of the routing table |
 | `GET` | `/control/activity` | The last few combo decisions, for the panel's live view |
 
 Three of these families need a sentence more than a row. A **container** is not something the relay

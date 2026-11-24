@@ -18,7 +18,7 @@ The conductor exposes six GPU-rental endpoints, plus the lane routes in
 |---|---|---|
 | `GET` | `/api/gpu/catalog` | which GPUs each platform offers |
 | `GET` | `/api/lanes` | what may be done on each host (refusals built in) |
-| `GET` | `/api/gpu/probe` | measure latency / throughput on a GPU |
+| `POST` | `/api/gpu/probe` | measure latency / throughput on a GPU |
 | `GET` | `/api/gpu/rentals` | current rentals and their state |
 | `POST` | `/api/gpu/apply` | submit a rental application |
 | `POST` | `/api/gpu/launch-plan` | order the configured deployments into launch waves (§9) |

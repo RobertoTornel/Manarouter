@@ -455,8 +455,8 @@ impl OAuthPlatform for Copilot {
         let mut out = Vec::new();
         // The session token minted from the GitHub token — never the GitHub token itself.
         // Every other request header (`Editor-Version`, `Copilot-Integration-Id`, the
-        // user-agent family) is catalogue-owned: its values are templates only the catalogue
-        // can fill, so duplicating them here would create a second copy to drift.
+        // user-agent family) comes from `fingerprint_headers` below, which the relay applies as
+        // the floor under provider headers; the catalogue records the same values.
         if let Some(h) = header("authorization", &format!("Bearer {}", tokens.access_token)) {
             out.push(h);
         }
@@ -465,11 +465,9 @@ impl OAuthPlatform for Copilot {
 
     fn fingerprint_headers(&self) -> &'static [(&'static str, &'static str)] {
         // Byte-identical to the catalogue's `[providers.headers]` — enforced by the registry
-        // test. `Editor-Version` is deliberately absent here: its value is a template
-        // (`vscode/${vs_code_version}`) that only the catalogue can fill, and it is mandatory
-        // upstream (hard 400 without it), so it must never be dropped by a mismatch between
-        // this list and the data.
+        // test, which now also pins `Editor-Version` so its global-list membership cannot drift.
         &[
+            ("Editor-Version", "vscode/1.105.0"),
             ("Copilot-Integration-Id", "vscode-chat"),
             ("editor-plugin-version", "copilot-chat/0.26.7"),
             ("user-agent", "GitHubCopilotChat/0.26.7"),

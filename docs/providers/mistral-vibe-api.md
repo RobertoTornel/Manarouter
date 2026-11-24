@@ -25,3 +25,15 @@ to `system` for this upstream.
 
 The dialect id is `mistral-vibe-api`, so a configured model is selected as
 `mistral-vibe-api/<model>`.
+
+### Requests must look like Vibe's own
+
+The upstream gates on the client identity, so the relay pins the `user-agent` every
+`mistral-vibe-api` request carries to the value the official CLI sends
+(`mistral-client-python/Mistral-Vibe/3.1.4`, capture from the
+[official source](https://github.com/mistralai/mistral-vibe), function
+`get_user_agent("mistral")` in `vibe/utils/http.py`). The header is applied after provider
+headers, so an operator template cannot re-brand the traffic to some other client's
+User-Agent — a request that looks like an unknown agent risks a refusal. When the CLI ships a
+new version, update `mr_core::published::mistral::USER_AGENT` plus the catalogue row together
+(the golden-header test pins the pair).

@@ -343,7 +343,9 @@ impl OAuthPlatform for MistralApi {
     }
 
     fn fingerprint_headers(&self) -> &'static [(&'static str, &'static str)] {
-        &[("user-agent", "vibe-cli")]
+        // The exact identity `vibe.utils.http.get_user_agent("mistral")` sends for Mistral
+        // completions in the official package.
+        &[("user-agent", mistral::USER_AGENT)]
     }
 }
 
@@ -351,6 +353,18 @@ impl OAuthPlatform for MistralApi {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_fingerprint_is_the_official_vibe_user_agent() {
+        // The platform upstream gates on the identity `vibe.utils.http.get_user_agent("mistral")`
+        // builds: `mistral-client-python/` + `Mistral-Vibe/<version>` (3.1.4 captured). Drifting
+        // this value turns every account into a client Mistral has never seen.
+        assert_eq!(
+            MistralApi.fingerprint_headers(),
+            &[("user-agent", mistral::USER_AGENT)]
+        );
+        assert_eq!(mistral::USER_AGENT, "mistral-client-python/Mistral-Vibe/3.1.4");
+    }
 
     #[test]
     fn an_api_key_maps_to_a_bearer_token_set_without_an_expiry_or_refresh_token() {

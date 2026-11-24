@@ -306,6 +306,12 @@ pub mod mistral {
     pub const USERINFO: &str = "https://auth.mistral.ai/userinfo";
     /// The OpenAI-compatible API origin the minted token addresses.
     pub const API: &str = "https://api.mistral.ai";
+    /// The `User-Agent` the official Mistral Vibe CLI sends with its completions: the Python
+    /// `vibe.utils.http.get_user_agent("mistral")` builds `mistral-client-python/` plus
+    /// `Mistral-Vibe/<version>` (captured from the 3.1.4 release). Relay requests for this
+    /// dialect send the same identity so a request through Manarouter is indistinguishable
+    /// from one Vibe itself made — the platform is known to gate on the CLI's marker.
+    pub const USER_AGENT: &str = "mistral-client-python/Mistral-Vibe/3.1.4";
     /// The OAuth client id embedded in the Mistral Vibe desktop app (v1.2.0), from its shipped bundle.
     pub const CLIENT_ID: &str = "88df79e3-3a98-4624-92fe-c607ecf06f1d";
     /// API audience from the app's OIDC authorization request.

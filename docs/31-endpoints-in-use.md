@@ -20,9 +20,9 @@ Every path accepts either header:
 `x-api-key` is checked first when both are present. The key is opaque to the client: the stack
 hashes it and compares the hash, so a key is shown once at creation and never again. A missing,
 malformed, or unknown key is `401` with the OpenAI error envelope and `WWW-Authenticate: Bearer`,
-except on `/v1/messages*`, which uses the Anthropic envelope. The `WWW-Authenticate` header carries
-`error="invalid_token"`, so a client can tell a rejected key from an absent one without parsing
-prose.
+except on `/v1/messages*`, which uses the Anthropic envelope. The header is the bare scheme — no
+`error=` parameter — so a client distinguishes a rejected key from an absent one by the JSON body,
+not the header.
 
 Keep the key out of shell history and `ps`. A 0600 curl config file is the least awkward way:
 

@@ -74,7 +74,20 @@ mr key rotate <id> --print
 mr key remove <id>
 ```
 
-A newly created or rotated key is printed once; save it securely and do not share it. Rotation invalidates the old key. `mr key create --help` shows optional `--allow-models`, `--allow-routes`, `--limit-requests`, and `--note` restrictions. `mr key remove` deletes a key immediately and any client still using it starts receiving 401 responses, so retire the client first.
+A newly created or rotated key is printed once; save it securely and do not share it. Rotation invalidates the old key. `mr key create --help` shows optional `--allow-models`, `--allow-routes`, `--allow-combos`, `--limit-requests`, and `--note` restrictions. `mr key remove` deletes a key immediately and any client still using it starts receiving 401 responses, so retire the client first.
+
+## Egress people
+
+```bash
+mr person add <tag> --proxy <proxy>
+mr person list
+mr person remove <tag>
+```
+
+A *person* is a tag plus the proxy their accounts egress through (for example a Tailscale peer's
+SOCKS5 endpoint). Declare a person once, then tag accounts with `--tag` in `mr account add`; the
+relay routes those accounts through that proxy. Removing a person keeps the tag on the accounts —
+they simply stop being routed through a proxy.
 
 ## Jobs — custom GPU work
 

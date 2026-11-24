@@ -1,6 +1,8 @@
 @echo off
 setlocal enabledelayedexpansion
-set KEY=mr-4798c9325ec415afbf0f11d925312b2480dfdf2f7b958acc62
+rem The client key comes from the environment; never commit one.
+if not defined MR_CLIENT_KEY ( echo Set MR_CLIENT_KEY first, e.g. mr key create --print ^> save it ^& exit /b 1 )
+set KEY=%MR_CLIENT_KEY%
 set BASE=https://pc.nutria-ordinal.ts.net:20900
 
 echo === 1) Relay health over tailnet (port 20900) ===
