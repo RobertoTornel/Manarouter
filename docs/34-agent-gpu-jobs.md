@@ -6,6 +6,12 @@ minutes to hours, and the agent wants to write the command itself rather than ha
 guess it. Manarouter's **job lane** rents a card for that. This page is the agent's field guide;
 `docs/27-gpu-jobs.md` is the lane's implementation record.
 
+> **Scope note.** Submitting jobs is authorized by any valid client key the same way chat is.
+> The `--allow-models`/`--allow-routes` limits on a key scope *model* routes (`/v1/chat/completions`
+> and friends) but **not** `/v1/jobs` — so a key narrowed to one model can still submit a rental
+> job. A client key is spending authority for its backend; hand it out accordingly. A jobs gate
+> is a known limitation recorded in [27-gpu-jobs.md](27-gpu-jobs.md).
+
 ## The mental model
 
 ```

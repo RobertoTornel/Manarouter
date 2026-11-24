@@ -18,6 +18,10 @@
 
 Auth is exactly the batch lane's: the same client key that calls a model. Bodies are the usual error envelope.
 
+> **Known limitation.** Key scoping (`--allow-models`/`--allow-routes`) gates *model* routes only;
+> `/v1/jobs` accepts any valid client key. A key is spending authority for its backend's rentals,
+> so scope key distribution accordingly until the lane grows its own per-key gate.
+
 ### Submit body
 
 ```json
