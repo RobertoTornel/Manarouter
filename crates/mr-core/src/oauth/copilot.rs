@@ -53,8 +53,12 @@ const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 /// §3.3: the mint endpoint pins its **own** API-version header. The catalogue's
 /// `x-github-api-version: 2025-04-01` is a different header on a different host (inference
-/// vs. minting); the two must not be "helpfully" unified.
-const MINT_API_VERSION: &str = "2024-12-15";
+/// vs. minting); the two must not be "helpfully" unified. Versions are date-shaped
+/// (`YYYY-MM-DD`) and GitHub withdraws old ones; live probing at the Copilot REST host showed
+/// `2024-12-15` withdrawn in favor of the `2026-08-01` captured by the working quota probe, so
+/// the token flow reuses that constant. This shared constant also covers the account-identity
+/// lookup, which line 448's call in this module needs now that the old pin breaks.
+const MINT_API_VERSION: &str = crate::quota::github::GITHUB_API_VERSION;
 
 /// §3.1: the device-code request body — exactly these two fields. The paired secret that
 /// sits next to this client id in the language-server bundle (§3.2) must **not** be sent:
@@ -849,8 +853,8 @@ mod tests {
         assert_eq!(Copilot.refresh_lead(), Duration::from_secs(300));
         assert_eq!(DEFAULT_API_HOST, "https://api.githubcopilot.com");
         assert_eq!(
-            MINT_API_VERSION, "2024-12-15",
-            "§3.3 mint pin, not the catalogue's 2025-04-01"
+            MINT_API_VERSION, crate::quota::github::GITHUB_API_VERSION,
+            "§3.3 mint version reuses the supported GitHub REST API version"
         );
         // authorization_url / exchange_code stay honest errors: neither exists here.
         let error = Copilot
