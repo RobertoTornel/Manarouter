@@ -17,6 +17,7 @@ mod alias;
 mod combo;
 mod config;
 mod doctor;
+mod jobs;
 mod key;
 mod migrate;
 mod models;
@@ -91,6 +92,9 @@ enum Command {
     /// Sync and list a provider's model catalogue.
     #[command(subcommand)]
     Models(models::ModelsCmd),
+    /// Submit and drive custom GPU jobs (render, fine-tune, any container) on the job lane.
+    #[command(subcommand)]
+    Jobs(jobs::JobsCmd),
     /// Inspect and rekey the encrypted secret vault.
     #[command(subcommand)]
     Vault(vault::VaultCmd),
@@ -268,6 +272,7 @@ async fn dispatch(command: Command, ctx: &Ctx) -> Result<(), CliError> {
         Command::Alias(c) => alias::run(c, ctx).await,
         Command::Key(c) => key::run(c, ctx).await,
         Command::Models(c) => models::run(c, ctx).await,
+        Command::Jobs(c) => jobs::run(c, ctx).await,
         Command::Vault(c) => vault::run(c, ctx).await,
         Command::Config(c) => config::run(c, ctx).await,
         Command::Serve(c) => serve::run(c, ctx).await,

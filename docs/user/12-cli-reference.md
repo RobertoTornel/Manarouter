@@ -21,7 +21,7 @@ mr provider remove <provider> [--force]
 ## Provider accounts and credentials
 
 ```bash
-mr account add <provider> --secret-stdin [--label <label>] [--credit-usd <USD>]
+mr account add <provider> --secret-stdin [--label <label>] [--credit-usd <USD>] [--tag <TAG>] [--model-allow <MODEL>] [--model-deny <MODEL>]
 mr account list <provider>
 mr account enable <provider> <account>
 mr account disable <provider> <account>
@@ -34,6 +34,8 @@ mr account remove <provider> <account> [--force]
 Use `--secret-stdin` and paste the upstream credential into standard input in your own terminal, then send EOF. Do not pass real credentials through `--secret <value>` or put them in a command, shell history, or support message. The CLI also accepts `--secret-env <VAR>`, but environment-variable exposure is environment-dependent. See [Security](11-security.md).
 
 `--credit-usd` and `set-credit` declare a balance the router cannot read for itself. The figure is a floor for one decision — starting a fine-tuning job, which requires more than $15 of known credit — not a spend meter, and `--clear` returns the account to "unknown" rather than zero. See [key selection](../05-key-selection.md#the-declared-balance-and-the-one-route-ranked-by-it).
+
+`--model-allow` and `--model-deny` (repeatable) restrict which models this credential may serve. A pattern is a model id or a prefix ending in `*` (for example `claude-*`); a deny entry always wins over an allow entry, and an account with no allow patterns serves every model. `mr account list` shows the result in its `MODELS` column. The relay enforces these lists per request; see [key selection §5](../05-key-selection.md#5-models_allow--models_deny-and-where-they-apply).
 
 ## Models and combos
 
@@ -73,6 +75,30 @@ mr key remove <id>
 ```
 
 A newly created or rotated key is printed once; save it securely and do not share it. Rotation invalidates the old key. `mr key create --help` shows optional `--allow-models`, `--allow-routes`, `--limit-requests`, and `--note` restrictions. `mr key remove` deletes a key immediately and any client still using it starts receiving 401 responses, so retire the client first.
+
+## Jobs — custom GPU work
+
+```bash
+mr jobs submit --backend demo --image python:3.12-slim --command python --command render.py --env STEPS=50 --max-seconds 3600
+mr jobs list [--limit 20] [--after <id>]
+mr jobs show <id>
+mr jobs cancel <id>
+mr jobs wait <id> --timeout 10m
+```
+
+Submits to the relay's job lane (`/v1/jobs`) — a rented card (`--backend vast`) or the free local
+simulator (`--backend demo`). `--gpu`, `--gpu-count` (1–8), `--disk-gb` and `--env NAME=VALUE`
+(repeatable) shape the request; `--body <FILE>` takes a raw JSON submission instead of flags.
+Jobs authenticate with the **client key** (the same key that calls a model), read from
+`MR_CLIENT_KEY` or piped on stdin — never a flag, because a flag lands in shell history.
+
+`wait` polls until the job reaches a terminal state and exits with it: `0` on `succeeded`, `1` on
+`failed`/`cancelled`, so `&&` chains in an agent script behave. Artifacts are fetched by name from
+`GET /v1/jobs/<id>/artifacts/<name>`; see [34-agent-gpu-jobs.md](../34-agent-gpu-jobs.md) for the
+agent's guide, and [27-gpu-jobs.md](../27-gpu-jobs.md) for the lane itself.
+
+A real rental bills for the whole `max_seconds` window whether the command is working or not;
+develop the command on `demo` first.
 
 ## Start and diagnose
 

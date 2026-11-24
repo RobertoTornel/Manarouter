@@ -122,7 +122,7 @@ Router/
     │       ├── catalog.rs          loads catalog/providers.toml into ProviderTemplates
     │       ├── error.rs            Error enum
     │       ├── published.rs        ★ OAuth public client constants, assembled from fragments
-    │       └── oauth/              ★ per-platform login/token/refresh (codex, copilot, antigravity, cursor, zcode, claude, mistral-vibe)
+    │       └── oauth/              ★ per-platform login/token/refresh (codex, copilot, antigravity, cursor, zcode, claude)
     ├── mr-dialects/                translation; nothing here runs when dialects match
     │   └── src/
     │       ├── lib.rs              ★ the dispatch + TranslateCtx contract
@@ -506,6 +506,7 @@ trigger.
     { "path": "docs/user/12-cli-reference.md", "purpose": "Every mr command with its flags", "read_when": "looking up a command" },
     { "path": "docs/25-gpu-rentals.md", "purpose": "Renting a GPU for a self-hosted model: the two lanes, KV capacity sizing, and what Manarouter will not do for you", "read_when": "planning self-hosted GPU capacity" },
     { "path": "docs/26-gpu-lanes.md", "purpose": "The remaining GPU lane surface behind the panel: Kaggle's four routes, what the platform can and cannot do, and what every error means; the Saturn, molab and Cerebrium lanes were removed", "read_when": "driving or debugging a GPU lane" },
+    { "path": "docs/34-agent-gpu-jobs.md", "purpose": "How an agent runs custom work on a rented card: the mr jobs command tree, the job lifecycle, and what each error means", "read_when": "rendering, fine-tuning or doing any non-inference work on a rental GPU" },
     { "path": "docs/providers/modal-vllm.md", "purpose": "The Modal vLLM provider: proxy-token auth, capacity settings and lifecycle fields", "read_when": "configuring a rented Modal endpoint" },
     { "path": "docs/research/ARCHITECTURE-gpu-rentals.md", "purpose": "The frozen interface spec for GPU rentals: config schema, conductor API, two catalogs, and the sizing rules", "read_when": "implementing or reviewing the GPU-rental feature" },
     { "path": "docs/research/vllm-sizing-and-quant.md", "purpose": "vLLM's exact KV formula, its quoting-layer and head-dim fallbacks, and the hybrid-attention correction", "read_when": "computing or reviewing a KV footprint" },
